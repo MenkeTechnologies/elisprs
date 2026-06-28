@@ -9,19 +9,27 @@ use crate::{compiler, host, reader};
 use std::path::Path;
 
 pub fn compile_file(src: &str, out: &Path) -> Result<(), String> {
-    let chunk = host::with_host(|h| {
+    // Load the prelude into the host first, so user code referencing it resolves
+    // and the embedded heap image includes the prelude objects.
+    let _ = crate::eval_str("");
+    let mut chunk = host::with_host(|h| {
         let forms = reader::read_all(h, src)?;
         compiler::compile_program(h, &forms)
     })?;
+    // Embed the user/prelude heap image so `Value::Obj` handles in the chunk's
+    // constants resolve in the fresh AOT-runtime host (see aot_runtime.rs).
+    let image = host::with_host(|h| h.export_heap_image());
+    let json = serde_json::to_string(&image).map_err(|e| e.to_string())?;
     eprintln!(
-        "lowered to fusevm chunk: {} ops, {} constants",
+        "lowered to fusevm chunk: {} ops, {} constants; heap image: {} objects",
         chunk.ops.len(),
-        chunk.constants.len()
+        chunk.constants.len(),
+        image.len()
     );
-    // Native object emission:
-    //   fusevm::aot::compile_object(&chunk, out).map_err(|e| e)?;
-    // is available when fusevm is built with its `aot` feature. Until that is
-    // wired into elisprs's Cargo features, report the lowering result.
-    let _ = out;
-    Err("native object emission requires fusevm's `aot` feature (lowering succeeded)".to_string())
+    chunk.names.push(format!("{}{}", host::HEAP_IMAGE_TAG, json));
+    // fusevm bincode-serializes the chunk into the object plus a native entry
+    // that deserializes and runs it on the VM. A standalone binary links this
+    // object against the elisprs runtime (aot_runtime::fusevm_aot_register_builtins).
+    fusevm::aot::compile_object(&chunk, out)?;
+    Ok(())
 }

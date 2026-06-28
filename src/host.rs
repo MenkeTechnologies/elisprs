@@ -15,9 +15,25 @@
 //! operations.
 
 use fusevm::{Chunk, VMResult, Value, VM};
+use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+
+/// Sentinel prefix marking the AOT heap image stashed in `chunk.names`.
+pub const HEAP_IMAGE_TAG: &str = "\u{0}ELHEAP\u{0}";
+
+/// A serializable mirror of a heap object — everything except `Subr` (a native
+/// fn pointer, re-installed by `install`). Used to ship the user/prelude heap
+/// into an AOT object so `Value::Obj` handles resolve in the AOT-runtime host.
+#[derive(Serialize, Deserialize)]
+pub enum SerObj {
+    Cons(Value, Value),
+    Symbol { name: String, value: Option<Value>, function: Option<Value>, special: bool },
+    Vector(Vec<Value>),
+    HashTable { test: u8, entries: Vec<(Value, Value)> },
+    Closure { required: Vec<u32>, optional: Vec<u32>, rest: Option<u32>, body: Chunk, is_macro: bool },
+}
 
 /// Extension-op IDs emitted by the compiler and dispatched here.
 pub mod ops {
@@ -136,6 +152,9 @@ pub enum Resolved {
 pub struct ElispHost {
     pub(crate) arena: Vec<Obj>,
     obarray: HashMap<String, u32>,
+    /// Arena length right after `install` (the builtin objects). Everything at or
+    /// above this index is user/prelude data — the portion serialized for AOT.
+    builtin_count: usize,
     /// Dynamic-binding save stack: (symbol handle, previous value cell).
     specstack: Vec<(u32, Option<Value>)>,
     /// Current lexical environment (the chain of `let`/closure frames).
@@ -159,6 +178,7 @@ impl ElispHost {
         let mut h = ElispHost {
             arena: Vec::new(),
             obarray: HashMap::new(),
+            builtin_count: 0,
             specstack: Vec::new(),
             lex: None,
             frame_stack: Vec::new(),
@@ -166,6 +186,7 @@ impl ElispHost {
             pending_throw: None,
         };
         crate::builtins::install(&mut h);
+        h.builtin_count = h.arena.len();
         h
     }
 
@@ -397,6 +418,65 @@ impl ElispHost {
             });
         }
         template.clone()
+    }
+    // ── AOT heap image ──
+    /// Serialize the user/prelude heap (arena ≥ `builtin_count`) for embedding
+    /// into an AOT object. Builtins are excluded — they are re-created by
+    /// `install` in the AOT-runtime host, at the same handles.
+    pub fn export_heap_image(&self) -> Vec<SerObj> {
+        self.arena[self.builtin_count..]
+            .iter()
+            .map(|o| match o {
+                Obj::Cons(a, b) => SerObj::Cons(a.clone(), b.clone()),
+                Obj::Symbol(s) => SerObj::Symbol {
+                    name: s.name.clone(),
+                    value: s.value.clone(),
+                    function: s.function.clone(),
+                    special: s.special,
+                },
+                Obj::Vector(v) => SerObj::Vector(v.clone()),
+                Obj::HashTable { test, entries } => {
+                    SerObj::HashTable { test: *test, entries: entries.clone() }
+                }
+                Obj::Closure { params, body, is_macro, .. } => SerObj::Closure {
+                    required: params.required.clone(),
+                    optional: params.optional.clone(),
+                    rest: params.rest,
+                    body: (**body).clone(),
+                    is_macro: *is_macro,
+                },
+                // No Subr ever lives in the user range (only `install` makes them).
+                Obj::Subr { .. } => SerObj::Symbol {
+                    name: "--unexpected-subr--".to_string(),
+                    value: None,
+                    function: None,
+                    special: false,
+                },
+            })
+            .collect()
+    }
+    /// Rebuild the user/prelude heap from an image. Must be called on a fresh
+    /// host (arena == builtins only) so handles line up with compile time.
+    pub fn import_heap_image(&mut self, image: Vec<SerObj>) {
+        for ser in image {
+            let id = self.arena.len() as u32;
+            let obj = match ser {
+                SerObj::Cons(a, b) => Obj::Cons(a, b),
+                SerObj::Symbol { name, value, function, special } => {
+                    self.obarray.insert(name.clone(), id);
+                    Obj::Symbol(SymbolData { name, value, function, special })
+                }
+                SerObj::Vector(v) => Obj::Vector(v),
+                SerObj::HashTable { test, entries } => Obj::HashTable { test, entries },
+                SerObj::Closure { required, optional, rest, body, is_macro } => Obj::Closure {
+                    params: Rc::new(Params { required, optional, rest }),
+                    body: Rc::new(body),
+                    is_macro,
+                    env: None,
+                },
+            };
+            self.arena.push(obj);
+        }
     }
     /// Bind a closure's params into the already-open current scope.
     pub fn bind_params_into_scope(

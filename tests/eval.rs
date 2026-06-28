@@ -10,6 +10,31 @@ fn eval(src: &str) -> String {
 }
 
 #[test]
+fn aot_chunk_is_self_contained() {
+    use elisprs::{compiler, host, reader};
+    // A program that uses the prelude (mapcar), a user defun, and a closure.
+    let src = "(defun sq (x) (* x x)) (mapcar #'sq (list 1 2 3 4))";
+
+    // Compile in a host with the prelude loaded, then capture the heap image
+    // exactly as `--aot` embeds it.
+    reset_host();
+    let _ = eval_str(""); // load prelude
+    let chunk = host::with_host(|h| {
+        let forms = reader::read_all(h, src).unwrap();
+        compiler::compile_program(h, &forms).unwrap()
+    });
+    let image = host::with_host(|h| h.export_heap_image());
+
+    // Simulate AOT load: a FRESH host (builtins only — no prelude, no user heap),
+    // rebuild the heap from the image, then run the chunk on fusevm. If the chunk
+    // is self-contained, every Value::Obj handle resolves and the result matches.
+    reset_host();
+    host::with_host(|h| h.import_heap_image(image));
+    let result = host::run_chunk(chunk).expect("aot run failed");
+    assert_eq!(print(&result, true), "(1 4 9 16)");
+}
+
+#[test]
 fn arithmetic() {
     assert_eq!(eval("(+ 1 2 3)"), "6");
     assert_eq!(eval("(* 2 (+ 3 4))"), "14");

@@ -6,6 +6,7 @@
 //! is no bespoke VM or JIT here — execution and codegen live in fusevm.
 
 pub mod aot;
+pub mod aot_runtime;
 pub mod builtins;
 pub mod compiler;
 pub mod dap;
