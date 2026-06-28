@@ -707,6 +707,61 @@ fn string_search(_h: &mut ElispHost, a: &[Value]) -> R {
     })
 }
 
+// ── numeric: float → integer rounding, and integer bit ops ──
+fn floor_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let (i, f, isf) = as_num(&a[0])?;
+    Ok(Value::Int(if isf { f.floor() as i64 } else { i }))
+}
+fn ceiling_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let (i, f, isf) = as_num(&a[0])?;
+    Ok(Value::Int(if isf { f.ceil() as i64 } else { i }))
+}
+fn round_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let (i, f, isf) = as_num(&a[0])?;
+    Ok(Value::Int(if isf { f.round() as i64 } else { i }))
+}
+fn truncate_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let (i, f, isf) = as_num(&a[0])?;
+    Ok(Value::Int(if isf { f.trunc() as i64 } else { i }))
+}
+fn float_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let (_i, f, _isf) = as_num(&a[0])?;
+    Ok(Value::Float(f))
+}
+fn logand_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let mut r: i64 = -1;
+    for v in a {
+        r &= as_int(v)?;
+    }
+    Ok(Value::Int(r))
+}
+fn logior_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let mut r: i64 = 0;
+    for v in a {
+        r |= as_int(v)?;
+    }
+    Ok(Value::Int(r))
+}
+fn logxor_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let mut r: i64 = 0;
+    for v in a {
+        r ^= as_int(v)?;
+    }
+    Ok(Value::Int(r))
+}
+fn lognot_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Int(!as_int(&a[0])?))
+}
+fn ash_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_int(&a[0])?;
+    let c = as_int(&a[1])?;
+    Ok(Value::Int(if c >= 0 {
+        n.wrapping_shl(c as u32)
+    } else {
+        n >> (-c) as u32
+    }))
+}
+
 /// Install the primitive subr set.
 pub fn install(h: &mut ElispHost) {
     let mut s = |n: &str, min: usize, max: Option<usize>, f: crate::host::SubrFn| {
@@ -803,4 +858,16 @@ pub fn install(h: &mut ElispHost) {
     s("princ", 1, Some(2), princ_fn);
     s("prin1", 1, Some(2), prin1_fn);
     s("number-to-string", 1, Some(1), number_to_string);
+    // numeric: float→int rounding + integer bit ops
+    s("floor", 1, Some(2), floor_fn);
+    s("ceiling", 1, Some(2), ceiling_fn);
+    s("round", 1, Some(2), round_fn);
+    s("truncate", 1, Some(2), truncate_fn);
+    s("float", 1, Some(1), float_fn);
+    s("logand", 0, None, logand_fn);
+    s("logior", 0, None, logior_fn);
+    s("logxor", 0, None, logxor_fn);
+    s("lognot", 1, Some(1), lognot_fn);
+    s("ash", 2, Some(2), ash_fn);
+    s("lsh", 2, Some(2), ash_fn);
 }

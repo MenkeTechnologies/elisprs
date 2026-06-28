@@ -320,6 +320,80 @@ pub const PRELUDE: &str = r#"
       (setq forms (cdr forms)))
     acc))
 
+;;; ---- more cl-lib / seq / subr-x / functional ----
+(defmacro cl-incf (place &rest amt) (if amt `(setq ,place (+ ,place ,(car amt))) `(setq ,place (1+ ,place))))
+(defmacro cl-decf (place &rest amt) (if amt `(setq ,place (- ,place ,(car amt))) `(setq ,place (1- ,place))))
+(defun cl-first (x) (car x))
+(defun cl-fourth (x) (nth 3 x))
+(defun cl-fifth (x) (nth 4 x))
+(defun cl-sixth (x) (nth 5 x))
+(defun cl-seventh (x) (nth 6 x))
+(defun cl-eighth (x) (nth 7 x))
+(defun cl-ninth (x) (nth 8 x))
+(defun cl-tenth (x) (nth 9 x))
+(defun cl-member (item lst) (member item lst))
+(defun cl-assoc (item alist) (assoc item alist))
+(defun cl-remove (item lst) (seq-remove (lambda (x) (equal x item)) lst))
+(defun cl-delete (item lst) (cl-remove item lst))
+(defun cl-substitute (new old lst) (mapcar (lambda (x) (if (equal x old) new x)) lst))
+(defun cl-acons (key val alist) (cons (cons key val) alist))
+(defun cl-list* (&rest args)
+  (if (null (cdr args)) (car args) (cons (car args) (apply (function cl-list*) (cdr args)))))
+
+(defun seq-map-indexed (fn seq)
+  (let ((i 0) (out nil))
+    (while seq (setq out (cons (funcall fn (car seq) i) out)) (setq seq (cdr seq)) (setq i (1+ i)))
+    (reverse out)))
+(defun seq-do-indexed (fn seq)
+  (let ((i 0)) (while seq (funcall fn (car seq) i) (setq seq (cdr seq)) (setq i (1+ i)))) nil)
+(defun seq-keep (fn seq) (seq-filter (function identity) (mapcar fn seq)))
+(defun seq-mapcat (fn seq) (apply (function append) (mapcar fn seq)))
+(defun seq-group-by (fn seq)
+  (let ((result nil))
+    (dolist (x seq)
+      (let* ((key (funcall fn x)) (cell (assoc key result)))
+        (if cell (setcdr cell (cons x (cdr cell)))
+          (setq result (cons (cons key (list x)) result)))))
+    (mapcar (lambda (c) (cons (car c) (reverse (cdr c)))) result)))
+
+(defun plist-put (plist prop val)
+  (let ((p plist) (done nil))
+    (while (and p (not done))
+      (if (eq (car p) prop) (progn (setcar (cdr p) val) (setq done t)) (setq p (cddr p))))
+    (if done plist (append plist (list prop val)))))
+(defun add-to-list (var elt)
+  (let ((cur (symbol-value var)))
+    (if (member elt cur) cur (set var (cons elt cur)))))
+
+(defun apply-partially (fn &rest args) (lambda (&rest more) (apply fn (append args more))))
+(defun complement (fn) (lambda (&rest args) (not (apply fn args))))
+(defun cl-constantly (x) (lambda (&rest --ignore--) x))
+
+(defun string-chop-newline (s) (if (string-suffix-p "\n" s) (substring s 0 (- (length s) 1)) s))
+(defun string-pad (s len) (let ((cur (length s))) (if (>= cur len) s (concat s (make-string (- len cur) 32)))))
+(defun string-replace (from to s)
+  (if (string-empty-p from) s
+    (let ((out "") (pos (string-search from s)))
+      (while pos
+        (setq out (concat out (substring s 0 pos) to))
+        (setq s (substring s (+ pos (length from)) (length s)))
+        (setq pos (string-search from s)))
+      (concat out s))))
+
+(defmacro while-let (binding &rest body)
+  (let ((var (car (car binding))) (val (car (cdr (car binding)))))
+    `(let ((,var ,val)) (while ,var ,@body (setq ,var ,val)))))
+
+(defmacro cl-case (expr &rest clauses)
+  `(let ((--cl-case-v-- ,expr))
+     (cond ,@(mapcar
+              (lambda (clause)
+                (let ((key (car clause)) (body (cdr clause)))
+                  (cond ((memq key '(t otherwise)) (cons t body))
+                        ((listp key) (cons (list 'memq '--cl-case-v-- (list 'quote key)) body))
+                        (t (cons (list 'eql '--cl-case-v-- (list 'quote key)) body)))))
+              clauses))))
+
 ;;; ---- ERT: Emacs Lisp Regression Testing (subset) ----
 ;; Ported from ERT: `should` / `should-not` / `should-error` / `skip-unless`
 ;; assertions, `ert-fail` / `ert-pass`, and `ert-deftest` with an optional

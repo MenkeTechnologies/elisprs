@@ -1,0 +1,22 @@
+{
+  "name": "elisprs-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Emacs Lisp on fusevm — pnpm task runner over the cargo workflow (matches the sibling repos' dev/build/test interface). elisprs is a pure Rust CLI; there is no frontend, so these scripts wrap cargo + the example self-tests.",
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "dev": "cargo run",
+    "repl": "cargo run",
+    "build": "cargo build --release",
+    "build:debug": "cargo build",
+    "test": "bash scripts/test.sh",
+    "test:rust": "cargo test --locked",
+    "test:examples": "cargo build --release --locked && sh scripts/run_examples.sh",
+    "lint": "cargo clippy --all-targets --locked -- -D warnings",
+    "fmt": "cargo fmt --all",
+    "fmt:check": "cargo fmt --all --check",
+    "doc": "RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps --locked",
+    "doc:open": "cargo doc --no-deps --open",
+    "clean": "cargo clean"
+  }
+}

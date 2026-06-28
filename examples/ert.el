@@ -32,10 +32,11 @@
   (should nil))                ; never reached
 
 (ert-deftest ert-known-limitation ()
-  "An expected failure (XFAIL) documents a not-yet-implemented subr without
-reddening the suite. Drop :expected-result once `upcase` lands."
+  "An expected failure (XFAIL) documents a not-yet-implemented feature without
+reddening the suite. elisprs has no buffer/editor object model yet, so buffer
+primitives are unbound. Drop :expected-result when buffers land."
   :expected-result :failed
-  (should (equal (upcase "hi") "HI")))
+  (should (bufferp (current-buffer))))
 
 ;; Exits 0: the skip and the XFAIL are both *expected*, so neither counts.
 (ert-run-tests-batch-and-exit)
