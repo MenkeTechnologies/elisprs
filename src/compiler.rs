@@ -107,7 +107,15 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
             ));
         }
         _ => {
-            // function call
+            // Fast path: lower core arithmetic/comparison on un-redefined
+            // primitives to native fusevm ops, so hot loops are JIT/AOT-able
+            // instead of dispatching to the host on every operation.
+            if let Some(n) = &name {
+                if h.is_primitive_fn(n) && try_native_op(h, b, n, &elems[1..])? {
+                    return Ok(());
+                }
+            }
+            // generic function call
             load_const(b, head);
             let argc = elems.len() - 1;
             for arg in &elems[1..] {
@@ -120,6 +128,61 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
         }
     }
     Ok(())
+}
+
+/// Lower a call to a native fusevm op sequence when the operator is a core
+/// numeric primitive with a compatible arity. Returns `Ok(true)` if lowered.
+/// (`/`, `%`, `mod` stay on the host to preserve elisp integer-division and
+/// remainder semantics; native arithmetic also skips the host's wrong-type
+/// signaling — an accepted fast-path trade-off for numbers.)
+fn try_native_op(
+    h: &mut ElispHost,
+    b: &mut ChunkBuilder,
+    name: &str,
+    args: &[Value],
+) -> Result<bool, String> {
+    let binop = |h: &mut ElispHost, b: &mut ChunkBuilder, op: Op| -> Result<(), String> {
+        compile_form(h, b, &args[0])?;
+        compile_form(h, b, &args[1])?;
+        b.emit(op, 0);
+        Ok(())
+    };
+    match name {
+        "+" | "*" | "-" => {
+            let (ident, op) = match name {
+                "+" => (0, Op::Add),
+                "*" => (1, Op::Mul),
+                _ => (0, Op::Sub),
+            };
+            if args.is_empty() {
+                b.emit(Op::LoadInt(ident), 0);
+            } else if name == "-" && args.len() == 1 {
+                compile_form(h, b, &args[0])?;
+                b.emit(Op::Negate, 0);
+            } else {
+                compile_form(h, b, &args[0])?;
+                for a in &args[1..] {
+                    compile_form(h, b, a)?;
+                    b.emit(op.clone(), 0);
+                }
+            }
+        }
+        "1+" if args.len() == 1 => {
+            compile_form(h, b, &args[0])?;
+            b.emit(Op::Inc, 0);
+        }
+        "1-" if args.len() == 1 => {
+            compile_form(h, b, &args[0])?;
+            b.emit(Op::Dec, 0);
+        }
+        "<" if args.len() == 2 => binop(h, b, Op::NumLt)?,
+        ">" if args.len() == 2 => binop(h, b, Op::NumGt)?,
+        "<=" if args.len() == 2 => binop(h, b, Op::NumLe)?,
+        ">=" if args.len() == 2 => binop(h, b, Op::NumGe)?,
+        "=" if args.len() == 2 => binop(h, b, Op::NumEq)?,
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn is_unsupported_special(kw: &str) -> bool {

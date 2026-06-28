@@ -458,6 +458,20 @@ impl ElispHost {
     pub fn builtin_count(&self) -> usize {
         self.builtin_count
     }
+    /// True if `name`'s function cell still holds its original primitive subr
+    /// (not redefined by the user). The compiler only lowers `+`/`<`/… to native
+    /// fusevm ops when this holds, so a user `(defun + …)` keeps host semantics.
+    pub fn is_primitive_fn(&self, name: &str) -> bool {
+        self.obarray
+            .get(name)
+            .and_then(|&id| self.arena.get(id as usize))
+            .and_then(|o| match o {
+                Obj::Symbol(s) => s.function.clone(),
+                _ => None,
+            })
+            .map(|f| matches!(self.obj(&f), Some(Obj::Subr { .. })))
+            .unwrap_or(false)
+    }
     pub fn arena_len(&self) -> usize {
         self.arena.len()
     }

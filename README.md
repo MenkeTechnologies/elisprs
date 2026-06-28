@@ -93,12 +93,15 @@ elisp --version
 
 **Special forms (21).** `quote` `function` `lambda` `progn` `prog1` `if` `when` `unless` `cond` `and` `or` `while` `setq` `let` `let*` `defun` `defmacro` `defvar` `defconst` `condition-case` `unwind-protect`.
 
-**Subrs (~65).**
+**Subrs (~80).**
 
 | Group | Functions |
 |---|---|
 | Arithmetic | `+ - * / % mod 1+ 1- abs max min = /= < > <= >=` |
 | Lists | `car cdr cons list append nth nthcdr reverse length member memq assoc assq` |
+| Mutation | `setcar setcdr aset` |
+| Vectors | `vector make-vector aref vectorp` |
+| Hash tables | `make-hash-table gethash puthash remhash clrhash maphash hash-table-count hash-table-keys hash-table-values hash-table-p` |
 | Predicates | `eq eql equal null not numberp integerp floatp stringp symbolp consp listp atom functionp` |
 | Symbols/cells | `set symbol-value symbol-function fset boundp fboundp symbol-name intern make-symbol` |
 | Strings | `concat string= string-equal string< upcase downcase number-to-string string-to-number` |
@@ -124,12 +127,15 @@ elisp --version
   (arith-error (format "caught %s" e)))   ; => "caught (arith-error division by zero)"
 ```
 
-**Known limitations (milestone 1)** — surfaced loudly rather than silently misread:
+**Now supported** (own cons model — `Obj::Cons(Value, Value)` heap cells, not `rust_lisp`'s list-only cdr):
 
-- **No dotted pairs.** `rust_lisp`'s cons cell always has a *list* cdr, so `(cons 1 2)` / `(a . b)` cannot be represented; both the reader and `cons` error on a non-list cdr. Alists must use `(key value)`, not `(key . value)`. Replacing the cons model is the top milestone-2 item.
-- **No backquote / unquote.** `` ` `` and `,` are rejected by the reader.
-- **Dynamic scope only.** `lexical-binding` is not honored yet.
-- **`setcar` / `setcdr`** are absent (`rust_lisp`'s `List` doesn't expose cons mutation) — arrives with the new cons model.
+- **Dotted pairs.** `(cons 1 2)` / `(a . b)` read, print (`(1 . 2)`), and round-trip; alists may use `(key . value)`.
+- **Backquote / unquote.** `` ` ``, `,`, and `,@` are read and expanded.
+- **`setcar` / `setcdr`** mutate cons cells in place.
+
+**Known limitations** — surfaced loudly rather than silently misread:
+
+- **Dynamic scope only.** `lexical-binding` is not honored yet (the lexical-binding frontend is in progress).
 
 This is a useful elisp core, **not** the ~1000-subr GNU Emacs surface, and it is not buffer-aware — editor integration (buffers, point, markers) is a separate track.
 
@@ -167,12 +173,15 @@ The grid reflects the current state of the tree, not aspiration — planned item
 | Lisp-2 obarray (value + function cells) | Working |
 | Dynamic binding (`let`/`let*`, special vars) | Working |
 | Special forms (21) + macros (`defmacro`) | Working |
-| Subr standard library (~65) | Working |
+| Subr standard library (~80) | Working |
+| Hash tables (`make-hash-table`/`gethash`/`puthash`/`maphash`) | Working |
+| Dotted pairs, backquote/unquote, `setcar`/`setcdr` | Working |
 | `elisp` CLI — file / `-e` / REPL | Working |
+| ERT test surface (`ert-deftest`/`should`/`should-error`) | Working (prelude) |
 | `--lsp` / `--dap` servers | Stub (planned) |
 | elisp → `fusevm::Chunk` lowering + execution (`compiler.rs` / `host.rs`) | Working |
 | `--aot` → native object via `fusevm::aot::compile_object` | Planned (lowering works; native emit pending) |
-| Dotted pairs, backquote, lexical binding, `setcar`/`setcdr` | Not yet |
+| `lexical-binding` | In progress |
 
 ---
 
@@ -210,7 +219,9 @@ cargo build --release
 cargo test
 ```
 
-Coverage spans `reader.rs` unit tests (number-vs-symbol tokenization, `#'` desugaring, `?c` char literals, dotted-pair rejection) and the end-to-end evaluation suite in [`tests/eval.rs`](tests/eval.rs) — arithmetic, recursion, higher-order functions, special forms, macros, and error handling driven through the public `eval_str` API.
+Coverage spans `reader.rs` unit tests (number-vs-symbol tokenization, `#'` desugaring, `?c` char literals, dotted-pair reading) and the end-to-end evaluation suite in [`tests/eval.rs`](tests/eval.rs) — arithmetic, recursion, higher-order functions, special forms, macros, and error handling driven through the public `eval_str` API.
+
+The [`examples/*.el`](examples) scripts are self-testing: each uses the prelude's ERT surface (`ert-deftest` / `should` / `should-error`) and `ert-run-tests-batch-and-exit`, which exits non-zero on any failure. [`tests/examples.rs`](tests/examples.rs) runs every example through the built `elisp` binary as a `cargo test` gate, and the CI `examples` job runs them through the release binary on Linux + macOS.
 
 ---
 

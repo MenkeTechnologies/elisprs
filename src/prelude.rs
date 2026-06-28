@@ -137,6 +137,189 @@ pub const PRELUDE: &str = r#"
 (defmacro ignore-errors (&rest body) `(condition-case nil (progn ,@body) (error nil)))
 (defmacro with-demoted-errors (fmt &rest body) `(condition-case --err-- (progn ,@body) (error (message ,fmt --err--) nil)))
 
+;;; ====================================================================
+;;; Standard library — subr / subr-x / seq / cl-lib written in elisp on
+;;; top of the primitives, the way Emacs bootstraps. (Buffer/marker ops,
+;;; floats→int, and function-cell introspection need host primitives and
+;;; are not included.)
+;;; ====================================================================
+
+;;; ---- predicates ----
+(defun booleanp (x) (if (or (eq x t) (eq x nil)) t nil))
+(defun characterp (x) (and (integerp x) (>= x 0)))
+(defun sequencep (x) (or (listp x) (vectorp x) (stringp x)))
+(defun arrayp (x) (or (vectorp x) (stringp x)))
+(defun string-or-null-p (x) (or (null x) (stringp x)))
+(defun xor (a b) (cond ((not a) b) ((not b) a) (t nil)))
+(defun proper-list-p (x)
+  (let ((n 0))
+    (while (consp x) (setq n (1+ n)) (setq x (cdr x)))
+    (if (null x) n nil)))
+
+;;; ---- numbers ----
+(defun expt (base e) (let ((r 1)) (while (> e 0) (setq r (* r base)) (setq e (1- e))) r))
+(defun gcd (a b)
+  (setq a (abs a)) (setq b (abs b))
+  (while (> b 0) (let ((tmp b)) (setq b (% a b)) (setq a tmp)))
+  a)
+(defun lcm (a b) (if (or (= a 0) (= b 0)) 0 (/ (abs (* a b)) (gcd a b))))
+(defun isqrt (n) (let ((r 0)) (while (<= (* (1+ r) (1+ r)) n) (setq r (1+ r))) r))
+(defun cl-signum (x) (cond ((> x 0) 1) ((< x 0) -1) (t 0)))
+(defun cl-evenp (n) (= (% n 2) 0))
+(defun cl-oddp (n) (= (% n 2) 1))
+(defun string-to-number (s)
+  (let ((chars (string-to-list s)) (sign 1) (n 0) (seen nil))
+    (while (and chars (or (= (car chars) 32) (= (car chars) 9))) (setq chars (cdr chars)))
+    (when (and chars (= (car chars) ?-)) (setq sign -1) (setq chars (cdr chars)))
+    (when (and chars (= (car chars) ?+)) (setq chars (cdr chars)))
+    (while (and chars (>= (car chars) ?0) (<= (car chars) ?9))
+      (setq n (+ (* n 10) (- (car chars) ?0))) (setq seen t) (setq chars (cdr chars)))
+    (if seen (* sign n) 0)))
+
+;;; ---- strings (ASCII) ----
+(defun string= (a b) (equal a b))
+(defun string-equal (a b) (equal a b))
+(defun string< (a b)
+  (let ((la (string-to-list a)) (lb (string-to-list b)) (res nil) (done nil))
+    (while (not done)
+      (cond ((null la) (setq res (not (null lb))) (setq done t))
+            ((null lb) (setq res nil) (setq done t))
+            ((< (car la) (car lb)) (setq res t) (setq done t))
+            ((> (car la) (car lb)) (setq res nil) (setq done t))
+            (t (setq la (cdr la)) (setq lb (cdr lb)))))
+    res))
+(defun string-lessp (a b) (string< a b))
+(defun string-greaterp (a b) (string< b a))
+(defun string-reverse (s) (apply (function string) (reverse (string-to-list s))))
+(defun upcase (s)
+  (apply (function string)
+         (mapcar (lambda (c) (if (and (>= c ?a) (<= c ?z)) (- c 32) c)) (string-to-list s))))
+(defun downcase (s)
+  (apply (function string)
+         (mapcar (lambda (c) (if (and (>= c ?A) (<= c ?Z)) (+ c 32) c)) (string-to-list s))))
+(defun capitalize (s)
+  (if (string-empty-p s) s
+    (let* ((chars (string-to-list (downcase s))) (c (car chars)))
+      (apply (function string)
+             (cons (if (and (>= c ?a) (<= c ?z)) (- c 32) c) (cdr chars))))))
+(defun string-trim-left (s)
+  (let ((chars (string-to-list s)))
+    (while (and chars (or (= (car chars) 32) (= (car chars) 9) (= (car chars) 10) (= (car chars) 13)))
+      (setq chars (cdr chars)))
+    (apply (function string) chars)))
+(defun string-trim-right (s) (string-reverse (string-trim-left (string-reverse s))))
+(defun string-trim (s) (string-trim-right (string-trim-left s)))
+(defun string-blank-p (s) (string-empty-p (string-trim s)))
+(defun string-remove-prefix (prefix s)
+  (if (string-prefix-p prefix s) (substring s (length prefix) (length s)) s))
+(defun string-remove-suffix (suffix s)
+  (if (string-suffix-p suffix s) (substring s 0 (- (length s) (length suffix))) s))
+
+;;; ---- lists ----
+(defun butlast (lst) (reverse (cdr (reverse lst))))
+(defun take (n lst)
+  (let ((out nil))
+    (while (and (> n 0) lst) (setq out (cons (car lst) out)) (setq lst (cdr lst)) (setq n (1- n)))
+    (reverse out)))
+(defun ntake (n lst) (take n lst))
+(defun flatten-tree (tree)
+  (cond ((null tree) nil)
+        ((consp tree) (append (flatten-tree (car tree)) (flatten-tree (cdr tree))))
+        (t (list tree))))
+(defun flatten-list (tree) (flatten-tree tree))
+(defun copy-tree (tree) (if (consp tree) (cons (copy-tree (car tree)) (copy-tree (cdr tree))) tree))
+(defun copy-sequence (seq) (if (listp seq) (append seq nil) seq))
+(defun ensure-list (x) (if (listp x) x (list x)))
+(defun mapcan (fn lst) (apply (function append) (mapcar fn lst)))
+(defun assoc-default (key alist) (let ((cell (assoc key alist))) (if cell (cdr cell) nil)))
+(defun rassoc (val alist)
+  (let ((res nil))
+    (while (and alist (not res))
+      (if (and (consp (car alist)) (equal (cdr (car alist)) val)) (setq res (car alist)))
+      (setq alist (cdr alist)))
+    res))
+(defun assq-delete-all (key alist)
+  (let ((out nil))
+    (while alist
+      (unless (and (consp (car alist)) (eq (car (car alist)) key)) (setq out (cons (car alist) out)))
+      (setq alist (cdr alist)))
+    (reverse out)))
+(defun nreverse (lst) (reverse lst))
+
+;;; ---- sort (stable merge sort, lists) ----
+(defun std--merge (a b pred)
+  (cond ((null a) b)
+        ((null b) a)
+        ((funcall pred (car b) (car a)) (cons (car b) (std--merge a (cdr b) pred)))
+        (t (cons (car a) (std--merge (cdr a) b pred)))))
+(defun std--halves (lst)
+  (let ((slow lst) (fast lst) (front nil))
+    (while (and fast (cdr fast))
+      (setq front (cons (car slow) front)) (setq slow (cdr slow)) (setq fast (cdr (cdr fast))))
+    (cons (reverse front) slow)))
+(defun sort (lst pred)
+  (if (or (null lst) (null (cdr lst))) lst
+    (let ((h (std--halves lst)))
+      (std--merge (sort (car h) pred) (sort (cdr h) pred) pred))))
+
+;;; ---- seq.el (list-oriented) ----
+(defun seq-take (seq n) (take n seq))
+(defun seq-drop (seq n) (nthcdr n seq))
+(defun seq-subseq (seq start end) (take (- end start) (nthcdr start seq)))
+(defun seq-uniq (seq) (delete-dups (append seq nil)))
+(defun seq-min (seq) (apply (function min) seq))
+(defun seq-max (seq) (apply (function max) seq))
+(defun seq-first (seq) (car seq))
+(defun seq-rest (seq) (cdr seq))
+(defun seq-position (seq elt)
+  (let ((i 0) (res nil))
+    (while (and seq (null res)) (if (equal (car seq) elt) (setq res i)) (setq seq (cdr seq)) (setq i (1+ i)))
+    res))
+(defun seq-into (seq type)
+  (cond ((eq type 'list) (append seq nil))
+        ((eq type 'vector) (apply (function vector) seq))
+        ((eq type 'string) (apply (function string) seq))
+        (t seq)))
+(defun seq-difference (a b) (seq-filter (lambda (x) (not (seq-contains-p b x))) a))
+(defun seq-intersection (a b) (seq-filter (lambda (x) (seq-contains-p b x)) a))
+(defun seq-union (a b) (append a (seq-difference b a)))
+(defun seq-sort (pred seq) (sort (append seq nil) pred))
+(defun seq-partition (seq n)
+  (let ((out nil))
+    (while seq (setq out (cons (take n seq) out)) (setq seq (nthcdr n seq)))
+    (reverse out)))
+
+;;; ---- cl-lib (subset) ----
+(defun cl-mapcar (fn lst) (mapcar fn lst))
+(defun cl-subseq (seq start end) (seq-subseq seq start end))
+(defun cl-position (item lst) (seq-position lst item))
+(defun cl-count (item lst) (let ((n 0)) (dolist (x lst) (if (equal x item) (setq n (1+ n)))) n))
+(defun cl-find (item lst) (if (member item lst) item nil))
+(defun cl-remove-duplicates (lst) (delete-dups (append lst nil)))
+(defun cl-getf (plist key) (plist-get plist key))
+
+;;; ---- subr-x macros ----
+(defmacro when-let (binding &rest body)
+  (let ((var (car (car binding))) (val (car (cdr (car binding)))))
+    `(let ((,var ,val)) (when ,var ,@body))))
+(defmacro if-let (binding then &rest else)
+  (let ((var (car (car binding))) (val (car (cdr (car binding)))))
+    `(let ((,var ,val)) (if ,var ,then ,@else))))
+(defmacro thread-first (x &rest forms)
+  (let ((acc x))
+    (while forms
+      (let ((form (car forms)))
+        (setq acc (if (consp form) (cons (car form) (cons acc (cdr form))) (list form acc))))
+      (setq forms (cdr forms)))
+    acc))
+(defmacro thread-last (x &rest forms)
+  (let ((acc x))
+    (while forms
+      (let ((form (car forms)))
+        (setq acc (if (consp form) (append form (list acc)) (list form acc))))
+      (setq forms (cdr forms)))
+    acc))
+
 ;;; ---- ERT: Emacs Lisp Regression Testing (subset) ----
 ;; Ported from ERT: `should` / `should-not` / `should-error` / `skip-unless`
 ;; assertions, `ert-fail` / `ert-pass`, and `ert-deftest` with an optional
@@ -148,11 +331,49 @@ pub const PRELUDE: &str = r#"
 
 (defvar ert--tests nil)   ; alist of (name . expected-result), :passed | :failed
 
+;; should-failure explanation: for an assertion `(PRED ARG...)`, each ARG is
+;; evaluated once and its value reported next to the form on failure — the way
+;; ERT explains a failing `should`. Limited to known pure predicates so eager
+;; argument evaluation can't change semantics; anything else falls back to a
+;; plain truthiness check.
+(defvar ert--explain-fns
+  '(= /= < > <= >= eq eql equal not null member memq assoc assq
+    stringp numberp integerp consp listp atom symbolp zerop))
+
+(defun ert--let-binds (syms args)
+  (if (null syms) nil
+    (cons (list (car syms) (car args)) (ert--let-binds (cdr syms) (cdr args)))))
+
+(defun ert--value-pairs (args syms)
+  (if (null args) nil
+    (cons (list 'cons (list 'quote (car args)) (car syms))
+          (ert--value-pairs (cdr args) (cdr syms)))))
+
+(defun ert--argsyms (n)
+  (let ((i 0) (out nil))
+    (while (< i n)
+      (setq out (cons (intern (concat "--ert-a" (number-to-string i) "--")) out))
+      (setq i (1+ i)))
+    (reverse out)))
+
 (defmacro should (form)
-  `(if ,form t (signal 'ert-test-failed (list 'should ',form))))
+  (if (and (consp form) (memq (car form) ert--explain-fns))
+      (let* ((fn (car form))
+             (args (cdr form))
+             (syms (ert--argsyms (length args))))
+        `(let ,(ert--let-binds syms args)
+           (if (,fn ,@syms) t
+             (signal 'ert-test-failed
+                     (list 'should ',form :values (list ,@(ert--value-pairs args syms)))))))
+    `(if ,form t (signal 'ert-test-failed (list 'should ',form)))))
 
 (defmacro should-not (form)
   `(if ,form (signal 'ert-test-failed (list 'should-not ',form)) t))
+
+(defmacro ert-info (_spec &rest body)
+  ;; Compatibility shim: real ERT attaches the info string to failure reports
+  ;; (which needs the ERT UI); here `ert-info` simply evaluates its BODY.
+  `(progn ,@body))
 
 (defmacro should-error (form &rest keys)
   (let* ((type (plist-get keys :type))
