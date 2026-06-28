@@ -19,6 +19,9 @@ pub const PRELUDE: &str = r#"
 (defun cadddr (x) (car (cdddr x)))
 (defun cddddr (x) (cdr (cdddr x)))
 
+;; Regexp matching folds case unless this is let-bound to nil (Emacs default t).
+(defvar case-fold-search t)
+
 ;;; ---- numeric helpers ----
 ;; Fixnum bounds match GNU Emacs on a 64-bit build (62-bit tagged integers).
 (defconst most-positive-fixnum 2305843009213693951)
@@ -49,7 +52,11 @@ pub const PRELUDE: &str = r#"
 (defun make-list (n x) (let ((r nil)) (while (> n 0) (setq r (cons x r)) (setq n (1- n))) r))
 (defun number-sequence (from to &optional inc)
   (setq inc (or inc 1))
-  (let ((r nil)) (while (<= from to) (setq r (cons from r)) (setq from (+ from inc))) (reverse r)))
+  (let ((r nil))
+    (if (< inc 0)
+        (while (>= from to) (setq r (cons from r)) (setq from (+ from inc)))
+      (while (<= from to) (setq r (cons from r)) (setq from (+ from inc))))
+    (reverse r)))
 (defun elt (seq n) (if (listp seq) (nth n seq) (aref seq n)))
 (defun safe-length (l) (length l))
 (defun caar-safe (x) (if (consp x) (car x) nil))
@@ -121,11 +128,23 @@ pub const PRELUDE: &str = r#"
 (defun delete (x l) (remove x l))
 (defun delq (x l) (remq x l))
 (defun delete-dups (l)
-  (let ((seen nil) (r nil))
-    (while l
-      (if (not (member (car l) seen)) (progn (setq seen (cons (car l) seen)) (setq r (cons (car l) r))))
-      (setq l (cdr l)))
-    (reverse r)))
+  ;; Destructively remove `equal' duplicates, keeping the first occurrence.
+  (let ((tail l))
+    (while tail
+      (setcdr tail (delete (car tail) (cdr tail)))
+      (setq tail (cdr tail))))
+  l)
+(defun nconc (&rest lists)
+  ;; Destructively concatenate LISTS by splicing each onto the previous tail.
+  (let ((result nil) (tail nil))
+    (dolist (l lists)
+      (when l
+        (if result (setcdr tail l) (setq result l))
+        (setq tail l)
+        (while (cdr tail) (setq tail (cdr tail)))))
+    result))
+(defun rassq-delete-all (value alist)
+  (seq-filter (lambda (p) (not (and (consp p) (eq (cdr p) value)))) alist))
 
 ;;; ---- cl-lib niceties ----
 (defun cl-first (l) (car l))
@@ -146,8 +165,8 @@ pub const PRELUDE: &str = r#"
 
 ;;; ---- control macros ----
 (defmacro prog2 (a b &rest body) (list (quote progn) a (cons (quote prog1) (cons b body))))
-(defmacro incf (place &rest amt) (if amt `(setq ,place (+ ,place ,(car amt))) `(setq ,place (1+ ,place))))
-(defmacro decf (place &rest amt) (if amt `(setq ,place (- ,place ,(car amt))) `(setq ,place (1- ,place))))
+(defmacro incf (place &rest amt) `(setf ,place (+ ,place ,(if amt (car amt) 1))))
+(defmacro decf (place &rest amt) `(setf ,place (- ,place ,(if amt (car amt) 1))))
 (defmacro push (x place) (list (quote setq) place (list (quote cons) x place)))
 ;; setf: assign to a generalized place. Supports a plain variable and the
 ;; common cons/sequence/hash/symbol places; multiple place/value pairs expand
@@ -379,12 +398,31 @@ pub const PRELUDE: &str = r#"
 (defun cl-getf (plist key) (plist-get plist key))
 
 ;;; ---- subr-x macros ----
-(defmacro when-let (binding &rest body)
-  (let ((var (car (car binding))) (val (car (cdr (car binding)))))
-    `(let ((,var ,val)) (when ,var ,@body))))
-(defmacro if-let (binding then &rest else)
-  (let ((var (car (car binding))) (val (car (cdr (car binding)))))
-    `(let ((,var ,val)) (if ,var ,then ,@else))))
+;; Build nested `(let ((VAR VAL)) (if VAR <inner> ELSE))` for a list of BINDINGS,
+;; short-circuiting to ELSE the first time a bound value is nil.
+(defun if-let--chain (bindings then else)
+  (if (null bindings) then
+    (let* ((b (car bindings))
+           (var (if (consp b) (car b) b))
+           (val (if (consp b) (car (cdr b)) b)))
+      (list 'let (list (list var val))
+            (list 'if var (if-let--chain (cdr bindings) then else) else)))))
+;; Accept the old single-binding spelling `(VAR VAL)` as well as a binding list.
+(defun if-let--norm (spec)
+  (if (and (consp spec) (symbolp (car spec))) (list spec) spec))
+(defmacro if-let* (bindings then &rest else)
+  (if-let--chain bindings then (cons 'progn else)))
+(defmacro when-let* (bindings &rest body)
+  (if-let--chain bindings (cons 'progn body) nil))
+(defmacro if-let (bindings then &rest else)
+  (if-let--chain (if-let--norm bindings) then (cons 'progn else)))
+(defmacro when-let (bindings &rest body)
+  (if-let--chain (if-let--norm bindings) (cons 'progn body) nil))
+(defmacro named-let (name bindings &rest body)
+  ;; A self-recursive local loop: (named-let f ((i 0)) (if … (f (1+ i)) i)).
+  (let ((vars (mapcar (function car) bindings))
+        (vals (mapcar (lambda (b) (car (cdr b))) bindings)))
+    `(progn (defun ,name ,vars ,@body) (,name ,@vals))))
 (defmacro thread-first (x &rest forms)
   (let ((acc x))
     (while forms
@@ -401,8 +439,8 @@ pub const PRELUDE: &str = r#"
     acc))
 
 ;;; ---- more cl-lib / seq / subr-x / functional ----
-(defmacro cl-incf (place &rest amt) (if amt `(setq ,place (+ ,place ,(car amt))) `(setq ,place (1+ ,place))))
-(defmacro cl-decf (place &rest amt) (if amt `(setq ,place (- ,place ,(car amt))) `(setq ,place (1- ,place))))
+(defmacro cl-incf (place &rest amt) `(setf ,place (+ ,place ,(if amt (car amt) 1))))
+(defmacro cl-decf (place &rest amt) `(setf ,place (- ,place ,(if amt (car amt) 1))))
 (defun cl-first (x) (car x))
 (defun cl-fourth (x) (nth 3 x))
 (defun cl-fifth (x) (nth 4 x))
@@ -467,10 +505,17 @@ pub const PRELUDE: &str = r#"
     (mapcar (lambda (c) (cons (car c) (reverse (cdr c)))) result)))
 
 (defun plist-put (plist prop val)
-  (let ((p plist) (done nil))
-    (while (and p (not done))
-      (if (eq (car p) prop) (progn (setcar (cdr p) val) (setq done t)) (setq p (cddr p))))
-    (if done plist (append plist (list prop val)))))
+  ;; Mutate PLIST in place: overwrite an existing PROP, or append (PROP VAL) to
+  ;; the tail via setcdr. Only a nil PLIST yields a fresh list (can't mutate nil).
+  (if (null plist)
+      (list prop val)
+    (let ((p plist) (done nil))
+      (while (not done)
+        (cond
+         ((eq (car p) prop) (setcar (cdr p) val) (setq done t))
+         ((cddr p) (setq p (cddr p)))
+         (t (setcdr (cdr p) (list prop val)) (setq done t))))
+      plist)))
 (defun add-to-list (var elt)
   (let ((cur (symbol-value var)))
     (if (member elt cur) cur (set var (cons elt cur)))))

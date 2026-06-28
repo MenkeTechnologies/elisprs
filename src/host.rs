@@ -950,6 +950,12 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 }
                 return Ok(Value::Undef);
             }
+            // `replace-regexp-in-string` with a *function* REP must call that
+            // function per match — VM re-entry — so it's handled here rather than
+            // in the (host-borrowing) subr, which only does string templates.
+            "replace-regexp-in-string" if args.len() >= 3 && !matches!(args[1], Value::Str(_)) => {
+                return replace_regexp_with_fn(args);
+            }
             // Nonlocal-exit intrinsics (the compiler rewrites catch/unwind-protect/
             // condition-case into these, passing lambda thunks).
             "--catch--" => return intrinsic_catch(args),
@@ -979,6 +985,61 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             run_closure(&params, &body, env, args)
         }
     }
+}
+
+/// `(replace-regexp-in-string REGEXP FUNC STRING …)` where FUNC is called on each
+/// match's text and returns its replacement. Match data is set before each call
+/// so the function can use `match-string`. Runs outside any host borrow.
+fn replace_regexp_with_fn(args: &[Value]) -> Result<Value, String> {
+    let pat = match &args[0] {
+        Value::Str(s) => s.to_string(),
+        _ => return Err("replace-regexp-in-string: regexp must be a string".to_string()),
+    };
+    let subject = match &args[2] {
+        Value::Str(s) => s.to_string(),
+        _ => return Err("replace-regexp-in-string: not a string".to_string()),
+    };
+    let repfn = args[1].clone();
+    let cf = with_host(|h| crate::builtins::case_fold_search(h));
+    let re = crate::builtins::compile_cf(&pat, cf)?;
+    let mut out = String::with_capacity(subject.len());
+    let mut last = 0usize;
+    for caps in re.captures_iter(&subject) {
+        let m = caps.get(0).unwrap();
+        out.push_str(&subject[last..m.start()]);
+        // Char-indexed match data so `match-string`/`match-beginning` work in FUNC.
+        let spans: Vec<Option<(usize, usize)>> = (0..caps.len())
+            .map(|i| {
+                caps.get(i).map(|g| {
+                    (
+                        crate::builtins::char_of_byte(&subject, g.start()),
+                        crate::builtins::char_of_byte(&subject, g.end()),
+                    )
+                })
+            })
+            .collect();
+        let matched = Value::str(subject[m.start()..m.end()].to_string());
+        with_host(|h| {
+            h.match_data = Some(MatchData {
+                subject: subject.clone(),
+                spans,
+            })
+        });
+        let r = call_function(&repfn, &[matched])?;
+        match r {
+            Value::Str(s) => out.push_str(&s),
+            _ => return Err("replace-regexp-in-string: replacement must be a string".to_string()),
+        }
+        last = m.end();
+        if m.start() == m.end() {
+            if let Some(c) = subject[last..].chars().next() {
+                out.push(c);
+                last += c.len_utf8();
+            }
+        }
+    }
+    out.push_str(&subject[last.min(subject.len())..]);
+    Ok(Value::str(out))
 }
 
 /// Stable merge sort driven by an elisp less-than predicate. `pred` is called as

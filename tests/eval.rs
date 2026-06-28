@@ -662,3 +662,70 @@ fn emacs_parity_search_and_assoc() {
     );
     assert_eq!(eval("(assoc-string \"z\" (list \"a\"))"), "nil");
 }
+
+#[test]
+fn emacs_parity_format_radix() {
+    // %x/%X/%o print sign + magnitude (not two's complement) for negatives.
+    assert_eq!(eval("(format \"%x\" -1)"), "\"-1\"");
+    assert_eq!(eval("(format \"%x\" -255)"), "\"-ff\"");
+    assert_eq!(eval("(format \"%X\" -255)"), "\"-FF\"");
+    assert_eq!(eval("(format \"%o\" -8)"), "\"-10\"");
+    // The # flag adds a 0x / 0X / 0 prefix (suppressed for zero).
+    assert_eq!(eval("(format \"%#x\" 255)"), "\"0xff\"");
+    assert_eq!(eval("(format \"%#X\" 255)"), "\"0XFF\"");
+    assert_eq!(eval("(format \"%#o\" 8)"), "\"010\"");
+    assert_eq!(eval("(format \"%#x\" 0)"), "\"0\"");
+    // Zero-fill goes after the sign and the 0x prefix.
+    assert_eq!(eval("(format \"%08x\" 255)"), "\"000000ff\"");
+    assert_eq!(eval("(format \"%#010x\" 255)"), "\"0x000000ff\"");
+    assert_eq!(eval("(format \"%05d\" -42)"), "\"-0042\"");
+}
+
+#[test]
+fn emacs_parity_case_fold_and_macros() {
+    // case-fold-search defaults to t: string matching folds case by default.
+    assert_eq!(eval("(string-match \"ABC\" \"abc\")"), "0");
+    assert_eq!(
+        eval("(let ((case-fold-search nil)) (string-match \"ABC\" \"abc\"))"),
+        "nil"
+    );
+    assert_eq!(
+        eval("(replace-regexp-in-string \"a\" \"X\" \"AaA\")"),
+        "\"XXX\""
+    );
+    // cl-incf / cl-decf work on generalized places (not just symbols).
+    assert_eq!(eval("(let ((l (list 1 2))) (cl-incf (car l)) l)"), "(2 2)");
+    assert_eq!(eval("(let ((x 5)) (incf x 3) x)"), "8");
+    // when-let* / if-let* with multiple sequential bindings, short-circuiting.
+    assert_eq!(eval("(when-let* ((a 1) (b 2)) (+ a b))"), "3");
+    assert_eq!(eval("(when-let* ((a 1) (b nil)) (+ a 1))"), "nil");
+    assert_eq!(eval("(if-let* ((a nil)) a 'else)"), "else");
+    assert_eq!(eval("(if-let* ((a 5)) a 'else)"), "5");
+    // named-let — a self-recursive local loop.
+    assert_eq!(
+        eval("(named-let loop ((i 0)) (if (< i 3) (loop (1+ i)) i))"),
+        "3"
+    );
+}
+
+#[test]
+fn emacs_parity_replace_function_rep() {
+    // A function REP is called on each match's text; its result is the replacement.
+    assert_eq!(
+        eval("(replace-regexp-in-string \"[0-9]+\" (lambda (m) (number-to-string (* 2 (string-to-number m)))) \"a5b10\")"),
+        "\"a10b20\""
+    );
+    assert_eq!(
+        eval("(replace-regexp-in-string \"[a-z]+\" #'upcase \"ab cd\")"),
+        "\"AB CD\""
+    );
+    // String REP (template) path still works unchanged.
+    assert_eq!(
+        eval("(replace-regexp-in-string \"[0-9]+\" \"#\" \"a1b22\")"),
+        "\"a#b#\""
+    );
+    assert_eq!(
+        eval("(replace-regexp-in-string \"\\\\([a-z]\\\\)=\\\\([0-9]\\\\)\" \"\\\\2:\\\\1\" \"x=1\")"),
+        "\"1:x\""
+    );
+}

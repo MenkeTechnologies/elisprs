@@ -26,6 +26,16 @@ IGNORE-CASE; `assoc` TESTFN; `string-pad` PADDING/START. Introspection: added
 `copy-alist`, `substring-no-properties`; `alist-get` DEFAULT/TESTFN; `string-trim`
 regexp arguments. Format: `+`/space sign flags and C-style `%e`; added
 `hash-table-test`, `nbutlast`, `memql`, `assoc-string`; `string-search` START arg.
+`format` `%x`/`%o` sign+magnitude for negatives and `#` flag. `case-fold-search`
+(default t) honored by `string-match`/`replace-regexp-in-string`; `incf`/`decf`/
+`cl-incf`/`cl-decf` on generalized places; multi-binding `when-let*`/`if-let*` and
+`named-let`.
+
+`replace-regexp-in-string` with a *function* REP now works (handled in the
+re-entrant `call_function` path).
+
+**Still divergent (harder):** pattern backreferences in regexps (the backing
+engine doesn't backtrack).
 
 ---
 

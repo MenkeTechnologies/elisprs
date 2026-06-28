@@ -61,6 +61,18 @@ All notable changes to elisprs are documented here. The format follows
 - Added `hash-table-test` and `nbutlast`.
 - `string-search` honors its optional START char index; added `memql` and
   `assoc-string`.
+- `format`: `%x` / `%X` / `%o` print sign + magnitude for negatives (`-ff`, not
+  two's complement), and the `#` flag adds a `0x` / `0X` / `0` prefix (zero-fill
+  goes after the sign and prefix: `%#010x` of 255 => `0x000000ff`).
+- `case-fold-search` (defvar, default `t`): `string-match` / `string-match-p` /
+  `replace-regexp-in-string` now fold case by default, and honor a `let`-bound nil.
+- `incf` / `decf` / `cl-incf` / `cl-decf` operate on generalized `setf` places
+  (`(cl-incf (car l))`), not only symbols.
+- `when-let` / `if-let` accept multiple sequential bindings; added `when-let*` /
+  `if-let*` and `named-let`.
+- `replace-regexp-in-string` accepts a function REP: it's called on each match's
+  text (with match data set) and its result is the replacement. Handled via the
+  re-entrant `call_function` path (like `mapcar`/`sort`), outside the host borrow.
 
 ### Added
 - `pcase` — structural dispatch (non-backquote subset): `_` wildcard,

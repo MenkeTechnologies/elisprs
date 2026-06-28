@@ -447,6 +447,19 @@ fn aset(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Err("wrong-type-argument: arrayp".to_string())
 }
+/// `(fillarray ARRAY ITEM)` — set every element of vector ARRAY to ITEM, in
+/// place. (Strings are immutable here, so only vectors are supported.)
+fn fillarray(h: &mut ElispHost, a: &[Value]) -> R {
+    if let Value::Obj(id) = &a[0] {
+        if let Some(Obj::Vector(items)) = h.arena.get_mut(*id as usize) {
+            for x in items.iter_mut() {
+                *x = a[1].clone();
+            }
+            return Ok(a[0].clone());
+        }
+    }
+    Err("wrong-type-argument: arrayp".to_string())
+}
 
 // ── symbols / cells ──
 fn symbol_name(h: &mut ElispHost, a: &[Value]) -> R {
@@ -541,9 +554,36 @@ struct FmtSpec {
     zero: bool,
     plus: bool,
     space: bool,
+    alt: bool,
     width: usize,
     prec: Option<usize>,
     conv: char,
+}
+
+/// Format an integer in `radix` (8/16) the way Emacs's `%o`/`%x`/`%X` do: a
+/// leading `-` and the magnitude's digits (not two's complement), with an
+/// optional `0`/`0x`/`0X` prefix when the `#` flag is set.
+fn format_radix(n: i64, radix: u32, upper: bool, alt: bool) -> String {
+    let (sign, mag) = if n < 0 {
+        ("-", n.unsigned_abs())
+    } else {
+        ("", n as u64)
+    };
+    let body = match (radix, upper) {
+        (16, true) => format!("{mag:X}"),
+        (16, false) => format!("{mag:x}"),
+        _ => format!("{mag:o}"),
+    };
+    let prefix = if alt && mag != 0 {
+        match (radix, upper) {
+            (16, true) => "0X",
+            (16, false) => "0x",
+            _ => "0",
+        }
+    } else {
+        ""
+    };
+    format!("{sign}{prefix}{body}")
 }
 
 /// C-style `%e`: a `prec`-digit mantissa, then `e`, a sign, and a ≥2-digit
@@ -588,13 +628,16 @@ fn pad(body: String, spec: &FmtSpec) -> String {
     if spec.left {
         format!("{body}{}", " ".repeat(fill))
     } else if spec.zero && matches!(spec.conv, 'd' | 'o' | 'x' | 'X' | 'e' | 'f' | 'g') {
-        // Keep any leading sign (-, +, space) ahead of the zero fill.
-        match body.chars().next() {
-            Some(sign @ ('-' | '+' | ' ')) => {
-                format!("{sign}{}{}", "0".repeat(fill), &body[1..])
-            }
-            _ => format!("{}{body}", "0".repeat(fill)),
+        // Keep any leading sign (-, +, space) and `0x`/`0X` radix prefix ahead of
+        // the zero fill: `%#010x` of 255 => `0x000000ff`.
+        let mut p = 0;
+        if matches!(body.chars().next(), Some('-' | '+' | ' ')) {
+            p = 1;
         }
+        if body[p..].starts_with("0x") || body[p..].starts_with("0X") {
+            p += 2;
+        }
+        format!("{}{}{}", &body[..p], "0".repeat(fill), &body[p..])
     } else {
         format!("{}{body}", " ".repeat(fill))
     }
@@ -644,7 +687,8 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             }
         }
         // flags
-        let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
+        let (mut left, mut zero, mut plus, mut space, mut alt) =
+            (false, false, false, false, false);
         if !width_done {
             while let Some(&f) = chars.peek() {
                 match f {
@@ -652,6 +696,7 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
                     '0' => zero = true,
                     '+' => plus = true,
                     ' ' => space = true,
+                    '#' => alt = true,
                     _ => break,
                 }
                 chars.next();
@@ -692,6 +737,7 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             zero,
             plus,
             space,
+            alt,
             width,
             prec,
             conv,
@@ -710,9 +756,9 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             'S' => h.print(arg, true),
             // The `+`/space sign flags apply to the signed conversions (d/e/f/g).
             'd' => apply_sign(as_num(arg)?.0.to_string(), &spec),
-            'o' => format!("{:o}", as_num(arg)?.0),
-            'x' => format!("{:x}", as_num(arg)?.0),
-            'X' => format!("{:X}", as_num(arg)?.0),
+            'o' => format_radix(as_num(arg)?.0, 8, false, spec.alt),
+            'x' => format_radix(as_num(arg)?.0, 16, false, spec.alt),
+            'X' => format_radix(as_num(arg)?.0, 16, true, spec.alt),
             'c' => char::from_u32(as_num(arg)?.0 as u32)
                 .map(String::from)
                 .unwrap_or_default(),
@@ -999,15 +1045,32 @@ fn byte_of_char(s: &str, char_idx: usize) -> usize {
         .map(|(b, _)| b)
         .unwrap_or(s.len())
 }
-fn char_of_byte(s: &str, byte_idx: usize) -> usize {
+pub(crate) fn char_of_byte(s: &str, byte_idx: usize) -> usize {
     s[..byte_idx].chars().count()
 }
 
-/// Compile an elisp regexp to a `regex::Regex`, surfacing both translation and
-/// compilation failures as elisp-style `invalid-regexp` errors.
-fn compile(pat: &str) -> Result<regex::Regex, String> {
+/// Compile an elisp regexp to a `regex::Regex` (optionally case-insensitively,
+/// for `case-fold-search`), surfacing translation and compilation failures as
+/// elisp-style `invalid-regexp` errors.
+pub(crate) fn compile_cf(pat: &str, case_insensitive: bool) -> Result<regex::Regex, String> {
     let translated = crate::regexp::translate(pat)?;
-    regex::Regex::new(&translated).map_err(|e| format!("invalid-regexp: {e}"))
+    let pat = if case_insensitive {
+        format!("(?i){translated}")
+    } else {
+        translated
+    };
+    regex::Regex::new(&pat).map_err(|e| format!("invalid-regexp: {e}"))
+}
+/// Read the dynamic `case-fold-search` (default t) — string matching folds case
+/// unless it is bound to nil.
+pub(crate) fn case_fold_search(h: &ElispHost) -> bool {
+    match h.find_symbol("case-fold-search") {
+        Some(sym) => h
+            .get_value(&sym)
+            .map(|v| !matches!(v, Value::Undef | Value::Bool(false)))
+            .unwrap_or(true),
+        None => true,
+    }
 }
 
 /// Run `re` against `subject` starting at char index `start`, returning the
@@ -1042,7 +1105,7 @@ fn string_match(h: &mut ElispHost, a: &[Value]) -> R {
         Some(Value::Undef) | Some(Value::Bool(false)) | None => 0,
         Some(v) => as_int(v)?.max(0) as usize,
     };
-    let re = compile(&pat)?;
+    let re = compile_cf(&pat, case_fold_search(h))?;
     match run_match(&re, &subject, start) {
         Some(spans) => {
             let begin = spans[0].map(|(b, _)| b as i64).unwrap_or(0);
@@ -1207,7 +1270,7 @@ fn expand_replacement(rep: &str, caps: &regex::Captures, subject: &str) -> Strin
 /// replace every match of REGEXP in STRING with REP. REP is a template (`\&`,
 /// `\N` backrefs) unless LITERAL is non-nil. Function-valued REP is not yet
 /// supported (string templates cover the common case without re-entering the VM).
-fn replace_regexp_in_string(_h: &mut ElispHost, a: &[Value]) -> R {
+fn replace_regexp_in_string(h: &mut ElispHost, a: &[Value]) -> R {
     let pat = as_string(&a[0])?;
     let rep = as_string(&a[1])?;
     let subject = as_string(&a[2])?;
@@ -1215,7 +1278,7 @@ fn replace_regexp_in_string(_h: &mut ElispHost, a: &[Value]) -> R {
         a.get(4),
         Some(Value::Undef) | Some(Value::Bool(false)) | None
     );
-    let re = compile(&pat)?;
+    let re = compile_cf(&pat, case_fold_search(h))?;
     let mut out = String::with_capacity(subject.len());
     let mut last = 0usize;
     for caps in re.captures_iter(&subject) {
@@ -1737,6 +1800,7 @@ pub fn install(h: &mut ElispHost) {
     s("make-vector", 2, Some(2), make_vector);
     s("aref", 2, Some(2), aref);
     s("aset", 3, Some(3), aset);
+    s("fillarray", 2, Some(2), fillarray);
     // symbols
     s("symbol-name", 1, Some(1), symbol_name);
     s("intern", 1, Some(2), intern_fn);
