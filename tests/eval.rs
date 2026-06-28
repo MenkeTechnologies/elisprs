@@ -561,3 +561,33 @@ fn emacs_parity_format_fields_and_misc_fns() {
     assert_eq!(eval("(seq-mapn '+ '(1 2) '(3 4))"), "(4 6)");
     assert_eq!(eval("(seq-mapn '+ '(1 2 3) '(10 20))"), "(11 22)");
 }
+
+#[test]
+fn emacs_parity_sweep_fixes() {
+    // vconcat / string-to-vector build vectors from any sequences.
+    assert_eq!(eval("(vconcat [1 2] [3 4])"), "[1 2 3 4]");
+    assert_eq!(eval("(vconcat \"ab\" [3] (list 4))"), "[97 98 3 4]");
+    assert_eq!(eval("(string-to-vector \"ab\")"), "[97 98]");
+    // fixnum constants.
+    assert_eq!(eval("most-positive-fixnum"), "2305843009213693951");
+    assert_eq!(eval("most-negative-fixnum"), "-2305843009213693952");
+    // abs keeps type and normalizes -0.0.
+    assert_eq!(eval("(abs -5)"), "5");
+    assert_eq!(eval("(abs -3.5)"), "3.5");
+    assert_eq!(eval("(abs -0.0)"), "0.0");
+    // string-prefix/suffix honor IGNORE-CASE; assoc takes a TESTFN.
+    assert_eq!(eval("(string-prefix-p \"AB\" \"abc\" t)"), "t");
+    assert_eq!(eval("(string-suffix-p \"C\" \"abc\" t)"), "t");
+    assert_eq!(
+        eval("(assoc \"a\" (list (cons \"a\" 1)) (function string=))"),
+        "(\"a\" . 1)"
+    );
+    // string-pad with PADDING + START; string-equal-ignore-case; upcase-initials.
+    assert_eq!(eval("(string-pad \"x\" 3 ?- t)"), "\"--x\"");
+    assert_eq!(eval("(string-pad \"x\" 3)"), "\"x  \"");
+    assert_eq!(eval("(string-equal-ignore-case \"AB\" \"ab\")"), "t");
+    assert_eq!(eval("(upcase-initials \"foo bar\")"), "\"Foo Bar\"");
+    // logcount.
+    assert_eq!(eval("(logcount 7)"), "3");
+    assert_eq!(eval("(logcount -2)"), "1");
+}

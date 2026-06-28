@@ -20,7 +20,10 @@ pub const PRELUDE: &str = r#"
 (defun cddddr (x) (cdr (cdddr x)))
 
 ;;; ---- numeric helpers ----
-(defun abs (x) (if (< x 0) (- x) x))
+;; Fixnum bounds match GNU Emacs on a 64-bit build (62-bit tagged integers).
+(defconst most-positive-fixnum 2305843009213693951)
+(defconst most-negative-fixnum -2305843009213693952)
+;; `abs` is a primitive subr (keeps int/float type; (abs -0.0) => 0.0).
 (defun max (x &rest xs) (while xs (if (> (car xs) x) (setq x (car xs))) (setq xs (cdr xs))) x)
 (defun min (x &rest xs) (while xs (if (< (car xs) x) (setq x (car xs))) (setq xs (cdr xs))) x)
 ;; `mod` is a primitive subr (handles float operands + divisor-sign semantics).
@@ -53,7 +56,13 @@ pub const PRELUDE: &str = r#"
 (defun memq (x l) (while (and l (not (eq x (car l)))) (setq l (cdr l))) l)
 (defun member (x l) (while (and l (not (equal x (car l)))) (setq l (cdr l))) l)
 (defun assq (k l) (let ((r nil)) (while (and l (not r)) (if (eq (caar l) k) (setq r (car l)) (setq l (cdr l)))) r))
-(defun assoc (k l) (let ((r nil)) (while (and l (not r)) (if (equal (caar l) k) (setq r (car l)) (setq l (cdr l)))) r))
+(defun assoc (k l &optional testfn)
+  (let ((r nil))
+    (while (and l (not r))
+      (if (if testfn (funcall testfn k (caar l)) (equal (caar l) k))
+          (setq r (car l))
+        (setq l (cdr l))))
+    r))
 (defun rassq (v l) (let ((r nil)) (while (and l (not r)) (if (eq (cdar l) v) (setq r (car l)) (setq l (cdr l)))) r))
 (defun alist-get (k al) (let ((p (assq k al))) (if p (cdr p) nil)))
 (defun plist-get (pl k)
@@ -405,6 +414,8 @@ pub const PRELUDE: &str = r#"
       (setq r (cons (apply fn (mapcar (function car) seqs)) r))
       (setq seqs (mapcar (function cdr) seqs)))
     (reverse r)))
+;; Like `format' (we don't translate `...' to curved quotes).
+(defun format-message (fmt &rest args) (apply (function format) fmt args))
 ;; The human-readable message for an error object (ERROR-SYMBOL . DATA).
 (defun error-message-string (err)
   (let ((sym (car err)) (data (cdr err)))
@@ -435,7 +446,25 @@ pub const PRELUDE: &str = r#"
 (defun cl-constantly (x) (lambda (&rest --ignore--) x))
 
 (defun string-chop-newline (s) (if (string-suffix-p "\n" s) (substring s 0 (- (length s) 1)) s))
-(defun string-pad (s len) (let ((cur (length s))) (if (>= cur len) s (concat s (make-string (- len cur) 32)))))
+(defun string-pad (s len &optional padding start)
+  ;; Pad S to LENGTH chars with PADDING (default space); pad on the left when
+  ;; START is non-nil, otherwise on the right.
+  (let ((pad (or padding 32)) (cur (length s)))
+    (if (>= cur len) s
+      (let ((fill (make-string (- len cur) pad)))
+        (if start (concat fill s) (concat s fill))))))
+(defun string-equal-ignore-case (a b) (string= (downcase a) (downcase b)))
+(defun upcase-initials (s)
+  ;; Upcase the first letter of every word, leaving the rest unchanged.
+  (let ((out nil) (in-word nil))
+    (dolist (c (string-to-list s))
+      (let* ((lower (and (>= c ?a) (<= c ?z)))
+             (alnum (or lower (and (>= c ?A) (<= c ?Z)) (and (>= c ?0) (<= c ?9)))))
+        (cond ((not alnum) (setq out (cons c out)))
+              (in-word (setq out (cons c out)))
+              (t (setq out (cons (if lower (- c 32) c) out))))
+        (setq in-word alnum)))
+    (apply (function string) (reverse out))))
 (defun string-replace (from to s)
   (if (string-empty-p from) s
     (let ((out "") (pos (string-search from s)))

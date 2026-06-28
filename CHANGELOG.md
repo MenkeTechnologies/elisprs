@@ -37,6 +37,16 @@ All notable changes to elisprs are documented here. The format follows
   general `#NNr…`); character modifier syntax `?\C-` / `?\^` / `?\M-` / `?\S-` /
   `?\H-` / `?\s-` / `?\A-`, nestable (`?\C-\M-a`); and the non-finite float read
   syntax `1.0e+INF` / `-1.0e+INF` / `0.0e+NaN`.
+- `format` supports `%N$` argument fields (`(format "%2$s %1$s" "a" "b")` =>
+  `"b a"`), combinable with flags/width (`%2$05d`).
+- Added more core functions: `logb`, `read`, `compare-strings`,
+  `error-message-string`, `seq-mapn`, and `format-message` (alias of `format`).
+- Found via a fresh Emacs parity sweep: added `vconcat`, `string-to-vector`,
+  `logcount`, `string-equal-ignore-case`, `upcase-initials`, and the constants
+  `most-positive-fixnum` / `most-negative-fixnum`; `abs` is now a subr (keeps
+  int/float type and normalizes `-0.0` => `0.0`); `string-prefix-p` /
+  `string-suffix-p` honor IGNORE-CASE; `assoc` takes an optional TESTFN;
+  `string-pad` takes PADDING and START.
 
 ### Added
 - `pcase` — structural dispatch (non-backquote subset): `_` wildcard,

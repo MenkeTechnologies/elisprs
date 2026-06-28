@@ -13,6 +13,16 @@ elref() { emacs -Q --batch --eval "(prin1 $1)" 2>&1; }   # ground truth
 
 ---
 
+## Additional parity gaps found via sweep — ✅ FIXED
+
+Beyond the numbered entries below, a fresh `elisp` vs `emacs -Q` sweep surfaced
+and fixed: `vconcat`, `string-to-vector`, `logcount`, `string-equal-ignore-case`,
+`upcase-initials`, `most-positive-fixnum` / `most-negative-fixnum`; `abs` keeping
+int/float type and normalizing `-0.0`; `string-prefix-p` / `string-suffix-p`
+IGNORE-CASE; `assoc` TESTFN; `string-pad` PADDING/START.
+
+---
+
 ## Core semantics — wrong values (highest severity)
 
 ### 1. No bignum support — silent integer overflow
@@ -248,3 +258,91 @@ Areas probed in round 2 that PASSED (now match Emacs): `floor`/`ceiling`/`trunca
 `string-search`/`string-replace`, `cl-case`, `when-let`/`if-let`, `pcase`
 `pred`/`or`/`and`/`guard`, the autoloaded `seq-` family on lists, `type-of`/`functionp`,
 `prin1-to-string` (the #23 entry — now present).
+
+---
+
+# Round 3 — additional confirmed divergences (vs `emacs -Q` 30.2)
+
+Third deep pass against the current binary. Ground truth = bare `emacs -Q --batch`;
+`cl-*` symbols void there are excluded. None of these overlap rounds 1–2.
+
+## Behavioral — wrong values / wrong errors
+
+### R3-A. String/char `\` escapes: named-control, hex, and octal all wrong
+The reader's `unescape` only maps `n t r 0 e`; every other escape falls through to the
+literal letter, and multi-char numeric escapes aren't consumed.
+- `?\a`→Emacs `7`, elisprs `97`; likewise `?\b`/`?\f`/`?\v`/`?\s`/`?\d` give the ASCII
+  of the letter instead of the control code
+- `?\x41`→Emacs `65`, elisprs `41`; `?\101` (octal)→`65` vs `1`
+- `"\x41"`→Emacs `"A"`, elisprs `"x41"`; `"\101"`→`"A"` vs `"101"`; `"\C-a"`→ctrl-char vs `"C-a"`
+- `(string-to-list "\x41\x42")`→Emacs `(65 66)`, elisprs `(120 52 49 120 52 50)`
+- `?\N{LATIN SMALL LETTER A}`→Emacs `97`, elisprs `error: void: {LATIN`
+- `src/reader.rs` `unescape` (~401-410), shared by string (~169) and char (~229) paths.
+  Round-1 #14 covered only `\C-`/`\M-` modifiers — this is the rest.
+
+### R3-B. Symbol read-escape (`\`) unsupported
+- `'foo\ bar` → Emacs symbol `foo bar`, elisprs `error: …void: bar`
+
+### R3-C. Symbol printing doesn't escape; empty symbol mis-prints
+- `(prin1-to-string (intern "a b"))` → Emacs `"a\\ b"`, elisprs `"a b"` (round-trips wrong)
+- `(prin1-to-string (intern ""))` → Emacs `"##"`, elisprs `""`
+
+### R3-D. `print-length` / `print-level` ignored
+- `(let ((print-length 3)) (prin1-to-string '(1 2 3 4 5)))` → Emacs `"(1 2 3 ...)"`, elisprs `"(1 2 3 4 5)"`
+- `(let ((print-level 2)) (prin1-to-string '(1 (2 (3)))))` → Emacs `"(1 (2 ...))"`, elisprs full
+
+### R3-E. `format` `%x`/`%o` on negatives print two's-complement, not signed
+- `(format "%x" -1)` → Emacs `"-1"`, elisprs `"ffffffffffffffff"`
+- `(format "%o" -8)` → Emacs `"-10"`, elisprs `"1777777777777777777770"`
+
+### R3-F. `format` `#` flag unsupported (returned literally)
+- `(format "%#x" 255)` → Emacs `"0xff"`, elisprs `"%#x"`
+
+### R3-G. `substring` doesn't bounds-check END
+- `(substring "abc" 1 10)` → Emacs signals `args-out-of-range ("abc" 1 10)`, elisprs `"bc"`
+  (round 1 checked negative indices, not over-range)
+
+### R3-H. `nth` on a vector returns nil instead of signaling
+- `(nth 1 [1 2 3])` → Emacs signals `wrong-type-argument listp [1 2 3]`, elisprs `nil`
+
+### R3-I. `last` on an improper (dotted) list errors instead of returning
+- `(last '(1 2 . 3))` → Emacs `(2 . 3)`, elisprs `error: wrong-type-argument: listp 3`
+
+### R3-J. `char-equal` ignores `case-fold-search`
+- `(char-equal ?a ?A)` → Emacs `t` (case-fold defaults t in batch), elisprs `nil`
+
+### R3-K. `signal`/`condition-case` stringify the entire error DATA list
+- `(condition-case e (signal 'my-err '(a b)) (t (cdr e)))` → Emacs `(a b)`, elisprs `("(a b)")`
+- General form of R2-B/R2-C: any signalled DATA is collapsed to one printed string, so
+  every handler reading `(cdr e)` gets garbage — even user `signal`.
+
+### R3-L. Hex reader rejects values above i64 range (hard error)
+- `#xFFFFFFFFFFFFFFFF` → Emacs `18446744073709551615`, elisprs `error: invalid digits for
+  base 16` (a reader error variant of the round-1 #1 bignum gap)
+
+## Missing builtins — confirmed `emacs -Q` returns a value, void in elisprs
+
+- **Eval/macros (high impact):** `eval` (`(eval '(+ 1 2))`→3), `macroexpand`,
+  `macroexpand-1`, `macroexpand-all`, `special-form-p`, `byte-code-function-p`,
+  `interactive-form`, `documentation`, `make-closure`
+- **Symbols/functions:** `fset`, `defalias`, `symbol-function` (`#<subr car>`), `put`/`get`,
+  `symbol-plist`, `setplist`, `fmakunbound`, `function-get`, `intern-soft` (→nil)
+- **Predicates/numbers:** `fixnump` (t), `bignump`, `log` (`(log 0)`→`-1.0e+INF`),
+  `logcount` (`(logcount 7)`→3)
+- **Lists/cons:** `nconc`, `member-ignore-case`, `rassq-delete-all`, `car-safe`, `cdr-safe`;
+  the c[ad]+r gaps `caadr`/`cadar`/`cdaar`/`cdadr`/`cddar` (void while `caaar`/`caddr`/`cdddr` exist)
+- **Strings:** `substring-no-properties`, `upcase-initials`, `string-fill`,
+  `string-clean-whitespace`, `string-bytes` (`"λ"`→2), `multibyte-string-p`, `char-width`,
+  `string>`, `string-version-lessp`, `value<` (Emacs-30 generic `<`)
+- **Records/bool-vectors:** `record` (`#s(foo 1 2)`), `recordp`, `make-bool-vector`, `bool-vector`
+- **Hash/equality:** `sxhash-equal`, `sxhash-eq`, `equal-including-properties`
+- **Reader/regexp/macros:** `read-from-string`, `regexp-opt`, `let-alist`, `dlet`
+
+Areas probed in round 3 that PASSED: radix literals `#16r`/`#2r`/`#36r`/`#x`/`#b`/`#o`,
+`?λ`/`"λ"` unicode, `?\C-\M-a` nesting, `?\^?`, `'()`, normal-magnitude float printing,
+`(expt 0 0)`, `(sqrt -1)`→NaN, `mod`/`%` signs, `ash`/`lsh`/`logand`, `ffloor`/`fround`,
+`flatten-tree`/`ensure-list`/`take`/`ntake`/`proper-list-p`/`delete`/`remq`/`delete-dups`/
+`assq-delete-all`/`safe-length`, `seq-*` on lists, `format` `%c`/`%.Nf`/`%-N.Ms`/`%g`,
+`string-pad`(2/3-arg)/`split-string`/`string-trim`/`mapconcat`/`read`, `pcase`
+pred/and/guard, `apply-partially`, hash put/get/maphash, `string<`/`string-greaterp`,
+`aref`/`elt`/`copy-sequence`/`reverse`/`sort` on vectors.

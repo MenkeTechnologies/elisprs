@@ -850,10 +850,22 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.list_from(parts.into_iter().map(Value::str).collect()))
 }
 fn string_prefix_p(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(as_string(&a[1])?.starts_with(&as_string(&a[0])?)))
+    let (pre, s) = (as_string(&a[0])?, as_string(&a[1])?);
+    let ignore_case = a.get(2).is_some_and(|v| !is_nil(v));
+    Ok(nil_or(if ignore_case {
+        s.to_lowercase().starts_with(&pre.to_lowercase())
+    } else {
+        s.starts_with(&pre)
+    }))
 }
 fn string_suffix_p(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(as_string(&a[1])?.ends_with(&as_string(&a[0])?)))
+    let (suf, s) = (as_string(&a[0])?, as_string(&a[1])?);
+    let ignore_case = a.get(2).is_some_and(|v| !is_nil(v));
+    Ok(nil_or(if ignore_case {
+        s.to_lowercase().ends_with(&suf.to_lowercase())
+    } else {
+        s.ends_with(&suf)
+    }))
 }
 fn string_empty_p(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(as_string(&a[0])?.is_empty()))
@@ -1412,6 +1424,56 @@ fn char_or_string_p(_h: &mut ElispHost, a: &[Value]) -> R {
 fn char_equal(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(as_int(&a[0])? == as_int(&a[1])?))
 }
+/// `(vconcat &rest SEQUENCES)` — concatenate any sequences (lists, vectors,
+/// strings) into a new vector. `(vconcat [1 2] "a")` => `[1 2 97]`.
+fn vconcat_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let mut out = Vec::new();
+    for v in a {
+        if is_nil(v) {
+            continue;
+        }
+        match h.obj(v) {
+            Some(Obj::Vector(items)) => out.extend(items.clone()),
+            _ => match v {
+                Value::Str(s) => out.extend(s.chars().map(|c| Value::Int(c as i64))),
+                _ => match h.list_vec(v) {
+                    Some(items) => out.extend(items),
+                    None => return Err("wrong-type-argument: sequencep".to_string()),
+                },
+            },
+        }
+    }
+    Ok(h.alloc(Obj::Vector(out)))
+}
+/// `(abs NUMBER)` — absolute value, keeping the int/float type (and turning
+/// `-0.0` into `0.0`, which a `(< x 0)` test would miss).
+fn abs_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    match &a[0] {
+        Value::Int(n) => Ok(Value::Int(n.wrapping_abs())),
+        Value::Float(f) => Ok(Value::Float(f.abs())),
+        _ => Err(format!(
+            "wrong-type-argument: numberp {}",
+            a[0].as_str_cow()
+        )),
+    }
+}
+/// `(logcount N)` — count of set bits for N≥0, or of clear bits for N<0 (i.e.
+/// bits differing from the sign bit), matching Emacs.
+fn logcount_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_int(&a[0])?;
+    let bits = if n >= 0 {
+        n.count_ones()
+    } else {
+        (!n).count_ones()
+    };
+    Ok(Value::Int(bits as i64))
+}
+/// `(string-to-vector STRING)` — a vector of STRING's character codes.
+fn string_to_vector(h: &mut ElispHost, a: &[Value]) -> R {
+    let s = as_string(&a[0])?;
+    let items: Vec<Value> = s.chars().map(|c| Value::Int(c as i64)).collect();
+    Ok(h.alloc(Obj::Vector(items)))
+}
 /// `(logb X)` — the binary exponent of |X|: floor(log2(|X|)).
 fn logb_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     let f = as_num(&a[0])?.1.abs();
@@ -1615,6 +1677,10 @@ pub fn install(h: &mut ElispHost) {
     s("functionp", 1, Some(1), functionp);
     s("char-or-string-p", 1, Some(1), char_or_string_p);
     s("char-equal", 2, Some(2), char_equal);
+    s("vconcat", 0, None, vconcat_fn);
+    s("string-to-vector", 1, Some(1), string_to_vector);
+    s("abs", 1, Some(1), abs_fn);
+    s("logcount", 1, Some(1), logcount_fn);
     s("logb", 1, Some(1), logb_fn);
     s("read", 1, Some(1), read_fn);
     s("compare-strings", 6, Some(7), compare_strings);
