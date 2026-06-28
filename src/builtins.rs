@@ -539,9 +539,43 @@ fn concat_fn(h: &mut ElispHost, a: &[Value]) -> R {
 struct FmtSpec {
     left: bool,
     zero: bool,
+    plus: bool,
+    space: bool,
     width: usize,
     prec: Option<usize>,
     conv: char,
+}
+
+/// C-style `%e`: a `prec`-digit mantissa, then `e`, a sign, and a ≥2-digit
+/// exponent (`1000.0` => `1.000000e+03`). Rust's `{:e}` omits the padding/sign.
+fn format_e(v: f64, prec: usize) -> String {
+    let s = format!("{:.*e}", prec, v);
+    match s.find('e') {
+        Some(epos) => {
+            let (mant, rest) = s.split_at(epos);
+            let exp = &rest[1..];
+            let (sign, digits) = match exp.strip_prefix('-') {
+                Some(d) => ('-', d),
+                None => ('+', exp.strip_prefix('+').unwrap_or(exp)),
+            };
+            format!("{mant}e{sign}{digits:0>2}")
+        }
+        None => s,
+    }
+}
+
+/// Prefix an explicit sign on a non-negative numeric body per the `+`/space
+/// flags (`+` wins over space). A leading `-` already carries the sign.
+fn apply_sign(body: String, spec: &FmtSpec) -> String {
+    if body.starts_with('-') {
+        body
+    } else if spec.plus {
+        format!("+{body}")
+    } else if spec.space {
+        format!(" {body}")
+    } else {
+        body
+    }
 }
 
 /// Pad `body` to `spec.width` honoring the `-` (left) and `0` (zero-fill) flags.
@@ -554,9 +588,12 @@ fn pad(body: String, spec: &FmtSpec) -> String {
     if spec.left {
         format!("{body}{}", " ".repeat(fill))
     } else if spec.zero && matches!(spec.conv, 'd' | 'o' | 'x' | 'X' | 'e' | 'f' | 'g') {
-        match body.strip_prefix('-') {
-            Some(rest) => format!("-{}{rest}", "0".repeat(fill)),
-            None => format!("{}{body}", "0".repeat(fill)),
+        // Keep any leading sign (-, +, space) ahead of the zero fill.
+        match body.chars().next() {
+            Some(sign @ ('-' | '+' | ' ')) => {
+                format!("{sign}{}{}", "0".repeat(fill), &body[1..])
+            }
+            _ => format!("{}{body}", "0".repeat(fill)),
         }
     } else {
         format!("{}{body}", " ".repeat(fill))
@@ -607,12 +644,14 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             }
         }
         // flags
-        let (mut left, mut zero) = (false, false);
+        let (mut left, mut zero, mut plus, mut space) = (false, false, false, false);
         if !width_done {
             while let Some(&f) = chars.peek() {
                 match f {
                     '-' => left = true,
                     '0' => zero = true,
+                    '+' => plus = true,
+                    ' ' => space = true,
                     _ => break,
                 }
                 chars.next();
@@ -651,6 +690,8 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
         let spec = FmtSpec {
             left,
             zero,
+            plus,
+            space,
             width,
             prec,
             conv,
@@ -667,19 +708,20 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
                 }
             }
             'S' => h.print(arg, true),
-            'd' => as_num(arg)?.0.to_string(),
+            // The `+`/space sign flags apply to the signed conversions (d/e/f/g).
+            'd' => apply_sign(as_num(arg)?.0.to_string(), &spec),
             'o' => format!("{:o}", as_num(arg)?.0),
             'x' => format!("{:x}", as_num(arg)?.0),
             'X' => format!("{:X}", as_num(arg)?.0),
             'c' => char::from_u32(as_num(arg)?.0 as u32)
                 .map(String::from)
                 .unwrap_or_default(),
-            'e' => match spec.prec {
-                Some(p) => format!("{:.*e}", p, as_num(arg)?.1),
-                None => format!("{:e}", as_num(arg)?.1),
-            },
-            'f' => format!("{:.*}", spec.prec.unwrap_or(6), as_num(arg)?.1),
-            'g' => format!("{}", as_num(arg)?.1),
+            'e' => apply_sign(format_e(as_num(arg)?.1, spec.prec.unwrap_or(6)), &spec),
+            'f' => apply_sign(
+                format!("{:.*}", spec.prec.unwrap_or(6), as_num(arg)?.1),
+                &spec,
+            ),
+            'g' => apply_sign(format!("{}", as_num(arg)?.1), &spec),
             other => {
                 // Unknown directive: emit verbatim, consume no argument.
                 out.push('%');
@@ -795,6 +837,16 @@ fn hash_table_count(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn hash_table_p(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::HashTable { .. }))))
+}
+/// `(hash-table-test TABLE)` — the symbol naming TABLE's comparison test.
+fn hash_table_test(h: &mut ElispHost, a: &[Value]) -> R {
+    let test = ht_view(h, &a[0])?.0;
+    let name = match test {
+        0 => "eq",
+        1 => "eql",
+        _ => "equal",
+    };
+    Ok(h.intern(name))
 }
 fn hash_table_keys(h: &mut ElispHost, a: &[Value]) -> R {
     let keys: Vec<Value> = ht_view(h, &a[0])?.1.into_iter().map(|(k, _)| k).collect();
@@ -920,8 +972,19 @@ fn string_to_list(h: &mut ElispHost, a: &[Value]) -> R {
 fn string_search(_h: &mut ElispHost, a: &[Value]) -> R {
     let needle = as_string(&a[0])?;
     let hay = as_string(&a[1])?;
-    Ok(match hay.find(&needle) {
-        Some(byte_idx) => Value::Int(hay[..byte_idx].chars().count() as i64),
+    // Optional START is a char index; search only the tail from there, then map
+    // the byte offset back to an absolute char index.
+    let start_char = match a.get(2) {
+        Some(Value::Int(n)) => (*n).max(0) as usize,
+        _ => 0,
+    };
+    let start_byte = hay
+        .char_indices()
+        .nth(start_char)
+        .map(|(b, _)| b)
+        .unwrap_or(hay.len());
+    Ok(match hay[start_byte..].find(&needle) {
+        Some(off) => Value::Int(hay[..start_byte + off].chars().count() as i64),
         None => Value::Undef,
     })
 }
@@ -1424,6 +1487,92 @@ fn char_or_string_p(_h: &mut ElispHost, a: &[Value]) -> R {
 fn char_equal(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(as_int(&a[0])? == as_int(&a[1])?))
 }
+/// `(symbol-function SYMBOL)` — the symbol's function-cell value, or nil.
+fn symbol_function(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(h.function_cell(&a[0]).unwrap_or(Value::Undef))
+}
+/// `(intern-soft NAME)` — the interned symbol named NAME, or nil if none exists.
+fn intern_soft(h: &mut ElispHost, a: &[Value]) -> R {
+    let name = match &a[0] {
+        Value::Str(s) => s.to_string(),
+        _ => h.sym_name(&a[0]).ok_or("wrong-type-argument: stringp")?,
+    };
+    Ok(h.find_symbol(&name).unwrap_or(Value::Undef))
+}
+fn subrp(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::Subr { .. }))))
+}
+// Forms elisprs lowers as compiler intrinsics but which Emacs classifies as
+// *macros* (`lambda`/`when`/… are macros there, not special forms).
+const INTRINSIC_MACROS: &[&str] = &["lambda", "when", "unless", "defun", "defmacro"];
+// The genuine special forms, matching Emacs's `special-form-p`.
+const SPECIAL_FORMS: &[&str] = &[
+    "quote",
+    "function",
+    "progn",
+    "prog1",
+    "prog2",
+    "if",
+    "cond",
+    "and",
+    "or",
+    "while",
+    "setq",
+    "let",
+    "let*",
+    "defvar",
+    "defconst",
+    "catch",
+    "unwind-protect",
+    "condition-case",
+    "save-current-buffer",
+    "save-excursion",
+    "save-restriction",
+];
+/// `(macrop OBJECT)` — non-nil if OBJECT is (or names) a macro.
+fn macrop(h: &mut ElispHost, a: &[Value]) -> R {
+    if matches!(
+        h.resolve_function(&a[0]),
+        Ok(Resolved::Closure { is_macro: true, .. })
+    ) {
+        return Ok(Value::Bool(true));
+    }
+    // The intrinsic forms have no closure to resolve, but are macros in Emacs.
+    let ok = h
+        .sym_name(&a[0])
+        .is_some_and(|n| INTRINSIC_MACROS.contains(&n.as_str()));
+    Ok(nil_or(ok))
+}
+/// `(special-form-p OBJECT)` — non-nil if OBJECT names a special form (per
+/// Emacs's classification, not elisprs's internal lowering).
+fn special_form_p(h: &mut ElispHost, a: &[Value]) -> R {
+    let ok = h
+        .sym_name(&a[0])
+        .map(|n| SPECIAL_FORMS.contains(&n.as_str()))
+        .unwrap_or(false);
+    Ok(nil_or(ok))
+}
+fn char_uppercase_p(_h: &mut ElispHost, a: &[Value]) -> R {
+    let c = char::from_u32(as_int(&a[0])? as u32);
+    Ok(nil_or(c.is_some_and(|c| c.is_uppercase())))
+}
+/// `(string-distance S1 S2 &optional BYTECOMPARE)` — Levenshtein edit distance.
+fn string_distance(_h: &mut ElispHost, a: &[Value]) -> R {
+    let s1: Vec<char> = as_string(&a[0])?.chars().collect();
+    let s2: Vec<char> = as_string(&a[1])?.chars().collect();
+    let m = s2.len();
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0usize; m + 1];
+    for (i, c1) in s1.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, c2) in s2.iter().enumerate() {
+            let cost = if c1 == c2 { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    Ok(Value::Int(prev[m] as i64))
+}
 /// `(vconcat &rest SEQUENCES)` — concatenate any sequences (lists, vectors,
 /// strings) into a new vector. `(vconcat [1 2] "a")` => `[1 2 97]`.
 fn vconcat_fn(h: &mut ElispHost, a: &[Value]) -> R {
@@ -1611,6 +1760,7 @@ pub fn install(h: &mut ElispHost) {
     s("remhash", 2, Some(2), remhash);
     s("clrhash", 1, Some(1), clrhash);
     s("hash-table-count", 1, Some(1), hash_table_count);
+    s("hash-table-test", 1, Some(1), hash_table_test);
     s("hash-table-p", 1, Some(1), hash_table_p);
     s("hash-table-keys", 1, Some(1), hash_table_keys);
     s("hash-table-values", 1, Some(1), hash_table_values);
@@ -1681,6 +1831,13 @@ pub fn install(h: &mut ElispHost) {
     s("string-to-vector", 1, Some(1), string_to_vector);
     s("abs", 1, Some(1), abs_fn);
     s("logcount", 1, Some(1), logcount_fn);
+    s("symbol-function", 1, Some(1), symbol_function);
+    s("intern-soft", 1, Some(1), intern_soft);
+    s("subrp", 1, Some(1), subrp);
+    s("macrop", 1, Some(1), macrop);
+    s("special-form-p", 1, Some(1), special_form_p);
+    s("char-uppercase-p", 1, Some(1), char_uppercase_p);
+    s("string-distance", 2, Some(3), string_distance);
     s("logb", 1, Some(1), logb_fn);
     s("read", 1, Some(1), read_fn);
     s("compare-strings", 6, Some(7), compare_strings);

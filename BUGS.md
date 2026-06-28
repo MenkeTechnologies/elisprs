@@ -15,20 +15,38 @@ elref() { emacs -Q --batch --eval "(prin1 $1)" 2>&1; }   # ground truth
 
 ## Additional parity gaps found via sweep — ✅ FIXED
 
-Beyond the numbered entries below, a fresh `elisp` vs `emacs -Q` sweep surfaced
+Beyond the numbered entries below, fresh `elisp` vs `emacs -Q` sweeps surfaced
 and fixed: `vconcat`, `string-to-vector`, `logcount`, `string-equal-ignore-case`,
 `upcase-initials`, `most-positive-fixnum` / `most-negative-fixnum`; `abs` keeping
 int/float type and normalizing `-0.0`; `string-prefix-p` / `string-suffix-p`
-IGNORE-CASE; `assoc` TESTFN; `string-pad` PADDING/START.
+IGNORE-CASE; `assoc` TESTFN; `string-pad` PADDING/START. Introspection: added
+`symbol-function`, `intern-soft`, `subrp`, `macrop`, `special-form-p`,
+`char-uppercase-p`, `string-distance`, `fixnump`, `bignump` (with `macrop` /
+`special-form-p` matching Emacs's classification). Sequences: `seq-concatenate`,
+`copy-alist`, `substring-no-properties`; `alist-get` DEFAULT/TESTFN; `string-trim`
+regexp arguments. Format: `+`/space sign flags and C-style `%e`; added
+`hash-table-test`, `nbutlast`, `memql`, `assoc-string`; `string-search` START arg.
 
 ---
 
 ## Core semantics — wrong values (highest severity)
 
-### 1. No bignum support — silent integer overflow
+### 1. No bignum support — silent integer overflow (⚠️ NOT a pure-frontend fix)
 - `(expt 2 100)` → Emacs `1267650600228229401496703205376`, elisprs `0`
 - `(* 1000000000000 1000000000000)` → Emacs `1000000000000000000000000`, elisprs `2003764205206896640`
 - Integer ops wrap i64 instead of promoting to bignum.
+- **Feasibility (investigated):** fusevm executes `+`/`-`/`*` via native ops that
+  **wrap silently** — `Op::Mul => self.arith_int_fast(i64::wrapping_mul, …)`
+  (`fusevm vm.rs:1104`; the Cranelift JIT path does the same). elisprs lowers hot
+  arithmetic to exactly these ops on purpose (the JIT/AOT story in the README), so
+  a bignum value type cannot promote on overflow without **either** (a) removing
+  the native-op lowering for `+`/`-`/`*` and routing all integer arithmetic
+  through host builtins with `checked_*` + promotion to a host-side
+  `Obj::Bignum(num_bigint::BigInt)` — sacrificing the native fast path — **or**
+  (b) changing fusevm itself (add an overflow-trap/host-fallback to the int ops).
+  Both are real architecture decisions (and touch equality/printing/comparison
+  too), so this is intentionally left for an explicit owner decision rather than a
+  silent half-fix that only works on the interpreted path.
 
 ### 2. ✅ FIXED — `(lambda …)` in operator (head) position fails
 - `((lambda (x) x) 5)` → Emacs `5`, elisprs `error: invalid-function`
@@ -82,7 +100,7 @@ IGNORE-CASE; `assoc` TESTFN; `string-pad` PADDING/START.
 
 ## Reader — read syntax not supported
 
-### 12. Vector literals `[…]` not read
+### 12. ✅ FIXED — Vector literals `[…]` not read
 - `[1 2 3]` → Emacs `[1 2 3]`, elisprs `error: Symbol's value as variable is void: [1`
 - `(vector 1 2 3)` works and prints `[1 2 3]`; only the literal reader is missing.
   Cascades to `(aref [10 20 30] 1)`, `(vconcat [1 2] [3 4])`, `(equal [1 2] [1 2])`, …
@@ -103,7 +121,7 @@ IGNORE-CASE; `assoc` TESTFN; `string-pad` PADDING/START.
 
 ## `format` directives
 
-### 16. Width / precision / flags silently ignored (returned literally)
+### 16. ✅ FIXED — Width / precision / flags silently ignored (returned literally)
 - `(format "%5d" 42)` → Emacs `"   42"`, elisprs `"%5d"`
 - `(format "%-5d|" 42)` → Emacs `"42   |"`, elisprs `"%-5d|"`
 - `(format "%05d" 42)` → Emacs `"00042"`, elisprs `"%05d"`
@@ -113,7 +131,7 @@ IGNORE-CASE; `assoc` TESTFN; `string-pad` PADDING/START.
 - `(format "% d" 5)` → Emacs `" 5"`, elisprs `"% d"`
 - Also `(format "%f" 3.14159)` → Emacs `"3.141590"` (6 digits), elisprs `"3.14159"`.
 
-### 17. Conversions `%X` `%o` `%e` `%g` unsupported (returned literally)
+### 17. ✅ FIXED — Conversions `%X` `%o` `%e` `%g` unsupported (returned literally)
 - `(format "%X" 255)` → Emacs `"FF"`, elisprs `"%X"`
 - `(format "%o" 8)` → Emacs `"10"`, elisprs `"%o"`
 - `(format "%e" 31415.9)` → Emacs `"3.141590e+04"`, elisprs `"%e"`
@@ -346,3 +364,81 @@ Areas probed in round 3 that PASSED: radix literals `#16r`/`#2r`/`#36r`/`#x`/`#b
 `string-pad`(2/3-arg)/`split-string`/`string-trim`/`mapconcat`/`read`, `pcase`
 pred/and/guard, `apply-partially`, hash put/get/maphash, `string<`/`string-greaterp`,
 `aref`/`elt`/`copy-sequence`/`reverse`/`sort` on vectors.
+
+---
+
+# Round 4 — additional confirmed divergences (vs `emacs -Q` 30.2)
+
+Fourth pass against the current binary. Ground truth = bare `emacs -Q --batch`;
+`cl-*`/`subr-x`-only symbols void there are excluded. No overlap with rounds 1–3.
+
+## Behavioral — wrong values / wrong errors
+
+### R4-A. `letrec` is broken
+- `(letrec ((a 1) (b (+ a 1))) (list a b))` → Emacs `(1 2)`, elisprs `error: …void: a`
+- `(letrec ((f (lambda (n) (if (= n 0) 1 (* n (funcall f (1- n))))))) (funcall f 5))` →
+  Emacs `120`, elisprs `error: invalid-function`. Forward/self references don't resolve
+  (`letrec` not in `src/prelude.rs`).
+
+### R4-B. `if-let` / `when-let` only bind the FIRST clause of a multi-binding list
+- `(if-let ((a 1) (b 2)) (+ a b) 'no)` → Emacs `3`, elisprs `error: …void: b`
+- `(if-let (a 1) a)` (single var-form) → Emacs `1`, elisprs `error: wrong-type-argument: listp a`
+- Macros at `src/prelude.rs:368-373` use only `(car binding)`. (Round 2's single nested-binding
+  case passes; the multi-binding and short forms don't.)
+
+### R4-C. `if-let*` / `when-let*` / `and-let*` undefined
+- `(when-let* ((a 1) (b 2)) (+ a b))` → Emacs `3`, elisprs `error: void-function: b`
+  (the `*` variants aren't defined, so `b` evaluates as a call)
+
+### R4-D. `seq-let` is broken
+- `(seq-let (a b) (list 1 2 3) (list a b))` → Emacs `(1 2)`, elisprs `error: …void: b`
+  (also the vector-pattern form). Destructuring binder not implemented.
+
+### R4-E. `condition-case` ignores the `:success` handler
+- `(condition-case x 5 (:success (* x 2)))` → Emacs `10`, elisprs `5`
+- The `:success` clause (run when BODY returns normally, VAR bound to the result) is dropped.
+  `src/compiler.rs:257` / `src/host.rs:1126`.
+
+### R4-F. `butlast` with negative N appends a spurious `nil`
+- `(butlast '(1 2 3) -1)` → Emacs `(1 2 3)`, elisprs `(1 2 3 nil)`
+- `src/prelude.rs:283` computes `keep = len - n` = 4 for n=-1 and walks `(nth 3 …)`→nil.
+  Emacs returns a full copy for any N ≤ 0. (N=0 happens to work.)
+
+### R4-G. Printer doesn't abbreviate `quote` / `function`
+- `(prin1-to-string '(quote a))` → Emacs `"'a"`, elisprs `"(quote a)"`
+- `'(function f)` → Emacs `"#'f"`, elisprs `"(function f)"`; same under `princ`/`format "%S"`.
+  `print-quoted` defaults non-nil; two-element quote/function/backquote/unquote lists should
+  print with reader sugar.
+
+### R4-H. `format` `%e` uses wrong exponent format and drops default precision
+- `(format "%e" 31415.9)` → Emacs `"3.141590e+04"`, elisprs `"3.14159e4"`
+- `(format "%e" 1.0)` → Emacs `"1.000000e+00"`, elisprs `"1e0"`
+- Exponent lacks sign + 2-digit zero-pad; default 6-digit precision not applied. (Round-1 #17
+  had `%e` returned-literally; now implemented but mis-formatted.)
+
+### R4-I. `format` `%g` ignores precision and the exponent-switch threshold
+- `(format "%.3g" 3.14159)` → Emacs `"3.14"`, elisprs `"3.14159"`
+- `(format "%g" 1000000.0)` → Emacs `"1e+06"`, elisprs `"1000000"`
+- Precision field and the magnitude threshold for exponent notation aren't honored. (Round-1
+  #17 had `%g` returned-literally; now partial.)
+
+## Missing builtins / macros — `emacs -Q` returns a value, void in elisprs
+
+- **Macros:** `pcase-exhaustive` (`two`), `with-suppressed-warnings`
+- **Completion:** `try-completion` (`"foo"`), `all-completions` (`("foo")`), `test-completion`
+  (`t`), `assoc-string` (`(assoc-string "A" '("a") t)`→`"a"`)
+- **Lists/plists:** `lax-plist-get`
+- **Seq:** `seq-set-equal-p` (`t`), `seq-sort-by` (`(3 2 1)`)
+- **Hash tables:** `hash-table-test` (→`eql`), `hash-table-size` (→`4`)
+- **Printing:** `pp-to-string` (`"(1 2)\n"`)
+
+Areas probed in round 4 that PASSED: `while-let`, `dlet` (was R3-missing — now present),
+`named-let`; `mapc`/`mapcan`/`mapconcat`(1-arg)/`assoc-default`/`plist-member`/`plist-put`/
+`alist-get` DEFAULT **and** the 5-arg TESTFN form (just fixed); `take`/`ntake`/`butlast 0`/
+`flatten-tree` dotted/`number-sequence` float step; the full `seq-` family on lists;
+`floor`/`ceiling`/`truncate`/`round`/`ffloor`/`fround`/`fceiling`/`ftruncate` on negatives,
+`natnump`/`zerop`/`logand`/`logior`/`logxor` identities, `abs`/`number-to-string`/`logb`;
+`keywordp`/`symbol-name :x`/`make-symbol`/`apply #'max`; `make-vector`/`make-list`/
+`make-string`/`string`/`char-to-string`/`string-to-char`/`vconcat`/`append` vector; printer
+`-0.0`/dotted-cons/`%S` vector/`%s nil`; `format` `%-10s`/`%010.3f`/`%5c`/`%x`/`%d` of char;
+`ignore-errors`/`ignore`/`always`/`xor`/`prog1`/`prog2`.

@@ -591,3 +591,74 @@ fn emacs_parity_sweep_fixes() {
     assert_eq!(eval("(logcount 7)"), "3");
     assert_eq!(eval("(logcount -2)"), "1");
 }
+
+#[test]
+fn emacs_parity_introspection_and_seq() {
+    // Function-cell introspection and predicates.
+    assert_eq!(eval("(subrp (symbol-function 'car))"), "t");
+    assert_eq!(eval("(intern-soft \"nonexistent-xyz-123\")"), "nil");
+    assert_eq!(eval("(fixnump 5)"), "t");
+    assert_eq!(eval("(fixnump 1.0)"), "nil");
+    assert_eq!(eval("(bignump 5)"), "nil");
+    assert_eq!(eval("(char-uppercase-p ?A)"), "t");
+    assert_eq!(eval("(char-uppercase-p ?a)"), "nil");
+    assert_eq!(eval("(string-distance \"kitten\" \"sitting\")"), "3");
+    // macrop / special-form-p match Emacs's classification.
+    assert_eq!(eval("(special-form-p 'if)"), "t");
+    assert_eq!(eval("(special-form-p 'when)"), "nil");
+    assert_eq!(eval("(macrop 'when)"), "t");
+    assert_eq!(eval("(macrop 'lambda)"), "t");
+    assert_eq!(eval("(macrop 'if)"), "nil");
+    // alist/seq additions.
+    assert_eq!(
+        eval("(alist-get 9 (list (cons 1 \"a\")) \"def\")"),
+        "\"def\""
+    );
+    assert_eq!(eval("(seq-concatenate 'list (list 1) (list 2))"), "(1 2)");
+    assert_eq!(eval("(seq-concatenate 'vector (list 1) [2])"), "[1 2]");
+    assert_eq!(eval("(seq-concatenate 'string (list 104 105))"), "\"hi\"");
+    assert_eq!(eval("(copy-alist (list (cons 1 2)))"), "((1 . 2))");
+    assert_eq!(eval("(substring-no-properties \"abc\" 1)"), "\"bc\"");
+    // string-trim with regexp args.
+    assert_eq!(eval("(string-trim \"xxhixx\" \"x+\" \"x+\")"), "\"hi\"");
+}
+
+#[test]
+fn emacs_parity_format_signs_and_misc() {
+    // format + / space sign flags on signed conversions.
+    assert_eq!(eval("(format \"%+d\" 5)"), "\"+5\"");
+    assert_eq!(eval("(format \"%+d\" -5)"), "\"-5\"");
+    assert_eq!(eval("(format \"% d\" 5)"), "\" 5\"");
+    assert_eq!(eval("(format \"%+.2f\" 3.14159)"), "\"+3.14\"");
+    assert_eq!(eval("(format \"%+05d\" 42)"), "\"+0042\"");
+    // %e is C-style: 6-digit default mantissa, signed >=2-digit exponent.
+    assert_eq!(eval("(format \"%e\" 31415.9)"), "\"3.141590e+04\"");
+    assert_eq!(eval("(format \"%e\" 0.001)"), "\"1.000000e-03\"");
+    assert_eq!(eval("(format \"%.2e\" 12345.0)"), "\"1.23e+04\"");
+    // hash-table-test / nbutlast.
+    assert_eq!(
+        eval("(hash-table-test (make-hash-table :test 'equal))"),
+        "equal"
+    );
+    assert_eq!(eval("(hash-table-test (make-hash-table))"), "eql");
+    assert_eq!(eval("(nbutlast (list 1 2 3))"), "(1 2)");
+}
+
+#[test]
+fn emacs_parity_search_and_assoc() {
+    // string-search honors the optional START char index.
+    assert_eq!(eval("(string-search \"lo\" \"hello world\" 5)"), "nil");
+    assert_eq!(eval("(string-search \"lo\" \"hello world\")"), "3");
+    assert_eq!(eval("(string-search \"o\" \"foo\" 2)"), "2");
+    // memql uses eql (matches floats by value).
+    assert_eq!(eval("(memql 2 (list 1 2 3))"), "(2 3)");
+    assert_eq!(eval("(memql 2.0 (list 1.0 2.0))"), "(2.0)");
+    // assoc-string: string keys, optional case folding, cons-or-string elements.
+    assert_eq!(eval("(assoc-string \"a\" (list \"a\" \"b\"))"), "\"a\"");
+    assert_eq!(eval("(assoc-string \"B\" (list \"a\" \"b\") t)"), "\"b\"");
+    assert_eq!(
+        eval("(assoc-string \"k\" (list (cons \"k\" 1)))"),
+        "(\"k\" . 1)"
+    );
+    assert_eq!(eval("(assoc-string \"z\" (list \"a\"))"), "nil");
+}

@@ -356,6 +356,18 @@ impl ElispHost {
         let v = self.intern(name);
         let _ = self.set_function_value(&v, def);
     }
+    /// The symbol's function cell (what `symbol-function` returns), if any.
+    pub fn function_cell(&self, sym: &Value) -> Option<Value> {
+        match self.obj(sym) {
+            Some(Obj::Symbol(s)) => s.function.clone(),
+            _ => None,
+        }
+    }
+    /// Look up an already-interned symbol by name without creating one
+    /// (`intern-soft`); returns `None` if absent.
+    pub fn find_symbol(&self, name: &str) -> Option<Value> {
+        self.obarray.get(name).map(|&id| Value::Obj(id))
+    }
     pub fn defsubr(&mut self, name: &str, min: usize, max: Option<usize>, f: SubrFn) {
         let subr = self.alloc(Obj::Subr {
             name: name.to_string(),

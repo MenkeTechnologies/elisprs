@@ -47,6 +47,20 @@ All notable changes to elisprs are documented here. The format follows
   int/float type and normalizes `-0.0` => `0.0`); `string-prefix-p` /
   `string-suffix-p` honor IGNORE-CASE; `assoc` takes an optional TESTFN;
   `string-pad` takes PADDING and START.
+- Introspection sweep: added `symbol-function`, `intern-soft`, `subrp`, `macrop`,
+  `special-form-p`, `char-uppercase-p`, `string-distance`, `fixnump`, `bignump`.
+  `macrop` / `special-form-p` follow Emacs's classification (`when`/`unless`/
+  `lambda`/`defun`/`defmacro` report as macros even though elisprs lowers them as
+  compiler intrinsics).
+- Added `seq-concatenate`, `copy-alist`, `substring-no-properties`; `alist-get`
+  takes DEFAULT and TESTFN; `string-trim` / `string-trim-left` / `string-trim-right`
+  accept regexp arguments.
+- `format`: the `+` and space sign flags now work on signed conversions
+  (`%+d`, `% d`, `%+.2f`, `%+05d`), and `%e` uses C-style formatting
+  (`3.141590e+04` — default 6-digit mantissa, signed ≥2-digit exponent).
+- Added `hash-table-test` and `nbutlast`.
+- `string-search` honors its optional START char index; added `memql` and
+  `assoc-string`.
 
 ### Added
 - `pcase` — structural dispatch (non-backquote subset): `_` wildcard,
