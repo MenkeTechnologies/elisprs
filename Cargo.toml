@@ -1,0 +1,26 @@
+[package]
+name = "elisprs"
+version = "0.1.0"
+edition = "2021"
+description = "Emacs Lisp as a fusevm frontend, built on the rust_lisp reader + value model. Milestone 1 is a tree-walk bootstrap with Lisp-2 obarray + dynamic binding; fusevm-Chunk lowering (compiler.rs) is the milestone-2 seam."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MenkeTechnologies/elisprs"
+
+[[bin]]
+name = "elisp"
+path = "src/main.rs"
+
+[lib]
+name = "elisprs"
+path = "src/lib.rs"
+
+[dependencies]
+# We lean on rust_lisp (MIT) for the S-expression reader and the Value/List
+# data model. Its evaluator is Lisp-1 + lexical; elisp is Lisp-2 + dynamic, so
+# the evaluator, environment, and standard library are ours (src/interp.rs,
+# src/builtins.rs). i64/f64 make fixnums/floats behave like real elisp.
+rust_lisp = { version = "0.18", default-features = false, features = ["i64", "f64"] }
+
+# Milestone 2 adds the fusevm path-dependency (mirroring awkrs/vimlrs/zshrs)
+# when compiler.rs begins lowering to fusevm::Chunk:
+# fusevm = { path = "../fusevm" }
