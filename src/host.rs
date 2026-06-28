@@ -303,6 +303,18 @@ impl ElispHost {
             }
         }
     }
+    /// Coerce any sequence — list, vector, or string — to a `Vec<Value>` (string
+    /// chars become integer char codes). `mapcar`/`seq-*` accept all of these.
+    pub fn seq_vec(&self, v: &Value) -> Option<Vec<Value>> {
+        match v {
+            Value::Str(s) => Some(s.chars().map(|c| Value::Int(c as i64)).collect()),
+            Value::Obj(id) => match self.arena.get(*id as usize) {
+                Some(Obj::Vector(items)) => Some(items.clone()),
+                _ => self.list_vec(v),
+            },
+            _ => self.list_vec(v),
+        }
+    }
 
     // ── symbol cells (dynamic / value cell) ──
     pub fn set_value(&mut self, v: &Value, val: Value) -> Result<(), String> {
@@ -429,6 +441,18 @@ impl ElispHost {
             self.unbind_to(depth);
             self.lex = saved;
         }
+    }
+    /// Pop scopes until `frame_stack` is back to `target_len`. A non-local exit
+    /// (`throw`/error) out of an inner `let` skips its `UNBIND`, leaking the
+    /// lexical scope; `run_closure` calls this to recover, so the caller's
+    /// lexical environment isn't corrupted.
+    pub fn unwind_scopes_to(&mut self, target_len: usize) {
+        while self.frame_stack.len() > target_len {
+            self.close_scope();
+        }
+    }
+    pub fn scope_depth(&self) -> usize {
+        self.frame_stack.len()
     }
     /// Bind `id` to `val` in the current scope — lexically, unless the symbol is
     /// special (`defvar`'d), in which case dynamically (saved on the specstack).
@@ -797,8 +821,29 @@ impl ElispHost {
                         "#<closure>".to_string()
                     }
                 }
-                Some(Obj::HashTable { entries, .. }) => {
-                    format!("#s(hash-table size {})", entries.len())
+                Some(Obj::HashTable { test, entries }) => {
+                    // Emacs-30 syntax: omit `test` when eql (the default), and
+                    // `data` when empty — `#s(hash-table test equal data (k v …))`.
+                    let mut s = String::from("#s(hash-table");
+                    match test {
+                        0 => s.push_str(" test eq"),
+                        2 => s.push_str(" test equal"),
+                        _ => {}
+                    }
+                    if !entries.is_empty() {
+                        s.push_str(" data (");
+                        for (i, (k, v)) in entries.iter().enumerate() {
+                            if i > 0 {
+                                s.push(' ');
+                            }
+                            s.push_str(&self.print(k, readable));
+                            s.push(' ');
+                            s.push_str(&self.print(v, readable));
+                        }
+                        s.push(')');
+                    }
+                    s.push(')');
+                    s
                 }
                 None => "#<dangling>".to_string(),
             },
@@ -907,7 +952,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 return call_function(&args[0], &a);
             }
             "mapcar" => {
-                let seq = with_host(|h| h.list_vec(&args[1])).ok_or("mapcar: not a list")?;
+                let seq = with_host(|h| h.seq_vec(&args[1])).ok_or("mapcar: not a sequence")?;
                 let mut out = Vec::with_capacity(seq.len());
                 for e in seq {
                     out.push(call_function(&args[0], &[e])?);
@@ -915,7 +960,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 return Ok(with_host(|h| h.list_from(out)));
             }
             "mapc" => {
-                let seq = with_host(|h| h.list_vec(&args[1])).ok_or("mapc: not a list")?;
+                let seq = with_host(|h| h.seq_vec(&args[1])).ok_or("mapc: not a sequence")?;
                 for e in seq {
                     call_function(&args[0], &[e])?;
                 }
@@ -1083,16 +1128,19 @@ fn run_closure(
     env: Lex,
     args: &[Value],
 ) -> Result<Value, String> {
+    let entry = with_host(|h| h.scope_depth());
     let setup = with_host(|h| {
         h.open_scope_in(env.clone());
         h.bind_params_into_scope(params, args)
     });
     if let Err(e) = setup {
-        with_host(|h| h.close_scope());
+        with_host(|h| h.unwind_scopes_to(entry));
         return Err(e);
     }
     let result = run_chunk((**body).clone());
-    with_host(|h| h.close_scope());
+    // Unwind to the entry depth (not just one scope): a `throw`/error out of an
+    // inner `let` inside the body leaks scopes that this restores.
+    with_host(|h| h.unwind_scopes_to(entry));
     result
 }
 

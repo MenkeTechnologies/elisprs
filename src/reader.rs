@@ -344,10 +344,39 @@ fn bq_expand(h: &mut ElispHost, form: &Value) -> Value {
         }
         // `,@x at top level is ill-formed; fall through to quoting.
     }
-    // A proper list: fold right, splicing where `,@` appears.
-    if let Some(elems) = h.list_vec(form) {
-        // (unquote x) was handled above; here elems are template elements.
-        let mut rest = Value::Undef; // nil
+    // A (possibly dotted) list: walk the cons spine collecting elements, then
+    // fold right. The tail may be nil (proper list), a `,x` unquote in the dotted
+    // position (`(a . ,x) -> the final cdr is x), or another atom.
+    if matches!(h.obj(form), Some(Obj::Cons(..))) {
+        let mut elems: Vec<Value> = Vec::new();
+        let mut cur = form.clone();
+        let tail;
+        loop {
+            match h.obj(&cur) {
+                Some(Obj::Cons(car, cdr)) => {
+                    let (car, cdr) = (car.clone(), cdr.clone());
+                    // A `,x in the dotted-cdr position becomes the final cdr.
+                    if let Some((kind, payload)) = unquote_kind(h, &cdr) {
+                        if kind == "unquote" {
+                            elems.push(car);
+                            tail = payload;
+                            break;
+                        }
+                    }
+                    elems.push(car);
+                    cur = cdr;
+                }
+                _ => {
+                    tail = if matches!(cur, Value::Undef) {
+                        Value::Undef
+                    } else {
+                        bq_expand(h, &cur)
+                    };
+                    break;
+                }
+            }
+        }
+        let mut rest = tail;
         for e in elems.iter().rev() {
             match unquote_kind(h, e) {
                 Some((kind, payload)) if kind == "unquote-splicing" => {

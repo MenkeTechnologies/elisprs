@@ -729,3 +729,349 @@ fn emacs_parity_replace_function_rep() {
         "\"1:x\""
     );
 }
+
+#[test]
+fn emacs_parity_mutation_and_seq() {
+    // nconc destructively concatenates (the first list's tail is spliced).
+    assert_eq!(eval("(nconc (list 1 2) (list 3 4))"), "(1 2 3 4)");
+    assert_eq!(
+        eval("(let ((a (list 1 2)) (b (list 3))) (nconc a b) a)"),
+        "(1 2 3)"
+    );
+    assert_eq!(eval("(nconc nil (list 1) nil (list 2))"), "(1 2)");
+    // plist-put mutates in place when appending a new key.
+    assert_eq!(
+        eval("(let ((p (list :a 1))) (plist-put p :b 2) p)"),
+        "(:a 1 :b 2)"
+    );
+    // delete-dups is destructive.
+    assert_eq!(
+        eval("(let ((l (list 1 2 2 3))) (delete-dups l) l)"),
+        "(1 2 3)"
+    );
+    // number-sequence with a negative step counts down.
+    assert_eq!(eval("(number-sequence 5 1 -1)"), "(5 4 3 2 1)");
+    assert_eq!(eval("(number-sequence 0 10 3)"), "(0 3 6 9)");
+    // fillarray fills a vector in place; rassq-delete-all drops matching cdrs.
+    assert_eq!(
+        eval("(let ((v (make-vector 3 0))) (fillarray v 7) v)"),
+        "[7 7 7]"
+    );
+    assert_eq!(
+        eval("(rassq-delete-all 2 (list (cons 'a 2) (cons 'b 3)))"),
+        "((b . 3))"
+    );
+}
+
+#[test]
+fn emacs_parity_cl_seq_extras() {
+    // cl-reduce honors :initial-value; empty + no init calls the function nullary.
+    assert_eq!(eval("(cl-reduce #'+ (list 1 2 3) :initial-value 10)"), "16");
+    assert_eq!(eval("(cl-reduce #'+ (list 1 2 3 4))"), "10");
+    assert_eq!(eval("(cl-reduce #'+ nil)"), "0");
+    // cl-mapcar walks N sequences in parallel.
+    assert_eq!(eval("(cl-mapcar #'+ (list 1 2) (list 3 4))"), "(4 6)");
+    assert_eq!(eval("(cl-mapcar #'+ (list 1 2 3) (list 10 20))"), "(11 22)");
+    // cl-remove-duplicates keeps the LAST occurrence of each element (Emacs default).
+    assert_eq!(eval("(cl-remove-duplicates (list 1 2 1 3 2))"), "(1 3 2)");
+    // seq-group-by lists groups in first-encounter order of the key.
+    assert_eq!(
+        eval("(seq-group-by #'cl-evenp (list 1 2 3 4))"),
+        "((nil 1 3) (t 2 4))"
+    );
+}
+
+#[test]
+fn emacs_parity_cl_control_and_length() {
+    // length= / length< / length> on sequences.
+    assert_eq!(eval("(length= (list 1 2) 2)"), "t");
+    assert_eq!(eval("(length< (list 1 2) 3)"), "t");
+    assert_eq!(eval("(length> (list 1 2 3) 2)"), "t");
+    assert_eq!(eval("(length= \"abc\" 3)"), "t");
+    // cl-getf with a default.
+    assert_eq!(eval("(cl-getf (list :a 1) :b 99)"), "99");
+    assert_eq!(eval("(cl-getf (list :a 1 :b 2) :b 99)"), "2");
+    // cl-typecase dispatches on the value's type.
+    assert_eq!(eval("(cl-typecase 5 (string 's) (integer 'i))"), "i");
+    assert_eq!(eval("(cl-typecase \"x\" (string 's) (integer 'i))"), "s");
+    assert_eq!(
+        eval("(cl-typecase 1.5 (integer 'i) (float 'f) (t 'o))"),
+        "f"
+    );
+    // cl-destructuring-bind: positional, &rest, &optional.
+    assert_eq!(
+        eval("(cl-destructuring-bind (a b c) (list 1 2 3) (+ a b c))"),
+        "6"
+    );
+    assert_eq!(
+        eval("(cl-destructuring-bind (a &rest r) (list 1 2 3 4) (list a r))"),
+        "(1 (2 3 4))"
+    );
+    assert_eq!(
+        eval("(cl-destructuring-bind (a &optional b) (list 1) (list a b))"),
+        "(1 nil)"
+    );
+    // string-clean-whitespace collapses runs and trims.
+    assert_eq!(eval("(string-clean-whitespace \"  a   b  \")"), "\"a b\"");
+}
+
+#[test]
+fn emacs_parity_cl_loop_subset() {
+    // Numeric for with to / below / downto / by.
+    assert_eq!(eval("(cl-loop for i from 1 to 5 collect i)"), "(1 2 3 4 5)");
+    assert_eq!(
+        eval("(cl-loop for i from 0 below 5 collect i)"),
+        "(0 1 2 3 4)"
+    );
+    assert_eq!(
+        eval("(cl-loop for i from 10 downto 7 collect i)"),
+        "(10 9 8 7)"
+    );
+    assert_eq!(
+        eval("(cl-loop for i from 1 to 10 by 2 collect i)"),
+        "(1 3 5 7 9)"
+    );
+    // for ... in / on.
+    assert_eq!(
+        eval("(cl-loop for x in (list 1 2 3) collect (* x x))"),
+        "(1 4 9)"
+    );
+    assert_eq!(
+        eval("(cl-loop for c on (list 1 2 3) collect (car c))"),
+        "(1 2 3)"
+    );
+    // Accumulation: sum / count / append / maximize / minimize.
+    assert_eq!(eval("(cl-loop for x in (list 1 2 3) sum x)"), "6");
+    assert_eq!(
+        eval("(cl-loop for x in (list 1 2 3 4) count (cl-evenp x))"),
+        "2"
+    );
+    assert_eq!(
+        eval("(cl-loop for x in (list (list 1) (list 2 3)) append x)"),
+        "(1 2 3)"
+    );
+    assert_eq!(eval("(cl-loop for i from 1 to 4 maximize (* i i))"), "16");
+    // repeat / until / do / finally return.
+    assert_eq!(eval("(cl-loop repeat 3 collect 9)"), "(9 9 9)");
+    assert_eq!(
+        eval("(cl-loop for i from 1 to 100 until (> i 3) collect i)"),
+        "(1 2 3)"
+    );
+    assert_eq!(
+        eval("(let ((s 0)) (cl-loop for i from 1 to 5 do (setq s (+ s i))) s)"),
+        "15"
+    );
+    assert_eq!(
+        eval("(cl-loop for i from 1 to 5 do (ignore i) finally return 42)"),
+        "42"
+    );
+}
+
+#[test]
+fn emacs_parity_cl_loop_conditionals() {
+    // when / unless conditionalize the following accumulation clause.
+    assert_eq!(
+        eval("(cl-loop for x in (list 1 2 3 4 5) when (cl-evenp x) collect x)"),
+        "(2 4)"
+    );
+    assert_eq!(
+        eval("(cl-loop for x in (list 1 2 3 4) unless (cl-evenp x) collect x)"),
+        "(1 3)"
+    );
+    assert_eq!(
+        eval("(cl-loop for x in (list 1 2 3 4 5) when (> x 2) sum x)"),
+        "12"
+    );
+    // if ... else.
+    assert_eq!(
+        eval("(cl-loop for x in (list 1 2 3) if (cl-oddp x) collect x else collect (- x))"),
+        "(1 -2 3)"
+    );
+    // with bindings; collect into a named var.
+    assert_eq!(
+        eval("(cl-loop with total = 0 for x in (list 1 2 3) do (setq total (+ total x)) finally return total)"),
+        "6"
+    );
+    assert_eq!(
+        eval("(cl-loop for x in (list 1 2 3) collect x into ys finally return (cons 'done ys))"),
+        "(done 1 2 3)"
+    );
+    // always / never / thereis.
+    assert_eq!(
+        eval("(cl-loop for x in (list 2 4 6) always (cl-evenp x))"),
+        "t"
+    );
+    assert_eq!(
+        eval("(cl-loop for x in (list 2 4 5) always (cl-evenp x))"),
+        "nil"
+    );
+    assert_eq!(
+        eval("(cl-loop for x in (list 1 3 5) never (cl-evenp x))"),
+        "t"
+    );
+    assert_eq!(
+        eval("(cl-loop for x in (list 1 2 3) thereis (and (cl-evenp x) x))"),
+        "2"
+    );
+}
+
+#[test]
+fn scope_restored_after_nonlocal_exit_from_nested_let() {
+    // A throw/error out of an inner `let` must not leak its lexical scope, or the
+    // surrounding bindings get corrupted. (Root cause of a macroexpander-looking
+    // bug where ERT `should` around a catch-emitting macro saw "void variable".)
+    assert_eq!(
+        eval("(let ((a 10)) (catch 'x (let ((b 2)) (throw 'x b))) a)"),
+        "10"
+    );
+    assert_eq!(
+        eval("(let ((a 7)) (condition-case nil (let ((b 1)) (error \"boom\")) (error nil)) a)"),
+        "7"
+    );
+    assert_eq!(
+        eval("(let ((a 1)) (catch 'x (let ((b 2)) (let ((c 3)) (throw 'x (+ b c))))) a)"),
+        "1"
+    );
+    // A macro that emits a catch/nested-let, wrapped in an ERT `should` inside an
+    // ert-deftest (three macro levels) — the exact shape that used to corrupt the
+    // ERT runner's locals.
+    assert_eq!(
+        eval(
+            "(progn (defun probe () \
+               (let ((a 5)) (catch 'd (let ((b 2)) (when (cl-evenp b) (throw 'd b)))) a)) \
+             (probe))"
+        ),
+        "5"
+    );
+}
+
+#[test]
+fn emacs_parity_sequences_and_introspection() {
+    // mapcar / seq-* accept any sequence (vector, string), not just lists.
+    assert_eq!(eval("(mapcar #'1+ [1 2 3])"), "(2 3 4)");
+    assert_eq!(eval("(mapcar #'1+ \"abc\")"), "(98 99 100)");
+    assert_eq!(eval("(seq-reduce #'+ [1 2 3] 0)"), "6");
+    assert_eq!(eval("(seq-filter #'cl-evenp [1 2 3 4])"), "(2 4)");
+    assert_eq!(eval("(seq-count #'cl-evenp [1 2 3 4])"), "2");
+    // boundp / default-value / gensym.
+    assert_eq!(eval("(boundp 'most-positive-fixnum)"), "t");
+    assert_eq!(eval("(boundp 'totally-undefined-xyz)"), "nil");
+    assert_eq!(eval("(default-value 'case-fold-search)"), "t");
+    assert_eq!(eval("(symbolp (gensym))"), "t");
+    // hash-table print syntax (Emacs 30): omit test=eql and empty data.
+    assert_eq!(
+        eval("(format \"%S\" (make-hash-table))"),
+        "\"#s(hash-table)\""
+    );
+    assert_eq!(
+        eval("(let ((h (make-hash-table))) (puthash 1 2 h) (format \"%S\" h))"),
+        "\"#s(hash-table data (1 2))\""
+    );
+    assert_eq!(
+        eval("(let ((h (make-hash-table :test 'equal))) (puthash \"a\" 1 h) (format \"%S\" h))"),
+        "\"#s(hash-table test equal data (\\\"a\\\" 1))\""
+    );
+}
+
+#[test]
+fn pcase_backquote_patterns() {
+    // Backquote (structural) patterns, supported via the reader's eager expansion.
+    assert_eq!(eval("(pcase (list 1 2) (`(,a ,b) (+ a b)))"), "3");
+    assert_eq!(
+        eval("(pcase (list 1 2 3) (`(,a ,b ,c) (list c b a)))"),
+        "(3 2 1)"
+    );
+    assert_eq!(eval("(pcase (cons 1 2) (`(,a . ,b) (+ a b)))"), "3");
+    assert_eq!(
+        eval("(pcase (list 1 2 3) (`(,a . ,rest) (list a rest)))"),
+        "(1 (2 3))"
+    );
+    // Nested, and literals inside the template.
+    assert_eq!(
+        eval("(pcase (list 1 (list 2 3)) (`(,a (,b ,c)) (list a b c)))"),
+        "(1 2 3)"
+    );
+    assert_eq!(eval("(pcase '(foo 5) (`(foo ,n) n) (_ 'no))"), "5");
+    // Non-matching subject (atom vs cons pattern) falls through safely.
+    assert_eq!(eval("(pcase 5 (`(,a ,b) 'pair) (_ 'atom))"), "atom");
+    assert_eq!(eval("(pcase (list 1) (`(,a ,b) 'two) (`(,a) 'one))"), "one");
+}
+
+#[test]
+fn dotted_backquote_reader() {
+    // The reader builds a dotted cons from a `,x in the dotted-cdr position.
+    assert_eq!(eval("(let ((a 1) (b 2)) `(,a . ,b))"), "(1 . 2)");
+    assert_eq!(eval("(let ((a 1) (b (list 2 3))) `(,a . ,b))"), "(1 2 3)");
+    assert_eq!(eval("(let ((a 1)) `(,a . 5))"), "(1 . 5)");
+    assert_eq!(eval("(let ((x 9)) `(a b . ,x))"), "(a b . 9)");
+}
+
+#[test]
+fn emacs_parity_local_functions_and_let_alist() {
+    // cl-flet: lexical local functions; #'NAME refs work too.
+    assert_eq!(eval("(cl-flet ((sq (n) (* n n))) (sq 6))"), "36");
+    assert_eq!(
+        eval("(cl-flet ((add (a b) (+ a b)) (neg (x) (- x))) (add (neg 3) 10))"),
+        "7"
+    );
+    assert_eq!(
+        eval("(cl-flet ((f (x) (* x 2))) (mapcar #'f (list 1 2 3)))"),
+        "(2 4 6)"
+    );
+    // cl-labels: self- and mutual recursion (closures capture the gensym by ref).
+    assert_eq!(
+        eval("(cl-labels ((fac (n) (if (= n 0) 1 (* n (fac (1- n)))))) (fac 5))"),
+        "120"
+    );
+    assert_eq!(
+        eval("(cl-labels ((evn (n) (if (= n 0) t (od (1- n)))) (od (n) (if (= n 0) nil (evn (1- n))))) (evn 10))"),
+        "t"
+    );
+    // and-let* / let-alist.
+    assert_eq!(eval("(and-let* ((x 5) (y 10)) (+ x y))"), "15");
+    assert_eq!(eval("(and-let* ((x 5) (y nil)) 99)"), "nil");
+    assert_eq!(
+        eval("(let-alist (list (cons 'a 1) (cons 'b 2)) (+ .a .b))"),
+        "3"
+    );
+    assert_eq!(
+        eval("(let-alist (list (cons 'name \"bob\")) .name)"),
+        "\"bob\""
+    );
+    // fset / fboundp.
+    assert_eq!(
+        eval("(progn (fset 'myf (lambda (x) (* x 3))) (myf 4))"),
+        "12"
+    );
+    assert_eq!(eval("(fboundp 'car)"), "t");
+    assert_eq!(eval("(fboundp 'undefined-xyz)"), "nil");
+    // cl-dolist / cl-dotimes.
+    assert_eq!(
+        eval("(let ((s 0)) (cl-dotimes (i 4) (setq s (+ s i))) s)"),
+        "6"
+    );
+}
+
+#[test]
+fn emacs_parity_cl_block_and_subseq() {
+    // cl-block / cl-return-from / cl-return.
+    assert_eq!(eval("(cl-block foo (cl-return-from foo 42) 99)"), "42");
+    assert_eq!(eval("(cl-block nil (cl-return 7) 8)"), "7");
+    assert_eq!(eval("(cl-block b (+ 1 (cl-return-from b 10)) 5)"), "10");
+    // cl-dolist establishes a nil block, so cl-return escapes it.
+    assert_eq!(
+        eval("(cl-dolist (x (list 1 2 3 4)) (if (= x 3) (cl-return x)))"),
+        "3"
+    );
+    // cl-pushnew: add unless present (by eql).
+    assert_eq!(eval("(let ((l (list 2 3))) (cl-pushnew 1 l) l)"), "(1 2 3)");
+    assert_eq!(eval("(let ((l (list 1 2))) (cl-pushnew 1 l) l)"), "(1 2)");
+    // cl-find-if-not.
+    assert_eq!(eval("(cl-find-if-not #'cl-evenp (list 2 4 5))"), "5");
+    assert_eq!(eval("(cl-find-if-not #'cl-evenp (list 2 4 6))"), "nil");
+    // cl-subseq / seq-subseq on any sequence, optional & negative end.
+    assert_eq!(eval("(cl-subseq \"hello\" 1 3)"), "\"el\"");
+    assert_eq!(eval("(cl-subseq [1 2 3 4] 1 3)"), "[2 3]");
+    assert_eq!(eval("(cl-subseq \"hello\" 2)"), "\"llo\"");
+    assert_eq!(eval("(cl-subseq [1 2 3 4 5] 1 -1)"), "[2 3 4]");
+}

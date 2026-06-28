@@ -486,6 +486,21 @@ fn set_fn(h: &mut ElispHost, a: &[Value]) -> R {
 fn symbol_value(h: &mut ElispHost, a: &[Value]) -> R {
     h.get_value(&a[0])
 }
+/// `(fset SYMBOL DEFINITION)` — set SYMBOL's function cell, returning DEFINITION.
+fn fset(h: &mut ElispHost, a: &[Value]) -> R {
+    h.set_function_value(&a[0], a[1].clone())?;
+    Ok(a[1].clone())
+}
+/// `(fboundp SYMBOL)` — non-nil if SYMBOL has a function definition.
+fn fboundp(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(h.resolve_function(&a[0]).is_ok()))
+}
+/// `(boundp SYMBOL)` — non-nil if SYMBOL currently has a value.
+fn boundp(h: &mut ElispHost, a: &[Value]) -> R {
+    // nil and t are always bound; otherwise the value cell must resolve.
+    let bound = is_nil(&a[0]) || matches!(a[0], Value::Bool(true)) || h.get_value(&a[0]).is_ok();
+    Ok(nil_or(bound))
+}
 
 // ── functional ──
 // `funcall`/`apply`/`mapcar`/`mapc` are intercepted in `host::call_function`
@@ -1807,6 +1822,9 @@ pub fn install(h: &mut ElispHost) {
     s("make-symbol", 1, Some(1), make_symbol_fn);
     s("set", 2, Some(2), set_fn);
     s("symbol-value", 1, Some(1), symbol_value);
+    s("boundp", 1, Some(1), boundp);
+    s("fset", 2, Some(2), fset);
+    s("fboundp", 1, Some(1), fboundp);
     // functional (funcall/apply/mapcar/mapc are handled in host::call_function)
     s("identity", 1, Some(1), identity);
     s("terpri", 0, Some(1), terpri);

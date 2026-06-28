@@ -432,6 +432,24 @@ const SUBRS: &[Entry] = &[
         doc: "Return SYMBOL's value.",
     },
     Entry {
+        name: "boundp",
+        kind: Kind::Function,
+        sig: "(boundp SYMBOL)",
+        doc: "Non-nil if SYMBOL has a value.",
+    },
+    Entry {
+        name: "fboundp",
+        kind: Kind::Function,
+        sig: "(fboundp SYMBOL)",
+        doc: "Non-nil if SYMBOL has a function definition.",
+    },
+    Entry {
+        name: "fset",
+        kind: Kind::Function,
+        sig: "(fset SYMBOL DEFINITION)",
+        doc: "Set SYMBOL's function cell to DEFINITION.",
+    },
+    Entry {
         name: "funcall",
         kind: Kind::Function,
         sig: "(funcall FUNCTION &rest ARGS)",

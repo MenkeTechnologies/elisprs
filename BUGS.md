@@ -32,7 +32,34 @@ regexp arguments. Format: `+`/space sign flags and C-style `%e`; added
 `named-let`.
 
 `replace-regexp-in-string` with a *function* REP now works (handled in the
-re-entrant `call_function` path).
+re-entrant `call_function` path). Destructive `plist-put` / `delete-dups`; added
+`nconc`, `rassq-delete-all`, `fillarray`; `number-sequence` negative step;
+`case-fold-search`; generalized-place `incf`/`decf`; `when-let*`/`if-let*`/`named-let`.
+cl-lib/seq parity (verified with libs loaded): `cl-reduce :initial-value`,
+`cl-mapcar` N-seq, `cl-remove-duplicates` keep-last, `seq-group-by` group order.
+Added `length=`/`length<`/`length>`, `cl-typecase`, `cl-destructuring-bind`,
+`string-clean-whitespace`; `cl-getf` DEFAULT.
+
+A broad `cl-loop` subset is now implemented: numeric/`in`/`on`/`repeat`/`while`/
+`until` drivers; `collect`/`append`/`nconc`/`sum`/`count`/`maximize`/`minimize`
+accumulators (with `into VAR`); `with VAR = VAL`; `when`/`unless`/`if`…`else`
+conditionals; `always`/`never`/`thereis`; `do`; `finally`. Not yet: parallel
+`for`, `across`, destructuring.
+
+Fixed a lexical-scope leak: a `throw`/`error` out of an inner `let` left the
+scope open (`run_closure` now unwinds to its entry depth), which was the real
+cause of the "void variable" failures when an ERT `should` wrapped a
+`catch`/nested-`let`-emitting macro — previously worked around per-feature.
+`mapcar`/`mapc`/`seq-*` accept any sequence (vector/string); added `boundp`,
+`gensym`, `default-value`; hash tables print in Emacs-30 `#s(hash-table …)` syntax.
+Added `cl-flet`/`cl-labels` (lexical local fns via call-rewriting; mutual/self
+recursion), `let-alist`, `and-let*`, `cl-dolist`/`cl-dotimes`, `fset`/`fboundp`.
+`pcase` backquote patterns (incl. dotted) now work; fixed dotted backquote reader.
+Added `cl-block`/`cl-return-from`/`cl-return`, `cl-pushnew`, `cl-find-if-not`;
+`cl-subseq`/`seq-subseq` are sequence-generic (optional/negative END).
+
+**Notable still-missing:** `string-fill` (word-wrapping); the `cl-loop` clauses
+above.
 
 **Still divergent (harder):** pattern backreferences in regexps (the backing
 engine doesn't backtrack).
@@ -239,9 +266,12 @@ parity bugs (they'd need `(require 'cl-lib)`).
 ### R2-F. `setq-default` is broken
 - `(setq-default x 5)` → Emacs `5`, elisprs `error: Symbol's value as variable is void: x`
 
-### R2-G. `pcase` backquote patterns unsupported
-- `` (pcase (list 1 2) (`(,a ,b) (+ a b))) `` → Emacs `3`, elisprs `error: pcase: unsupported pattern (cons a (cons b nil))`
-- Plain reader backquote works; only pcase destructuring on it fails. (`pcase-let` backquote too.)
+### R2-G. ✅ FIXED — `pcase` backquote patterns
+- `` (pcase (list 1 2) (`(,a ,b) (+ a b))) `` → `3`.
+- Supported by teaching `pcase--compile` to read the reader's eager backquote
+  expansion (`cons`/`quote`/literals) as structural patterns — incl. nested and
+  dotted `` `(,a . ,rest) ``. Also fixed a reader bug where dotted backquote
+  `` `(,a . ,b) `` mis-expanded the unquoted tail.
 
 ## Sequence / string semantics
 

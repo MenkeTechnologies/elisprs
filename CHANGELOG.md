@@ -6,6 +6,12 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed (Emacs parity — see BUGS.md)
+- Lexical scope leak on non-local exit: a `throw` or `error` out of an inner
+  `let` skipped its scope cleanup, so `run_closure` (the catch/condition-case
+  thunk runner) left inner scopes open and corrupted the caller's lexical
+  bindings. It now unwinds the scope stack to the entry depth. This was the root
+  cause of the "void variable" failures seen when an ERT `should` wrapped a
+  macro that expands to `catch`/nested-`let` (e.g. `pcase`, `cl-loop`).
 - `eq` is now object identity: `(eq 1.0 1.0)` => `nil` (distinct float objects).
   `eql` keeps by-value float comparison; `eq`/`eql` split into separate subrs.
 - `round` uses banker's rounding (half to even): `(round 2.5)` => `2`.
@@ -73,6 +79,37 @@ All notable changes to elisprs are documented here. The format follows
 - `replace-regexp-in-string` accepts a function REP: it's called on each match's
   text (with match data set) and its result is the replacement. Handled via the
   re-entrant `call_function` path (like `mapcar`/`sort`), outside the host borrow.
+- `plist-put` and `delete-dups` are now destructive (mutate in place), matching
+  Emacs; added `nconc`, `rassq-delete-all`, and `fillarray`; `number-sequence`
+  handles a negative step.
+- cl-lib/seq parity (ground-truthed with the libraries loaded): `cl-reduce` takes
+  `:initial-value`; `cl-mapcar` walks N sequences; `cl-remove-duplicates` keeps the
+  last occurrence (Emacs default); `seq-group-by` lists groups in first-encounter
+  order.
+- Added `length=` / `length<` / `length>`, `cl-typecase`, `cl-destructuring-bind`
+  (positional / `&optional` / `&rest`), and `string-clean-whitespace`; `cl-getf`
+  takes a DEFAULT.
+- `cl-loop` (common subset): numeric `for … from/to/below/downto/above/by`,
+  `for … in/on`, `repeat`, `while`/`until`; the `collect`/`append`/`nconc`/`sum`/
+  `count`/`maximize`/`minimize` accumulators; `do`; and `finally [return]`.
+  Plus `with VAR = VAL`, accumulate `into VAR`, `when`/`unless`/`if`…`else`
+  conditionals, and the `always`/`never`/`thereis` boolean clauses.
+  (Not yet: parallel `for`, `across`, destructuring.)
+- `mapcar` / `mapc` and the `seq-*` iterators accept any sequence (vector / string,
+  not just lists). Added `boundp`, `gensym`, `default-value`.
+- Hash tables print in Emacs-30 syntax: `#s(hash-table [test T] [data (k v …)])`,
+  omitting `test` when `eql` and `data` when empty.
+- `pcase` now supports backquote (structural) patterns — `` `(,a ,b) ``,
+  `` `(,a . ,rest) ``, nested, and literals — recognized from the reader's eager
+  backquote expansion (no lazy backquote needed).
+- Reader: fixed dotted backquote `` `(,a . ,b) `` (and `` `(a b . ,x) ``), which
+  previously mis-expanded the unquoted dotted tail.
+- Added `cl-flet` / `cl-labels` (lexical local functions via a call-rewriting code
+  walk; `cl-labels` supports self- and mutual recursion), `let-alist`, `and-let*`,
+  `cl-dolist` / `cl-dotimes`, and the `fset` / `fboundp` primitives.
+- Added `cl-block` / `cl-return-from` / `cl-return` (named escapes; `cl-dolist` /
+  `cl-dotimes` now establish the nil block), `cl-pushnew`, `cl-find-if-not`;
+  `cl-subseq` / `seq-subseq` work on any sequence with an optional and negative END.
 
 ### Added
 - `pcase` — structural dispatch (non-backquote subset): `_` wildcard,

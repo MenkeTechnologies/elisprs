@@ -134,7 +134,7 @@ elisp --version
 - **Dotted pairs.** `(cons 1 2)` / `(a . b)` read, print (`(1 . 2)`), and round-trip; alists may use `(key . value)`.
 - **Backquote / unquote.** `` ` ``, `,`, and `,@` are read and expanded.
 - **`setcar` / `setcdr`** mutate cons cells in place.
-- **`pcase`.** Structural dispatch over `_`, literals, `'x`, symbol binders, `(pred FN)`, `(guard EXPR)`, `(and …)`, `(or …)`. (Backquote patterns `` `(,a ,b) `` await lazy backquote — the reader currently expands backquote at read time.)
+- **`pcase`.** Structural dispatch over `_`, literals, `'x`, symbol binders, `(pred FN)`, `(guard EXPR)`, `(and …)`, `(or …)`, and **backquote patterns** `` `(,a ,b) `` / `` `(,a . ,rest) `` (incl. nested), recognized from the reader's eager backquote expansion.
 - **Regexps.** `string-match` & friends translate elisp regexp syntax (`\(` `\|` `\{`, `\<`/`\>`, `\w`/`\s-`) to a backing engine and record char-indexed match data; `replace-regexp-in-string` expands `\&`/`\N` templates. (Pattern backreferences `\1` are rejected — the engine doesn't backtrack.)
 - **Vector literals.** `[1 2 3]` reads as a self-evaluating vector (elements unevaluated); `aref` / `elt` / `length` / `append` / `sort` operate on it.
 - **Generalized `setf`** over the common places: `car`, `cdr`, `nth`, `elt`, `aref`, `gethash`, `symbol-value`, plus plain variables and multiple place/value pairs.

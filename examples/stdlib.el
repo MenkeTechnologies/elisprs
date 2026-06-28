@@ -123,8 +123,10 @@
                  (list (cons 0 'a) (cons 1 'b))))
   (should (equal (seq-keep (lambda (x) (if (cl-evenp x) x nil)) (list 1 2 3 4)) (list 2 4)))
   (should (equal (seq-mapcat (lambda (x) (list x x)) (list 1 2)) (list 1 1 2 2)))
+  ;; Groups appear in first-encounter order of their key (matching Emacs):
+  ;; 1 -> nil first, then 2 -> t.
   (should (equal (seq-group-by #'cl-evenp (list 1 2 3 4))
-                 (list (cons t (list 2 4)) (cons nil (list 1 3))))))
+                 (list (cons nil (list 1 3)) (cons t (list 2 4))))))
 
 (ert-deftest std-more-strings ()
   (should (equal (string-replace "a" "X" "banana") "bXnXnX"))
