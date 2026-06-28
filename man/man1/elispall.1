@@ -1,0 +1,125 @@
+.\" elispall(1) — comprehensive all-in-one man page for elisprs
+.\" Modeled after zshall(1): every man page in one document.
+.\" Render with:  man -l man/man1/elispall.1
+.\" Install:      cp man/man1/elispall.1 /usr/local/share/man/man1/
+.TH ELISPALL 1 "2026-06-28" "elisprs 0.1.0" "User Commands"
+.SH NAME
+elispall \- the elisprs comprehensive reference (invocation, reader, special
+forms, standard library, architecture, milestone status, roadmap)
+.SH OVERVIEW
+This is the all-in-one
+.B elisprs
+reference. For the concise command page see
+.BR elisp (1).
+.PP
+.B elisprs
+runs Emacs Lisp (\fB.el\fR) as standalone programs. It is built to become the
+fifth language hosted on the
+.B fusevm
+bytecode VM, after
+.BR zshrs ", " stryke ", " awkrs ", and " vimlrs .
+At milestone 1 it executes on a self-contained tree-walk evaluator; the fusevm
+lowering is the milestone-2 seam.
+.SH INVOCATION
+.B elisp
+[\fIOPTIONS\fR] [\fIFILE\fR | \fB\-e\fR \fIPROGRAM\fR]
+.PP
+See
+.BR elisp (1)
+for the full option list:
+.BR \-e / \-\-eval ,
+.BR \-\-lsp ,
+.BR \-\-dap ,
+.BR \-\-aot ,
+.BR \-V / \-\-version ,
+.BR \-h / \-\-help .
+With no arguments a REPL is started (parenthesis-balanced multi-line input;
+Ctrl-D exits).
+.SH "DESIGN: REUSE / OWN SPLIT"
+Emacs Lisp is a Lisp-2 (separate value and function cells per symbol) and is, by
+default, dynamically scoped. No general-purpose embeddable Lisp provides those,
+so elisprs splits the problem:
+.TP
+.B Reused \(em data model
+The
+.B rust_lisp
+crate (MIT) supplies \fBValue\fR/\fBList\fR/\fBSymbol\fR. Function objects ride
+in \fBValue::Foreign(Rc<dyn Any>)\fR, so closures, macros, and subrs are added
+without forking the value enum.
+.TP
+.B Own \(em the reader
+rust_lisp's number-greedy tokenizer splits \fB1+\fR/\fB1\-\fR and lacks
+\fB#'\fR, \fB?c\fR, and dotted pairs.
+.I src/reader.rs
+is a small elisp-correct reader emitting rust_lisp values.
+.TP
+.B Own \(em the semantics
+The obarray (value + function cells), dynamic binding (a specstack that saves and
+restores prior value cells), the special forms, and the standard library are all
+in-crate. rust_lisp's Lisp-1, lexical evaluator is not used.
+.SH "READER SYNTAX"
+Integers, floats, strings with escapes, symbols (including \fB1+\fR, \fB1\-\fR,
+\fB<=\fR, \fB:keywords\fR), \fBnil\fR/\fBt\fR, \fB'\fRquote, \fB#'\fRfunction,
+\fB?c\fR character literals, and \fB;\fR comments.
+.SH "SPECIAL FORMS"
+.B quote function lambda progn prog1 if when unless cond and or while setq let
+.B let* defun defmacro defvar defconst condition-case unwind-protect
+.PP
+Lambda lists accept \fB&optional\fR and \fB&rest\fR. Macros expand and are
+re-evaluated.
+.B condition-case
+matches the \fBerror\fR umbrella and specific error symbols.
+.SH "STANDARD LIBRARY (~65 SUBRS)"
+.TP
+.B Arithmetic
++ \- * / % mod 1+ 1\- abs max min = /= < > <= >=
+.TP
+.B Lists
+car cdr cons list append nth nthcdr reverse length member memq assoc assq
+.TP
+.B Predicates
+eq eql equal null not numberp integerp floatp stringp symbolp consp listp atom
+functionp
+.TP
+.B Symbols / cells
+set symbol-value symbol-function fset boundp fboundp symbol-name intern
+make-symbol
+.TP
+.B Strings
+concat string= string-equal string< upcase downcase number-to-string
+string-to-number
+.TP
+.B I/O and format
+format message princ prin1 print terpri
+.TP
+.B Functional
+funcall apply mapcar mapc identity
+.SH "PATH TO FUSEVM (MILESTONE 2)"
+The lowering follows the same frontend pattern as
+.IR strykelang/strykelang/fusevm_native.rs :
+.IP 1. 4
+Add \fBValue::{Cons, Symbol}\fR to \fBfusevm/src/value.rs\fR and a dynamic-binding
+stack to the \fBVM\fR struct \(em the one invasive core change.
+.IP 2. 4
+Reserve an elisp \fBOp::Extended(id, arg)\fR range; register a handler via
+\fBvm.set_extension_handler(...)\fR for quote, funcall, special-var bind, and
+cons navigation.
+.IP 3. 4
+Lower each top-level form in \fBcompiler.rs\fR; lambda bodies become sub-chunks.
+.IP 4. 4
+Bind the subr library through \fBvm.register_builtin(...)\fR.
+.PP
+The three-tier Cranelift JIT and the
+.B \-\-aot
+path (via \fBfusevm::aot::compile_object\fR) then come for free.
+.SH LIMITATIONS
+No dotted pairs, backquote/unquote, \fBlexical-binding\fR, or
+\fBsetcar\fR/\fBsetcdr\fR at milestone 1; unsupported reader syntax errors
+loudly. Not buffer-aware.
+.SH "SEE ALSO"
+.BR elisp (1).
+Reference and engineering report: https://menketechnologies.github.io/elisprs/ .
+.SH AUTHOR
+MenkeTechnologies <https://github.com/MenkeTechnologies>.
+.SH LICENSE
+MIT OR Apache-2.0. Bundles rust_lisp (MIT).

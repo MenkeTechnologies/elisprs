@@ -1,0 +1,109 @@
+.\" Manpage for elisp (elisprs).
+.\" Contact https://github.com/MenkeTechnologies/elisprs to correct errors or omissions.
+.TH ELISP 1 "2026-06-28" "elisprs 0.1.0" "User Commands"
+.SH NAME
+elisp \- Emacs Lisp interpreter (run .el outside Emacs; Lisp-2 obarray with dynamic binding, on the rust_lisp value model)
+.SH SYNOPSIS
+.B elisp
+[\fIOPTIONS\fR] [\fIFILE\fR | \fB\-e\fR \fIPROGRAM\fR]
+.SH DESCRIPTION
+.B elisp
+evaluates Emacs Lisp as a standalone program. It is the command-line front
+end of
+.BR elisprs ,
+an Emacs Lisp runtime in Rust built to become a frontend for the
+.B fusevm
+bytecode VM (the engine behind
+.BR zshrs ,
+.BR stryke ,
+.BR awkrs ,
+and
+.BR vimlrs ).
+.PP
+Emacs Lisp is a Lisp-2 \(em every symbol carries a separate value cell and
+function cell \(em and is, by default, dynamically scoped. elisprs reuses the
+.B rust_lisp
+crate (MIT) for its \fBValue\fR/\fBList\fR/\fBSymbol\fR data model, but the
+reader, the obarray, dynamic binding, the special forms, and the standard
+library are its own; rust_lisp's Lisp-1, lexically scoped evaluator is not used.
+.PP
+At milestone 1 the program runs on a self-contained tree-walk evaluator. The
+.B fusevm
+lowering is staged in
+.I src/compiler.rs
+and is not yet wired; it backs the
+.B \-\-aot
+path.
+.SH OPTIONS
+.TP
+.I FILE
+Evaluate the forms in \fIFILE\fR (typically a \fB.el\fR file) in order.
+.TP
+.BR \-e ", " \-\-eval " " \fIPROGRAM\fR
+Evaluate \fIPROGRAM\fR and print the value of the last form.
+.TP
+.B \-\-lsp
+Run the language server over stdio. Stub at milestone 1.
+.TP
+.B \-\-dap
+Run the debug adapter over stdio. Stub at milestone 1.
+.TP
+.BR \-\-aot " " \fIFILE\fR " " \fB\-o\fR " " \fIOUT\fR
+Ahead-of-time compile \fIFILE\fR to a native object \fIOUT\fR via
+\fBfusevm::aot::compile_object\fR. Requires the milestone-2 lowering; reports a
+not-implemented signal until then.
+.TP
+.BR \-V ", " \-\-version
+Print version and exit.
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
+.PP
+With no arguments,
+.B elisp
+starts a read-eval-print loop. Input is accumulated until parentheses balance,
+so multi-line forms work; Ctrl-D exits.
+.SH LANGUAGE
+Reader syntax: integers, floats, strings with escapes, symbols (including
+\fB1+\fR / \fB1\-\fR / \fB<=\fR / \fB:keywords\fR), \fBnil\fR / \fBt\fR,
+\fB'\fRquote, \fB#'\fRfunction, \fB?c\fR character literals, and \fB;\fR comments.
+.PP
+Special forms: \fBquote function lambda progn prog1 if when unless cond and or
+while setq let let* defun defmacro defvar defconst condition-case
+unwind-protect\fR.
+A standard library of roughly 65 subrs covers lists, arithmetic, strings,
+predicates, I/O/format, and functional operators.
+.SH LIMITATIONS
+Milestone 1 does not support dotted pairs \fB(a . b)\fR, backquote/unquote,
+\fBlexical-binding\fR, or \fBsetcar\fR/\fBsetcdr\fR. Unsupported reader syntax
+errors loudly rather than being silently misread. The interpreter is not
+buffer-aware (no buffers, point, or markers).
+.SH EXIT STATUS
+.B elisp
+exits 0 on success and non-zero if a file cannot be read or evaluation signals
+an uncaught error.
+.SH EXAMPLES
+Evaluate an expression:
+.PP
+.RS
+.nf
+elisp \-e '(mapcar #'\(aq1+ \(aq(1 2 3))'   \(rh (2 3 4)
+.fi
+.RE
+.PP
+Run a file:
+.PP
+.RS
+.nf
+elisp examples/demo.el
+.fi
+.RE
+.SH SEE ALSO
+.BR elispall (1).
+Reference and engineering report: https://menketechnologies.github.io/elisprs/ .
+.B fusevm:
+https://github.com/MenkeTechnologies/fusevm .
+.SH AUTHOR
+MenkeTechnologies <https://github.com/MenkeTechnologies>.
+.SH LICENSE
+MIT OR Apache-2.0. Bundles rust_lisp (MIT).
