@@ -2,9 +2,15 @@
 name = "elisprs"
 version = "0.1.0"
 edition = "2021"
-description = "Emacs Lisp as a fusevm frontend: reader + compiler to fusevm::Chunk + an ElispHost object heap. No bespoke VM/JIT — execution and codegen live in fusevm."
+authors = ["MenkeTechnologies"]
+description = "Emacs Lisp as a fusevm frontend: a reader and compiler to fusevm::Chunk on an ElispHost object heap, with no bespoke VM or JIT"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MenkeTechnologies/elisprs"
+homepage = "https://menketechnologies.github.io/elisprs/"
+documentation = "https://docs.rs/elisprs"
+readme = "README.md"
+keywords = ["emacs", "lisp", "elisp", "interpreter", "fusevm"]
+categories = ["command-line-utilities", "compilers"]
 
 [[bin]]
 name = "elisp"
@@ -20,3 +26,12 @@ path = "src/lib.rs"
 # (src/host.rs, reached from fusevm's extension handler). The cons/symbol/
 # vector cells ride through the VM as `Value::Obj(u32)` handles into that heap.
 fusevm = { path = "../fusevm" }
+
+# `elisp --lsp` speaks LSP over stdio (src/lsp.rs); `elisp --dap` speaks the
+# Debug Adapter Protocol over stdio (src/dap.rs). libc gives the DAP server a
+# pipe + dup2 to capture the debuggee's stdout (princ/prin1) so program output
+# streams as `output` events instead of corrupting the JSON-RPC channel.
+lsp-server = "0.7.9"
+lsp-types = "0.97.0"
+serde_json = "1"
+libc = "0.2"
