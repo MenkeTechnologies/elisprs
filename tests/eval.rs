@@ -451,6 +451,11 @@ fn emacs_parity_math_and_introspection() {
     assert_eq!(eval("(isnan (/ 0.0 0.0))"), "t");
     assert_eq!(eval("(fround 2.5)"), "2.0");
     assert_eq!(eval("(ffloor 2.7)"), "2.0");
+    // fceiling / ftruncate round toward +inf / zero but keep a float result.
+    assert_eq!(eval("(fceiling 3.2)"), "4.0");
+    assert_eq!(eval("(fceiling -3.2)"), "-3.0");
+    assert_eq!(eval("(ftruncate 3.9)"), "3.0");
+    assert_eq!(eval("(ftruncate -3.9)"), "-3.0");
 }
 
 #[test]
