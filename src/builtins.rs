@@ -747,17 +747,24 @@ fn substring(_h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
     let s = as_string(&a[0])?;
-    let parts: Vec<Value> = if a.len() < 2 || is_nil(&a[1]) {
-        s.split_whitespace().map(Value::str).collect()
+    // With the default separators (whitespace) OMIT-NULLS is implicitly on; with
+    // an explicit SEPARATORS it defaults off unless the 3rd arg is non-nil.
+    let default_seps = a.len() < 2 || is_nil(&a[1]);
+    let omit_nulls = default_seps || a.get(2).is_some_and(|v| !is_nil(v));
+    let mut parts: Vec<String> = if default_seps {
+        s.split_whitespace().map(|w| w.to_string()).collect()
     } else {
         let sep = as_string(&a[1])?;
         if sep.is_empty() {
-            s.chars().map(|c| Value::str(c.to_string())).collect()
+            s.chars().map(|c| c.to_string()).collect()
         } else {
-            s.split(sep.as_str()).map(Value::str).collect()
+            s.split(sep.as_str()).map(|w| w.to_string()).collect()
         }
     };
-    Ok(h.list_from(parts))
+    if omit_nulls {
+        parts.retain(|w| !w.is_empty());
+    }
+    Ok(h.list_from(parts.into_iter().map(Value::str).collect()))
 }
 fn string_prefix_p(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(as_string(&a[1])?.starts_with(&as_string(&a[0])?)))

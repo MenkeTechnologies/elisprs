@@ -5,6 +5,16 @@ All notable changes to elisprs are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed (Emacs parity — see BUGS.md)
+- `eq` is now object identity: `(eq 1.0 1.0)` => `nil` (distinct float objects).
+  `eql` keeps by-value float comparison; `eq`/`eql` split into separate subrs.
+- `round` uses banker's rounding (half to even): `(round 2.5)` => `2`.
+- `mod` is a primitive subr handling float operands and divisor-sign semantics:
+  `(mod 13.5 4)` => `1.5`, `(mod -1 3)` => `2`.
+- `split-string` honors OMIT-NULLS (3rd arg); default separators omit implicitly.
+- `dotimes` / `dolist` evaluate and return their optional RESULT form.
+- `capitalize` upcases the first letter of every word, not just the first.
+
 ### Added
 - Regexp support: `string-match` / `string-match-p`, `match-beginning` /
   `match-end` / `match-string`, `match-data` / `set-match-data`,

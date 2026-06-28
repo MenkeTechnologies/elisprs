@@ -385,3 +385,40 @@ fn pcase_non_backquote_subset() {
     );
     assert_eq!(eval("(pcase 3 ((or 1 2 3) 'low) (_ 'high))"), "low");
 }
+
+#[test]
+fn emacs_parity_value_fixes() {
+    // eq is object identity: distinct float objects are not eq, fixnums are.
+    assert_eq!(eval("(eq 1.0 1.0)"), "nil");
+    assert_eq!(eval("(eq 1 1)"), "t");
+    assert_eq!(eval("(eql 1.0 1.0)"), "t"); // eql compares floats by value
+    assert_eq!(eval("(eql 1 1.0)"), "nil");
+    assert_eq!(eval("(equal 1.0 1.0)"), "t");
+    // round half to even (banker's rounding).
+    assert_eq!(eval("(round 2.5)"), "2");
+    assert_eq!(eval("(round 0.5)"), "0");
+    assert_eq!(eval("(round -2.5)"), "-2");
+    assert_eq!(eval("(round 3.5)"), "4");
+    // mod: result takes the divisor's sign; float operands keep float result.
+    assert_eq!(eval("(mod 13.5 4)"), "1.5");
+    assert_eq!(eval("(mod -1 3)"), "2");
+    assert_eq!(eval("(mod 1 -3)"), "-2");
+    // split-string honors OMIT-NULLS (3rd arg); default-separators omits implicitly.
+    assert_eq!(
+        eval("(split-string \"a,b,,c\" \",\" t)"),
+        "(\"a\" \"b\" \"c\")"
+    );
+    assert_eq!(
+        eval("(split-string \"a,b,,c\" \",\")"),
+        "(\"a\" \"b\" \"\" \"c\")"
+    );
+    // dotimes/dolist return the RESULT form (with the var bound).
+    assert_eq!(eval("(dotimes (i 3 i) i)"), "3");
+    assert_eq!(
+        eval("(let ((s nil)) (dolist (x '(1 2 3) s) (push x s)))"),
+        "(3 2 1)"
+    );
+    // capitalize upcases every word.
+    assert_eq!(eval("(capitalize \"hello world\")"), "\"Hello World\"");
+    assert_eq!(eval("(capitalize \"foo-bar baz\")"), "\"Foo-Bar Baz\"");
+}

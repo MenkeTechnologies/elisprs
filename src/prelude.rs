@@ -495,19 +495,22 @@ pub const PRELUDE: &str = r#"
           (cons (list (cons 'or alts)) binds)))
        (t (error "pcase: unsupported pattern %S" pat)))))
    (t (error "pcase: unsupported pattern %S" pat))))
+(defun pcase--clause (clause)
+  ;; Build one `cond' clause (TEST BODY) from a pcase clause (PATTERN BODY...).
+  ;; Bindings wrap BOTH the test and the body via `let*' so a `guard' in TEST
+  ;; sees the binders. This `cond' shape (like `cl-case') expands cleanly when
+  ;; nested in a macro-produced `defun' (e.g. an ERT `should'); a `catch'/`throw'
+  ;; shape does not — it miscompiles to a "void variable" error there.
+  (let* ((r (pcase--compile (car clause) '--pcase-v--))
+         (tests (car r))
+         (binds (cdr r))
+         (conj (if tests (cons 'and tests) t))
+         (test (if binds (list 'let* binds conj) conj))
+         (body (cons 'progn (cdr clause))))
+    (list test (if binds (list 'let* binds body) body))))
 (defmacro pcase (expr &rest clauses)
   `(let ((--pcase-v-- ,expr))
-     (catch 'pcase--done
-       ,@(mapcar
-          (lambda (clause)
-            (let* ((r (pcase--compile (car clause) '--pcase-v--))
-                   (tests (car r))
-                   (binds (cdr r)))
-              `(let* ,binds
-                 (when ,(if tests (cons 'and tests) t)
-                   (throw 'pcase--done (progn ,@(cdr clause)))))))
-          clauses)
-       nil)))
+     (cond ,@(mapcar (function pcase--clause) clauses))))
 (defmacro pcase-let (bindings &rest body)
   ;; Only the simple `(SYM VALUE)` binding form is supported (full pcase-let
   ;; destructuring needs backquote patterns).

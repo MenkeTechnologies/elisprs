@@ -26,13 +26,13 @@ elref() { emacs -Q --batch --eval "(prin1 $1)" 2>&1; }   # ground truth
 - `(funcall (lambda …) …)` works, so only *direct* application of a lambda form is
   broken. Very common idiom.
 
-### 3. `eq` on floats returns `t` (must be object identity → `nil`)
+### 3. ✅ FIXED — `eq` on floats returns `t` (must be object identity → `nil`)
 - `(eq 1.0 1.0)` → Emacs `nil`, elisprs `t`
 - `el_eq` compares floats by bit pattern. `src/builtins.rs:163`
   (`Value::Float(x), Value::Float(y) => x.to_bits() == y.to_bits()`).
   `eql`/`equal` are correct; `eq` must not equate distinct float objects.
 
-### 4. `round` uses round-half-away-from-zero, not banker's rounding
+### 4. ✅ FIXED — `round` uses round-half-away-from-zero, not banker's rounding
 - `(round 2.5)` → Emacs `2`, elisprs `3`
 - `(round 0.5)` → Emacs `0`, elisprs `1`
 - `(round -2.5)` → Emacs `-2`, elisprs `-3`
@@ -45,7 +45,7 @@ elref() { emacs -Q --batch --eval "(prin1 $1)" 2>&1; }   # ground truth
   (`src/compiler.rs:170-176`), bypassing the correct `one_plus` builtin
   (`src/builtins.rs:115`). `(funcall #'1+ 1.0)` is correct.
 
-### 6. `mod` truncates a float operand
+### 6. ✅ FIXED — `mod` truncates a float operand
 - `(mod 13.5 4)` → Emacs `1.5`, elisprs `1`
 
 ### 7. `expt` mishandles float / negative exponents
@@ -57,15 +57,15 @@ elref() { emacs -Q --batch --eval "(prin1 $1)" 2>&1; }   # ground truth
 - `(string-to-number "1.5e3")` → Emacs `1500.0`, elisprs `1`
 - `(string-to-number "ff" 16)` → Emacs `255`, elisprs `error: wrong-number-of-arguments`
 
-### 9. `split-string` ignores OMIT-NULLS
+### 9. ✅ FIXED — `split-string` ignores OMIT-NULLS
 - `(split-string "a,b,,c" "," t)` → Emacs `("a" "b" "c")`, elisprs `("a" "b" "" "c")`
 
-### 10. `dotimes` / `dolist` ignore the RESULT form (3rd spec element)
+### 10. ✅ FIXED — `dotimes` / `dolist` ignore the RESULT form (3rd spec element)
 - `(dotimes (i 3 i) i)` → Emacs `3`, elisprs `nil`
 - `(let ((s nil)) (dolist (x '(1 2 3) s) (push x s)))` → Emacs `(3 2 1)`, elisprs `nil`
 - Macros in `src/prelude.rs:122-134` never emit the result form `(caddr spec)`.
 
-### 11. `capitalize` only capitalizes the first word
+### 11. ✅ FIXED — `capitalize` only capitalizes the first word
 - `(capitalize "hello world")` → Emacs `"Hello World"`, elisprs `"Hello world"`
 
 ---
