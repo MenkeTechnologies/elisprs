@@ -23,7 +23,7 @@ pub const PRELUDE: &str = r#"
 (defun abs (x) (if (< x 0) (- x) x))
 (defun max (x &rest xs) (while xs (if (> (car xs) x) (setq x (car xs))) (setq xs (cdr xs))) x)
 (defun min (x &rest xs) (while xs (if (< (car xs) x) (setq x (car xs))) (setq xs (cdr xs))) x)
-(defun mod (x y) (let ((r (% x y))) (if (if (< r 0) (> y 0) (< y 0)) (+ r y) r)))
+;; `mod` is a primitive subr (handles float operands + divisor-sign semantics).
 (defun /= (a b) (not (= a b)))
 (defun plusp (x) (> x 0))
 (defun minusp (x) (< x 0))
@@ -149,18 +149,25 @@ pub const PRELUDE: &str = r#"
         (if rest `(progn ,exp (setf ,@rest)) exp)))))
 (defmacro pop (place) (list (quote prog1) (list (quote car) place) (list (quote setq) place (list (quote cdr) place))))
 (defmacro dolist (spec &rest body)
-  (let ((var (car spec)) (lst (cadr spec)))
+  ;; (dolist (VAR LIST [RESULT]) BODY...) — RESULT (with VAR bound to nil) is the
+  ;; value of the form; nil if omitted.
+  (let ((var (car spec)) (lst (cadr spec)) (result (car (cddr spec))))
     `(let ((,var nil) (--dolist-tail-- ,lst))
        (while --dolist-tail--
          (setq ,var (car --dolist-tail--))
          ,@body
-         (setq --dolist-tail-- (cdr --dolist-tail--))))))
+         (setq --dolist-tail-- (cdr --dolist-tail--)))
+       (setq ,var nil)
+       ,result)))
 (defmacro dotimes (spec &rest body)
-  (let ((var (car spec)) (cnt (cadr spec)))
+  ;; (dotimes (VAR COUNT [RESULT]) BODY...) — RESULT (with VAR bound to COUNT) is
+  ;; the value of the form; nil if omitted.
+  (let ((var (car spec)) (cnt (cadr spec)) (result (car (cddr spec))))
     `(let ((,var 0) (--dotimes-limit-- ,cnt))
        (while (< ,var --dotimes-limit--)
          ,@body
-         (setq ,var (1+ ,var))))))
+         (setq ,var (1+ ,var)))
+       ,result)))
 
 ;;; ---- error handling ----
 (defmacro ignore-errors (&rest body) `(condition-case nil (progn ,@body) (error nil)))
@@ -234,10 +241,19 @@ pub const PRELUDE: &str = r#"
   (apply (function string)
          (mapcar (lambda (c) (if (and (>= c ?A) (<= c ?Z)) (+ c 32) c)) (string-to-list s))))
 (defun capitalize (s)
-  (if (string-empty-p s) s
-    (let* ((chars (string-to-list (downcase s))) (c (car chars)))
-      (apply (function string)
-             (cons (if (and (>= c ?a) (<= c ?z)) (- c 32) c) (cdr chars))))))
+  ;; Upcase the first letter of every word (run of alphanumerics), downcase the
+  ;; rest: (capitalize "hello world") => "Hello World".
+  (let ((out nil) (in-word nil))
+    (dolist (c (string-to-list s))
+      (let* ((lower (and (>= c ?a) (<= c ?z)))
+             (upper (and (>= c ?A) (<= c ?Z)))
+             (alnum (or lower upper (and (>= c ?0) (<= c ?9)))))
+        (cond
+         ((not alnum) (setq out (cons c out)))
+         (in-word (setq out (cons (if upper (+ c 32) c) out)))
+         (t (setq out (cons (if lower (- c 32) c) out))))
+        (setq in-word alnum)))
+    (apply (function string) (reverse out))))
 (defun string-trim-left (s)
   (let ((chars (string-to-list s)))
     (while (and chars (or (= (car chars) 32) (= (car chars) 9) (= (car chars) 10) (= (car chars) 13)))

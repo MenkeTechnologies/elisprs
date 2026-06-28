@@ -112,6 +112,26 @@ fn modulo(_h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(Value::Int(x % y))
 }
+// `mod` (vs `%`): the result takes the sign of the divisor, and either operand
+// may be a float — (mod 13.5 4) => 1.5, (mod -1 3) => 2.
+fn mod_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let (xi, xf, xisf) = as_num(&a[0])?;
+    let (yi, yf, yisf) = as_num(&a[1])?;
+    if xisf || yisf {
+        if yf == 0.0 {
+            return Err("arith-error: division by zero".to_string());
+        }
+        return Ok(Value::Float(xf - yf * (xf / yf).floor()));
+    }
+    if yi == 0 {
+        return Err("arith-error: division by zero".to_string());
+    }
+    let mut r = xi % yi;
+    if r != 0 && (r < 0) != (yi < 0) {
+        r += yi;
+    }
+    Ok(Value::Int(r))
+}
 fn one_plus(_h: &mut ElispHost, a: &[Value]) -> R {
     let (i, f, isf) = as_num(&a[0])?;
     Ok(if isf {
@@ -154,13 +174,15 @@ fn ge(_h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── equality ──
+// `eq` is object identity. Fixnums and interned symbols/heap handles compare by
+// value, but two distinct float *objects* are never `eq` (matching Emacs:
+// `(eq 1.0 1.0)` => nil). `eql` adds by-value float comparison on top of `eq`.
 fn el_eq(h: &ElispHost, a: &Value, b: &Value) -> bool {
     if is_nil(a) && is_nil(b) {
         return true;
     }
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
         (Value::Obj(x), Value::Obj(y)) => x == y,
         (Value::Bool(true), Value::Bool(true)) => true,
         _ => {
@@ -169,8 +191,14 @@ fn el_eq(h: &ElispHost, a: &Value, b: &Value) -> bool {
         }
     }
 }
+fn el_eql(h: &ElispHost, a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        _ => el_eq(h, a, b),
+    }
+}
 fn el_equal(h: &ElispHost, a: &Value, b: &Value) -> bool {
-    if el_eq(h, a, b) {
+    if el_eql(h, a, b) {
         return true;
     }
     match (a, b) {
@@ -189,6 +217,9 @@ fn el_equal(h: &ElispHost, a: &Value, b: &Value) -> bool {
 }
 fn eq_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(el_eq(h, &a[0], &a[1])))
+}
+fn eql_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(el_eql(h, &a[0], &a[1])))
 }
 fn equal_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(el_equal(h, &a[0], &a[1])))
@@ -1053,8 +1084,9 @@ fn ceiling_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Int(if isf { f.ceil() as i64 } else { i }))
 }
 fn round_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    // Emacs rounds half to even (banker's rounding): (round 2.5) => 2, (round 0.5) => 0.
     let (i, f, isf) = as_num(&a[0])?;
-    Ok(Value::Int(if isf { f.round() as i64 } else { i }))
+    Ok(Value::Int(if isf { f.round_ties_even() as i64 } else { i }))
 }
 fn truncate_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     let (i, f, isf) = as_num(&a[0])?;
@@ -1109,6 +1141,7 @@ pub fn install(h: &mut ElispHost) {
     s("*", 0, None, mul);
     s("/", 1, None, div);
     s("%", 2, Some(2), modulo);
+    s("mod", 2, Some(2), mod_fn);
     s("1+", 1, Some(1), one_plus);
     s("1-", 1, Some(1), one_minus);
     s("=", 1, None, num_eq);
@@ -1118,7 +1151,7 @@ pub fn install(h: &mut ElispHost) {
     s(">=", 1, None, ge);
     // equality / predicates
     s("eq", 2, Some(2), eq_fn);
-    s("eql", 2, Some(2), eq_fn);
+    s("eql", 2, Some(2), eql_fn);
     s("equal", 2, Some(2), equal_fn);
     s("null", 1, Some(1), null_fn);
     s("not", 1, Some(1), null_fn);
