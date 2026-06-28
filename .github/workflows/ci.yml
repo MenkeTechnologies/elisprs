@@ -49,3 +49,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --verbose
       - run: cargo test --locked --verbose
+
+  examples:
+    name: Example scripts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      # Run every examples/*.el through the real binary. Each example is a
+      # self-test: it checks its results with an `expect` helper and raises an
+      # elisp `error` (non-zero exit) on a mismatch, so a behaviour regression
+      # in a lowered feature fails this job.
+      - name: Run example scripts
+        run: sh scripts/run_examples.sh
+        env:
+          ELISP: ${{ github.workspace }}/target/release/elisp
