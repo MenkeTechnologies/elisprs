@@ -15,7 +15,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("elisp (elisprs) {} — fusevm frontend", env!("CARGO_PKG_VERSION"));
+        println!(
+            "elisp (elisprs) {} — fusevm frontend",
+            env!("CARGO_PKG_VERSION")
+        );
         return ExitCode::SUCCESS;
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -101,7 +104,10 @@ fn run_aot(args: &[String]) -> ExitCode {
 fn repl() -> ExitCode {
     let stdin = io::stdin();
     let mut buf = String::new();
-    println!("elisp (elisprs) {} — fusevm frontend REPL. Ctrl-D to exit.", env!("CARGO_PKG_VERSION"));
+    println!(
+        "elisp (elisprs) {} — fusevm frontend REPL. Ctrl-D to exit.",
+        env!("CARGO_PKG_VERSION")
+    );
     loop {
         print!("{} ", if buf.is_empty() { "elisp>" } else { "  ...>" });
         let _ = io::stdout().flush();

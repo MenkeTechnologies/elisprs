@@ -19,9 +19,9 @@ use lsp_types::request::{
     Completion, DocumentSymbolRequest, HoverRequest, Request as _, SignatureHelpRequest,
 };
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse,
-    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    Documentation, Hover, HoverContents, HoverParams, MarkupContent, MarkupKind, OneOf, Position,
+    CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse, Diagnostic,
+    DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams, Documentation,
+    Hover, HoverContents, HoverParams, MarkupContent, MarkupKind, OneOf, Position,
     PublishDiagnosticsParams, Range, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
     SignatureHelpParams, SignatureInformation, SymbolInformation, SymbolKind,
     TextDocumentSyncCapability, TextDocumentSyncKind, Uri, WorkDoneProgressOptions,
@@ -43,83 +43,448 @@ enum Kind {
 /// Special forms the compiler recognizes (lowered or pending). Offered for
 /// completion/hover regardless of lowering status — they are valid elisp.
 const SPECIAL_FORMS: &[Entry] = &[
-    Entry { name: "quote", kind: Kind::SpecialForm, sig: "(quote OBJECT)", doc: "Return OBJECT, unevaluated." },
-    Entry { name: "function", kind: Kind::SpecialForm, sig: "(function OBJECT)", doc: "Like quote, but for functions (`#'`)." },
-    Entry { name: "lambda", kind: Kind::SpecialForm, sig: "(lambda ARGLIST BODY...)", doc: "An anonymous function." },
-    Entry { name: "progn", kind: Kind::SpecialForm, sig: "(progn BODY...)", doc: "Evaluate BODY in order; return the last value." },
-    Entry { name: "if", kind: Kind::SpecialForm, sig: "(if COND THEN ELSE...)", doc: "If COND is non-nil, eval THEN, else the ELSE forms." },
-    Entry { name: "when", kind: Kind::SpecialForm, sig: "(when COND BODY...)", doc: "If COND is non-nil, eval BODY." },
-    Entry { name: "unless", kind: Kind::SpecialForm, sig: "(unless COND BODY...)", doc: "If COND is nil, eval BODY." },
-    Entry { name: "and", kind: Kind::SpecialForm, sig: "(and CONDITIONS...)", doc: "Eval forms until one is nil; return the last value." },
-    Entry { name: "or", kind: Kind::SpecialForm, sig: "(or CONDITIONS...)", doc: "Eval forms until one is non-nil; return it." },
-    Entry { name: "setq", kind: Kind::SpecialForm, sig: "(setq SYM VAL SYM VAL...)", doc: "Set each SYM's value cell to VAL." },
-    Entry { name: "let", kind: Kind::SpecialForm, sig: "(let BINDINGS BODY...)", doc: "Bind variables in parallel, then eval BODY." },
-    Entry { name: "let*", kind: Kind::SpecialForm, sig: "(let* BINDINGS BODY...)", doc: "Bind variables sequentially, then eval BODY." },
-    Entry { name: "while", kind: Kind::SpecialForm, sig: "(while COND BODY...)", doc: "While COND is non-nil, eval BODY." },
-    Entry { name: "cond", kind: Kind::SpecialForm, sig: "(cond CLAUSES...)", doc: "Try each (TEST BODY...) clause; eval the first whose TEST is non-nil." },
-    Entry { name: "defun", kind: Kind::SpecialForm, sig: "(defun NAME ARGLIST BODY...)", doc: "Define NAME as a function." },
-    Entry { name: "defmacro", kind: Kind::SpecialForm, sig: "(defmacro NAME ARGLIST BODY...)", doc: "Define NAME as a macro." },
-    Entry { name: "defvar", kind: Kind::SpecialForm, sig: "(defvar NAME &optional INIT DOC)", doc: "Define a special (dynamic) variable." },
-    Entry { name: "defconst", kind: Kind::SpecialForm, sig: "(defconst NAME INIT &optional DOC)", doc: "Define a constant special variable." },
+    Entry {
+        name: "quote",
+        kind: Kind::SpecialForm,
+        sig: "(quote OBJECT)",
+        doc: "Return OBJECT, unevaluated.",
+    },
+    Entry {
+        name: "function",
+        kind: Kind::SpecialForm,
+        sig: "(function OBJECT)",
+        doc: "Like quote, but for functions (`#'`).",
+    },
+    Entry {
+        name: "lambda",
+        kind: Kind::SpecialForm,
+        sig: "(lambda ARGLIST BODY...)",
+        doc: "An anonymous function.",
+    },
+    Entry {
+        name: "progn",
+        kind: Kind::SpecialForm,
+        sig: "(progn BODY...)",
+        doc: "Evaluate BODY in order; return the last value.",
+    },
+    Entry {
+        name: "if",
+        kind: Kind::SpecialForm,
+        sig: "(if COND THEN ELSE...)",
+        doc: "If COND is non-nil, eval THEN, else the ELSE forms.",
+    },
+    Entry {
+        name: "when",
+        kind: Kind::SpecialForm,
+        sig: "(when COND BODY...)",
+        doc: "If COND is non-nil, eval BODY.",
+    },
+    Entry {
+        name: "unless",
+        kind: Kind::SpecialForm,
+        sig: "(unless COND BODY...)",
+        doc: "If COND is nil, eval BODY.",
+    },
+    Entry {
+        name: "and",
+        kind: Kind::SpecialForm,
+        sig: "(and CONDITIONS...)",
+        doc: "Eval forms until one is nil; return the last value.",
+    },
+    Entry {
+        name: "or",
+        kind: Kind::SpecialForm,
+        sig: "(or CONDITIONS...)",
+        doc: "Eval forms until one is non-nil; return it.",
+    },
+    Entry {
+        name: "setq",
+        kind: Kind::SpecialForm,
+        sig: "(setq SYM VAL SYM VAL...)",
+        doc: "Set each SYM's value cell to VAL.",
+    },
+    Entry {
+        name: "let",
+        kind: Kind::SpecialForm,
+        sig: "(let BINDINGS BODY...)",
+        doc: "Bind variables in parallel, then eval BODY.",
+    },
+    Entry {
+        name: "let*",
+        kind: Kind::SpecialForm,
+        sig: "(let* BINDINGS BODY...)",
+        doc: "Bind variables sequentially, then eval BODY.",
+    },
+    Entry {
+        name: "while",
+        kind: Kind::SpecialForm,
+        sig: "(while COND BODY...)",
+        doc: "While COND is non-nil, eval BODY.",
+    },
+    Entry {
+        name: "cond",
+        kind: Kind::SpecialForm,
+        sig: "(cond CLAUSES...)",
+        doc: "Try each (TEST BODY...) clause; eval the first whose TEST is non-nil.",
+    },
+    Entry {
+        name: "defun",
+        kind: Kind::SpecialForm,
+        sig: "(defun NAME ARGLIST BODY...)",
+        doc: "Define NAME as a function.",
+    },
+    Entry {
+        name: "defmacro",
+        kind: Kind::SpecialForm,
+        sig: "(defmacro NAME ARGLIST BODY...)",
+        doc: "Define NAME as a macro.",
+    },
+    Entry {
+        name: "defvar",
+        kind: Kind::SpecialForm,
+        sig: "(defvar NAME &optional INIT DOC)",
+        doc: "Define a special (dynamic) variable.",
+    },
+    Entry {
+        name: "defconst",
+        kind: Kind::SpecialForm,
+        sig: "(defconst NAME INIT &optional DOC)",
+        doc: "Define a constant special variable.",
+    },
 ];
 
 /// The installed primitive subrs (mirrors `builtins::install`).
 const SUBRS: &[Entry] = &[
-    Entry { name: "+", kind: Kind::Function, sig: "(+ &rest NUMBERS)", doc: "Sum of the arguments." },
-    Entry { name: "-", kind: Kind::Function, sig: "(- &rest NUMBERS)", doc: "Negation, or subtraction from the first." },
-    Entry { name: "*", kind: Kind::Function, sig: "(* &rest NUMBERS)", doc: "Product of the arguments." },
-    Entry { name: "/", kind: Kind::Function, sig: "(/ DIVIDEND &rest DIVISORS)", doc: "Quotient of the arguments." },
-    Entry { name: "%", kind: Kind::Function, sig: "(% X Y)", doc: "Integer remainder of X divided by Y." },
-    Entry { name: "1+", kind: Kind::Function, sig: "(1+ NUMBER)", doc: "NUMBER plus one." },
-    Entry { name: "1-", kind: Kind::Function, sig: "(1- NUMBER)", doc: "NUMBER minus one." },
-    Entry { name: "=", kind: Kind::Function, sig: "(= &rest NUMBERS)", doc: "Non-nil if all numbers are equal." },
-    Entry { name: "<", kind: Kind::Function, sig: "(< &rest NUMBERS)", doc: "Non-nil if numbers strictly increase." },
-    Entry { name: ">", kind: Kind::Function, sig: "(> &rest NUMBERS)", doc: "Non-nil if numbers strictly decrease." },
-    Entry { name: "<=", kind: Kind::Function, sig: "(<= &rest NUMBERS)", doc: "Non-nil if numbers are non-decreasing." },
-    Entry { name: ">=", kind: Kind::Function, sig: "(>= &rest NUMBERS)", doc: "Non-nil if numbers are non-increasing." },
-    Entry { name: "eq", kind: Kind::Function, sig: "(eq A B)", doc: "Non-nil if A and B are the same object." },
-    Entry { name: "eql", kind: Kind::Function, sig: "(eql A B)", doc: "Like eq, but compares numbers by value." },
-    Entry { name: "equal", kind: Kind::Function, sig: "(equal A B)", doc: "Non-nil if A and B are structurally equal." },
-    Entry { name: "null", kind: Kind::Function, sig: "(null OBJECT)", doc: "Non-nil if OBJECT is nil." },
-    Entry { name: "not", kind: Kind::Function, sig: "(not OBJECT)", doc: "Non-nil if OBJECT is nil." },
-    Entry { name: "consp", kind: Kind::Function, sig: "(consp OBJECT)", doc: "Non-nil if OBJECT is a cons cell." },
-    Entry { name: "listp", kind: Kind::Function, sig: "(listp OBJECT)", doc: "Non-nil if OBJECT is a list (cons or nil)." },
-    Entry { name: "atom", kind: Kind::Function, sig: "(atom OBJECT)", doc: "Non-nil if OBJECT is not a cons cell." },
-    Entry { name: "symbolp", kind: Kind::Function, sig: "(symbolp OBJECT)", doc: "Non-nil if OBJECT is a symbol." },
-    Entry { name: "stringp", kind: Kind::Function, sig: "(stringp OBJECT)", doc: "Non-nil if OBJECT is a string." },
-    Entry { name: "numberp", kind: Kind::Function, sig: "(numberp OBJECT)", doc: "Non-nil if OBJECT is a number." },
-    Entry { name: "integerp", kind: Kind::Function, sig: "(integerp OBJECT)", doc: "Non-nil if OBJECT is an integer." },
-    Entry { name: "floatp", kind: Kind::Function, sig: "(floatp OBJECT)", doc: "Non-nil if OBJECT is a float." },
-    Entry { name: "vectorp", kind: Kind::Function, sig: "(vectorp OBJECT)", doc: "Non-nil if OBJECT is a vector." },
-    Entry { name: "zerop", kind: Kind::Function, sig: "(zerop NUMBER)", doc: "Non-nil if NUMBER is zero." },
-    Entry { name: "cons", kind: Kind::Function, sig: "(cons CAR CDR)", doc: "Create a new cons cell." },
-    Entry { name: "car", kind: Kind::Function, sig: "(car LIST)", doc: "Return the first element of LIST." },
-    Entry { name: "cdr", kind: Kind::Function, sig: "(cdr LIST)", doc: "Return the rest of LIST after the first element." },
-    Entry { name: "setcar", kind: Kind::Function, sig: "(setcar CELL VALUE)", doc: "Set the car of CELL to VALUE." },
-    Entry { name: "setcdr", kind: Kind::Function, sig: "(setcdr CELL VALUE)", doc: "Set the cdr of CELL to VALUE." },
-    Entry { name: "list", kind: Kind::Function, sig: "(list &rest OBJECTS)", doc: "Return a newly created list of OBJECTS." },
-    Entry { name: "append", kind: Kind::Function, sig: "(append &rest SEQUENCES)", doc: "Concatenate lists into one." },
-    Entry { name: "reverse", kind: Kind::Function, sig: "(reverse SEQUENCE)", doc: "Return a reversed copy of SEQUENCE." },
-    Entry { name: "length", kind: Kind::Function, sig: "(length SEQUENCE)", doc: "Return the length of SEQUENCE." },
-    Entry { name: "nth", kind: Kind::Function, sig: "(nth N LIST)", doc: "Return the Nth element of LIST." },
-    Entry { name: "vector", kind: Kind::Function, sig: "(vector &rest OBJECTS)", doc: "Return a vector of OBJECTS." },
-    Entry { name: "make-vector", kind: Kind::Function, sig: "(make-vector LENGTH INIT)", doc: "Return a vector of LENGTH elements, all INIT." },
-    Entry { name: "aref", kind: Kind::Function, sig: "(aref ARRAY IDX)", doc: "Return the IDX'th element of ARRAY." },
-    Entry { name: "aset", kind: Kind::Function, sig: "(aset ARRAY IDX VALUE)", doc: "Set the IDX'th element of ARRAY to VALUE." },
-    Entry { name: "symbol-name", kind: Kind::Function, sig: "(symbol-name SYMBOL)", doc: "Return SYMBOL's name as a string." },
-    Entry { name: "intern", kind: Kind::Function, sig: "(intern NAME)", doc: "Return the interned symbol named NAME." },
-    Entry { name: "make-symbol", kind: Kind::Function, sig: "(make-symbol NAME)", doc: "Return a fresh symbol named NAME." },
-    Entry { name: "set", kind: Kind::Function, sig: "(set SYMBOL VALUE)", doc: "Set SYMBOL's value cell to VALUE." },
-    Entry { name: "symbol-value", kind: Kind::Function, sig: "(symbol-value SYMBOL)", doc: "Return SYMBOL's value." },
-    Entry { name: "funcall", kind: Kind::Function, sig: "(funcall FUNCTION &rest ARGS)", doc: "Call FUNCTION with ARGS." },
-    Entry { name: "apply", kind: Kind::Function, sig: "(apply FUNCTION &rest ARGS LIST)", doc: "Call FUNCTION with ARGS and the elements of LIST." },
-    Entry { name: "identity", kind: Kind::Function, sig: "(identity ARG)", doc: "Return ARG unchanged." },
-    Entry { name: "concat", kind: Kind::Function, sig: "(concat &rest STRINGS)", doc: "Concatenate STRINGS into one string." },
-    Entry { name: "format", kind: Kind::Function, sig: "(format STRING &rest ARGS)", doc: "Format ARGS per the %-directives in STRING." },
-    Entry { name: "message", kind: Kind::Function, sig: "(message FORMAT &rest ARGS)", doc: "Print a formatted message (to stderr)." },
-    Entry { name: "princ", kind: Kind::Function, sig: "(princ OBJECT)", doc: "Output OBJECT (no quoting)." },
-    Entry { name: "prin1", kind: Kind::Function, sig: "(prin1 OBJECT)", doc: "Output OBJECT in read syntax." },
-    Entry { name: "number-to-string", kind: Kind::Function, sig: "(number-to-string NUMBER)", doc: "Return NUMBER rendered as a string." },
+    Entry {
+        name: "+",
+        kind: Kind::Function,
+        sig: "(+ &rest NUMBERS)",
+        doc: "Sum of the arguments.",
+    },
+    Entry {
+        name: "-",
+        kind: Kind::Function,
+        sig: "(- &rest NUMBERS)",
+        doc: "Negation, or subtraction from the first.",
+    },
+    Entry {
+        name: "*",
+        kind: Kind::Function,
+        sig: "(* &rest NUMBERS)",
+        doc: "Product of the arguments.",
+    },
+    Entry {
+        name: "/",
+        kind: Kind::Function,
+        sig: "(/ DIVIDEND &rest DIVISORS)",
+        doc: "Quotient of the arguments.",
+    },
+    Entry {
+        name: "%",
+        kind: Kind::Function,
+        sig: "(% X Y)",
+        doc: "Integer remainder of X divided by Y.",
+    },
+    Entry {
+        name: "1+",
+        kind: Kind::Function,
+        sig: "(1+ NUMBER)",
+        doc: "NUMBER plus one.",
+    },
+    Entry {
+        name: "1-",
+        kind: Kind::Function,
+        sig: "(1- NUMBER)",
+        doc: "NUMBER minus one.",
+    },
+    Entry {
+        name: "=",
+        kind: Kind::Function,
+        sig: "(= &rest NUMBERS)",
+        doc: "Non-nil if all numbers are equal.",
+    },
+    Entry {
+        name: "<",
+        kind: Kind::Function,
+        sig: "(< &rest NUMBERS)",
+        doc: "Non-nil if numbers strictly increase.",
+    },
+    Entry {
+        name: ">",
+        kind: Kind::Function,
+        sig: "(> &rest NUMBERS)",
+        doc: "Non-nil if numbers strictly decrease.",
+    },
+    Entry {
+        name: "<=",
+        kind: Kind::Function,
+        sig: "(<= &rest NUMBERS)",
+        doc: "Non-nil if numbers are non-decreasing.",
+    },
+    Entry {
+        name: ">=",
+        kind: Kind::Function,
+        sig: "(>= &rest NUMBERS)",
+        doc: "Non-nil if numbers are non-increasing.",
+    },
+    Entry {
+        name: "eq",
+        kind: Kind::Function,
+        sig: "(eq A B)",
+        doc: "Non-nil if A and B are the same object.",
+    },
+    Entry {
+        name: "eql",
+        kind: Kind::Function,
+        sig: "(eql A B)",
+        doc: "Like eq, but compares numbers by value.",
+    },
+    Entry {
+        name: "equal",
+        kind: Kind::Function,
+        sig: "(equal A B)",
+        doc: "Non-nil if A and B are structurally equal.",
+    },
+    Entry {
+        name: "null",
+        kind: Kind::Function,
+        sig: "(null OBJECT)",
+        doc: "Non-nil if OBJECT is nil.",
+    },
+    Entry {
+        name: "not",
+        kind: Kind::Function,
+        sig: "(not OBJECT)",
+        doc: "Non-nil if OBJECT is nil.",
+    },
+    Entry {
+        name: "consp",
+        kind: Kind::Function,
+        sig: "(consp OBJECT)",
+        doc: "Non-nil if OBJECT is a cons cell.",
+    },
+    Entry {
+        name: "listp",
+        kind: Kind::Function,
+        sig: "(listp OBJECT)",
+        doc: "Non-nil if OBJECT is a list (cons or nil).",
+    },
+    Entry {
+        name: "atom",
+        kind: Kind::Function,
+        sig: "(atom OBJECT)",
+        doc: "Non-nil if OBJECT is not a cons cell.",
+    },
+    Entry {
+        name: "symbolp",
+        kind: Kind::Function,
+        sig: "(symbolp OBJECT)",
+        doc: "Non-nil if OBJECT is a symbol.",
+    },
+    Entry {
+        name: "stringp",
+        kind: Kind::Function,
+        sig: "(stringp OBJECT)",
+        doc: "Non-nil if OBJECT is a string.",
+    },
+    Entry {
+        name: "numberp",
+        kind: Kind::Function,
+        sig: "(numberp OBJECT)",
+        doc: "Non-nil if OBJECT is a number.",
+    },
+    Entry {
+        name: "integerp",
+        kind: Kind::Function,
+        sig: "(integerp OBJECT)",
+        doc: "Non-nil if OBJECT is an integer.",
+    },
+    Entry {
+        name: "floatp",
+        kind: Kind::Function,
+        sig: "(floatp OBJECT)",
+        doc: "Non-nil if OBJECT is a float.",
+    },
+    Entry {
+        name: "vectorp",
+        kind: Kind::Function,
+        sig: "(vectorp OBJECT)",
+        doc: "Non-nil if OBJECT is a vector.",
+    },
+    Entry {
+        name: "zerop",
+        kind: Kind::Function,
+        sig: "(zerop NUMBER)",
+        doc: "Non-nil if NUMBER is zero.",
+    },
+    Entry {
+        name: "cons",
+        kind: Kind::Function,
+        sig: "(cons CAR CDR)",
+        doc: "Create a new cons cell.",
+    },
+    Entry {
+        name: "car",
+        kind: Kind::Function,
+        sig: "(car LIST)",
+        doc: "Return the first element of LIST.",
+    },
+    Entry {
+        name: "cdr",
+        kind: Kind::Function,
+        sig: "(cdr LIST)",
+        doc: "Return the rest of LIST after the first element.",
+    },
+    Entry {
+        name: "setcar",
+        kind: Kind::Function,
+        sig: "(setcar CELL VALUE)",
+        doc: "Set the car of CELL to VALUE.",
+    },
+    Entry {
+        name: "setcdr",
+        kind: Kind::Function,
+        sig: "(setcdr CELL VALUE)",
+        doc: "Set the cdr of CELL to VALUE.",
+    },
+    Entry {
+        name: "list",
+        kind: Kind::Function,
+        sig: "(list &rest OBJECTS)",
+        doc: "Return a newly created list of OBJECTS.",
+    },
+    Entry {
+        name: "append",
+        kind: Kind::Function,
+        sig: "(append &rest SEQUENCES)",
+        doc: "Concatenate lists into one.",
+    },
+    Entry {
+        name: "reverse",
+        kind: Kind::Function,
+        sig: "(reverse SEQUENCE)",
+        doc: "Return a reversed copy of SEQUENCE.",
+    },
+    Entry {
+        name: "length",
+        kind: Kind::Function,
+        sig: "(length SEQUENCE)",
+        doc: "Return the length of SEQUENCE.",
+    },
+    Entry {
+        name: "nth",
+        kind: Kind::Function,
+        sig: "(nth N LIST)",
+        doc: "Return the Nth element of LIST.",
+    },
+    Entry {
+        name: "vector",
+        kind: Kind::Function,
+        sig: "(vector &rest OBJECTS)",
+        doc: "Return a vector of OBJECTS.",
+    },
+    Entry {
+        name: "make-vector",
+        kind: Kind::Function,
+        sig: "(make-vector LENGTH INIT)",
+        doc: "Return a vector of LENGTH elements, all INIT.",
+    },
+    Entry {
+        name: "aref",
+        kind: Kind::Function,
+        sig: "(aref ARRAY IDX)",
+        doc: "Return the IDX'th element of ARRAY.",
+    },
+    Entry {
+        name: "aset",
+        kind: Kind::Function,
+        sig: "(aset ARRAY IDX VALUE)",
+        doc: "Set the IDX'th element of ARRAY to VALUE.",
+    },
+    Entry {
+        name: "symbol-name",
+        kind: Kind::Function,
+        sig: "(symbol-name SYMBOL)",
+        doc: "Return SYMBOL's name as a string.",
+    },
+    Entry {
+        name: "intern",
+        kind: Kind::Function,
+        sig: "(intern NAME)",
+        doc: "Return the interned symbol named NAME.",
+    },
+    Entry {
+        name: "make-symbol",
+        kind: Kind::Function,
+        sig: "(make-symbol NAME)",
+        doc: "Return a fresh symbol named NAME.",
+    },
+    Entry {
+        name: "set",
+        kind: Kind::Function,
+        sig: "(set SYMBOL VALUE)",
+        doc: "Set SYMBOL's value cell to VALUE.",
+    },
+    Entry {
+        name: "symbol-value",
+        kind: Kind::Function,
+        sig: "(symbol-value SYMBOL)",
+        doc: "Return SYMBOL's value.",
+    },
+    Entry {
+        name: "funcall",
+        kind: Kind::Function,
+        sig: "(funcall FUNCTION &rest ARGS)",
+        doc: "Call FUNCTION with ARGS.",
+    },
+    Entry {
+        name: "apply",
+        kind: Kind::Function,
+        sig: "(apply FUNCTION &rest ARGS LIST)",
+        doc: "Call FUNCTION with ARGS and the elements of LIST.",
+    },
+    Entry {
+        name: "identity",
+        kind: Kind::Function,
+        sig: "(identity ARG)",
+        doc: "Return ARG unchanged.",
+    },
+    Entry {
+        name: "concat",
+        kind: Kind::Function,
+        sig: "(concat &rest STRINGS)",
+        doc: "Concatenate STRINGS into one string.",
+    },
+    Entry {
+        name: "format",
+        kind: Kind::Function,
+        sig: "(format STRING &rest ARGS)",
+        doc: "Format ARGS per the %-directives in STRING.",
+    },
+    Entry {
+        name: "message",
+        kind: Kind::Function,
+        sig: "(message FORMAT &rest ARGS)",
+        doc: "Print a formatted message (to stderr).",
+    },
+    Entry {
+        name: "princ",
+        kind: Kind::Function,
+        sig: "(princ OBJECT)",
+        doc: "Output OBJECT (no quoting).",
+    },
+    Entry {
+        name: "prin1",
+        kind: Kind::Function,
+        sig: "(prin1 OBJECT)",
+        doc: "Output OBJECT in read syntax.",
+    },
+    Entry {
+        name: "number-to-string",
+        kind: Kind::Function,
+        sig: "(number-to-string NUMBER)",
+        doc: "Return NUMBER rendered as a string.",
+    },
 ];
 
 fn lookup(name: &str) -> Option<&'static Entry> {
@@ -206,7 +571,11 @@ fn main_loop(c: &Connection) -> Result<(), Box<dyn std::error::Error + Sync + Se
 }
 
 fn ok_response(id: RequestId, value: serde_json::Value) -> Response {
-    Response { id, result: Some(value), error: None }
+    Response {
+        id,
+        result: Some(value),
+        error: None,
+    }
 }
 
 fn handle_request(req: &Request, docs: &HashMap<String, String>) -> Response {
@@ -227,8 +596,9 @@ fn handle_request(req: &Request, docs: &HashMap<String, String>) -> Response {
             let p: Result<lsp_types::DocumentSymbolParams, _> =
                 serde_json::from_value(req.params.clone());
             p.ok().and_then(|p| {
-                docs.get(&uri_key(&p.text_document.uri))
-                    .map(|t| serde_json::to_value(document_symbols(&p.text_document.uri, t)).unwrap())
+                docs.get(&uri_key(&p.text_document.uri)).map(|t| {
+                    serde_json::to_value(document_symbols(&p.text_document.uri, t)).unwrap()
+                })
             })
         }
         SignatureHelpRequest::METHOD => {
@@ -252,11 +622,16 @@ fn publish(
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let diags = diagnostics(text);
-    let params = PublishDiagnosticsParams { uri: uri.clone(), diagnostics: diags, version: None };
-    c.sender.send(Message::Notification(lsp_server::Notification {
-        method: PublishDiagnostics::METHOD.to_string(),
-        params: serde_json::to_value(params)?,
-    }))?;
+    let params = PublishDiagnosticsParams {
+        uri: uri.clone(),
+        diagnostics: diags,
+        version: None,
+    };
+    c.sender
+        .send(Message::Notification(lsp_server::Notification {
+            method: PublishDiagnostics::METHOD.to_string(),
+            params: serde_json::to_value(params)?,
+        }))?;
     Ok(())
 }
 
@@ -281,10 +656,16 @@ impl LineIndex {
             Ok(l) => l,
             Err(l) => l - 1,
         };
-        Position { line: line as u32, character: (offset - self.line_starts[line]) as u32 }
+        Position {
+            line: line as u32,
+            character: (offset - self.line_starts[line]) as u32,
+        }
     }
     fn range(&self, start: usize, end: usize) -> Range {
-        Range { start: self.position(start), end: self.position(end) }
+        Range {
+            start: self.position(start),
+            end: self.position(end),
+        }
     }
 }
 
@@ -329,7 +710,11 @@ fn diagnostics(text: &str) -> Vec<Diagnostic> {
             }
             '?' => {
                 // char literal: skip the (possibly escaped) next char
-                i += if chars.get(i + 1) == Some(&'\\') { 3 } else { 2 };
+                i += if chars.get(i + 1) == Some(&'\\') {
+                    3
+                } else {
+                    2
+                };
                 continue;
             }
             '(' => stack.push(i),
@@ -339,14 +724,20 @@ fn diagnostics(text: &str) -> Vec<Diagnostic> {
                 }
             }
             '`' | ',' => {
-                out.push(diag(idx.range(i, i + 1), "backquote/unquote not supported yet"));
+                out.push(diag(
+                    idx.range(i, i + 1),
+                    "backquote/unquote not supported yet",
+                ));
             }
             _ => {}
         }
         i += 1;
     }
     for open in stack {
-        out.push(diag(idx.range(open, open + 1), "unclosed `(` — missing `)`"));
+        out.push(diag(
+            idx.range(open, open + 1),
+            "unclosed `(` — missing `)`",
+        ));
     }
     out
 }
@@ -427,7 +818,10 @@ fn hover(text: &str, pos: Position) -> Option<Hover> {
     let e = lookup(&tok)?;
     let md = format!("```elisp\n{}\n```\n\n{}", e.sig, e.doc);
     Some(Hover {
-        contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value: md }),
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: md,
+        }),
         range: None,
     })
 }
@@ -495,7 +889,10 @@ fn document_symbols(uri: &Uri, text: &str) -> Vec<SymbolInformation> {
                             kind,
                             tags: None,
                             deprecated: None,
-                            location: lsp_types::Location { uri: uri.clone(), range: idx.range(j, end) },
+                            location: lsp_types::Location {
+                                uri: uri.clone(),
+                                range: idx.range(j, end),
+                            },
                             container_name: None,
                         });
                     }

@@ -40,21 +40,21 @@ class ElisprsSettingsTest {
     }
 
     @Test fun `isSupportedFile matches by extension`() {
-        val s = fresh("vim")
-        assertTrue(s.isSupportedFile("plugin.vim", "vim"))
-        assertTrue(s.isSupportedFile("init.vim", "vim"))
+        val s = fresh("el")
+        assertTrue(s.isSupportedFile("greet.el", "el"))
+        assertTrue(s.isSupportedFile("init.el", "el"))
         assertFalse(s.isSupportedFile("readme.md", "md"))
     }
 
-    @Test fun `isSupportedFile recognizes vimrc family without extension`() {
-        val s = fresh("vim")
-        for (name in listOf("vimrc", ".vimrc", "_vimrc", "gvimrc", ".gvimrc", "_gvimrc", ".exrc", "_exrc", ".nvimrc")) {
+    @Test fun `isSupportedFile recognizes Emacs init dotfiles without extension`() {
+        val s = fresh("el")
+        for (name in listOf(".emacs", "_emacs", ".gnus", ".spacemacs", ".viper")) {
             assertTrue("$name should be supported", s.isSupportedFile(name, null))
         }
     }
 
     @Test fun `isSupportedFile rejects unrelated dotfiles`() {
-        val s = fresh("vim")
+        val s = fresh("el")
         assertFalse(s.isSupportedFile(".bashrc", null))
         assertFalse(s.isSupportedFile(".zshrc", null))
         assertFalse(s.isSupportedFile(".profile", null))

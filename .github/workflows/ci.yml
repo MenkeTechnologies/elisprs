@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# elisprs is a pure fusevm frontend: it lowers elisp to fusevm bytecode and runs
+# it on fusevm::VM (no bespoke VM/JIT of its own). Its Cargo.toml depends on
+# fusevm by path (`../fusevm`) because elisprs tracks fusevm's tip — it uses VM
+# API (e.g. `Value::Obj` heap handles) that is not in a published fusevm release
+# yet. So every job checks out the sibling fusevm repo next to this one, making
+# `../fusevm` resolve in CI exactly as it does locally.
+jobs:
+  lint:
+    name: Lint (fmt, clippy, doc)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout elisprs
+        uses: actions/checkout@v4
+        with:
+          path: elisprs
+      - name: Checkout fusevm (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: MenkeTechnologies/fusevm
+          path: fusevm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: elisprs
+      - run: cargo fmt --all --check
+        working-directory: elisprs
+      - run: cargo clippy --all-targets --locked -- -D warnings
+        working-directory: elisprs
+      - run: cargo doc --no-deps --locked
+        working-directory: elisprs
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout elisprs
+        uses: actions/checkout@v4
+        with:
+          path: elisprs
+      - name: Checkout fusevm (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: MenkeTechnologies/fusevm
+          path: fusevm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: elisprs
+      - run: cargo build --locked --verbose
+        working-directory: elisprs
+      - run: cargo test --locked --verbose
+        working-directory: elisprs

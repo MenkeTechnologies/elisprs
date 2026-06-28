@@ -8,35 +8,25 @@ import com.intellij.openapi.options.colors.ColorSettingsPage
 import javax.swing.Icon
 
 class ElisprsColorSettingsPage : ColorSettingsPage {
+    // Only the categories the Emacs Lisp lexer actually emits get a slot. (Other
+    // keys remain defined in [ElisprsColors] for the highlighter's fallbacks.)
     private val attrs = arrayOf(
-        AttributesDescriptor("Comments//Line comment (\")", ElisprsColors.COMMENT),
-        AttributesDescriptor("Comments//Shebang (#!)", ElisprsColors.SHEBANG),
+        AttributesDescriptor("Comments//Line comment (;)", ElisprsColors.COMMENT),
         AttributesDescriptor("Strings//Double-quoted (\"…\")", ElisprsColors.STRING_DQ),
-        AttributesDescriptor("Strings//Single-quoted ('…')", ElisprsColors.STRING_SQ),
-        AttributesDescriptor("Numbers//Integer / float / hex", ElisprsColors.NUMBER),
+        AttributesDescriptor("Numbers//Integer / float / char / radix", ElisprsColors.NUMBER),
 
-        AttributesDescriptor("Keywords//Statement / control (if/function/let/try)", ElisprsColors.KEYWORD),
-        AttributesDescriptor("Keywords//Ex command (set/autocmd/nnoremap/syntax)", ElisprsColors.COMMAND),
+        AttributesDescriptor("Keywords//Special form (defun/let/if/lambda)", ElisprsColors.KEYWORD),
 
-        AttributesDescriptor("Names//Builtin function (len/has/printf)", ElisprsColors.BUILTIN_FUNCTION),
-        AttributesDescriptor("Names//Function declaration / autoload", ElisprsColors.FUNCTION_DECL),
+        AttributesDescriptor("Names//Builtin subr (car/cons/+)", ElisprsColors.BUILTIN_FUNCTION),
+        AttributesDescriptor("Names//Definition name (defun/defvar)", ElisprsColors.FUNCTION_DECL),
         AttributesDescriptor("Names//Identifier", ElisprsColors.IDENTIFIER),
 
-        AttributesDescriptor("Variables//Scope-prefixed (g: s: b: l: a:)", ElisprsColors.SCOPE_VAR),
-        AttributesDescriptor("Variables//Special (v:true v:count v:shell_error)", ElisprsColors.SPECIAL_VAR),
-        AttributesDescriptor("Variables//Option (&name &l:name)", ElisprsColors.OPTION),
-        AttributesDescriptor("Variables//Environment (\$NAME)", ElisprsColors.ENV_VAR),
-        AttributesDescriptor("Variables//Register (@x)", ElisprsColors.REGISTER),
+        AttributesDescriptor("Constants//Keyword / t / nil (:foo t nil)", ElisprsColors.SPECIAL_VAR),
 
-        AttributesDescriptor("Operators//Generic operator", ElisprsColors.OPERATOR),
-        AttributesDescriptor("Operators//Assignment (= += -= .=)", ElisprsColors.ASSIGN_OP),
-        AttributesDescriptor("Operators//Bar (|)", ElisprsColors.BAR),
-        AttributesDescriptor("Operators//Line continuation (\\)", ElisprsColors.LINE_CONTINUATION),
+        AttributesDescriptor("Operators//Reader prefix (' ` , #')", ElisprsColors.OPERATOR),
 
         AttributesDescriptor("Punctuation//Parentheses ( )", ElisprsColors.PAREN),
-        AttributesDescriptor("Punctuation//Braces { }", ElisprsColors.BRACE),
-        AttributesDescriptor("Punctuation//Brackets [ ]", ElisprsColors.BRACKET),
-        AttributesDescriptor("Punctuation//Comma", ElisprsColors.COMMA),
+        AttributesDescriptor("Punctuation//Vector brackets [ ]", ElisprsColors.BRACKET),
 
         AttributesDescriptor("Errors//Bad character", ElisprsColors.BAD_CHAR),
     )
@@ -50,61 +40,31 @@ class ElisprsColorSettingsPage : ColorSettingsPage {
     override fun getDisplayName(): String = "elisprs"
 
     companion object {
-        // Every grammar/syntax category appears at least once so each color
-        // slot has a live preview in Settings → Editor → Color Scheme → elisprs.
+        // Every emitted token category appears at least once so each color slot
+        // has a live preview in Settings → Editor → Color Scheme → elisprs.
         private val DEMO = """
-            #!/usr/bin/env elisprs
-            " demo.vim — every token category for color tweaking.
-            " A leading double-quote begins a comment to end-of-line.
+            ;;; demo.el --- every token category  -*- lexical-binding: t; -*-
+            ;; A leading semicolon begins a comment to end-of-line.
 
-            " ── options + settings ──
-            set number expandtab shiftwidth=4
-            setlocal textwidth=80
-            let &l:foldlevel = 2
+            (defvar my-count 0
+              "A demo variable.")
 
-            " ── declarations + scope vars + specials ──
-            let g:loaded_demo = v:true
-            let s:cache = {}
-            let b:counter = 0x1F
-            const PI = 3.14159
+            (defconst my-pi 3.14159)
 
-            " ── function declaration + builtins + env + register ──
-            function! s:Greet(name) abort
-                let l:msg = printf("hello, %s (pid=%d)", a:name, getpid())
-                echomsg l:msg
-                let @a = $HOME .. '/.vimrc'
-                if has('nvim') && len(l:msg) > 0
-                    return v:true
-                endif
-                return v:false
-            endfunction
+            (defun greet (name &optional loud)
+              "Say hello to NAME; shout when LOUD."
+              (let ((msg (format "hello, %s (#%d)" name (1+ my-count)))
+                    (tag :greeting))
+                (when (and loud (> (length name) 0))
+                  (setq msg (upcase msg)))
+                (message "%s" msg)
+                (if loud t nil)))
 
-            " ── for / while / try ──
-            for item in range(1, 10)
-                call s:Greet('world ' .. item)
-            endfor
+            (dolist (who '("a" "b" "c"))
+              (greet who))
 
-            while line('.') < 100 && !empty(getline('.'))
-                normal! j
-            endwhile
-
-            try
-                source ~/.vim/extra.vim
-            catch /E484/
-                echoerr 'cannot open file: ' .. v:exception
-            finally
-                echo 'done'
-            endtry
-
-            " ── autoload call + mappings + autocmd ──
-            call plug#begin('~/.vim/plugged')
-            nnoremap <silent> <leader>w :write<CR>
-            augroup demo
-                autocmd!
-                autocmd BufWritePre *.vim call s:Greet('save')
-            augroup END
-
-            highlight Comment ctermfg=green guifg=#5f8700
+            (aref [?A ?B ?C] 0)
+            (mapcar #'greet (vector "x" "y"))
         """.trimIndent()
     }
 }

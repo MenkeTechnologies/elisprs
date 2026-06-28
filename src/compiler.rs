@@ -98,8 +98,13 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
         Some("defun") => compile_defun(h, b, &elems, false)?,
         Some("defmacro") => compile_defun(h, b, &elems, true)?,
         Some("defvar") | Some("defconst") => compile_defvar(h, b, &elems)?,
+        Some("catch") => compile_catch(h, b, &elems)?,
+        Some("unwind-protect") => compile_unwind(h, b, &elems)?,
+        Some("condition-case") => compile_condition_case(h, b, &elems)?,
         Some(kw) if is_unsupported_special(kw) => {
-            return Err(format!("special form `{kw}` not yet lowered (nonlocal-exit milestone)"));
+            return Err(format!(
+                "special form `{kw}` not yet lowered (buffer milestone)"
+            ));
         }
         _ => {
             // function call
@@ -118,7 +123,63 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
 }
 
 fn is_unsupported_special(kw: &str) -> bool {
-    matches!(kw, "condition-case" | "unwind-protect" | "catch" | "throw" | "save-excursion")
+    matches!(
+        kw,
+        "save-excursion" | "save-current-buffer" | "save-restriction"
+    )
+}
+
+// ── nonlocal-exit lowering: rewrite to intrinsic calls with lambda thunks ──
+
+fn lambda_of(h: &mut ElispHost, body: &[Value]) -> Value {
+    let mut items = vec![h.intern("lambda"), Value::Undef]; // (lambda () body...)
+    items.extend_from_slice(body);
+    h.list_from(items)
+}
+fn call_of(h: &mut ElispHost, name: &str, args: Vec<Value>) -> Value {
+    let mut items = vec![h.intern(name)];
+    items.extend(args);
+    h.list_from(items)
+}
+fn quote_of(h: &mut ElispHost, v: Value) -> Value {
+    let q = h.intern("quote");
+    h.list_from(vec![q, v])
+}
+
+fn compile_catch(h: &mut ElispHost, b: &mut ChunkBuilder, elems: &[Value]) -> Result<(), String> {
+    let tag = elems.get(1).cloned().unwrap_or(Value::Undef);
+    let thunk = lambda_of(h, elems.get(2..).unwrap_or(&[]));
+    let form = call_of(h, "--catch--", vec![tag, thunk]);
+    compile_form(h, b, &form)
+}
+
+fn compile_unwind(h: &mut ElispHost, b: &mut ChunkBuilder, elems: &[Value]) -> Result<(), String> {
+    let body_form = elems.get(1).cloned().unwrap_or(Value::Undef);
+    let body = lambda_of(h, &[body_form]);
+    let cleanup = lambda_of(h, elems.get(2..).unwrap_or(&[]));
+    let form = call_of(h, "--unwind--", vec![body, cleanup]);
+    compile_form(h, b, &form)
+}
+
+fn compile_condition_case(
+    h: &mut ElispHost,
+    b: &mut ChunkBuilder,
+    elems: &[Value],
+) -> Result<(), String> {
+    let var = elems.get(1).cloned().unwrap_or(Value::Undef);
+    let body_form = elems.get(2).cloned().unwrap_or(Value::Undef);
+    let body = lambda_of(h, &[body_form]);
+    let mut pairs = Vec::new();
+    for hc in elems.get(3..).unwrap_or(&[]) {
+        let parts = h.list_vec(hc).ok_or("condition-case: malformed handler")?;
+        let cond = quote_of(h, parts.first().cloned().unwrap_or(Value::Undef));
+        let hthunk = lambda_of(h, parts.get(1..).unwrap_or(&[]));
+        pairs.push(call_of(h, "list", vec![cond, hthunk]));
+    }
+    let handlers_form = call_of(h, "list", pairs);
+    let qvar = quote_of(h, var);
+    let form = call_of(h, "--condition-case--", vec![qvar, body, handlers_form]);
+    compile_form(h, b, &form)
 }
 
 fn compile_body_chunk(h: &mut ElispHost, forms: &[Value]) -> Result<Chunk, String> {
@@ -136,7 +197,11 @@ fn compile_lambda(
     let arglist = elems.get(1).cloned().unwrap_or(Value::Undef);
     let params = h.parse_params(&arglist)?;
     let body = compile_body_chunk(h, elems.get(2..).unwrap_or(&[]))?;
-    let clo = h.alloc(Obj::Closure { params: Rc::new(params), body: Rc::new(body), is_macro });
+    let clo = h.alloc(Obj::Closure {
+        params: Rc::new(params),
+        body: Rc::new(body),
+        is_macro,
+    });
     load_const(b, clo);
     Ok(())
 }
@@ -154,7 +219,11 @@ fn compile_defun(
     let arglist = elems.get(2).cloned().unwrap_or(Value::Undef);
     let params = h.parse_params(&arglist)?;
     let body = compile_body_chunk(h, elems.get(3..).unwrap_or(&[]))?;
-    let clo = h.alloc(Obj::Closure { params: Rc::new(params), body: Rc::new(body), is_macro });
+    let clo = h.alloc(Obj::Closure {
+        params: Rc::new(params),
+        body: Rc::new(body),
+        is_macro,
+    });
     load_const(b, name); // symbol
     load_const(b, clo); // definition
     b.emit(Op::Extended(ops::FSET, 0), 0); // sets function cell, leaves the symbol
@@ -192,9 +261,13 @@ fn compile_let(
     elems: &[Value],
     sequential: bool,
 ) -> Result<(), String> {
-    let bindings = h.list_vec(elems.first().unwrap_or(&Value::Undef)).unwrap_or_default();
-    let parsed: Vec<(Value, Value)> =
-        bindings.iter().map(|bd| parse_binding(h, bd)).collect::<Result<_, _>>()?;
+    let bindings = h
+        .list_vec(elems.first().unwrap_or(&Value::Undef))
+        .unwrap_or_default();
+    let parsed: Vec<(Value, Value)> = bindings
+        .iter()
+        .map(|bd| parse_binding(h, bd))
+        .collect::<Result<_, _>>()?;
     let n = parsed.len();
     if sequential {
         // let*: bind each before evaluating the next init

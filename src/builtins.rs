@@ -8,7 +8,11 @@ use fusevm::Value;
 type R = Result<Value, String>;
 
 fn nil_or(b: bool) -> Value {
-    if b { Value::Bool(true) } else { Value::Undef }
+    if b {
+        Value::Bool(true)
+    } else {
+        Value::Undef
+    }
 }
 fn is_nil(v: &Value) -> bool {
     matches!(v, Value::Undef | Value::Bool(false))
@@ -23,7 +27,11 @@ fn as_num(v: &Value) -> Result<(i64, f64, bool), String> {
     }
 }
 fn num_result(i: i64, f: f64, isf: bool) -> Value {
-    if isf { Value::Float(f) } else { Value::Int(i) }
+    if isf {
+        Value::Float(f)
+    } else {
+        Value::Int(i)
+    }
 }
 
 fn add(_h: &mut ElispHost, a: &[Value]) -> R {
@@ -52,7 +60,11 @@ fn sub(_h: &mut ElispHost, a: &[Value]) -> R {
     }
     let (i0, f0, mut isf) = as_num(&a[0])?;
     if a.len() == 1 {
-        return Ok(if isf { Value::Float(-f0) } else { Value::Int(-i0) });
+        return Ok(if isf {
+            Value::Float(-f0)
+        } else {
+            Value::Int(-i0)
+        });
     }
     let (mut i, mut f) = (i0, f0);
     for v in &a[1..] {
@@ -89,11 +101,19 @@ fn modulo(_h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn one_plus(_h: &mut ElispHost, a: &[Value]) -> R {
     let (i, f, isf) = as_num(&a[0])?;
-    Ok(if isf { Value::Float(f + 1.0) } else { Value::Int(i + 1) })
+    Ok(if isf {
+        Value::Float(f + 1.0)
+    } else {
+        Value::Int(i + 1)
+    })
 }
 fn one_minus(_h: &mut ElispHost, a: &[Value]) -> R {
     let (i, f, isf) = as_num(&a[0])?;
-    Ok(if isf { Value::Float(f - 1.0) } else { Value::Int(i - 1) })
+    Ok(if isf {
+        Value::Float(f - 1.0)
+    } else {
+        Value::Int(i - 1)
+    })
 }
 
 fn cmp(a: &[Value], pred: fn(f64, f64) -> bool) -> R {
@@ -169,14 +189,20 @@ fn car(h: &mut ElispHost, a: &[Value]) -> R {
     match h.obj(&a[0]) {
         Some(Obj::Cons(x, _)) => Ok(x.clone()),
         _ if is_nil(&a[0]) => Ok(Value::Undef),
-        _ => Err(format!("wrong-type-argument: listp {}", h.print(&a[0], true))),
+        _ => Err(format!(
+            "wrong-type-argument: listp {}",
+            h.print(&a[0], true)
+        )),
     }
 }
 fn cdr(h: &mut ElispHost, a: &[Value]) -> R {
     match h.obj(&a[0]) {
         Some(Obj::Cons(_, y)) => Ok(y.clone()),
         _ if is_nil(&a[0]) => Ok(Value::Undef),
-        _ => Err(format!("wrong-type-argument: listp {}", h.print(&a[0], true))),
+        _ => Err(format!(
+            "wrong-type-argument: listp {}",
+            h.print(&a[0], true)
+        )),
     }
 }
 fn setcar(h: &mut ElispHost, a: &[Value]) -> R {
@@ -224,7 +250,9 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
         Value::Undef => Ok(Value::Int(0)),
         Value::Obj(_) => match h.obj(&a[0]) {
             Some(Obj::Vector(items)) => Ok(Value::Int(items.len() as i64)),
-            _ => Ok(Value::Int(h.list_vec(&a[0]).map(|v| v.len()).unwrap_or(0) as i64)),
+            _ => Ok(Value::Int(
+                h.list_vec(&a[0]).map(|v| v.len()).unwrap_or(0) as i64
+            )),
         },
         _ => Err("wrong-type-argument: sequencep".to_string()),
     }
@@ -232,7 +260,11 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
 fn nth_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let n = as_num(&a[0])?.0;
     let v = h.list_vec(&a[1]).unwrap_or_default();
-    Ok(if n < 0 { Value::Undef } else { v.get(n as usize).cloned().unwrap_or(Value::Undef) })
+    Ok(if n < 0 {
+        Value::Undef
+    } else {
+        v.get(n as usize).cloned().unwrap_or(Value::Undef)
+    })
 }
 
 // ── predicates ──
@@ -243,7 +275,9 @@ fn consp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::Cons(..)))))
 }
 fn listp(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(is_nil(&a[0]) || matches!(h.obj(&a[0]), Some(Obj::Cons(..)))))
+    Ok(nil_or(
+        is_nil(&a[0]) || matches!(h.obj(&a[0]), Some(Obj::Cons(..))),
+    ))
 }
 fn atom(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(!matches!(h.obj(&a[0]), Some(Obj::Cons(..)))))
@@ -270,7 +304,9 @@ fn vectorp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::Vector(_)))))
 }
 fn zerop(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(matches!(a[0], Value::Int(0)) || matches!(a[0], Value::Float(f) if f == 0.0)))
+    Ok(nil_or(
+        matches!(a[0], Value::Int(0)) || matches!(a[0], Value::Float(f) if f == 0.0),
+    ))
 }
 
 // ── vectors ──
@@ -311,7 +347,9 @@ fn aset(h: &mut ElispHost, a: &[Value]) -> R {
 
 // ── symbols / cells ──
 fn symbol_name(h: &mut ElispHost, a: &[Value]) -> R {
-    h.sym_name(&a[0]).map(Value::str).ok_or("wrong-type-argument: symbolp".to_string())
+    h.sym_name(&a[0])
+        .map(Value::str)
+        .ok_or("wrong-type-argument: symbolp".to_string())
 }
 fn intern_fn(h: &mut ElispHost, a: &[Value]) -> R {
     match &a[0] {
@@ -333,6 +371,23 @@ fn symbol_value(h: &mut ElispHost, a: &[Value]) -> R {
 // plain subrs here.
 fn identity(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(a[0].clone())
+}
+
+// ── nonlocal exits ──
+// `throw` records the (tag, value) and aborts via the error channel; `catch`
+// (an intrinsic in host::call_function) intercepts it.
+fn throw_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    h.pending_throw = Some((a[0].clone(), a.get(1).cloned().unwrap_or(Value::Undef)));
+    Err("--throw--".to_string())
+}
+fn error_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let msg = el_format(h, a)?;
+    Err(format!("error: {msg}"))
+}
+fn signal_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let sym = h.sym_name(&a[0]).unwrap_or_else(|| "error".to_string());
+    let data = h.print(a.get(1).unwrap_or(&Value::Undef), true);
+    Err(format!("{sym}: {data}"))
 }
 
 // ── strings / format / IO ──
@@ -388,18 +443,25 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
                 ai += 1;
             }
             Some('x') => {
-                out.push_str(&format!("{:x}", as_num(a.get(ai).unwrap_or(&Value::Undef))?.0));
+                out.push_str(&format!(
+                    "{:x}",
+                    as_num(a.get(ai).unwrap_or(&Value::Undef))?.0
+                ));
                 ai += 1;
             }
             Some('c') => {
-                if let Some(ch) = char::from_u32(as_num(a.get(ai).unwrap_or(&Value::Undef))?.0 as u32)
+                if let Some(ch) =
+                    char::from_u32(as_num(a.get(ai).unwrap_or(&Value::Undef))?.0 as u32)
                 {
                     out.push(ch);
                 }
                 ai += 1;
             }
             Some('f') => {
-                out.push_str(&format!("{}", as_num(a.get(ai).unwrap_or(&Value::Undef))?.1));
+                out.push_str(&format!(
+                    "{}",
+                    as_num(a.get(ai).unwrap_or(&Value::Undef))?.1
+                ));
                 ai += 1;
             }
             Some(o) => {
@@ -493,6 +555,11 @@ pub fn install(h: &mut ElispHost) {
     s("symbol-value", 1, Some(1), symbol_value);
     // functional (funcall/apply/mapcar/mapc are handled in host::call_function)
     s("identity", 1, Some(1), identity);
+    // nonlocal exits (catch/unwind-protect/condition-case are compiler intrinsics)
+    s("throw", 2, Some(2), throw_fn);
+    s("error", 1, None, error_fn);
+    s("user-error", 1, None, error_fn);
+    s("signal", 2, Some(2), signal_fn);
     // strings / IO
     s("concat", 0, None, concat_fn);
     s("format", 1, None, format_fn);

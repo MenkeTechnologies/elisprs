@@ -14,7 +14,7 @@
 //! re-entrant entry point and only ever borrows the host for short, nested-free
 //! operations.
 
-use fusevm::{Chunk, Value, VMResult, VM};
+use fusevm::{Chunk, VMResult, Value, VM};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -51,14 +51,32 @@ pub enum Obj {
     Cons(Value, Value),
     Symbol(SymbolData),
     Vector(Vec<Value>),
-    Subr { name: String, min: usize, max: Option<usize>, f: SubrFn },
-    Closure { params: Rc<Params>, body: Rc<Chunk>, is_macro: bool },
+    Subr {
+        name: String,
+        min: usize,
+        max: Option<usize>,
+        f: SubrFn,
+    },
+    Closure {
+        params: Rc<Params>,
+        body: Rc<Chunk>,
+        is_macro: bool,
+    },
 }
 
 /// Resolution of a function designator to something callable.
 pub enum Resolved {
-    Subr { f: SubrFn, min: usize, max: Option<usize>, name: String },
-    Closure { params: Rc<Params>, body: Rc<Chunk>, is_macro: bool },
+    Subr {
+        f: SubrFn,
+        min: usize,
+        max: Option<usize>,
+        name: String,
+    },
+    Closure {
+        params: Rc<Params>,
+        body: Rc<Chunk>,
+        is_macro: bool,
+    },
 }
 
 pub struct ElispHost {
@@ -199,7 +217,12 @@ impl ElispHost {
         let _ = self.set_function_value(&v, def);
     }
     pub fn defsubr(&mut self, name: &str, min: usize, max: Option<usize>, f: SubrFn) {
-        let subr = self.alloc(Obj::Subr { name: name.to_string(), min, max, f });
+        let subr = self.alloc(Obj::Subr {
+            name: name.to_string(),
+            min,
+            max,
+            f,
+        });
         self.set_function(name, subr);
     }
     pub fn is_bound(&self, v: &Value) -> bool {
@@ -215,7 +238,11 @@ impl ElispHost {
     }
     pub fn specbind(&mut self, sym: &Value, val: Value) -> Result<(), String> {
         let id = self.sym_handle(sym).ok_or("cannot bind a non-symbol")?;
-        let old = if let Obj::Symbol(s) = &self.arena[id as usize] { s.value.clone() } else { None };
+        let old = if let Obj::Symbol(s) = &self.arena[id as usize] {
+            s.value.clone()
+        } else {
+            None
+        };
         self.specstack.push((id, old));
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.value = Some(val);
@@ -261,7 +288,11 @@ impl ElispHost {
     /// Parse a lambda list form into structured params (interning the symbols).
     pub fn parse_params(&mut self, arglist: &Value) -> Result<Params, String> {
         let items = self.list_vec(arglist).ok_or("malformed lambda list")?;
-        let mut p = Params { required: vec![], optional: vec![], rest: None };
+        let mut p = Params {
+            required: vec![],
+            optional: vec![],
+            rest: None,
+        };
         let mut mode = 0u8;
         for it in items {
             let id = self.sym_handle(&it).ok_or("lambda list: expected symbol")?;
@@ -286,9 +317,18 @@ impl ElispHost {
         for _ in 0..64 {
             match self.obj(&cur) {
                 Some(Obj::Subr { f, min, max, name }) => {
-                    return Ok(Resolved::Subr { f: *f, min: *min, max: *max, name: name.clone() })
+                    return Ok(Resolved::Subr {
+                        f: *f,
+                        min: *min,
+                        max: *max,
+                        name: name.clone(),
+                    })
                 }
-                Some(Obj::Closure { params, body, is_macro }) => {
+                Some(Obj::Closure {
+                    params,
+                    body,
+                    is_macro,
+                }) => {
                     return Ok(Resolved::Closure {
                         params: params.clone(),
                         body: body.clone(),
@@ -336,7 +376,11 @@ impl ElispHost {
                 }
                 Some(Obj::Subr { name, .. }) => format!("#<subr {name}>"),
                 Some(Obj::Closure { is_macro, .. }) => {
-                    if *is_macro { "#<macro>".to_string() } else { "#<closure>".to_string() }
+                    if *is_macro {
+                        "#<macro>".to_string()
+                    } else {
+                        "#<closure>".to_string()
+                    }
                 }
                 None => "#<dangling>".to_string(),
             },
@@ -347,30 +391,25 @@ impl ElispHost {
         let mut out = String::from("(");
         let mut cur = v.clone();
         let mut first = true;
-        loop {
-            match self.obj(&cur) {
-                Some(Obj::Cons(a, d)) => {
-                    if !first {
-                        out.push(' ');
-                    }
-                    first = false;
-                    out.push_str(&self.print(a, readable));
-                    let next = d.clone();
-                    match next {
-                        Value::Undef => break,
-                        Value::Obj(id)
-                            if matches!(self.arena.get(id as usize), Some(Obj::Cons(..))) =>
-                        {
-                            cur = next;
-                        }
-                        _ => {
-                            out.push_str(" . ");
-                            out.push_str(&self.print(&next, readable));
-                            break;
-                        }
-                    }
+        while let Some(Obj::Cons(a, d)) = self.obj(&cur) {
+            if !first {
+                out.push(' ');
+            }
+            first = false;
+            out.push_str(&self.print(a, readable));
+            let next = d.clone();
+            match next {
+                Value::Undef => break,
+                Value::Obj(id)
+                    if matches!(self.arena.get(id as usize), Some(Obj::Cons(..))) =>
+                {
+                    cur = next;
                 }
-                _ => break,
+                _ => {
+                    out.push_str(" . ");
+                    out.push_str(&self.print(&next, readable));
+                    break;
+                }
             }
         }
         out.push(')');
@@ -379,6 +418,32 @@ impl ElispHost {
 
     pub fn take_error(&mut self) -> Option<String> {
         self.error.take()
+    }
+
+    /// `eq`-style identity comparison (used for `catch`/`throw` tags).
+    pub fn values_eq(&self, a: &Value, b: &Value) -> bool {
+        if !el_truthy(a) && !el_truthy(b) {
+            return true;
+        }
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+            (Value::Obj(x), Value::Obj(y)) => x == y,
+            (Value::Bool(true), Value::Bool(true)) => true,
+            _ => false,
+        }
+    }
+
+    /// Build the `(error-symbol "message")` object a `condition-case` handler
+    /// binds its variable to, from a rendered "symbol: message" error string.
+    pub fn make_error_object(&mut self, e: &str) -> Value {
+        let (sym, msg) = match e.split_once(':') {
+            Some((s, m)) => (s.trim().to_string(), m.trim().to_string()),
+            None => ("error".to_string(), e.to_string()),
+        };
+        let s = self.intern(&sym);
+        let m = Value::str(msg);
+        self.list_from(vec![s, m])
     }
 }
 
@@ -440,6 +505,11 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 }
                 return Ok(args[1].clone());
             }
+            // Nonlocal-exit intrinsics (the compiler rewrites catch/unwind-protect/
+            // condition-case into these, passing lambda thunks).
+            "--catch--" => return intrinsic_catch(args),
+            "--unwind--" => return intrinsic_unwind(args),
+            "--condition-case--" => return intrinsic_condition_case(args),
             _ => {}
         }
     }
@@ -452,7 +522,11 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             }
             with_host(|h| f(h, args))
         }
-        Resolved::Closure { params, body, is_macro } => {
+        Resolved::Closure {
+            params,
+            body,
+            is_macro,
+        } => {
             if is_macro {
                 return Err("macro called as a function (use it in a macro position)".to_string());
             }
@@ -480,9 +554,11 @@ pub fn macroexpand_1(form: &Value) -> Result<Option<Value>, String> {
             return None;
         }
         match h.resolve_function(&elems[0]) {
-            Ok(Resolved::Closure { params, body, is_macro: true }) => {
-                Some((params, body, elems[1..].to_vec()))
-            }
+            Ok(Resolved::Closure {
+                params,
+                body,
+                is_macro: true,
+            }) => Some((params, body, elems[1..].to_vec())),
             _ => None,
         }
     });
@@ -520,6 +596,83 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
     Ok(with_host(|h| h.list_from(out)))
 }
 
+/// `(catch TAG THUNK)` — run the thunk; if a `throw` to a matching tag unwinds
+/// out of it, return the thrown value; otherwise re-propagate.
+fn intrinsic_catch(args: &[Value]) -> Result<Value, String> {
+    let tag = args.first().cloned().unwrap_or(Value::Undef);
+    let thunk = args.get(1).cloned().unwrap_or(Value::Undef);
+    match call_function(&thunk, &[]) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let pend = with_host(|h| h.pending_throw.clone());
+            match pend {
+                Some((ttag, tval)) if with_host(|h| h.values_eq(&ttag, &tag)) => {
+                    with_host(|h| h.pending_throw = None);
+                    Ok(tval)
+                }
+                _ => Err(e), // not our throw (or a real error): keep unwinding
+            }
+        }
+    }
+}
+
+/// `(unwind-protect BODY-THUNK CLEANUP-THUNK)` — always run cleanup, preserving
+/// an in-flight throw across it, then propagate the body's result.
+fn intrinsic_unwind(args: &[Value]) -> Result<Value, String> {
+    let body = args.first().cloned().unwrap_or(Value::Undef);
+    let cleanup = args.get(1).cloned().unwrap_or(Value::Undef);
+    let r = call_function(&body, &[]);
+    let saved = with_host(|h| h.pending_throw.take());
+    let _ = call_function(&cleanup, &[]);
+    with_host(|h| {
+        if h.pending_throw.is_none() {
+            h.pending_throw = saved;
+        }
+    });
+    r
+}
+
+/// `(condition-case VAR BODY-THUNK HANDLERS)` where HANDLERS is a list of
+/// `(CONDITION HANDLER-THUNK)`. Catches *errors* (not throws); binds VAR to the
+/// error object while the matching handler runs.
+fn intrinsic_condition_case(args: &[Value]) -> Result<Value, String> {
+    let var = args.first().cloned().unwrap_or(Value::Undef);
+    let body = args.get(1).cloned().unwrap_or(Value::Undef);
+    let handlers = args.get(2).cloned().unwrap_or(Value::Undef);
+    match call_function(&body, &[]) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // A throw is not an error — let it keep unwinding to its catch.
+            if with_host(|h| h.pending_throw.is_some()) {
+                return Err(e);
+            }
+            let esym: String = e.split(':').next().unwrap_or("error").trim().to_string();
+            let hlist = with_host(|h| h.list_vec(&handlers)).unwrap_or_default();
+            for hp in hlist {
+                let parts = with_host(|h| h.list_vec(&hp)).unwrap_or_default();
+                if parts.len() < 2 {
+                    continue;
+                }
+                let cname = with_host(|h| h.sym_name(&parts[0])).unwrap_or_default();
+                if cname == "error" || cname == "t" || cname == esym {
+                    let depth = with_host(|h| {
+                        let d = h.specdepth();
+                        if matches!(h.obj(&var), Some(Obj::Symbol(_))) {
+                            let eobj = h.make_error_object(&e);
+                            let _ = h.specbind(&var, eobj);
+                        }
+                        d
+                    });
+                    let hr = call_function(&parts[1], &[]);
+                    with_host(|h| h.unbind_to(depth));
+                    return hr;
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 /// fusevm extension handler. Non-capturing (satisfies `Send`); reaches the heap
 /// through the thread-local host.
 pub fn ext_dispatch(vm: &mut VM, id: u16, arg: u8) {
@@ -538,20 +691,14 @@ pub fn ext_dispatch(vm: &mut VM, id: u16, arg: u8) {
             let symv = vm.pop();
             match call_function(&symv, &args) {
                 Ok(v) => vm.push(v),
-                Err(e) => {
-                    with_host(|h| h.error = Some(e));
-                    vm.push(Value::Undef);
-                }
+                Err(e) => abort(vm, e),
             }
         }
         ops::GETVAR => {
             let symv = vm.pop();
             match with_host(|h| h.get_value(&symv)) {
                 Ok(v) => vm.push(v),
-                Err(e) => {
-                    with_host(|h| h.error = Some(e));
-                    vm.push(Value::Undef);
-                }
+                Err(e) => abort(vm, e),
             }
         }
         ops::SETVAR => {
@@ -602,6 +749,14 @@ pub fn ext_dispatch_wide(vm: &mut VM, id: u16, n: usize) {
         }
         _ => {}
     }
+}
+
+/// Abort the running chunk: record the error and halt the VM immediately (so
+/// code after a failing/throwing call does not run). The loop guard
+/// `ip < ops.len()` makes this safe.
+fn abort(vm: &mut VM, e: String) {
+    with_host(|h| h.error = Some(e));
+    vm.ip = vm.chunk.ops.len();
 }
 
 /// Run a compiled chunk on a fresh fusevm VM, returning the elisp result.

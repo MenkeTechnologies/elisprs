@@ -77,7 +77,10 @@ impl Dap {
 
     fn event(&mut self, event: &str, body: J) {
         let seq = self.next_seq();
-        send(&self.out, &json!({"seq": seq, "type": "event", "event": event, "body": body}));
+        send(
+            &self.out,
+            &json!({"seq": seq, "type": "event", "event": event, "body": body}),
+        );
     }
     fn respond(&mut self, req: &J, body: J) {
         let seq = self.next_seq();
@@ -111,7 +114,10 @@ impl Dap {
                     self.event("initialized", json!({}));
                 }
                 "setBreakpoints" => {
-                    let bps = msg["arguments"]["breakpoints"].as_array().cloned().unwrap_or_default();
+                    let bps = msg["arguments"]["breakpoints"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
                     self.breakpoints.clear();
                     let mut verified = Vec::new();
                     for bp in &bps {
@@ -145,14 +151,20 @@ impl Dap {
     // ── execution ──
     fn run_program(&mut self) {
         let Some(path) = self.program.clone() else {
-            self.event("output", json!({"category": "stderr", "output": "no program specified\n"}));
+            self.event(
+                "output",
+                json!({"category": "stderr", "output": "no program specified\n"}),
+            );
             self.terminate();
             return;
         };
         let src = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
-                self.event("output", json!({"category": "stderr", "output": format!("cannot read {path}: {e}\n")}));
+                self.event(
+                    "output",
+                    json!({"category": "stderr", "output": format!("cannot read {path}: {e}\n")}),
+                );
                 self.terminate();
                 return;
             }
@@ -162,7 +174,10 @@ impl Dap {
         let forms = match with_host(|h| crate::reader::read_all(h, &src)) {
             Ok(f) => f,
             Err(e) => {
-                self.event("output", json!({"category": "stderr", "output": format!("read error: {e}\n")}));
+                self.event(
+                    "output",
+                    json!({"category": "stderr", "output": format!("read error: {e}\n")}),
+                );
                 self.terminate();
                 return;
             }
@@ -174,7 +189,10 @@ impl Dap {
             self.cur_line = line;
             if stepping || (line != 0 && self.breakpoints.contains(&line)) {
                 let reason = if stepping { "step" } else { "breakpoint" };
-                self.event("stopped", json!({"reason": reason, "threadId": 1, "allThreadsStopped": true}));
+                self.event(
+                    "stopped",
+                    json!({"reason": reason, "threadId": 1, "allThreadsStopped": true}),
+                );
                 match self.pause_loop() {
                     Resume::Continue => stepping = false,
                     Resume::Next => stepping = true,
@@ -188,17 +206,26 @@ impl Dap {
             let chunk = match with_host(|h| crate::compiler::compile_top(h, form)) {
                 Ok(c) => c,
                 Err(e) => {
-                    self.event("output", json!({"category": "stderr", "output": format!("compile error: {e}\n")}));
+                    self.event(
+                        "output",
+                        json!({"category": "stderr", "output": format!("compile error: {e}\n")}),
+                    );
                     continue;
                 }
             };
             match crate::host::run_chunk(chunk) {
                 Ok(v) => {
                     let printed = with_host(|h| h.print(&v, true));
-                    self.event("output", json!({"category": "stdout", "output": format!("{printed}\n")}));
+                    self.event(
+                        "output",
+                        json!({"category": "stdout", "output": format!("{printed}\n")}),
+                    );
                 }
                 Err(e) => {
-                    self.event("output", json!({"category": "stderr", "output": format!("error: {e}\n")}));
+                    self.event(
+                        "output",
+                        json!({"category": "stderr", "output": format!("error: {e}\n")}),
+                    );
                 }
             }
         }
@@ -242,12 +269,18 @@ impl Dap {
                     self.respond(&msg, json!({ "variables": vars }));
                 }
                 "evaluate" => {
-                    let expr = msg["arguments"]["expression"].as_str().unwrap_or("").to_string();
+                    let expr = msg["arguments"]["expression"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
                     let result = eval_in_host(&expr);
                     self.respond(&msg, json!({"result": result, "variablesReference": 0}));
                 }
                 "setBreakpoints" => {
-                    let bps = msg["arguments"]["breakpoints"].as_array().cloned().unwrap_or_default();
+                    let bps = msg["arguments"]["breakpoints"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
                     self.breakpoints.clear();
                     let mut verified = Vec::new();
                     for bp in &bps {
@@ -356,7 +389,11 @@ fn toplevel_lines(src: &str) -> Vec<u32> {
                 }
             }
             '?' => {
-                i += if chars.get(i + 1) == Some(&'\\') { 3 } else { 2 };
+                i += if chars.get(i + 1) == Some(&'\\') {
+                    3
+                } else {
+                    2
+                };
                 continue;
             }
             '(' => {
@@ -444,7 +481,11 @@ impl Capture {
                 }
             });
 
-            Ok(Capture { out, saved_stdout: saved, reader_thread: Some(reader_thread) })
+            Ok(Capture {
+                out,
+                saved_stdout: saved,
+                reader_thread: Some(reader_thread),
+            })
         }
     }
 }

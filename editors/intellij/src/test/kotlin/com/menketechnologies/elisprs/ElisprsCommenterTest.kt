@@ -11,13 +11,13 @@ import org.junit.Test
 class ElisprsCommenterTest {
     private val c = ElisprsCommenter()
 
-    @Test fun `line comment prefix is double-quote-space`() {
-        assertEquals("\" ", c.lineCommentPrefix)
+    @Test fun `line comment prefix is double-semicolon-space`() {
+        assertEquals(";; ", c.lineCommentPrefix)
     }
 
     @Test fun `there is no block comment form`() {
         // Emacs Lisp has no block-comment delimiters — the hooks must be null so
-        // Cmd+Opt+/ degrades to line-by-line `"` commenting.
+        // Cmd+Opt+/ degrades to line-by-line `;;` commenting.
         assertNull(c.blockCommentPrefix)
         assertNull(c.blockCommentSuffix)
         assertNull(c.commentedBlockCommentPrefix)

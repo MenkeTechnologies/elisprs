@@ -13,7 +13,11 @@ pub fn compile_file(src: &str, out: &Path) -> Result<(), String> {
         let forms = reader::read_all(h, src)?;
         compiler::compile_program(h, &forms)
     })?;
-    eprintln!("lowered to fusevm chunk: {} ops, {} constants", chunk.ops.len(), chunk.constants.len());
+    eprintln!(
+        "lowered to fusevm chunk: {} ops, {} constants",
+        chunk.ops.len(),
+        chunk.constants.len()
+    );
     // Native object emission:
     //   fusevm::aot::compile_object(&chunk, out).map_err(|e| e)?;
     // is available when fusevm is built with its `aot` feature. Until that is

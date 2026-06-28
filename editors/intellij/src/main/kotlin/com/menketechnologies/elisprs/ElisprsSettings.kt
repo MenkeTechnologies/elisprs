@@ -15,7 +15,7 @@ class ElisprsSettings : PersistentStateComponent<ElisprsSettings.State> {
         var lspEnabled: Boolean = true,
         var extraLspArgs: String = "",
         var disableLexerHighlighting: Boolean = false,
-        var fileExtensions: String = "vim",
+        var fileExtensions: String = "el",
         var autoRestartLsp: Boolean = true,
         var lspEnv: String = "",
         var logLspToFile: Boolean = false,
@@ -67,19 +67,15 @@ class ElisprsSettings : PersistentStateComponent<ElisprsSettings.State> {
     /** Match a virtual file's name/extension against the configured set. */
     fun isSupportedFile(filename: String, extension: String?): Boolean {
         if (extension != null && extension in supportedExtensions()) return true
-        // Recognized Vim dotfile / rc bases regardless of extension.
+        // Recognized Emacs init dotfiles regardless of extension.
         return filename in DOTFILES
     }
 
     companion object {
-        // The vimrc / gvimrc / exrc / nvim family. `init.vim` also matches
-        // by the `vim` extension, but is listed here so the bare-name path
-        // (extension == null) still recognizes it.
+        // Classic Emacs init dotfiles that have no `.el` extension. `init.el`
+        // / `early-init.el` already match by the `el` extension.
         private val DOTFILES = setOf(
-            "vimrc", ".vimrc", "_vimrc",
-            "gvimrc", ".gvimrc", "_gvimrc",
-            ".exrc", "_exrc",
-            ".nvimrc", "init.vim",
+            ".emacs", "_emacs", ".gnus", ".spacemacs", ".viper",
         )
 
         fun getInstance(): ElisprsSettings =

@@ -132,4 +132,8 @@ pub const PRELUDE: &str = r#"
        (while (< ,var --dotimes-limit--)
          ,@body
          (setq ,var (1+ ,var))))))
+
+;;; ---- error handling ----
+(defmacro ignore-errors (&rest body) `(condition-case nil (progn ,@body) (error nil)))
+(defmacro with-demoted-errors (fmt &rest body) `(condition-case --err-- (progn ,@body) (error (message ,fmt --err--) nil)))
 "#;

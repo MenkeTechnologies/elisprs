@@ -10,7 +10,10 @@ use crate::host::ElispHost;
 use fusevm::Value;
 
 pub fn read_all(h: &mut ElispHost, src: &str) -> Result<Vec<Value>, String> {
-    let mut r = Reader { chars: src.chars().collect(), pos: 0 };
+    let mut r = Reader {
+        chars: src.chars().collect(),
+        pos: 0,
+    };
     let mut out = Vec::new();
     loop {
         r.skip_ws();
