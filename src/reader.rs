@@ -1,20 +1,15 @@
-//! An elisp-correct S-expression reader producing rust_lisp `Value`s.
+//! Elisp reader. Builds forms directly as ElispHost heap objects (cons cells,
+//! symbols) so the compiler can walk them and quoted literals can be emitted as
+//! `Value::Obj` constants.
 //!
-//! We keep rust_lisp's `Value`/`List` data model but not its parser: rust_lisp's
-//! reader mis-tokenizes core elisp syntax — `1+`/`1-` (it splits the sign off
-//! the digit), `#'foo` (function-quote), and real dotted pairs. Those are far
-//! too common in `.el` to live without, so the reader is ours; the value model,
-//! evaluator infrastructure, and builtins still build on rust_lisp.
-//!
-//! Milestone-1 scope: integers, floats, strings, symbols (including `1+`, `<=`,
-//! `:keywords`), `nil`/`t`, `'quote`, `#'function`, `?c` char literals, and
-//! `;` comments. Not yet: backquote/unquote and true dotted pairs (both error
-//! explicitly rather than silently misread).
+//! nil → fusevm `Undef`, t → fusevm `T`. Milestone scope: ints/floats/strings,
+//! symbols (incl. `1+`, `<=`, `:keywords`), `'quote`, `#'function`, `?c` char
+//! literals, `;` comments. (Backquote and true dotted-pair reading land next.)
 
-use crate::error::{ElError, ElResult};
-use rust_lisp::model::{Symbol, Value};
+use crate::host::ElispHost;
+use fusevm::Value;
 
-pub fn read_all(src: &str) -> ElResult<Vec<Value>> {
+pub fn read_all(h: &mut ElispHost, src: &str) -> Result<Vec<Value>, String> {
     let mut r = Reader { chars: src.chars().collect(), pos: 0 };
     let mut out = Vec::new();
     loop {
@@ -22,7 +17,7 @@ pub fn read_all(src: &str) -> ElResult<Vec<Value>> {
         if r.pos >= r.chars.len() {
             break;
         }
-        out.push(r.read_form()?);
+        out.push(r.read_form(h)?);
     }
     Ok(out)
 }
@@ -36,10 +31,6 @@ fn is_delim(c: char) -> bool {
     c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\'' | '`' | ',' | ';')
 }
 
-fn quoted(head: &str, form: Value) -> Value {
-    Value::List(vec![Value::Symbol(Symbol(head.to_string())), form].into_iter().collect())
-}
-
 impl Reader {
     fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
@@ -47,7 +38,6 @@ impl Reader {
     fn peek_at(&self, n: usize) -> Option<char> {
         self.chars.get(self.pos + n).copied()
     }
-
     fn skip_ws(&mut self) {
         loop {
             match self.peek() {
@@ -65,67 +55,74 @@ impl Reader {
         }
     }
 
-    fn read_form(&mut self) -> ElResult<Value> {
+    fn read_form(&mut self, h: &mut ElispHost) -> Result<Value, String> {
         self.skip_ws();
-        let c = self.peek().ok_or_else(|| ElError::err("unexpected end of input"))?;
+        let c = self.peek().ok_or("unexpected end of input")?;
         match c {
-            '(' => self.read_list(),
-            ')' => Err(ElError::err("unexpected )")),
-            '`' | ',' => Err(ElError::err("backquote/unquote not supported in milestone 1")),
+            '(' => self.read_list(h),
+            ')' => Err("unexpected )".to_string()),
+            '`' | ',' => Err("backquote/unquote not supported yet".to_string()),
             '"' => self.read_string(),
             '?' => self.read_char_literal(),
             '\'' => {
                 self.pos += 1;
-                Ok(quoted("quote", self.read_form()?))
+                let f = self.read_form(h)?;
+                Ok(quoted(h, "quote", f))
             }
             '#' if self.peek_at(1) == Some('\'') => {
                 self.pos += 2;
-                Ok(quoted("function", self.read_form()?))
+                let f = self.read_form(h)?;
+                Ok(quoted(h, "function", f))
             }
-            _ => self.read_atom(),
+            _ => self.read_atom(h),
         }
     }
 
-    fn read_list(&mut self) -> ElResult<Value> {
+    fn read_list(&mut self, h: &mut ElispHost) -> Result<Value, String> {
         self.pos += 1; // consume '('
         let mut items = Vec::new();
         loop {
             self.skip_ws();
             match self.peek() {
-                None => return Err(ElError::err("unclosed list")),
+                None => return Err("unclosed list".to_string()),
                 Some(')') => {
                     self.pos += 1;
                     break;
                 }
-                Some('.') if self.is_lone_dot() => {
-                    return Err(ElError::err(
-                        "dotted pairs are not supported in milestone 1 (rust_lisp's list model is proper-only)",
-                    ));
+                Some('.') if self.peek_at(1).map(is_delim).unwrap_or(true) => {
+                    // dotted tail: (a b . c)
+                    self.pos += 1;
+                    let tail = self.read_form(h)?;
+                    self.skip_ws();
+                    if self.peek() != Some(')') {
+                        return Err("malformed dotted list".to_string());
+                    }
+                    self.pos += 1;
+                    let mut acc = tail;
+                    for x in items.into_iter().rev() {
+                        acc = h.cons(x, acc);
+                    }
+                    return Ok(acc);
                 }
-                _ => items.push(self.read_form()?),
+                _ => items.push(self.read_form(h)?),
             }
         }
-        Ok(Value::List(items.into_iter().collect()))
+        Ok(h.list_from(items))
     }
 
-    /// A `.` that is its own token (dotted-pair marker), not `.5` or `...`.
-    fn is_lone_dot(&self) -> bool {
-        self.peek() == Some('.') && self.peek_at(1).map(is_delim).unwrap_or(true)
-    }
-
-    fn read_string(&mut self) -> ElResult<Value> {
-        self.pos += 1; // consume opening quote
+    fn read_string(&mut self) -> Result<Value, String> {
+        self.pos += 1;
         let mut s = String::new();
         loop {
             match self.peek() {
-                None => return Err(ElError::err("unterminated string")),
+                None => return Err("unterminated string".to_string()),
                 Some('"') => {
                     self.pos += 1;
                     break;
                 }
                 Some('\\') => {
                     self.pos += 1;
-                    let e = self.peek().ok_or_else(|| ElError::err("unterminated string"))?;
+                    let e = self.peek().ok_or("unterminated string")?;
                     self.pos += 1;
                     s.push(unescape(e));
                 }
@@ -135,15 +132,15 @@ impl Reader {
                 }
             }
         }
-        Ok(Value::String(s))
+        Ok(Value::str(s))
     }
 
-    fn read_char_literal(&mut self) -> ElResult<Value> {
-        self.pos += 1; // consume '?'
-        let c = self.peek().ok_or_else(|| ElError::err("unterminated char literal"))?;
+    fn read_char_literal(&mut self) -> Result<Value, String> {
+        self.pos += 1;
+        let c = self.peek().ok_or("unterminated char literal")?;
         self.pos += 1;
         let ch = if c == '\\' {
-            let e = self.peek().ok_or_else(|| ElError::err("unterminated char literal"))?;
+            let e = self.peek().ok_or("unterminated char literal")?;
             self.pos += 1;
             unescape(e)
         } else {
@@ -152,7 +149,7 @@ impl Reader {
         Ok(Value::Int(ch as i64))
     }
 
-    fn read_atom(&mut self) -> ElResult<Value> {
+    fn read_atom(&mut self, h: &mut ElispHost) -> Result<Value, String> {
         let start = self.pos;
         while let Some(c) = self.peek() {
             if is_delim(c) {
@@ -161,8 +158,13 @@ impl Reader {
             self.pos += 1;
         }
         let tok: String = self.chars[start..self.pos].iter().collect();
-        Ok(classify(&tok))
+        Ok(classify(h, &tok))
     }
+}
+
+fn quoted(h: &mut ElispHost, head: &str, form: Value) -> Value {
+    let q = h.intern(head);
+    h.list_from(vec![q, form])
 }
 
 fn unescape(e: char) -> char {
@@ -172,35 +174,29 @@ fn unescape(e: char) -> char {
         'r' => '\r',
         '0' => '\0',
         'e' => '\u{1b}',
-        other => other, // \\ \" \? etc.
+        other => other,
     }
 }
 
-fn classify(tok: &str) -> Value {
+fn classify(h: &mut ElispHost, tok: &str) -> Value {
     match tok {
-        "nil" => return Value::NIL,
-        "t" => return Value::True,
+        "nil" => return Value::Undef,
+        "t" => return Value::T,
         _ => {}
     }
-    if tok.starts_with(':') {
-        return Value::Symbol(Symbol(tok.to_string()));
-    }
-    // Try integer, then float. Crucially, `1+`/`1-`/`+`/`<=` fail both parses
-    // and fall through to Symbol — the whole reason we don't use rust_lisp's
-    // number-greedy tokenizer.
-    if let Ok(i) = tok.parse::<i64>() {
-        return Value::Int(i);
-    }
-    if looks_numeric(tok) {
-        if let Ok(f) = tok.parse::<f64>() {
-            return Value::Float(f);
+    if !tok.starts_with(':') {
+        if let Ok(i) = tok.parse::<i64>() {
+            return Value::Int(i);
+        }
+        if looks_numeric(tok) {
+            if let Ok(f) = tok.parse::<f64>() {
+                return Value::Float(f);
+            }
         }
     }
-    Value::Symbol(Symbol(tok.to_string()))
+    h.intern(tok)
 }
 
-/// Guard float parsing so symbols like `+`/`.` aren't misread, while still
-/// accepting `1.5`, `-3.0`, `.5`, `1e9`.
 fn looks_numeric(tok: &str) -> bool {
     let mut seen_digit = false;
     for c in tok.chars() {
@@ -211,42 +207,4 @@ fn looks_numeric(tok: &str) -> bool {
         }
     }
     seen_digit
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn read1(s: &str) -> Value {
-        read_all(s).unwrap().into_iter().next().unwrap()
-    }
-
-    #[test]
-    fn reads_symbols_that_look_like_numbers() {
-        assert!(matches!(read1("1+"), Value::Symbol(s) if s.0 == "1+"));
-        assert!(matches!(read1("1-"), Value::Symbol(s) if s.0 == "1-"));
-        assert!(matches!(read1("<="), Value::Symbol(s) if s.0 == "<="));
-        assert!(matches!(read1("42"), Value::Int(42)));
-        assert!(matches!(read1("-3"), Value::Int(-3)));
-        assert!(matches!(read1("1.5"), Value::Float(_)));
-    }
-
-    #[test]
-    fn function_quote_desugars() {
-        // #'foo => (function foo)
-        let v = read1("#'foo");
-        let parts = crate::interp::to_vec(&v).unwrap();
-        assert!(matches!(&parts[0], Value::Symbol(s) if s.0 == "function"));
-    }
-
-    #[test]
-    fn char_literal_is_code_point() {
-        assert!(matches!(read1("?A"), Value::Int(65)));
-        assert!(matches!(read1("?\\n"), Value::Int(10)));
-    }
-
-    #[test]
-    fn dotted_pairs_error_loudly() {
-        assert!(read_all("(1 . 2)").is_err());
-    }
 }

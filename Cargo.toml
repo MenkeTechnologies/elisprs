@@ -2,7 +2,7 @@
 name = "elisprs"
 version = "0.1.0"
 edition = "2021"
-description = "Emacs Lisp as a fusevm frontend, built on the rust_lisp reader + value model. Milestone 1 is a tree-walk bootstrap with Lisp-2 obarray + dynamic binding; fusevm-Chunk lowering (compiler.rs) is the milestone-2 seam."
+description = "Emacs Lisp as a fusevm frontend: reader + compiler to fusevm::Chunk + an ElispHost object heap. No bespoke VM/JIT — execution and codegen live in fusevm."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MenkeTechnologies/elisprs"
 
@@ -15,12 +15,8 @@ name = "elisprs"
 path = "src/lib.rs"
 
 [dependencies]
-# We lean on rust_lisp (MIT) for the S-expression reader and the Value/List
-# data model. Its evaluator is Lisp-1 + lexical; elisp is Lisp-2 + dynamic, so
-# the evaluator, environment, and standard library are ours (src/interp.rs,
-# src/builtins.rs). i64/f64 make fixnums/floats behave like real elisp.
-rust_lisp = { version = "0.18", default-features = false, features = ["i64", "f64"] }
-
-# Milestone 2 adds the fusevm path-dependency (mirroring awkrs/vimlrs/zshrs)
-# when compiler.rs begins lowering to fusevm::Chunk:
-# fusevm = { path = "../fusevm" }
+# elisp executes on fusevm. elisprs is a pure frontend: it lowers elisp to
+# fusevm bytecode (src/compiler.rs) and hosts the elisp object heap
+# (src/host.rs, reached from fusevm's extension handler). The cons/symbol/
+# vector cells ride through the VM as `Value::Obj(u32)` handles into that heap.
+fusevm = { path = "../fusevm" }
