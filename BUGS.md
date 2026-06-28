@@ -56,7 +56,11 @@ Added `cl-flet`/`cl-labels` (lexical local fns via call-rewriting; mutual/self
 recursion), `let-alist`, `and-let*`, `cl-dolist`/`cl-dotimes`, `fset`/`fboundp`.
 `pcase` backquote patterns (incl. dotted) now work; fixed dotted backquote reader.
 Added `cl-block`/`cl-return-from`/`cl-return`, `cl-pushnew`, `cl-find-if-not`;
-`cl-subseq`/`seq-subseq` are sequence-generic (optional/negative END).
+`cl-subseq`/`seq-subseq` are sequence-generic (optional/negative END). `cl-defstruct`
+(constructor/accessors/predicate/copier, setf-able slots) — instances are vectors,
+so printing/`type-of` differ from Emacs records. `cl-member`/`cl-assoc`/`cl-find`/
+`cl-position`/`cl-count`/`cl-remove`/`cl-delete`/`cl-substitute` take `:test`/`:key`/
+`:count` keyword args.
 
 **Notable still-missing:** `string-fill` (word-wrapping); the `cl-loop` clauses
 above.

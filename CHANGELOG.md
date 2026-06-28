@@ -110,6 +110,13 @@ All notable changes to elisprs are documented here. The format follows
 - Added `cl-block` / `cl-return-from` / `cl-return` (named escapes; `cl-dolist` /
   `cl-dotimes` now establish the nil block), `cl-pushnew`, `cl-find-if-not`;
   `cl-subseq` / `seq-subseq` work on any sequence with an optional and negative END.
+- `cl-defstruct` — generates the keyword constructor (per-slot defaults), `NAME-p`
+  predicate, `NAME-SLOT` accessors (`setf`-able), and `copy-NAME`. Instances are
+  `[cl-struct-NAME …]` vectors, so behavior matches but printing / `type-of` differ
+  from Emacs records.
+- `cl-member` / `cl-assoc` / `cl-find` / `cl-position` / `cl-count` / `cl-remove` /
+  `cl-delete` / `cl-substitute` now take `:test` / `:key` (and `:count` where
+  applicable) keyword arguments, and preserve the input sequence's type.
 
 ### Added
 - `pcase` — structural dispatch (non-backquote subset): `_` wildcard,

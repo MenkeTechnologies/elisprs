@@ -1075,3 +1075,92 @@ fn emacs_parity_cl_block_and_subseq() {
     assert_eq!(eval("(cl-subseq \"hello\" 2)"), "\"llo\"");
     assert_eq!(eval("(cl-subseq [1 2 3 4 5] 1 -1)"), "[2 3 4]");
 }
+
+#[test]
+fn emacs_parity_cl_defstruct() {
+    // Constructor (keyword args + per-slot defaults), accessors, predicate, copier.
+    assert_eq!(
+        eval("(cl-defstruct point x y) (let ((p (make-point :x 3 :y 4))) (list (point-x p) (point-y p)))"),
+        "(3 4)"
+    );
+    assert_eq!(
+        eval("(cl-defstruct dd (x 0) (y 10)) (let ((p (make-dd :x 3))) (list (dd-x p) (dd-y p)))"),
+        "(3 10)"
+    );
+    assert_eq!(eval("(cl-defstruct e3 x y) (e3-p (make-e3))"), "t");
+    assert_eq!(eval("(cl-defstruct e4 a b) (e4-p (list 1 2))"), "nil");
+    assert_eq!(
+        eval("(cl-defstruct cc x) (let* ((a (make-cc :x 1)) (b (copy-cc a))) (list (cc-x b) (eq a b)))"),
+        "(1 nil)"
+    );
+    // setf / cl-incf on a slot (accessor registered for setf across top-level forms).
+    assert_eq!(
+        eval("(cl-defstruct sf x y) (let ((p (make-sf :x 1 :y 2))) (setf (sf-x p) 99) (cl-incf (sf-y p) 10) (list (sf-x p) (sf-y p)))"),
+        "(99 12)"
+    );
+    // cl-defstruct returns the struct name.
+    assert_eq!(eval("(cl-defstruct ret a b)"), "ret");
+}
+
+#[test]
+fn emacs_parity_cl_keyword_seq_fns() {
+    // :test / :key on the matching cl-* functions.
+    assert_eq!(eval("(cl-member 2.0 (list 1 2 3) :test #'=)"), "(2 3)");
+    assert_eq!(eval("(cl-position 3 (list 1 2 3 4) :test #'=)"), "2");
+    assert_eq!(eval("(cl-find 2 (list 1 2 3) :key #'1-)"), "3");
+    assert_eq!(eval("(cl-count 2 (list 1 2 2 3 2))"), "3");
+    assert_eq!(
+        eval("(cl-assoc \"x\" (list (cons \"x\" 1)) :test #'string=)"),
+        "(\"x\" . 1)"
+    );
+    // :count on cl-remove / cl-substitute.
+    assert_eq!(eval("(cl-remove 2 (list 1 2 3 2))"), "(1 3)");
+    assert_eq!(eval("(cl-remove 2 (list 1 2 3 2) :count 1)"), "(1 3 2)");
+    assert_eq!(eval("(cl-substitute 9 2 (list 1 2 3 2))"), "(1 9 3 9)");
+    assert_eq!(
+        eval("(cl-substitute 9 2 (list 1 2 3 2) :count 1)"),
+        "(1 9 3 2)"
+    );
+    // type preserved (string in, string out).
+    assert_eq!(eval("(cl-remove ?a \"banana\")"), "\"bnn\"");
+    // defaults still work without keywords.
+    assert_eq!(eval("(cl-member 2 (list 1 2 3))"), "(2 3)");
+    assert_eq!(
+        eval("(cl-assoc 2 (list (cons 1 \"a\") (cons 2 \"b\")))"),
+        "(2 . \"b\")"
+    );
+}
+
+#[test]
+fn emacs_parity_error_object_data() {
+    // condition-case binds the handler var to the real (SYMBOL . DATA) object,
+    // so the data list is preserved (not stringified).
+    assert_eq!(
+        eval("(condition-case e (signal 'wrong-type-argument (list 'integerp 5)) (wrong-type-argument (list (car e) (cadr e) (caddr e))))"),
+        "(wrong-type-argument integerp 5)"
+    );
+    assert_eq!(
+        eval("(condition-case e (signal 'my-err '(1 2 3)) (my-err (caddr e)))"),
+        "2"
+    );
+    // error builds (error "MESSAGE").
+    assert_eq!(
+        eval("(condition-case e (error \"boom\") (error e))"),
+        "(error \"boom\")"
+    );
+    assert_eq!(
+        eval("(condition-case e (error \"x %d\" 5) (error (cdr e)))"),
+        "(\"x 5\")"
+    );
+    // car of a non-cons yields a wrong-type-argument; symbol matches.
+    assert_eq!(
+        eval("(condition-case e (car 5) (error (car e)))"),
+        "wrong-type-argument"
+    );
+    // ignore-error (singular) and with-suppressed-warnings.
+    assert_eq!(eval("(ignore-error wrong-type-argument (car 5))"), "nil");
+    assert_eq!(
+        eval("(with-suppressed-warnings ((obsolete foo)) (+ 1 2))"),
+        "3"
+    );
+}

@@ -179,6 +179,10 @@ pub struct ElispHost {
     /// A pending `throw`: (tag, value). Set by `throw`, consumed by `catch`.
     /// Distinguishes a non-local `throw` from an ordinary error during unwinding.
     pub(crate) pending_throw: Option<(Value, Value)>,
+    /// The structured error object `(ERROR-SYMBOL . DATA)` from the most recent
+    /// `signal`/`error`, so `condition-case` can bind the handler variable to the
+    /// real list (not a re-parsed string). Cleared when entering a c-c body.
+    pub(crate) pending_error: Option<Value>,
     /// Regexp match data from the last successful `string-match`: the subject
     /// string plus char-position spans for the whole match (group 0) and each
     /// capture group. `match-beginning`/`match-end`/`match-string` read it.
@@ -212,6 +216,7 @@ impl ElispHost {
             frame_stack: Vec::new(),
             error: None,
             pending_throw: None,
+            pending_error: None,
             match_data: None,
         };
         crate::builtins::install(&mut h);
@@ -1239,6 +1244,8 @@ fn intrinsic_condition_case(args: &[Value]) -> Result<Value, String> {
     let var = args.first().cloned().unwrap_or(Value::Undef);
     let body = args.get(1).cloned().unwrap_or(Value::Undef);
     let handlers = args.get(2).cloned().unwrap_or(Value::Undef);
+    // Running the body forward: any leftover error object is stale.
+    with_host(|h| h.pending_error = None);
     match call_function(&body, &[]) {
         Ok(v) => Ok(v),
         Err(e) => {
@@ -1246,7 +1253,17 @@ fn intrinsic_condition_case(args: &[Value]) -> Result<Value, String> {
             if with_host(|h| h.pending_throw.is_some()) {
                 return Err(e);
             }
-            let esym: String = e.split(':').next().unwrap_or("error").trim().to_string();
+            // Prefer the structured error object's symbol over the message string.
+            let esym: String = with_host(|h| {
+                h.pending_error
+                    .as_ref()
+                    .and_then(|eo| h.obj(eo))
+                    .and_then(|o| match o {
+                        Obj::Cons(car, _) => h.sym_name(car),
+                        _ => None,
+                    })
+            })
+            .unwrap_or_else(|| e.split(':').next().unwrap_or("error").trim().to_string());
             let hlist = with_host(|h| h.list_vec(&handlers)).unwrap_or_default();
             for hp in hlist {
                 let parts = with_host(|h| h.list_vec(&hp)).unwrap_or_default();
@@ -1258,7 +1275,12 @@ fn intrinsic_condition_case(args: &[Value]) -> Result<Value, String> {
                     let depth = with_host(|h| {
                         let d = h.specdepth();
                         if matches!(h.obj(&var), Some(Obj::Symbol(_))) {
-                            let eobj = h.make_error_object(&e);
+                            // Bind to the real (SYMBOL . DATA) object when we have
+                            // it; otherwise reconstruct one from the message.
+                            let eobj = h
+                                .pending_error
+                                .take()
+                                .unwrap_or_else(|| h.make_error_object(&e));
                             let _ = h.specbind(&var, eobj);
                         }
                         d

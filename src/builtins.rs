@@ -529,13 +529,22 @@ fn throw_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Err("--throw--".to_string())
 }
 fn error_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    // Error object: (error "MESSAGE"). Keep it for condition-case.
     let msg = el_format(h, a)?;
+    let esym = h.intern("error");
+    let mstr = Value::str(msg.clone());
+    let data = h.list_from(vec![mstr]);
+    h.pending_error = Some(h.cons(esym, data));
     Err(format!("error: {msg}"))
 }
 fn signal_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    // Error object: (ERROR-SYMBOL . DATA) — preserve the actual data list.
     let sym = h.sym_name(&a[0]).unwrap_or_else(|| "error".to_string());
-    let data = h.print(a.get(1).unwrap_or(&Value::Undef), true);
-    Err(format!("{sym}: {data}"))
+    let display = h.print(a.get(1).unwrap_or(&Value::Undef), true);
+    let symv = h.intern(&sym);
+    let data = a.get(1).cloned().unwrap_or(Value::Undef);
+    h.pending_error = Some(h.cons(symv, data));
+    Err(format!("{sym}: {display}"))
 }
 
 // ── strings / format / IO ──
