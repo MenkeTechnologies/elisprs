@@ -25,6 +25,21 @@ pub fn read_all(h: &mut ElispHost, src: &str) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
+/// Read a single form starting at char index `start`, returning it together
+/// with the char index just past it (for `read-from-string`).
+pub fn read_one(h: &mut ElispHost, src: &str, start: usize) -> Result<(Value, usize), String> {
+    let mut r = Reader {
+        chars: src.chars().collect(),
+        pos: start.min(src.chars().count()),
+    };
+    r.skip_ws();
+    if r.pos >= r.chars.len() {
+        return Err("end-of-file".into());
+    }
+    let form = r.read_form(h)?;
+    Ok((form, r.pos))
+}
+
 struct Reader {
     chars: Vec<char>,
     pos: usize,
@@ -392,6 +407,29 @@ fn bq_expand(h: &mut ElispHost, form: &Value) -> Value {
             }
         }
         return rest;
+    }
+    // A vector template `[…]: fold the elements like a list, then `vconcat' the
+    // resulting list back into a vector. (`pcase--compile' recognises the
+    // `vconcat' head as a vector pattern.)
+    if let Some(Obj::Vector(items)) = h.obj(form) {
+        let items = items.clone();
+        let mut rest = Value::Undef;
+        for e in items.iter().rev() {
+            match unquote_kind(h, e) {
+                Some((kind, payload)) if kind == "unquote-splicing" => {
+                    rest = call_form(h, "append", payload, rest);
+                }
+                Some((_unquote, payload)) => {
+                    rest = call_form(h, "cons", payload, rest);
+                }
+                None => {
+                    let sub = bq_expand(h, e);
+                    rest = call_form(h, "cons", sub, rest);
+                }
+            }
+        }
+        let f = h.intern("vconcat");
+        return h.list_from(vec![f, rest]);
     }
     // Atom: symbols must be quoted; self-evaluating atoms can stand as-is.
     match form {

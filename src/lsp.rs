@@ -450,6 +450,12 @@ const SUBRS: &[Entry] = &[
         doc: "Set SYMBOL's function cell to DEFINITION.",
     },
     Entry {
+        name: "eval",
+        kind: Kind::Function,
+        sig: "(eval FORM &optional LEXICAL)",
+        doc: "Evaluate FORM and return its value.",
+    },
+    Entry {
         name: "funcall",
         kind: Kind::Function,
         sig: "(funcall FUNCTION &rest ARGS)",

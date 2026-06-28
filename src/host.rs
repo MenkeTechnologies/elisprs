@@ -779,6 +779,13 @@ impl ElispHost {
         Err("function indirection too deep".to_string())
     }
 
+    /// If `items` is a cl-defstruct instance (slot 0 is a symbol `cl-struct-NAME`),
+    /// return the struct NAME; otherwise `None`.
+    pub fn struct_tag_name(&self, items: &[Value]) -> Option<String> {
+        let tag = self.sym_name(items.first()?)?;
+        tag.strip_prefix("cl-struct-").map(|s| s.to_string())
+    }
+
     // ── printing ──
     pub fn print(&self, v: &Value, readable: bool) -> String {
         match v {
@@ -797,10 +804,8 @@ impl ElispHost {
                     .to_string()
                 } else if f.is_infinite() {
                     if *f < 0.0 { "-1.0e+INF" } else { "1.0e+INF" }.to_string()
-                } else if f.fract() == 0.0 {
-                    format!("{f:.1}")
                 } else {
-                    format!("{f}")
+                    format_float(*f)
                 }
             }
             Value::Str(s) => {
@@ -814,9 +819,17 @@ impl ElispHost {
                 Some(Obj::Symbol(s)) => s.name.clone(),
                 Some(Obj::Cons(..)) => self.print_list(v, readable),
                 Some(Obj::Vector(items)) => {
-                    let parts: Vec<String> =
-                        items.iter().map(|e| self.print(e, readable)).collect();
-                    format!("[{}]", parts.join(" "))
+                    // A cl-defstruct instance is a vector tagged `cl-struct-NAME`
+                    // in slot 0; print it as Emacs's record syntax `#s(NAME …)`.
+                    if let Some(name) = self.struct_tag_name(items) {
+                        let parts: Vec<String> =
+                            items[1..].iter().map(|e| self.print(e, readable)).collect();
+                        format!("#s({name} {})", parts.join(" "))
+                    } else {
+                        let parts: Vec<String> =
+                            items.iter().map(|e| self.print(e, readable)).collect();
+                        format!("[{}]", parts.join(" "))
+                    }
                 }
                 Some(Obj::Subr { name, .. }) => format!("#<subr {name}>"),
                 Some(Obj::Closure { is_macro, .. }) => {
@@ -913,6 +926,33 @@ impl ElispHost {
     }
 }
 
+/// Print a finite float the way Emacs does: the shortest round-tripping form,
+/// choosing exponential notation when the decimal exponent is ≤ -5, or ≥ 15 and
+/// the exponential string is shorter (so `1e15` => `1e+15` but
+/// `1234567890123456.0` stays decimal). Integer-valued floats keep a `.0`.
+pub fn format_float(f: f64) -> String {
+    let e_full = format!("{f:e}"); // "M[.MMM]eP"
+    let (mantissa, exp_part) = e_full.rsplit_once('e').unwrap();
+    let exp: i64 = exp_part.parse().unwrap_or(0);
+    let dec = {
+        let d = format!("{f}");
+        if d.contains('.') {
+            d
+        } else {
+            format!("{d}.0")
+        }
+    };
+    let exp_str = {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:0>2}", exp.abs())
+    };
+    if exp <= -5 || (exp >= 15 && exp_str.len() < dec.len()) {
+        exp_str
+    } else {
+        dec
+    }
+}
+
 /// elisp truthiness: only `nil` (fusevm `Undef`) is false.
 pub fn el_truthy(v: &Value) -> bool {
     !matches!(v, Value::Undef | Value::Bool(false))
@@ -972,20 +1012,59 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 return Ok(args[1].clone());
             }
             "sort" => {
-                // (sort SEQ PRED): stable sort a list/vector by the less-than
-                // predicate, which re-enters elisp — so it lives here, not as a
-                // plain subr. Returns a freshly built sequence of the same kind.
-                let pred = &args[1];
-                let (mut items, was_vec) = with_host(|h| match h.obj(&args[0]) {
+                // Stable sort of a list/vector. Supports the classic
+                // (sort SEQ PRED), the Emacs-30 keyword form
+                // (sort SEQ &key :lessp :key :reverse), and (sort SEQ) which
+                // falls back to the default `value<` ordering. Re-enters elisp
+                // for PRED/:key so it lives here, not as a plain subr.
+                let (items, was_vec) = with_host(|h| match h.obj(&args[0]) {
                     Some(Obj::Vector(v)) => (v.clone(), true),
                     _ => (h.list_vec(&args[0]).unwrap_or_default(), false),
                 });
-                merge_sort_by(&mut items, pred)?;
+                let is_kw =
+                    |v: &Value| with_host(|h| h.sym_name(v)).is_some_and(|n| n.starts_with(':'));
+                let mut pred: Option<Value> = None;
+                let mut key: Option<Value> = None;
+                let mut reverse = false;
+                if args.len() == 2 && !is_kw(&args[1]) {
+                    pred = Some(args[1].clone());
+                } else {
+                    let mut idx = 1;
+                    while idx < args.len() {
+                        let kw = with_host(|h| h.sym_name(&args[idx])).unwrap_or_default();
+                        let val = args.get(idx + 1).cloned().unwrap_or(Value::Undef);
+                        let truthy = !matches!(val, Value::Undef | Value::Bool(false));
+                        match kw.as_str() {
+                            ":lessp" | ":predicate" => pred = Some(val),
+                            ":key" => {
+                                if truthy {
+                                    key = Some(val)
+                                }
+                            }
+                            ":reverse" => reverse = truthy,
+                            _ => {}
+                        }
+                        idx += 2;
+                    }
+                }
+                let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+                for it in &items {
+                    let k = match &key {
+                        Some(kf) => call_function(kf, std::slice::from_ref(it))?,
+                        None => it.clone(),
+                    };
+                    pairs.push((k, it.clone()));
+                }
+                merge_sort_by(&mut pairs, pred.as_ref())?;
+                let mut sorted: Vec<Value> = pairs.into_iter().map(|(_, it)| it).collect();
+                if reverse {
+                    sorted.reverse();
+                }
                 return Ok(with_host(|h| {
                     if was_vec {
-                        h.alloc(Obj::Vector(items))
+                        h.alloc(Obj::Vector(sorted))
                     } else {
-                        h.list_from(items)
+                        h.list_from(sorted)
                     }
                 }));
             }
@@ -1000,6 +1079,26 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 }
                 return Ok(Value::Undef);
             }
+            // `eval` macroexpands, compiles, and runs a form — re-entrant, so it
+            // lives here (outside any host borrow), like the other intrinsics.
+            "eval" => {
+                let expanded = macroexpand_all(&args[0])?;
+                let chunk = with_host(|h| crate::compiler::compile_top(h, &expanded))?;
+                return run_chunk(chunk);
+            }
+            // The macro-expansion functions run macro expanders (re-entrant).
+            "macroexpand-1" => {
+                return Ok(macroexpand_1(&args[0])?.unwrap_or_else(|| args[0].clone()));
+            }
+            "macroexpand" => {
+                // Expand the head to a fixpoint; don't recurse into sub-forms.
+                let mut f = args[0].clone();
+                while let Some(e) = macroexpand_1(&f)? {
+                    f = e;
+                }
+                return Ok(f);
+            }
+            "macroexpand-all" => return macroexpand_all(&args[0]),
             // `replace-regexp-in-string` with a *function* REP must call that
             // function per match — VM re-entry — so it's handled here rather than
             // in the (host-borrowing) subr, which only does string templates.
@@ -1095,7 +1194,32 @@ fn replace_regexp_with_fn(args: &[Value]) -> Result<Value, String> {
 /// Stable merge sort driven by an elisp less-than predicate. `pred` is called as
 /// `(pred a b)`; a non-nil result means `a` precedes `b`. Equal elements keep
 /// their input order (the merge takes from the left run on ties).
-fn merge_sort_by(items: &mut Vec<Value>, pred: &Value) -> Result<(), String> {
+fn num_f(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
+    }
+}
+
+/// Default `value<` ordering used by `(sort SEQ)` with no predicate: numbers
+/// compare numerically, strings and symbol names lexically.
+fn value_lt(a: &Value, b: &Value) -> Result<bool, String> {
+    if let (Some(x), Some(y)) = (num_f(a), num_f(b)) {
+        return Ok(x < y);
+    }
+    if let (Value::Str(x), Value::Str(y)) = (a, b) {
+        return Ok(x < y);
+    }
+    match (with_host(|h| h.sym_name(a)), with_host(|h| h.sym_name(b))) {
+        (Some(x), Some(y)) => Ok(x < y),
+        _ => Err("value<: unsupported comparison".into()),
+    }
+}
+
+/// Stable merge sort of `(key, item)` pairs by `key`. With `pred` it re-enters
+/// elisp `(pred key_j key_i)`; without, it falls back to `value_lt`.
+fn merge_sort_by(items: &mut Vec<(Value, Value)>, pred: Option<&Value>) -> Result<(), String> {
     let n = items.len();
     if n < 2 {
         return Ok(());
@@ -1109,13 +1233,19 @@ fn merge_sort_by(items: &mut Vec<Value>, pred: &Value) -> Result<(), String> {
     items.reserve(left.len() + right.len());
     while i < left.len() && j < right.len() {
         // Take from the right only when right[j] strictly precedes left[i].
-        let rhs_first = call_function(pred, &[right[j].clone(), left[i].clone()])?;
-        if matches!(rhs_first, Value::Undef | Value::Bool(false)) {
-            items.push(left[i].clone());
-            i += 1;
-        } else {
+        let rhs_first = match pred {
+            Some(p) => {
+                let r = call_function(p, &[right[j].0.clone(), left[i].0.clone()])?;
+                !matches!(r, Value::Undef | Value::Bool(false))
+            }
+            None => value_lt(&right[j].0, &left[i].0)?,
+        };
+        if rhs_first {
             items.push(right[j].clone());
             j += 1;
+        } else {
+            items.push(left[i].clone());
+            i += 1;
         }
     }
     items.extend_from_slice(&left[i..]);

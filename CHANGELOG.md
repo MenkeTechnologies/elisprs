@@ -6,6 +6,114 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed (Emacs parity — see BUGS.md)
+- `condition-case` now binds the handler variable to the real `(ERROR-SYMBOL .
+  DATA)` object, preserving `signal`'s data list — `(signal 'wrong-type-argument
+  '(integerp 5))` caught binds `(wrong-type-argument integerp 5)`, so `(cadr e)` =>
+  `integerp`. Previously the data was stringified. Also added `ignore-error`
+  (singular) and `with-suppressed-warnings`.
+- `#'(lambda …)` / `(function (lambda …))` now compiles to a closure instead of
+  loading the literal lambda form (which `funcall` rejected as `invalid-function`).
+- `user-error` signals the `user-error` condition (not `error`). Added the symbol
+  property system (`get` / `put` / `symbol-plist`), `define-error`, and seeded the
+  standard error conditions, so `error-message-string` matches Emacs
+  (`"Wrong type argument: integerp, 5"`). Added `seq-let`, `macroexp-progn`,
+  `cl-function`, and `pcase-let` destructuring patterns.
+- Added `cl-letf` (save/set/restore generalized places), `letrec`, `dlet`;
+  `cl-destructuring-bind` handles nested patterns, and `seq-let` handles `&rest`.
+- `cl-defstruct` instances now print as Emacs record syntax `#s(NAME …)`
+  (recursively), `type-of` returns the struct name, and `recordp` / `cl-struct-p`
+  recognize them. (`vectorp` still returns t — they're vectors under the hood.)
+- Added `eval` (macroexpands, compiles, and runs a form), and `cl-loop`'s numeric
+  `for` accepts an implicit `from 0` (`(cl-loop for i below 5 collect i)`).
+- Added the `rx` macro — compiles an S-expression regexp (string/char literals, the named
+  character classes and anchors, `group`/`group-n`/`or`/`seq`, the quantifiers `*`/`+`/`?`/
+  `=`/`>=`/`**`/`repeat`, char sets `(any …)`/`(not …)`, `literal`/`regexp`) to a regexp
+  string, with Emacs's single-char-`or`→char-class folding. Also wired `(rx …)` as a pcase
+  pattern (matches the value string against the compiled regexp).
+- Backquoted **vector** templates now evaluate (`` `[,a ,b] `` => `[1 2]`, including `,@`
+  splicing), and pcase supports backquoted vector **patterns** `` `[,a ,b] `` with
+  exact-length matching and no error on non-vector values.
+- Added `pcase-let*` and `pcase-dolist`, and the pcase `(seq P0 P1 …)` pattern (matches each
+  subpattern against successive elements of a list/vector/string).
+- `cl-loop` learned more iteration clauses: `for V across SEQ`, `for V being [the|each]
+  {elements|hash-keys|hash-values} of SOURCE`, `for V = INIT [then STEP]` (correctly
+  interleaved with `until`/`while`), `when/unless COND return X`, and an accepted `named NAME`.
+- Added `read-from-string` (returns `(OBJECT . END-INDEX)`, honoring START) and `pp-to-string`
+  / `pp`. Added `cl-substitute-if` / `cl-substitute-if-not`, `cl-mapcan`, and the
+  uni/multibyte shims `string-to-multibyte` / `string-as-multibyte` / `string-to-unibyte` /
+  `string-as-unibyte` / `multibyte-string-p`. `seq-contains-p` now works on strings/vectors
+  (not just lists), and `remove` preserves the sequence type (a vector input yields a vector).
+- `cl-defmethod` gained full CLOS method combination: `:before` / `:after` / `:around`
+  qualifiers (run in standard order around the primary), and `cl-call-next-method` /
+  `cl-next-method-p` (a primary chains to the next-most-specific primary; an `:around` chains
+  to the rest of the combination). A qualified method no longer collides with the primary that
+  shares its specializers. `cl-call-next-method` past the end signals `cl-no-next-method`.
+- Added `cl-coerce`, `cl-gensym`, and `cl-digit-char-p`.
+- Added `cl-defgeneric` / `cl-defmethod` — single- and multi-argument type dispatch with
+  specificity ordering (a more specific specializer wins: `integer` over `number`, `(eql V)`
+  over a type), `(eql V)` and `(head V)` specializers, unspecialized args, and per-specializer
+  method redefinition. An unhandled call signals `cl-no-applicable-method`.
+- `char-equal` now honors `case-fold-search` (default `t`), so `(char-equal ?a ?A)` => `t`.
+  Added `cl-assert` (signals `cl-assertion-failed`, a subtype of `error`), `cl-check-type`
+  (signals `wrong-type-argument`), and `format-spec`.
+- Added `cl-pairlis`, `cl-tailp`, `cl-ldiff` (the latter two key off `eq` tail identity),
+  and `lax-plist-get`. `cl-remove-duplicates` now honors `:from-end` (keep the first
+  occurrence instead of the last).
+- Added the transcendental float-math builtins (none existed before): `exp`, `log` (with an
+  optional base), `sin`, `cos`, `tan`, `asin`, `acos`, `atan` (1- or 2-arg `atan2`), plus
+  `ldexp`, `frexp` (returns `(SIGNIFICAND . EXPONENT)`), and `copysign`. Added `cl-parse-integer`.
+- Added more `seq.el` functions: `seq-sort-by`, `seq-split`, `seq-positions`,
+  `seq-remove-at-position`, and gave `seq-mapcat` its optional TYPE argument. `seq-partition`
+  now preserves the element type (a vector input yields vector chunks).
+- `sort` no longer panics on `(sort SEQ)` with no predicate — it falls back to the
+  default `value<` ordering (numbers numerically, strings/symbols lexically). It also
+  accepts the Emacs-30 keyword form `(sort SEQ &key :lessp :key :reverse)`.
+- `cl-defstruct` now honors the `(:constructor NAME)` and `(:conc-name PREFIX)` options
+  in the name/options head.
+- `format` `%g` now implements proper C-printf semantics — it switches to exponent
+  notation when the decimal exponent is `>= precision` (default 6) or `< -4`, honors the
+  precision field as significant digits, trims trailing zeros (kept with the `#` flag), and
+  respects width/sign flags. `(format "%g" 1000000.0)` => `"1e+06"`, `(format "%.3g" 3.14159)`
+  => `"3.14"`. (Was returning the value's default rendering, ignoring precision and the
+  threshold — closes BUGS.md R4-I `%g`.)
+- Added display-width and byte/char utilities: `string-width`, `char-width` (East-Asian
+  wide/fullwidth chars count as 2 columns, combining marks as 0), `truncate-string-to-width`,
+  `string-bytes` (UTF-8 byte count), and `subst-char-in-string`. Added `cl-type-of`
+  (`fixnum`/`null`/`cons` refinements over `type-of`), `number-or-marker-p`,
+  `integer-or-marker-p`.
+- Added `cl-the`, `cl-etypecase`, `cl-ecase`, and `cl-do` (with CL parallel stepping).
+  `cl-loop` now destructures `for PATTERN in LIST` (e.g. `for (a b) in …`, including
+  dotted `(k . v)` patterns), and `cl-destructuring-bind` accepts a dotted arglist tail.
+- `split-string` now treats its SEPARATORS argument as a regexp (Emacs semantics),
+  so `(split-string "a1b2c" "[0-9]")` => `("a" "b" "c")`. The `cl-remove-if` /
+  `cl-remove-if-not` family honors `:count`, and `cl-position` / `cl-count` /
+  `cl-position-if` / `cl-count-if` honor `:start` / `:end`. Added `string-version-lessp`
+  (numeric-run-aware compare) and made `format-message` curve-quote its format string.
+- Added the Common-Lisp set/sequence family: `cl-union`, `cl-intersection`,
+  `cl-set-difference` (all honoring `:test`), `cl-adjoin`, `cl-subst`, `cl-maplist`,
+  `cl-merge`, `cl-stable-sort`, `cl-delete-duplicates`, and `cl-endp`. `cl-reduce` now
+  honors `:from-end` (right fold) and `:key`.
+- Added the Common-Lisp integer-math family: `cl-floor`, `cl-ceiling`, `cl-truncate`,
+  `cl-round` (each returning `(QUOTIENT REMAINDER)`), `cl-mod`, `cl-rem`, `cl-gcd`,
+  `cl-lcm` (variadic, with the `()`→0/1 and zero-arg identities), and `cl-isqrt`.
+  Fixed `cl-oddp` to hold for negative odd integers (`(cl-oddp -3)` => `t`).
+- Added the `cl-*-if` count/position family: `cl-count-if`, `cl-count-if-not`,
+  `cl-position-if`, `cl-position-if-not` (all honoring `:key`). Added `string-fill`
+  (greedy column-wrapping at spaces).
+- `pcase` now supports the `(app FN PAT)` pattern (match PAT against `(FN value)`),
+  and `(pred FN)` / `(app FN …)` accept a `lambda` as FN, not just a named function.
+- `setf` learned two more generalized places: `(alist-get K A)` (setcdr an existing
+  cell, else cons a new `(K . V)` pair onto the front) and `(plist-get P K)` (set an
+  existing value cell, else prepend `K V` — matching Emacs's order for a new key).
+  Added `cl-typep`.
+- Exposed `macroexpand` / `macroexpand-1` / `macroexpand-all` (work on user and
+  prelude macros; the built-in `when`/`unless`/… are compiler intrinsics, not real
+  macros, so they pass through unchanged). Added `indirect-function`, `cl-sort`
+  (with `:key`), `commandp`, `plistp`.
+- Float printing matches Emacs: the shortest round-tripping representation, in
+  exponential notation when the decimal exponent is ≤ -5, or ≥ 15 and shorter
+  (`1e100` => `1e+100`, `1e15` => `1e+15`, but `1234567890123456.0` stays decimal).
+- Added the `pcase` `(cl-type TYPE)` pattern and `pcase-exhaustive`.
 - Lexical scope leak on non-local exit: a `throw` or `error` out of an inner
   `let` skipped its scope cleanup, so `run_closure` (the catch/condition-case
   thunk runner) left inner scopes open and corrupted the caller's lexical

@@ -57,10 +57,23 @@ recursion), `let-alist`, `and-let*`, `cl-dolist`/`cl-dotimes`, `fset`/`fboundp`.
 `pcase` backquote patterns (incl. dotted) now work; fixed dotted backquote reader.
 Added `cl-block`/`cl-return-from`/`cl-return`, `cl-pushnew`, `cl-find-if-not`;
 `cl-subseq`/`seq-subseq` are sequence-generic (optional/negative END). `cl-defstruct`
-(constructor/accessors/predicate/copier, setf-able slots) — instances are vectors,
-so printing/`type-of` differ from Emacs records. `cl-member`/`cl-assoc`/`cl-find`/
+(constructor/accessors/predicate/copier, setf-able slots; instances print as
+`#s(NAME …)`, `type-of`/`recordp`/`cl-struct-p` recognize them — but `vectorp` is
+still t since they're vectors underneath). `cl-member`/`cl-assoc`/`cl-find`/
 `cl-position`/`cl-count`/`cl-remove`/`cl-delete`/`cl-substitute` take `:test`/`:key`/
-`:count` keyword args.
+`:count` keyword args. Fixed `condition-case` to bind the real `(SYMBOL . DATA)`
+error object (data list preserved, not stringified); added `ignore-error`,
+`with-suppressed-warnings`. Fixed `#'(lambda …)` to compile to a closure.
+`user-error` signals `user-error`; added `get`/`put`/`symbol-plist`,
+`define-error` + seeded error conditions (so `error-message-string` matches Emacs),
+`seq-let`, `macroexp-progn`, `cl-function`, and `pcase-let` destructuring.
+Added `cl-letf`, `letrec`, `dlet`; nested `cl-destructuring-bind`; `seq-let` `&rest`.
+`cl-defstruct` instances print as `#s(NAME …)` (type-of/recordp/cl-struct-p too).
+Added `eval`; `cl-loop` numeric `for` accepts an implicit `from 0`. Exposed
+`macroexpand`/`-1`/`-all` (user/prelude macros; intrinsic `when`/`unless` pass
+through), `indirect-function`, `cl-sort`, `commandp`, `plistp`. Float printing now
+matches Emacs (shortest form, exponential for extreme magnitudes); added the pcase
+`(cl-type …)` pattern and `pcase-exhaustive`.
 
 **Notable still-missing:** `string-fill` (word-wrapping); the `cl-loop` clauses
 above.
@@ -460,11 +473,12 @@ Fourth pass against the current binary. Ground truth = bare `emacs -Q --batch`;
 - Exponent lacks sign + 2-digit zero-pad; default 6-digit precision not applied. (Round-1 #17
   had `%e` returned-literally; now implemented but mis-formatted.)
 
-### R4-I. `format` `%g` ignores precision and the exponent-switch threshold
+### R4-I. `format` `%g` ignores precision and the exponent-switch threshold — ✅ FIXED (R5-H)
 - `(format "%.3g" 3.14159)` → Emacs `"3.14"`, elisprs `"3.14159"`
 - `(format "%g" 1000000.0)` → Emacs `"1e+06"`, elisprs `"1000000"`
-- Precision field and the magnitude threshold for exponent notation aren't honored. (Round-1
-  #17 had `%g` returned-literally; now partial.)
+- Fixed in R5-H: `format_g` now implements C-printf `%g` — exponent form when the decimal
+  exponent is `>= precision` (default 6) or `< -4`, precision counts significant digits,
+  trailing zeros trimmed (kept with `#`), width/sign flags honored.
 
 ## Missing builtins / macros — `emacs -Q` returns a value, void in elisprs
 
@@ -486,3 +500,194 @@ Areas probed in round 4 that PASSED: `while-let`, `dlet` (was R3-missing — now
 `make-string`/`string`/`char-to-string`/`string-to-char`/`vconcat`/`append` vector; printer
 `-0.0`/dotted-cons/`%S` vector/`%s nil`; `format` `%-10s`/`%010.3f`/`%5c`/`%x`/`%d` of char;
 `ignore-errors`/`ignore`/`always`/`xor`/`prog1`/`prog2`.
+
+### R5-A. `pcase (app FN PAT)` / `(pred LAMBDA)` / `setf` places — ✅ FIXED
+- `(pcase 5 ((app 1+ 6) 'yes))` → Emacs `yes`, was void
+- `(pcase 3 ((pred (lambda (n) (> n 1))) 'big))` → Emacs `big`, was void (lambda as FN)
+- `(let ((a (list (cons 1 2)))) (setf (alist-get 1 a) 99) a)` → Emacs `((1 . 99))`, was unsupported place
+- `(let ((p (list :a 1))) (setf (plist-get p :b) 2) p)` → Emacs `(:b 2 :a 1)` (prepends new key)
+- `(cl-typep 5 'integer)` → Emacs `t`, was void
+- Fixed: added `pcase--apply` (handles lambda / named / curried FN), the `app` arm and a
+  lambda-aware `pred` arm in `pcase--compile`; `setf--expand` places for `alist-get`/`plist-get`;
+  `cl-typep`.
+
+### R5-B. Missing `cl-*-if` count/position + `string-fill` — ✅ FIXED
+- `(cl-count-if #'cl-oddp '(1 2 3 4 5))` → Emacs `3`, was void
+- `(cl-count-if-not …)`, `(cl-position-if …)`, `(cl-position-if-not …)` likewise void
+- `(string-fill "a b c d" 3)` → Emacs `"a b\nc d"`, was void
+- Fixed: added the four `cl-*-if` predicates (honoring `:key`) next to `cl-count`/`cl-position`,
+  and `string-fill` (greedy wrap at spaces).
+
+### R5-C. Missing `cl-` integer math + `cl-oddp` negative bug — ✅ FIXED
+- `(cl-floor 7 2)` → Emacs `(3 1)`; `cl-ceiling`/`cl-truncate`/`cl-round` likewise void
+- `(cl-mod 7 3)`/`(cl-rem -7 3)`/`(cl-gcd 12 18 8)`→`2`/`(cl-lcm 4 6 10)`→`60`/`(cl-isqrt 17)`→`4`: all void
+- `(cl-oddp -3)` → Emacs `t`, elisprs `nil` (used `(= (% n 2) 1)`, wrong for negatives)
+- Fixed: added the two-value `cl-floor`/`cl-ceiling`/`cl-truncate`/`cl-round` (on the existing
+  2-arg builtins), `cl-mod`/`cl-rem`, variadic `cl-gcd`/`cl-lcm`, `cl-isqrt`; `cl-oddp` now uses
+  `/=`.
+
+### R5-D. Missing `cl-` set/seq family + `cl-reduce :from-end` — ✅ FIXED
+- `cl-union`/`cl-intersection`/`cl-set-difference`/`cl-adjoin`/`cl-subst`/`cl-maplist`/`cl-merge`/
+  `cl-stable-sort`/`cl-delete-duplicates`/`cl-endp`: all void
+- `(cl-reduce #'- '(1 2 3) :from-end t)` → Emacs `2`, elisprs `-4` (folded left, ignored `:from-end`)
+- Fixed: added the listed functions (set ops honor `:test`, result orders match Emacs —
+  union/intersection reversed-scan, set-difference forward); `cl-reduce` now does a right fold
+  for `:from-end` and applies `:key`. (NOTE: still no `:count`/`:start`/`:end` bounding keywords
+  on the `cl-remove`/`cl-position` family — tracked separately.)
+
+### R5-E. `split-string` regexp + `cl` bounding keywords + misc — ✅ FIXED
+- `(split-string "a1b2c" "[0-9]")` → Emacs `("a" "b" "c")`, elisprs `("a1b2c")` (SEPARATORS was
+  matched literally, not as a regexp)
+- `(cl-remove-if #'cl-oddp '(1 2 3 4) :count 1)` → Emacs `(2 3 4)`, was `wrong-number-of-arguments`
+- `(cl-position 3 '(1 2 3 4 3) :start 3)` → Emacs `4`, elisprs `2`; `cl-count` ignored `:start`/`:end`
+- `(format-message "use `%s'" "x")` → Emacs `"use ‘x’"` (grave/apostrophe not curve-quoted)
+- `(string-version-lessp "foo2" "foo10")` → Emacs `t`, was void
+- Fixed: `split_string` now compiles SEPARATORS via the regexp engine; added `:count` to the
+  `cl-remove-if` family and `:start`/`:end` (via `cl--in-bounds`) to `cl-position`/`cl-count`/
+  `cl-position-if`/`cl-count-if`; `format-message` curve-quotes its format string; added
+  `string-version-lessp` (numeric-run compare). Resolves the `:count`/`:start`/`:end` note above.
+
+### R5-F. Missing `cl-do`/`cl-the`/`cl-etypecase` + `cl-loop`/`cl-db` destructuring — ✅ FIXED
+- `(cl-do ((i 0 (1+ i)) (s 0 (+ s i))) ((= i 4) s))` → Emacs `6` (parallel steps), was
+  `Symbol's value as variable is void: s`
+- `(cl-the integer 5)` → `5`; `(cl-etypecase 5 (integer 'i))`/`cl-ecase`: all void
+- `(cl-loop for (a b) in '((1 2) (3 4)) collect (+ a b))` → Emacs `(3 7)`, was `let: binding
+  name must be a symbol`; dotted `(k . v)` patterns errored `wrong-type-argument: listp v`
+- Fixed: added the macros (`cl-do` uses temp-bound parallel stepping); `cl-loop`'s `for … in`
+  now destructures a pattern via `cl-db--binds`; `cl-db--binds` handles a dotted-list tail (so
+  `cl-destructuring-bind` `(a . b)` works too).
+- STILL TODO: `(pcase S ((rx …) …))` — `rx` patterns inside `pcase` are unsupported (needs the
+  `rx`→regexp compiler wired into `pcase--compile`).
+
+### R5-G. Missing width/byte/type utilities — ✅ FIXED
+- `(string-width "日本語")`→`6`, `(char-width ?日)`→`2`, `truncate-string-to-width`,
+  `(string-bytes "héllo")`→`6`, `(subst-char-in-string ?a ?X "banana")`→`"bXnXnX"`: all void
+- `(cl-type-of 5)`→`fixnum`, `(number-or-marker-p 5)`/`(integer-or-marker-p 5)`→`t`: all void
+- Fixed: added all the above in the prelude. `char-width` covers the East-Asian wide/fullwidth
+  ranges (→2) and combining marks (→0); `cl-type-of` refines `type-of` (`fixnum`/`null`/`cons`).
+- KNOWN GAPS this sweep (deferred): `(type-of (lambda …))` → Emacs 30 `interpreted-function`
+  (we return `function`); `(string-replace "" …)` should signal `wrong-length-argument`.
+
+### R5-H. `format` `%g` C-printf semantics — ✅ FIXED
+- See R4-I above (now resolved). `(format "%g" 1234567.0)`→`"1.23457e+06"`,
+  `(format "%g" 0.00001)`→`"1e-05"`, `(format "%#g" 1.5)`→`"1.50000"`, all match Emacs.
+- Still deferred: `%E` is invalid in Emacs (signals an error) but we emit it verbatim — minor.
+
+### R5-I. `sort` panic / Emacs-30 keyword form + `cl-defstruct` options — ✅ FIXED
+- `(sort (list 3 1 2))` (no predicate) → **Rust panic** `index out of bounds` (indexed `args[1]`
+  unconditionally); now `(1 2 3)` via default `value<`.
+- `(sort SEQ :key … :lessp … :reverse …)` (Emacs-30 keyword form) → `void-function: :key`; now
+  supported (`:key`/`:lessp`/`:predicate`/`:reverse`).
+- `(cl-defstruct (pt3 (:constructor mk)) a)` then `(mk :a 5)` → `void-function: mk`; now the
+  `(:constructor NAME)` and `(:conc-name PREFIX)` options are honored.
+- Fixed in `host.rs` (`merge_sort_by` now sorts `(key,item)` pairs with an optional predicate +
+  `value_lt` fallback; the `sort` arm parses both call forms) and the `cl-defstruct` macro.
+- STILL TODO: real `record`/`make-record`/`recordp` primitives — `cl-defstruct` rides on
+  tagged vectors, so `(record 'foo 1 2)` and a true record type (distinct from `vectorp`) are
+  unsupported. Architectural (needs a new heap object kind); deferred pending owner go-ahead.
+
+### R5-J. More `seq.el` functions + `seq-partition` type — ✅ FIXED
+- `seq-sort-by`/`seq-split`/`seq-positions`/`seq-remove-at-position`: all void;
+  `(seq-mapcat #'list '(1 2) 'list)` → `wrong-number-of-arguments` (missing optional TYPE)
+- `(seq-partition [1 2 3 4 5] 2)` → Emacs `([1 2] [3 4] [5])`, elisprs returned list chunks
+- Fixed: added the four functions, gave `seq-mapcat` its TYPE arg (via `seq-concatenate`), and
+  made `seq-partition` keep the input's element type.
+- Note: `with-memoization` still void — its only sweep case was a degenerate misuse; skipped.
+
+### R5-K. Transcendental float math was entirely missing — ✅ FIXED
+- `(log 100 10)`→`2.0`, `(exp 1)`, `(sin 0)`, `(cos 0)`, `(tan 0)`, `(asin 1)`, `(acos 1)`,
+  `(atan 1)`/`(atan 1 1)`, `(ldexp 1.5 3)`→`12.0`, `(frexp 8.0)`→`(0.5 . 4)`,
+  `(copysign 3.0 -1.0)`→`-3.0`, `(cl-parse-integer "42")`: all void
+- Fixed: added all the above as Rust builtins (`log` takes an optional base; `atan` does `atan2`
+  with two args; `frexp` returns a `(significand . exponent)` cons) plus `cl-parse-integer` in
+  the prelude. Results match Emacs (both use the platform libm).
+- Deferred (architectural): `(truncate 1.0e+300)` needs bignums; `float-time`/`current-time`
+  are non-deterministic so not parity-testable.
+
+### R5-L. `cl` list/plist gaps + `cl-remove-duplicates :from-end` — ✅ FIXED
+- `(cl-remove-duplicates '(1 2 1 3) :from-end t)` → Emacs `(1 2 3)` (keep first), elisprs `(2 1 3)`
+- `cl-pairlis`, `cl-tailp`, `cl-ldiff`, `lax-plist-get`: all void
+- Fixed: `cl-remove-duplicates` now branches on `:from-end`; added the four functions
+  (`cl-tailp`/`cl-ldiff` walk the cdr chain by `eq` identity, matching Emacs).
+- Note: `map-merge` (and the rest of `map.el`) are void in `emacs -Q` too — not divergences.
+
+### R5-M. `char-equal` case-fold + `cl-assert`/`cl-check-type`/`format-spec` — ✅ FIXED
+- `(char-equal ?a ?A)` → Emacs `t`, elisprs `nil` — it ignored `case-fold-search` (which
+  defaults to `t`, so the comparison folds case by default)
+- `cl-assert`/`cl-check-type` void (`integer` read as a variable); `format-spec` void
+- Fixed: `char_equal` now folds case via `case_fold_search`; added the macros (`cl-assert`
+  signals `cl-assertion-failed`, seeded as a child of `error`; `cl-check-type` uses `cl-typep`)
+  and `format-spec` in the prelude.
+- (Resolved in R5-N below.)
+
+### R5-N. `cl-defgeneric` / `cl-defmethod` type-dispatch generics — ✅ FIXED
+- `(cl-defgeneric area (s)) (cl-defmethod area ((s integer)) (* s s)) (area 4)` → `16`; were void.
+- Implemented in the prelude: a per-name method table (`cl--generic-table`), a dispatcher that
+  matches each arg against its specializer and picks the most specific applicable method
+  (`integer` > `number`, `(eql V)`/`(head V)` > a plain type), unspecialized args, multi-arg
+  dispatch, method redefinition (replace by equal specializers), and `cl-no-applicable-method`.
+- Verified vs Emacs across 10 cases (disjoint types, specificity, eql, fallback, multi-arg).
+- Follow-up DONE in R5-O: full method combination implemented.
+
+### R5-P. `read-from-string`/`pp-to-string` + `seq-contains-p`/`remove` type + cl bits — ✅ FIXED
+- `read-from-string`/`pp-to-string`/`cl-substitute-if`/`cl-mapcan`/`string-to-multibyte`/
+  `multibyte-string-p`: all void
+- `(seq-contains-p "abc" ?b)` → `wrong-type-argument: listp` (only handled lists)
+- `(remove 3 [1 2 3])` → Emacs `[1 2]`, elisprs `(1 2)` (didn't preserve the vector type)
+- Fixed: added `read_one(src,start)->(form,end)` in the reader + a `read-from-string` subr;
+  `pp-to-string`/`pp`, the `cl-substitute-if[-not]`/`cl-mapcan` and uni/multibyte shims;
+  `seq-contains-p` coerces via `append`, `remove` re-`vconcat`s a vector input.
+- (Hit the prelude-ordering gotcha once more — `multibyte-string-p` first used `dolist` before
+  it's defined; rewrote with `while`.)
+- Still architectural/deferred: bool-vectors (`#&N…`), text properties (`propertize`/
+  `#("x" 0 1 (…))`), buffer functions (`with-temp-buffer`/`insert`).
+
+### R5-Q. More `cl-loop` clauses — ✅ FIXED
+- `for V across SEQ`, `for V being [the|each] {elements|hash-keys|hash-values} of SRC`,
+  `for V = INIT [then STEP]`, `when/unless COND return X`, `named NAME`: all errored
+  (`unsupported clause` / `expected an accumulation clause, got return`).
+- Fixed in the `cl-loop` macro. Subtlety: `for = then` must be modeled like the numeric `for`
+  (init in `binds`, step at end in `steps`) so V is current when a later `until`/`while` test
+  runs — `(cl-loop for x = 5 then (1- x) until (= x 0) collect x)` → `(5 4 3 2 1)`. `return`
+  added as an action in `cl-loop--accum` (so it works inside `when`/`if`).
+
+### R5-R. `pcase-let*` / `pcase-dolist` / pcase `seq` pattern — ✅ FIXED
+- `pcase-let*` and `pcase-dolist` were undefined → `invalid-function` (the binding list parsed
+  as a call). `(pcase '(1 2) ((seq a b) …))` → `unsupported pattern (seq a b)`.
+- Fixed: `pcase-let*` reuses `pcase-let` (its `let*` expansion is already sequential);
+  `pcase-dolist` wraps `dolist` + `pcase-let`; the `seq` pattern compiles each subpattern
+  against `(elt VAL i)` under a `sequencep` guard (works on lists, vectors, strings).
+- Vector patterns DONE in R5-S. `(rx …)` patterns still TODO.
+
+### R5-S. Backquoted vector templates + pcase vector patterns — ✅ FIXED
+- `` `[,a ,b] `` in value position stayed a literal vector of `(unquote a)` forms (didn't
+  evaluate); as a pcase pattern it errored `unsupported pattern`.
+- Fixed: `bq_expand` now folds a vector template into `(vconcat LISTFORM)` (so `,`/`,@` work);
+  `pcase--compile` reads a `vconcat`-headed pattern as a vector match — `(vectorp VAL)` guard +
+  match the cons-pattern against `(append VAL nil)`. Exact-length matching falls out of the
+  cons pattern's `nil` terminator; non-vectors fail cleanly (the `lv` binding is guarded).
+- Also hardened the `seq` pattern (R5-R) the same way so `(pcase 5 ((seq a b) …))` fails
+  instead of erroring on `(elt 5 0)`.
+- `(rx …)` patterns DONE in R5-T.
+
+### R5-T. `rx` macro + `(rx …)` pcase pattern — ✅ FIXED
+- `rx` was entirely void. Added a prelude `rx`→regexp-string compiler covering string/char
+  literals; the named classes/anchors (`bol`/`eol`/`bos`/`eos`/`digit`/`alpha`/`space`/`word`/
+  …); `seq`/`and`/`or`/`group`/`group-n`; quantifiers `*`/`0+`/`+`/`1+`/`?`/`opt`/`=`/`>=`/
+  `**`/`repeat`; char sets `(any …)`/`(in …)` and `(not …)`; and `literal`/`regexp`. Matches
+  Emacs's output including the single-char-`or`→`[abc]` folding.
+- Wired `(rx …)` into `pcase--compile` (string-match the value, guarded by `stringp`).
+- Minor remaining cosmetic gap: Emacs sorts char-set ranges (`(any "a-z" "0-9")` → `"[0-9a-z]"`,
+  we emit `"[a-z0-9]"`) — functionally identical, byte order differs.
+
+### R5-O. `cl-defmethod` method combination + `cl-coerce`/`cl-gensym`/`cl-digit-char-p` — ✅ FIXED
+- A qualified method clobbered the primary: `(cl-defmethod q :before ((x integer)) …)` made
+  `(q 5)` return the `:before` value (`nil`) because dedup keyed only on specializers, so the
+  `:before` replaced the primary with equal specs.
+- `cl-coerce`/`cl-gensym`/`cl-digit-char-p` were void.
+- Fixed: methods now store a QUALIFIER (dedup keys on qualifier+specs); the dispatcher orders
+  applicable methods by specificity and runs the CLOS effective method — `:around` (most
+  specific first, wrapping) → `:before` (all, most specific first) → primary chain → `:after`
+  (all, least specific first). `cl-call-next-method`/`cl-next-method-p` walk the chain via the
+  dynamic `cl--cnm-next`/`cl--cnm-args`; exhaustion signals `cl-no-next-method`. Added the three
+  `cl-` functions. Verified vs Emacs (before/after order, around wrapping, primary chaining `1 2 3`).

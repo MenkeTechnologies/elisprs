@@ -81,7 +81,26 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
     };
     match name.as_deref() {
         Some("quote") => load_const(b, elems.get(1).cloned().unwrap_or(Value::Undef)),
-        Some("function") => load_const(b, elems.get(1).cloned().unwrap_or(Value::Undef)),
+        Some("function") => {
+            // `#'(lambda ...)` is the closure, not the literal lambda form — so
+            // compile a lambda argument like `lambda` does; otherwise (a symbol)
+            // load it as a constant for the CALL handler to resolve.
+            let arg = elems.get(1).cloned().unwrap_or(Value::Undef);
+            let arg_elems = match h.obj(&arg) {
+                Some(Obj::Cons(..)) => h.list_vec(&arg),
+                _ => None,
+            };
+            let is_lambda = arg_elems
+                .as_ref()
+                .and_then(|e| e.first())
+                .map(|f| h.sym_name(f).as_deref() == Some("lambda"))
+                .unwrap_or(false);
+            if is_lambda {
+                compile_lambda(h, b, &arg_elems.unwrap(), false)?;
+            } else {
+                load_const(b, arg);
+            }
+        }
         Some("lambda") => compile_lambda(h, b, &elems, false)?,
         Some("progn") => compile_progn(h, b, &elems[1..])?,
         Some("prog1") => compile_prog1(h, b, &elems[1..])?,

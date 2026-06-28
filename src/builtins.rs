@@ -495,6 +495,21 @@ fn fset(h: &mut ElispHost, a: &[Value]) -> R {
 fn fboundp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(h.resolve_function(&a[0]).is_ok()))
 }
+/// `(indirect-function OBJECT)` — follow symbol→function-cell aliases to the final
+/// function object (a subr/closure), or nil if undefined.
+fn indirect_function(h: &mut ElispHost, a: &[Value]) -> R {
+    let mut cur = a[0].clone();
+    for _ in 0..64 {
+        match h.obj(&cur) {
+            Some(Obj::Symbol(s)) => match &s.function {
+                Some(def) => cur = def.clone(),
+                None => return Ok(Value::Undef),
+            },
+            _ => return Ok(cur),
+        }
+    }
+    Ok(cur)
+}
 /// `(boundp SYMBOL)` — non-nil if SYMBOL currently has a value.
 fn boundp(h: &mut ElispHost, a: &[Value]) -> R {
     // nil and t are always bound; otherwise the value cell must resolve.
@@ -536,6 +551,15 @@ fn error_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let data = h.list_from(vec![mstr]);
     h.pending_error = Some(h.cons(esym, data));
     Err(format!("error: {msg}"))
+}
+fn user_error_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    // Like `error`, but signals the `user-error` condition.
+    let msg = el_format(h, a)?;
+    let esym = h.intern("user-error");
+    let mstr = Value::str(msg.clone());
+    let data = h.list_from(vec![mstr]);
+    h.pending_error = Some(h.cons(esym, data));
+    Err(format!("user-error: {msg}"))
 }
 fn signal_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // Error object: (ERROR-SYMBOL . DATA) — preserve the actual data list.
@@ -612,6 +636,44 @@ fn format_radix(n: i64, radix: u32, upper: bool, alt: bool) -> String {
 
 /// C-style `%e`: a `prec`-digit mantissa, then `e`, a sign, and a ≥2-digit
 /// exponent (`1000.0` => `1.000000e+03`). Rust's `{:e}` omits the padding/sign.
+/// C-printf `%g`: pick `%e` or `%f` by the decimal exponent, with PREC
+/// significant digits; trailing zeros are trimmed unless `alt` (the `#` flag).
+fn format_g(v: f64, prec: usize, alt: bool) -> String {
+    let p = prec.max(1);
+    let strip = |mant: &str| -> String {
+        if mant.contains('.') {
+            mant.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            mant.to_string()
+        }
+    };
+    // Decimal exponent X from an %e rendering (0 for a zero value).
+    let x: i32 = if v == 0.0 {
+        0
+    } else {
+        let es = format!("{:.*e}", p - 1, v);
+        es[es.find('e').unwrap() + 1..].parse().unwrap_or(0)
+    };
+    if x >= -4 && x < p as i32 {
+        let prec_f = (p as i32 - 1 - x).max(0) as usize;
+        let s = format!("{:.*}", prec_f, v);
+        if alt {
+            s
+        } else {
+            strip(&s)
+        }
+    } else {
+        let body = format_e(v, p - 1);
+        if alt {
+            body
+        } else {
+            match body.find('e') {
+                Some(ep) => format!("{}{}", strip(&body[..ep]), &body[ep..]),
+                None => strip(&body),
+            }
+        }
+    }
+}
 fn format_e(v: f64, prec: usize) -> String {
     let s = format!("{:.*e}", prec, v);
     match s.find('e') {
@@ -791,7 +853,10 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
                 format!("{:.*}", spec.prec.unwrap_or(6), as_num(arg)?.1),
                 &spec,
             ),
-            'g' => apply_sign(format!("{}", as_num(arg)?.1), &spec),
+            'g' => apply_sign(
+                format_g(as_num(arg)?.1, spec.prec.unwrap_or(6), spec.alt),
+                &spec,
+            ),
             other => {
                 // Unknown directive: emit verbatim, consume no argument.
                 out.push('%');
@@ -963,7 +1028,9 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
         if sep.is_empty() {
             s.chars().map(|c| c.to_string()).collect()
         } else {
-            s.split(sep.as_str()).map(|w| w.to_string()).collect()
+            // SEPARATORS is a regexp in Emacs, not a literal string.
+            let re = compile_cf(&sep, false)?;
+            re.split(&s).map(|w| w.to_string()).collect()
         }
     };
     if omit_nulls {
@@ -1444,6 +1511,57 @@ fn expt_fn(_h: &mut ElispHost, a: &[Value]) -> R {
 fn sqrt_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Float(as_num(&a[0])?.1.sqrt()))
 }
+fn exp_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(&a[0])?.1.exp()))
+}
+fn log_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let x = as_num(&a[0])?.1;
+    Ok(Value::Float(match a.get(1) {
+        Some(b) => x.log(as_num(b)?.1),
+        None => x.ln(),
+    }))
+}
+fn sin_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(&a[0])?.1.sin()))
+}
+fn cos_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(&a[0])?.1.cos()))
+}
+fn tan_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(&a[0])?.1.tan()))
+}
+fn asin_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(&a[0])?.1.asin()))
+}
+fn acos_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(&a[0])?.1.acos()))
+}
+fn atan_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let y = as_num(&a[0])?.1;
+    Ok(Value::Float(match a.get(1) {
+        Some(x) => y.atan2(as_num(x)?.1),
+        None => y.atan(),
+    }))
+}
+fn ldexp_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let m = as_num(&a[0])?.1;
+    let e = as_num(&a[1])?.0 as i32;
+    Ok(Value::Float(m * 2f64.powi(e)))
+}
+fn copysign_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(&a[0])?.1.copysign(as_num(&a[1])?.1)))
+}
+fn frexp_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    // Decompose V into (SIGNIFICAND . EXPONENT) with the significand in [0.5,1).
+    let v = as_num(&a[0])?.1;
+    let (m, e) = if v == 0.0 || !v.is_finite() {
+        (v, 0)
+    } else {
+        let e = v.abs().log2().floor() as i32 + 1;
+        (v / 2f64.powi(e), e)
+    };
+    Ok(h.cons(Value::Float(m), Value::Int(e as i64)))
+}
 fn isnan_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(a[0], Value::Float(f) if f.is_nan())))
 }
@@ -1539,6 +1657,12 @@ fn string_to_number(_h: &mut ElispHost, a: &[Value]) -> R {
 
 /// `(type-of OBJECT)` — the symbol naming OBJECT's primitive type.
 fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
+    // A cl-defstruct instance reports its struct name (like an Emacs record).
+    if let Some(Obj::Vector(items)) = h.obj(&a[0]) {
+        if let Some(name) = h.struct_tag_name(&items.clone()) {
+            return Ok(h.intern(&name));
+        }
+    }
     let name = match &a[0] {
         Value::Int(_) => "integer",
         Value::Float(_) => "float",
@@ -1557,6 +1681,12 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
     };
     Ok(h.intern(name))
 }
+/// `(recordp OBJECT)` / `(cl-struct-p OBJECT)` — non-nil for a cl-defstruct
+/// instance (a `cl-struct-NAME`-tagged vector, in this model).
+fn recordp(h: &mut ElispHost, a: &[Value]) -> R {
+    let ok = matches!(h.obj(&a[0]), Some(Obj::Vector(items)) if h.struct_tag_name(&items.clone()).is_some());
+    Ok(nil_or(ok))
+}
 
 /// `(functionp OBJECT)` — non-nil if OBJECT can be called as a function (a subr,
 /// a non-macro closure, or a symbol whose function cell resolves to one).
@@ -1571,8 +1701,19 @@ fn functionp(h: &mut ElispHost, a: &[Value]) -> R {
 fn char_or_string_p(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(a[0], Value::Int(_) | Value::Str(_))))
 }
-fn char_equal(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(as_int(&a[0])? == as_int(&a[1])?))
+fn char_equal(h: &mut ElispHost, a: &[Value]) -> R {
+    let (c1, c2) = (as_int(&a[0])?, as_int(&a[1])?);
+    if c1 == c2 {
+        return Ok(Value::Bool(true));
+    }
+    // With case-fold-search (default t), compare case-insensitively.
+    if case_fold_search(h) {
+        if let (Some(x), Some(y)) = (char::from_u32(c1 as u32), char::from_u32(c2 as u32)) {
+            let eq = x.to_lowercase().eq(y.to_lowercase());
+            return Ok(nil_or(eq));
+        }
+    }
+    Ok(Value::Bool(false))
 }
 /// `(symbol-function SYMBOL)` — the symbol's function-cell value, or nil.
 fn symbol_function(h: &mut ElispHost, a: &[Value]) -> R {
@@ -1728,6 +1869,17 @@ fn read_fn(h: &mut ElispHost, a: &[Value]) -> R {
         .next()
         .ok_or_else(|| "end-of-file".to_string())
 }
+/// `(read-from-string STRING &optional START END)` — read the first object from
+/// STRING (from char index START), returning `(OBJECT . END-INDEX)`.
+fn read_from_string(h: &mut ElispHost, a: &[Value]) -> R {
+    let s = as_string(&a[0])?;
+    let start = match a.get(1) {
+        Some(Value::Int(n)) => (*n).max(0) as usize,
+        _ => 0,
+    };
+    let (form, end) = crate::reader::read_one(h, &s, start)?;
+    Ok(h.cons(form, Value::Int(end as i64)))
+}
 /// `(compare-strings S1 START1 END1 S2 START2 END2 &optional IGNORE-CASE)` —
 /// `t` if the substrings are equal, else a signed 1-based index of the first
 /// mismatch (negative when S1 sorts before S2), per Emacs.
@@ -1834,6 +1986,7 @@ pub fn install(h: &mut ElispHost) {
     s("boundp", 1, Some(1), boundp);
     s("fset", 2, Some(2), fset);
     s("fboundp", 1, Some(1), fboundp);
+    s("indirect-function", 1, Some(2), indirect_function);
     // functional (funcall/apply/mapcar/mapc are handled in host::call_function)
     s("identity", 1, Some(1), identity);
     s("terpri", 0, Some(1), terpri);
@@ -1842,7 +1995,7 @@ pub fn install(h: &mut ElispHost) {
     // nonlocal exits (catch/unwind-protect/condition-case are compiler intrinsics)
     s("throw", 2, Some(2), throw_fn);
     s("error", 1, None, error_fn);
-    s("user-error", 1, None, error_fn);
+    s("user-error", 1, None, user_error_fn);
     s("signal", 2, Some(2), signal_fn);
     // hash tables (maphash is intercepted in host::call_function)
     s("make-hash-table", 0, None, make_hash_table);
@@ -1906,6 +2059,17 @@ pub fn install(h: &mut ElispHost) {
     // parity: float math / parsing / introspection
     s("expt", 2, Some(2), expt_fn);
     s("sqrt", 1, Some(1), sqrt_fn);
+    s("exp", 1, Some(1), exp_fn);
+    s("log", 1, Some(2), log_fn);
+    s("sin", 1, Some(1), sin_fn);
+    s("cos", 1, Some(1), cos_fn);
+    s("tan", 1, Some(1), tan_fn);
+    s("asin", 1, Some(1), asin_fn);
+    s("acos", 1, Some(1), acos_fn);
+    s("atan", 1, Some(2), atan_fn);
+    s("ldexp", 2, Some(2), ldexp_fn);
+    s("copysign", 2, Some(2), copysign_fn);
+    s("frexp", 1, Some(1), frexp_fn);
     s("isnan", 1, Some(1), isnan_fn);
     s("fround", 1, Some(1), fround_fn);
     s("ffloor", 1, Some(1), ffloor_fn);
@@ -1915,6 +2079,8 @@ pub fn install(h: &mut ElispHost) {
     s("downcase", 1, Some(1), downcase_fn);
     s("upcase", 1, Some(1), upcase_fn);
     s("type-of", 1, Some(1), type_of);
+    s("recordp", 1, Some(1), recordp);
+    s("cl-struct-p", 1, Some(1), recordp);
     s("functionp", 1, Some(1), functionp);
     s("char-or-string-p", 1, Some(1), char_or_string_p);
     s("char-equal", 2, Some(2), char_equal);
@@ -1931,5 +2097,6 @@ pub fn install(h: &mut ElispHost) {
     s("string-distance", 2, Some(3), string_distance);
     s("logb", 1, Some(1), logb_fn);
     s("read", 1, Some(1), read_fn);
+    s("read-from-string", 1, Some(3), read_from_string);
     s("compare-strings", 6, Some(7), compare_strings);
 }
