@@ -186,8 +186,14 @@ fn prelude_derived_surface() {
 fn nonlocal_exits() {
     assert_eq!(eval("(catch 'done (throw 'done 42))"), "42");
     assert_eq!(eval("(catch 'x (+ 1 (throw 'x 99)) 999)"), "99"); // throw aborts mid-expr
-    assert_eq!(eval("(catch 'outer (catch 'inner (throw 'outer 7)) 8)"), "7");
-    assert_eq!(eval("(condition-case nil (/ 1 0) (error 'caught))"), "caught");
+    assert_eq!(
+        eval("(catch 'outer (catch 'inner (throw 'outer 7)) 8)"),
+        "7"
+    );
+    assert_eq!(
+        eval("(condition-case nil (/ 1 0) (error 'caught))"),
+        "caught"
+    );
     assert_eq!(eval("(condition-case nil (+ 1 2) (error 'no))"), "3");
     assert_eq!(eval("(ignore-errors (/ 1 0))"), "nil");
     assert_eq!(eval("(ignore-errors 123)"), "123");
@@ -197,5 +203,8 @@ fn nonlocal_exits() {
         "cleaned"
     );
     // catch+throw as a loop break
-    assert_eq!(eval("(catch 'x (dotimes (i 100) (if (= i 5) (throw 'x i))))"), "5");
+    assert_eq!(
+        eval("(catch 'x (dotimes (i 100) (if (= i 5) (throw 'x i))))"),
+        "5"
+    );
 }

@@ -25,7 +25,7 @@ path = "src/lib.rs"
 # fusevm bytecode (src/compiler.rs) and hosts the elisp object heap
 # (src/host.rs, reached from fusevm's extension handler). The cons/symbol/
 # vector cells ride through the VM as `Value::Obj(u32)` handles into that heap.
-fusevm = { path = "../fusevm" }
+fusevm = "0.14.3"
 
 # `elisp --lsp` speaks LSP over stdio (src/lsp.rs); `elisp --dap` speaks the
 # Debug Adapter Protocol over stdio (src/dap.rs). libc gives the DAP server a

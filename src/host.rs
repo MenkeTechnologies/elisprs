@@ -62,6 +62,12 @@ pub enum Obj {
         body: Rc<Chunk>,
         is_macro: bool,
     },
+    /// An elisp hash table. `test`: 0 = eq, 1 = eql, 2 = equal. Association-vector
+    /// storage (linear scan) — fine for the table sizes elisp config uses.
+    HashTable {
+        test: u8,
+        entries: Vec<(Value, Value)>,
+    },
 }
 
 /// Resolution of a function designator to something callable.
@@ -382,6 +388,9 @@ impl ElispHost {
                         "#<closure>".to_string()
                     }
                 }
+                Some(Obj::HashTable { entries, .. }) => {
+                    format!("#s(hash-table size {})", entries.len())
+                }
                 None => "#<dangling>".to_string(),
             },
             other => other.as_str_cow().into_owned(),
@@ -400,9 +409,7 @@ impl ElispHost {
             let next = d.clone();
             match next {
                 Value::Undef => break,
-                Value::Obj(id)
-                    if matches!(self.arena.get(id as usize), Some(Obj::Cons(..))) =>
-                {
+                Value::Obj(id) if matches!(self.arena.get(id as usize), Some(Obj::Cons(..))) => {
                     cur = next;
                 }
                 _ => {
@@ -504,6 +511,17 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                     call_function(&args[0], &[e])?;
                 }
                 return Ok(args[1].clone());
+            }
+            "maphash" => {
+                let entries = with_host(|h| match h.obj(&args[1]) {
+                    Some(Obj::HashTable { entries, .. }) => Some(entries.clone()),
+                    _ => None,
+                })
+                .ok_or("maphash: not a hash table")?;
+                for (k, v) in entries {
+                    call_function(&args[0], &[k, v])?;
+                }
+                return Ok(Value::Undef);
             }
             // Nonlocal-exit intrinsics (the compiler rewrites catch/unwind-protect/
             // condition-case into these, passing lambda thunks).
