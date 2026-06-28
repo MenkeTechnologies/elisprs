@@ -2,9 +2,9 @@
 //! symbols) so the compiler can walk them and quoted literals can be emitted as
 //! `Value::Obj` constants.
 //!
-//! nil → fusevm `Undef`, t → fusevm `T`. Milestone scope: ints/floats/strings,
-//! symbols (incl. `1+`, `<=`, `:keywords`), `'quote`, `#'function`, `?c` char
-//! literals, `;` comments. (Backquote and true dotted-pair reading land next.)
+//! nil → fusevm `Undef`, t → fusevm `T`. Reads: ints/floats/strings, symbols
+//! (incl. `1+`, `<=`, `:keywords`), `'quote`, `#'function`, `?c` char literals,
+//! `;` comments, backquote/unquote (`` ` `` `,` `,@`), and dotted pairs (`a . b`).
 
 use crate::host::ElispHost;
 use fusevm::Value;

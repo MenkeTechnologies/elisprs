@@ -110,7 +110,7 @@ elisp --version
 
 `defun`/`defmacro`/`lambda` support `&optional` and `&rest`; macros expand and re-evaluate; `condition-case` matches the `error` umbrella and specific error symbols.
 
-**A taste** (runnable as [`examples/demo.el`](examples/demo.el) via `elisp examples/demo.el`):
+**A taste** (the [`examples/`](examples) directory has runnable, self-testing ERT versions — `elisp examples/demo.el`):
 
 ```elisp
 (defun fact (n) (if (<= n 1) 1 (* n (fact (1- n)))))
