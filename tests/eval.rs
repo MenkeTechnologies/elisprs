@@ -504,3 +504,60 @@ fn emacs_parity_compiler_fixes() {
     assert_eq!(eval("(1+ 41)"), "42");
     assert_eq!(eval("(let ((i 0)) (while (< i 5) (setq i (1+ i))) i)"), "5");
 }
+
+#[test]
+fn emacs_parity_reader_cluster() {
+    // Radix-prefixed integer literals (#x / #o / #b, uppercase, #NNr, signed).
+    assert_eq!(eval("#x1f"), "31");
+    assert_eq!(eval("#b101"), "5");
+    assert_eq!(eval("#o17"), "15");
+    assert_eq!(eval("#xFF"), "255");
+    assert_eq!(eval("#x-10"), "-16");
+    assert_eq!(eval("#16rFF"), "255");
+    assert_eq!(eval("(+ #xff 1)"), "256");
+    // Character modifier syntax: control / meta / shift, nestable.
+    assert_eq!(eval("?\\C-a"), "1");
+    assert_eq!(eval("?\\C-A"), "1");
+    assert_eq!(eval("?\\C-?"), "127");
+    assert_eq!(eval("?\\^a"), "1");
+    assert_eq!(eval("?\\M-a"), "134217825");
+    assert_eq!(eval("?\\C-\\M-a"), "134217729");
+    assert_eq!(eval("?\\S-a"), "33554529");
+    // Plain char literals still work.
+    assert_eq!(eval("?A"), "65");
+    // Non-finite float read syntax round-trips through print.
+    assert_eq!(eval("1.0e+INF"), "1.0e+INF");
+    assert_eq!(eval("-1.0e+INF"), "-1.0e+INF");
+    assert_eq!(eval("0.0e+NaN"), "0.0e+NaN");
+}
+
+#[test]
+fn emacs_parity_format_fields_and_misc_fns() {
+    // %N$ argument fields, combinable with flags/width.
+    assert_eq!(eval("(format \"%2$s %1$s\" \"a\" \"b\")"), "\"b a\"");
+    assert_eq!(eval("(format \"%1$s %1$s\" \"x\" \"y\")"), "\"x x\"");
+    assert_eq!(eval("(format \"%2$05d\" 1 42)"), "\"00042\"");
+    // Sequential directives still advance normally.
+    assert_eq!(eval("(format \"%s %s\" \"a\" \"b\")"), "\"a b\"");
+    // logb / read / compare-strings.
+    assert_eq!(eval("(logb 8)"), "3");
+    assert_eq!(eval("(logb 1)"), "0");
+    assert_eq!(eval("(read \"(1 2 3)\")"), "(1 2 3)");
+    assert_eq!(eval("(read \"42\")"), "42");
+    assert_eq!(
+        eval("(compare-strings \"abc\" nil nil \"abd\" nil nil)"),
+        "-3"
+    );
+    assert_eq!(
+        eval("(compare-strings \"abc\" nil nil \"abc\" nil nil)"),
+        "t"
+    );
+    assert_eq!(
+        eval("(compare-strings \"ABC\" nil nil \"abc\" nil nil t)"),
+        "t"
+    );
+    // error-message-string / seq-mapn.
+    assert_eq!(eval("(error-message-string '(error \"hi\"))"), "\"hi\"");
+    assert_eq!(eval("(seq-mapn '+ '(1 2) '(3 4))"), "(4 6)");
+    assert_eq!(eval("(seq-mapn '+ '(1 2 3) '(10 20))"), "(11 22)");
+}

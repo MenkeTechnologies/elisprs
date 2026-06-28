@@ -77,16 +77,16 @@ elref() { emacs -Q --batch --eval "(prin1 $1)" 2>&1; }   # ground truth
 - `(vector 1 2 3)` works and prints `[1 2 3]`; only the literal reader is missing.
   Cascades to `(aref [10 20 30] 1)`, `(vconcat [1 2] [3 4])`, `(equal [1 2] [1 2])`, …
 
-### 13. Radix literals `#x` `#b` `#o` not read
+### 13. ✅ FIXED — Radix literals `#x` `#b` `#o` not read
 - `#x1f` → Emacs `31`, elisprs `error: …void: #x1f` (same for `#b101`→5, `#o17`→15)
 
-### 14. Char modifier syntax `?\C-` / `?\M-` not read
+### 14. ✅ FIXED — Char modifier syntax `?\C-` / `?\M-` not read
 - `?\C-a` → Emacs `1`, elisprs `error: …void: -a`
 - `?\M-a` → Emacs `134217825`, elisprs `error: …void: -a`
 - Plain `?A`→65 and `?\n`→10 work; only modifier escapes fail. `src/reader.rs:156`
   (`read_char_literal`).
 
-### 15. Float special-value read syntax not supported
+### 15. ✅ FIXED — Float special-value read syntax not supported
 - `1.0e+INF` → Emacs `1.0e+INF`, elisprs `error: …void: 1.0e+INF`
 
 ---
@@ -109,7 +109,7 @@ elref() { emacs -Q --batch --eval "(prin1 $1)" 2>&1; }   # ground truth
 - `(format "%e" 31415.9)` → Emacs `"3.141590e+04"`, elisprs `"%e"`
 - `(format "%g" 100000.0)` → Emacs `"100000"`, elisprs `"%g"`
 
-### 18. Argument field numbers `%N$` unsupported
+### 18. ✅ FIXED — Argument field numbers `%N$` unsupported
 - `(format "%2$s %1$s" "a" "b")` → Emacs `"b a"`, elisprs `"%2$s %1$s"`
 
 ---
@@ -137,11 +137,12 @@ elref() { emacs -Q --batch --eval "(prin1 $1)" 2>&1; }   # ground truth
 - `(append '(1 2) '(3 4) 5)` → Emacs `(1 2 3 4 . 5)` (dotted tail), elisprs `error: wrong-type-argument: listp`
 - `(downcase ?A)` → Emacs `97`, elisprs `error: wrong-type-argument: stringp 65` (also `(upcase ?a)`)
 
-### 23. 🟡 PARTIAL — Core functions present in `emacs -Q` but void in elisprs
+### 23. ✅ FIXED — Core functions present in `emacs -Q` but void in elisprs
 Added: `type-of`, `functionp`, `char-or-string-p`, `sqrt`, `fround`, `ffloor`,
-`fceiling`, `ftruncate`, `isnan`, `char-equal` (`prin1-to-string` already present).
-Still missing: `read`, `logb`, `compare-strings`, `error-message-string`,
-`format-message`, `seq-mapn`.
+`fceiling`, `ftruncate`, `isnan`, `char-equal`, `logb`, `read`, `compare-strings`,
+`error-message-string`, `seq-mapn` (`prin1-to-string` already present).
+`format-message` is an alias of `format` here (no curved-quote translation), so it
+is provided as such.
 
 ---
 

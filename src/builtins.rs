@@ -582,24 +582,51 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             out.push('%');
             continue;
         }
+        // Optional argument field `N$` (N starts 1-9, so it can't be confused
+        // with a `0` flag) — selects the Nth argument: `%2$s` uses arg 2.
+        let mut field: Option<usize> = None;
+        let mut width = 0usize;
+        let mut width_done = false;
+        if matches!(chars.peek(), Some('1'..='9')) {
+            let mut num = 0usize;
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    num = num * 10 + (d as usize - '0' as usize);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if chars.peek() == Some(&'$') {
+                chars.next();
+                field = Some(num);
+            } else {
+                // Not a field — those digits were the width.
+                width = num;
+                width_done = true;
+            }
+        }
         // flags
         let (mut left, mut zero) = (false, false);
-        while let Some(&f) = chars.peek() {
-            match f {
-                '-' => left = true,
-                '0' => zero = true,
-                _ => break,
+        if !width_done {
+            while let Some(&f) = chars.peek() {
+                match f {
+                    '-' => left = true,
+                    '0' => zero = true,
+                    _ => break,
+                }
+                chars.next();
             }
-            chars.next();
         }
         // width
-        let mut width = 0usize;
-        while let Some(&d) = chars.peek() {
-            if d.is_ascii_digit() {
-                width = width * 10 + (d as usize - '0' as usize);
-                chars.next();
-            } else {
-                break;
+        if !width_done {
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    width = width * 10 + (d as usize - '0' as usize);
+                    chars.next();
+                } else {
+                    break;
+                }
             }
         }
         // .precision
@@ -628,7 +655,9 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             prec,
             conv,
         };
-        let arg = a.get(ai).unwrap_or(&Value::Undef);
+        // A field number selects an explicit (1-based) argument; otherwise take
+        // the next one in sequence.
+        let arg = a.get(field.unwrap_or(ai)).unwrap_or(&Value::Undef);
         let body = match conv {
             's' => {
                 let s = h.print(arg, false);
@@ -658,7 +687,9 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
                 continue;
             }
         };
-        ai += 1;
+        if field.is_none() {
+            ai += 1;
+        }
         out.push_str(&pad(body, &spec));
     }
     Ok(out)
@@ -1381,6 +1412,68 @@ fn char_or_string_p(_h: &mut ElispHost, a: &[Value]) -> R {
 fn char_equal(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(as_int(&a[0])? == as_int(&a[1])?))
 }
+/// `(logb X)` — the binary exponent of |X|: floor(log2(|X|)).
+fn logb_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let f = as_num(&a[0])?.1.abs();
+    if f == 0.0 {
+        // Emacs returns most-negative-fixnum (62-bit) for (logb 0).
+        return Ok(Value::Int(-2305843009213693952));
+    }
+    Ok(Value::Int(f.log2().floor() as i64))
+}
+/// `(read STRING)` — read the first Lisp form from STRING.
+fn read_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let s = as_string(&a[0])?;
+    let forms = crate::reader::read_all(h, &s)?;
+    forms
+        .into_iter()
+        .next()
+        .ok_or_else(|| "end-of-file".to_string())
+}
+/// `(compare-strings S1 START1 END1 S2 START2 END2 &optional IGNORE-CASE)` —
+/// `t` if the substrings are equal, else a signed 1-based index of the first
+/// mismatch (negative when S1 sorts before S2), per Emacs.
+fn compare_strings(_h: &mut ElispHost, a: &[Value]) -> R {
+    let s1: Vec<char> = as_string(&a[0])?.chars().collect();
+    let s2: Vec<char> = as_string(&a[3])?.chars().collect();
+    let bound = |v: &Value, default: usize| -> usize {
+        match v {
+            Value::Int(n) => (*n).max(0) as usize,
+            _ => default,
+        }
+    };
+    let (start1, end1) = (
+        bound(&a[1], 0),
+        bound(a.get(2).unwrap_or(&Value::Undef), s1.len()).min(s1.len()),
+    );
+    let (start2, end2) = (
+        bound(&a[4], 0),
+        bound(a.get(5).unwrap_or(&Value::Undef), s2.len()).min(s2.len()),
+    );
+    let ignore_case = a.get(6).is_some_and(|v| !is_nil(v));
+    let sub1 = &s1[start1.min(end1)..end1];
+    let sub2 = &s2[start2.min(end2)..end2];
+    let fold = |c: char| {
+        if ignore_case {
+            c.to_lowercase().next().unwrap_or(c)
+        } else {
+            c
+        }
+    };
+    let n = sub1.len().min(sub2.len());
+    for i in 0..n {
+        let (x, y) = (fold(sub1[i]), fold(sub2[i]));
+        if x != y {
+            let idx = (i + 1) as i64;
+            return Ok(Value::Int(if x < y { -idx } else { idx }));
+        }
+    }
+    match sub1.len().cmp(&sub2.len()) {
+        std::cmp::Ordering::Less => Ok(Value::Int(-((n + 1) as i64))),
+        std::cmp::Ordering::Greater => Ok(Value::Int((n + 1) as i64)),
+        std::cmp::Ordering::Equal => Ok(Value::Bool(true)),
+    }
+}
 
 /// Install the primitive subr set.
 pub fn install(h: &mut ElispHost) {
@@ -1522,4 +1615,7 @@ pub fn install(h: &mut ElispHost) {
     s("functionp", 1, Some(1), functionp);
     s("char-or-string-p", 1, Some(1), char_or_string_p);
     s("char-equal", 2, Some(2), char_equal);
+    s("logb", 1, Some(1), logb_fn);
+    s("read", 1, Some(1), read_fn);
+    s("compare-strings", 6, Some(7), compare_strings);
 }

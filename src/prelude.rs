@@ -397,6 +397,22 @@ pub const PRELUDE: &str = r#"
   (let ((i 0)) (while seq (funcall fn (car seq) i) (setq seq (cdr seq)) (setq i (1+ i)))) nil)
 (defun seq-keep (fn seq) (seq-filter (function identity) (mapcar fn seq)))
 (defun seq-mapcat (fn seq) (apply (function append) (mapcar fn seq)))
+(defun seq-mapn (fn &rest seqs)
+  ;; Apply FN across N sequences in parallel, stopping at the shortest:
+  ;; (seq-mapn #'+ '(1 2) '(3 4)) => (4 6).
+  (let ((r nil))
+    (while (not (memq nil seqs))
+      (setq r (cons (apply fn (mapcar (function car) seqs)) r))
+      (setq seqs (mapcar (function cdr) seqs)))
+    (reverse r)))
+;; The human-readable message for an error object (ERROR-SYMBOL . DATA).
+(defun error-message-string (err)
+  (let ((sym (car err)) (data (cdr err)))
+    (cond
+     ((and (eq sym 'error) (stringp (car data))) (car data))
+     ((null data) (symbol-name sym))
+     (t (concat (symbol-name sym) ": "
+                (mapconcat (lambda (x) (if (stringp x) x (format "%S" x))) data ", "))))))
 (defun seq-group-by (fn seq)
   (let ((result nil))
     (dolist (x seq)

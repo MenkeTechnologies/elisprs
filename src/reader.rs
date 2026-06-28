@@ -94,6 +94,13 @@ impl Reader {
                 let f = self.read_form(h)?;
                 Ok(quoted(h, "function", f))
             }
+            '#' if matches!(
+                self.peek_at(1),
+                Some('x' | 'X' | 'o' | 'O' | 'b' | 'B' | '0'..='9')
+            ) =>
+            {
+                self.read_radix(h)
+            }
             _ => self.read_atom(h),
         }
     }
@@ -175,17 +182,113 @@ impl Reader {
     }
 
     fn read_char_literal(&mut self) -> Result<Value, String> {
-        self.pos += 1;
+        self.pos += 1; // consume '?'
+        Ok(Value::Int(self.read_char_spec()?))
+    }
+
+    /// Read one character specification (after `?`), honoring the modifier
+    /// prefixes `\C-` / `\^` (control), `\M-` (meta), `\S-` (shift), `\H-`,
+    /// `\s-`, `\A-`, which may nest: `?\C-\M-a` => control+meta a.
+    fn read_char_spec(&mut self) -> Result<i64, String> {
         let c = self.peek().ok_or("unterminated char literal")?;
         self.pos += 1;
-        let ch = if c == '\\' {
-            let e = self.peek().ok_or("unterminated char literal")?;
-            self.pos += 1;
-            unescape(e)
-        } else {
-            c
+        if c != '\\' {
+            return Ok(c as i64);
+        }
+        let e = self.peek().ok_or("unterminated char literal")?;
+        let dash = self.peek_at(1) == Some('-');
+        match e {
+            'C' if dash => {
+                self.pos += 2;
+                Ok(apply_control(self.read_char_spec()?))
+            }
+            '^' => {
+                self.pos += 1;
+                Ok(apply_control(self.read_char_spec()?))
+            }
+            'M' if dash => {
+                self.pos += 2;
+                Ok(self.read_char_spec()? | C_META)
+            }
+            'S' if dash => {
+                self.pos += 2;
+                Ok(self.read_char_spec()? | C_SHIFT)
+            }
+            'H' if dash => {
+                self.pos += 2;
+                Ok(self.read_char_spec()? | C_HYPER)
+            }
+            's' if dash => {
+                self.pos += 2;
+                Ok(self.read_char_spec()? | C_SUPER)
+            }
+            'A' if dash => {
+                self.pos += 2;
+                Ok(self.read_char_spec()? | C_ALT)
+            }
+            _ => {
+                self.pos += 1;
+                Ok(unescape(e) as i64)
+            }
+        }
+    }
+
+    /// Read a radix-prefixed integer: `#x1f` / `#b101` / `#o17` (and uppercase),
+    /// or the general `#NNr…` form (e.g. `#16rFF`). An optional sign may follow
+    /// the prefix.
+    fn read_radix(&mut self, _h: &mut ElispHost) -> Result<Value, String> {
+        self.pos += 1; // consume '#'
+        let c = self.peek().ok_or("unterminated radix literal")?;
+        let base: u32 = match c {
+            'x' | 'X' => {
+                self.pos += 1;
+                16
+            }
+            'o' | 'O' => {
+                self.pos += 1;
+                8
+            }
+            'b' | 'B' => {
+                self.pos += 1;
+                2
+            }
+            '0'..='9' => {
+                let mut n = 0u32;
+                while let Some(d) = self.peek().and_then(|c| c.to_digit(10)) {
+                    n = n * 10 + d;
+                    self.pos += 1;
+                }
+                match self.peek() {
+                    Some('r') | Some('R') => self.pos += 1,
+                    _ => return Err("malformed radix literal (expected `r`)".to_string()),
+                }
+                if !(2..=36).contains(&n) {
+                    return Err(format!("invalid radix {n}"));
+                }
+                n
+            }
+            _ => return Err(format!("unsupported reader macro #{c}")),
         };
-        Ok(Value::Int(ch as i64))
+        let mut sign = 1i64;
+        match self.peek() {
+            Some('+') => self.pos += 1,
+            Some('-') => {
+                sign = -1;
+                self.pos += 1;
+            }
+            _ => {}
+        }
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if is_delim(c) {
+                break;
+            }
+            self.pos += 1;
+        }
+        let tok: String = self.chars[start..self.pos].iter().collect();
+        let n = i64::from_str_radix(&tok, base)
+            .map_err(|_| format!("invalid digits for base {base}: {tok}"))?;
+        Ok(Value::Int(sign * n))
     }
 
     fn read_atom(&mut self, h: &mut ElispHost) -> Result<Value, String> {
@@ -268,6 +371,33 @@ fn bq_expand(h: &mut ElispHost, form: &Value) -> Value {
     }
 }
 
+// Emacs character modifier bits (see `Character Type` in the manual).
+const C_META: i64 = 1 << 27;
+const C_CTL: i64 = 1 << 26;
+const C_SHIFT: i64 = 1 << 25;
+const C_HYPER: i64 = 1 << 24;
+const C_SUPER: i64 = 1 << 23;
+const C_ALT: i64 = 1 << 22;
+const C_MODMASK: i64 = C_META | C_CTL | C_SHIFT | C_HYPER | C_SUPER | C_ALT;
+
+/// Apply the control modifier to a (possibly already modified) character: fold
+/// ASCII letters / `@A-Z[\]^_` into 0–31, `?` into 127, and otherwise set the
+/// control bit. Any non-control modifier bits already present are preserved.
+fn apply_control(c: i64) -> i64 {
+    let mods = c & C_MODMASK;
+    let base = c & !C_MODMASK;
+    let ctrl = if base == '?' as i64 {
+        127
+    } else if (b'a' as i64..=b'z' as i64).contains(&base) {
+        base - b'a' as i64 + 1
+    } else if (64..=95).contains(&base) {
+        base ^ 64
+    } else {
+        return c | C_CTL;
+    };
+    ctrl | mods
+}
+
 fn unescape(e: char) -> char {
     match e {
         'n' => '\n',
@@ -292,6 +422,27 @@ fn classify(h: &mut ElispHost, tok: &str) -> Value {
         if looks_numeric(tok) {
             if let Ok(f) = tok.parse::<f64>() {
                 return Value::Float(f);
+            }
+        }
+        // Emacs read syntax for the non-finite floats: a float mantissa followed
+        // by `e+INF` or `e+NaN` (e.g. `1.0e+INF`, `-0.0e+NaN`).
+        if let Some(mant) = tok.strip_suffix("e+INF") {
+            if mant.parse::<f64>().is_ok() {
+                let inf = if mant.starts_with('-') {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                };
+                return Value::Float(inf);
+            }
+        }
+        if let Some(mant) = tok.strip_suffix("e+NaN") {
+            if mant.parse::<f64>().is_ok() {
+                return Value::Float(if mant.starts_with('-') {
+                    -f64::NAN
+                } else {
+                    f64::NAN
+                });
             }
         }
     }

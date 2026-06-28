@@ -33,6 +33,10 @@ All notable changes to elisprs are documented here. The format follows
 - `1+` / `1-` preserve float contagion (`(1+ 1.0)` => `2.0`): they lower to the
   float-aware native `Add`/`Sub` ops instead of integer `Inc`/`Dec`, keeping the
   fast path for integer loop counters.
+- Reader: radix-prefixed integers `#x1f` / `#o17` / `#b101` (and uppercase /
+  general `#NNr…`); character modifier syntax `?\C-` / `?\^` / `?\M-` / `?\S-` /
+  `?\H-` / `?\s-` / `?\A-`, nestable (`?\C-\M-a`); and the non-finite float read
+  syntax `1.0e+INF` / `-1.0e+INF` / `0.0e+NaN`.
 
 ### Added
 - `pcase` — structural dispatch (non-backquote subset): `_` wildcard,
