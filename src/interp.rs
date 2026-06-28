@@ -17,8 +17,8 @@
 
 use crate::callable::{Callable, Params};
 use crate::error::{ElError, ElResult};
+use crate::reader::read_all;
 use rust_lisp::model::{List, Symbol, Value};
-use rust_lisp::parser::parse;
 use std::any::Any;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -543,8 +543,7 @@ impl Interp {
     // ── top-level entry + printing ──
     pub fn eval_str(&mut self, src: &str) -> ElResult<Value> {
         let mut last = Value::NIL;
-        for form in parse(src) {
-            let form = form.map_err(|e| ElError::err(format!("parse error: {e:?}")))?;
+        for form in read_all(src)? {
             last = self.eval(&form)?;
         }
         Ok(last)

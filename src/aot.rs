@@ -10,13 +10,11 @@
 //! pretending to produce an object.
 
 use crate::error::ElResult;
-use rust_lisp::parser::parse;
+use crate::reader::read_all;
 use std::path::Path;
 
 pub fn compile_file(src: &str, _out: &Path) -> ElResult<()> {
-    let forms: Vec<_> = parse(src)
-        .map(|r| r.map_err(|e| crate::error::ElError::err(format!("parse error: {e:?}"))))
-        .collect::<ElResult<_>>()?;
+    let forms = read_all(src)?;
     // Lowering is the milestone-2 seam; this returns the not-implemented signal.
     crate::compiler::lower(&forms)?;
     // Once lowering exists:

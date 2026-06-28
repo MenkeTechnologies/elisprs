@@ -13,6 +13,7 @@ pub mod dap;
 pub mod error;
 pub mod interp;
 pub mod lsp;
+pub mod reader;
 
 pub use error::{ElError, ElResult};
 pub use interp::Interp;
