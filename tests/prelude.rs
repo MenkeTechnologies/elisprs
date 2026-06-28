@@ -111,9 +111,51 @@ fn cl_family() {
 fn place_mutating_macros() {
     assert_eq!(eval("(let ((x 5)) (incf x) x)"), "6");
     assert_eq!(eval("(let ((x 5)) (decf x) x)"), "4");
+    // incf/decf take an optional step amount.
+    assert_eq!(eval("(let ((x 5)) (incf x 10) x)"), "15");
+    assert_eq!(eval("(let ((x 5)) (decf x 3) x)"), "2");
     assert_eq!(eval("(let ((l '(1 2 3))) (pop l))"), "1");
     assert_eq!(eval("(let ((l '(1 2 3))) (pop l) l)"), "(2 3)");
     assert_eq!(eval("(let ((l '(2 3))) (push 1 l) l)"), "(1 2 3)");
+}
+
+#[test]
+fn setf_generalized_places() {
+    // plain variable
+    assert_eq!(eval("(let ((x 1)) (setf x 9) x)"), "9");
+    // cons cells
+    assert_eq!(
+        eval("(let ((l (list 1 2 3))) (setf (car l) 9) l)"),
+        "(9 2 3)"
+    );
+    assert_eq!(
+        eval("(let ((l (list 1 2 3))) (setf (cdr l) '(8)) l)"),
+        "(1 8)"
+    );
+    // nth / elt into a list
+    assert_eq!(
+        eval("(let ((l (list 1 2 3))) (setf (nth 1 l) 9) l)"),
+        "(1 9 3)"
+    );
+    assert_eq!(
+        eval("(let ((l (list 10 20 30))) (setf (elt l 2) 99) l)"),
+        "(10 20 99)"
+    );
+    // aref into a vector
+    assert_eq!(
+        eval("(let ((v (vector 0 0 0))) (setf (aref v 1) 7) v)"),
+        "[0 7 0]"
+    );
+    // gethash into a hash table
+    assert_eq!(
+        eval("(let ((h (make-hash-table))) (setf (gethash 'k h) 42) (gethash 'k h))"),
+        "42"
+    );
+    // multiple place/value pairs, left to right
+    assert_eq!(
+        eval("(let ((a 1) (b 2)) (setf a 10 b 20) (list a b))"),
+        "(10 20)"
+    );
 }
 
 #[test]

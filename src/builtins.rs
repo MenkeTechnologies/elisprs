@@ -245,9 +245,16 @@ fn append_fn(h: &mut ElispHost, a: &[Value]) -> R {
         if is_nil(v) {
             continue;
         }
-        match h.list_vec(v) {
-            Some(items) => out.extend(items),
-            None => return Err("wrong-type-argument: listp".to_string()),
+        // Lists, vectors, and strings are all sequences `append` can flatten.
+        match h.obj(v) {
+            Some(Obj::Vector(items)) => out.extend(items.clone()),
+            _ => match v {
+                Value::Str(s) => out.extend(s.chars().map(|c| Value::Int(c as i64))),
+                _ => match h.list_vec(v) {
+                    Some(items) => out.extend(items),
+                    None => return Err("wrong-type-argument: sequencep".to_string()),
+                },
+            },
         }
     }
     Ok(h.list_from(out))
@@ -370,6 +377,12 @@ fn intern_fn(h: &mut ElispHost, a: &[Value]) -> R {
         _ => Err("wrong-type-argument: stringp".to_string()),
     }
 }
+fn make_symbol_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    match &a[0] {
+        Value::Str(s) => Ok(h.make_symbol(&s.to_string())),
+        _ => Err("wrong-type-argument: stringp".to_string()),
+    }
+}
 fn set_fn(h: &mut ElispHost, a: &[Value]) -> R {
     h.set_value(&a[0], a[1].clone())?;
     Ok(a[1].clone())
@@ -392,6 +405,9 @@ fn terpri(_h: &mut ElispHost, _a: &[Value]) -> R {
 fn print_fn(h: &mut ElispHost, a: &[Value]) -> R {
     println!("{}", h.print(&a[0], true));
     Ok(a[0].clone())
+}
+fn prin1_to_string(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::str(h.print(&a[0], true)))
 }
 
 // ── nonlocal exits ──
@@ -436,6 +452,34 @@ fn concat_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(Value::str(out))
 }
+/// A parsed `%`-directive: `%[-][0][width][.prec]CONV`.
+struct FmtSpec {
+    left: bool,
+    zero: bool,
+    width: usize,
+    prec: Option<usize>,
+    conv: char,
+}
+
+/// Pad `body` to `spec.width` honoring the `-` (left) and `0` (zero-fill) flags.
+/// Zero-fill only applies to right-justified numerics and goes after any sign.
+fn pad(body: String, spec: &FmtSpec) -> String {
+    if body.chars().count() >= spec.width {
+        return body;
+    }
+    let fill = spec.width - body.chars().count();
+    if spec.left {
+        format!("{body}{}", " ".repeat(fill))
+    } else if spec.zero && matches!(spec.conv, 'd' | 'o' | 'x' | 'X' | 'e' | 'f' | 'g') {
+        match body.strip_prefix('-') {
+            Some(rest) => format!("-{}{rest}", "0".repeat(fill)),
+            None => format!("{}{body}", "0".repeat(fill)),
+        }
+    } else {
+        format!("{}{body}", " ".repeat(fill))
+    }
+}
+
 fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
     let fmt = match &a[0] {
         Value::Str(s) => s.to_string(),
@@ -449,48 +493,90 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             out.push(c);
             continue;
         }
-        match chars.next() {
-            Some('%') => out.push('%'),
-            Some('s') => {
-                out.push_str(&h.print(a.get(ai).unwrap_or(&Value::Undef), false));
-                ai += 1;
-            }
-            Some('S') => {
-                out.push_str(&h.print(a.get(ai).unwrap_or(&Value::Undef), true));
-                ai += 1;
-            }
-            Some('d') => {
-                out.push_str(&as_num(a.get(ai).unwrap_or(&Value::Undef))?.0.to_string());
-                ai += 1;
-            }
-            Some('x') => {
-                out.push_str(&format!(
-                    "{:x}",
-                    as_num(a.get(ai).unwrap_or(&Value::Undef))?.0
-                ));
-                ai += 1;
-            }
-            Some('c') => {
-                if let Some(ch) =
-                    char::from_u32(as_num(a.get(ai).unwrap_or(&Value::Undef))?.0 as u32)
-                {
-                    out.push(ch);
-                }
-                ai += 1;
-            }
-            Some('f') => {
-                out.push_str(&format!(
-                    "{}",
-                    as_num(a.get(ai).unwrap_or(&Value::Undef))?.1
-                ));
-                ai += 1;
-            }
-            Some(o) => {
-                out.push('%');
-                out.push(o);
-            }
-            None => out.push('%'),
+        // %% is a literal percent and takes no flags/argument.
+        if chars.peek() == Some(&'%') {
+            chars.next();
+            out.push('%');
+            continue;
         }
+        // flags
+        let (mut left, mut zero) = (false, false);
+        while let Some(&f) = chars.peek() {
+            match f {
+                '-' => left = true,
+                '0' => zero = true,
+                _ => break,
+            }
+            chars.next();
+        }
+        // width
+        let mut width = 0usize;
+        while let Some(&d) = chars.peek() {
+            if d.is_ascii_digit() {
+                width = width * 10 + (d as usize - '0' as usize);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        // .precision
+        let mut prec = None;
+        if chars.peek() == Some(&'.') {
+            chars.next();
+            let mut p = 0usize;
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    p = p * 10 + (d as usize - '0' as usize);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            prec = Some(p);
+        }
+        let Some(conv) = chars.next() else {
+            out.push('%');
+            break;
+        };
+        let spec = FmtSpec {
+            left,
+            zero,
+            width,
+            prec,
+            conv,
+        };
+        let arg = a.get(ai).unwrap_or(&Value::Undef);
+        let body = match conv {
+            's' => {
+                let s = h.print(arg, false);
+                match spec.prec {
+                    Some(p) => s.chars().take(p).collect(),
+                    None => s,
+                }
+            }
+            'S' => h.print(arg, true),
+            'd' => as_num(arg)?.0.to_string(),
+            'o' => format!("{:o}", as_num(arg)?.0),
+            'x' => format!("{:x}", as_num(arg)?.0),
+            'X' => format!("{:X}", as_num(arg)?.0),
+            'c' => char::from_u32(as_num(arg)?.0 as u32)
+                .map(String::from)
+                .unwrap_or_default(),
+            'e' => match spec.prec {
+                Some(p) => format!("{:.*e}", p, as_num(arg)?.1),
+                None => format!("{:e}", as_num(arg)?.1),
+            },
+            'f' => format!("{:.*}", spec.prec.unwrap_or(6), as_num(arg)?.1),
+            'g' => format!("{}", as_num(arg)?.1),
+            other => {
+                // Unknown directive: emit verbatim, consume no argument.
+                out.push('%');
+                out.push(other);
+                continue;
+            }
+        };
+        ai += 1;
+        out.push_str(&pad(body, &spec));
     }
     Ok(out)
 }
@@ -1065,13 +1151,14 @@ pub fn install(h: &mut ElispHost) {
     // symbols
     s("symbol-name", 1, Some(1), symbol_name);
     s("intern", 1, Some(2), intern_fn);
-    s("make-symbol", 1, Some(1), intern_fn);
+    s("make-symbol", 1, Some(1), make_symbol_fn);
     s("set", 2, Some(2), set_fn);
     s("symbol-value", 1, Some(1), symbol_value);
     // functional (funcall/apply/mapcar/mapc are handled in host::call_function)
     s("identity", 1, Some(1), identity);
     s("terpri", 0, Some(1), terpri);
     s("print", 1, Some(2), print_fn);
+    s("prin1-to-string", 1, Some(1), prin1_to_string);
     // nonlocal exits (catch/unwind-protect/condition-case are compiler intrinsics)
     s("throw", 2, Some(2), throw_fn);
     s("error", 1, None, error_fn);

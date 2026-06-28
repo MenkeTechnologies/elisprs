@@ -239,6 +239,16 @@ impl ElispHost {
         self.obarray.insert(name.to_string(), id);
         Value::Obj(id)
     }
+    /// Allocate a fresh *uninterned* symbol: it carries `name` but is not put in
+    /// the obarray, so each call yields a distinct object (`make-symbol`).
+    pub fn make_symbol(&mut self, name: &str) -> Value {
+        self.alloc(Obj::Symbol(SymbolData {
+            name: name.to_string(),
+            value: None,
+            function: None,
+            special: false,
+        }))
+    }
     pub fn obj(&self, v: &Value) -> Option<&Obj> {
         match v {
             Value::Obj(id) => self.arena.get(*id as usize),
@@ -889,6 +899,24 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 }
                 return Ok(args[1].clone());
             }
+            "sort" => {
+                // (sort SEQ PRED): stable sort a list/vector by the less-than
+                // predicate, which re-enters elisp — so it lives here, not as a
+                // plain subr. Returns a freshly built sequence of the same kind.
+                let pred = &args[1];
+                let (mut items, was_vec) = with_host(|h| match h.obj(&args[0]) {
+                    Some(Obj::Vector(v)) => (v.clone(), true),
+                    _ => (h.list_vec(&args[0]).unwrap_or_default(), false),
+                });
+                merge_sort_by(&mut items, pred)?;
+                return Ok(with_host(|h| {
+                    if was_vec {
+                        h.alloc(Obj::Vector(items))
+                    } else {
+                        h.list_from(items)
+                    }
+                }));
+            }
             "maphash" => {
                 let entries = with_host(|h| match h.obj(&args[1]) {
                     Some(Obj::HashTable { entries, .. }) => Some(entries.clone()),
@@ -929,6 +957,37 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             run_closure(&params, &body, env, args)
         }
     }
+}
+
+/// Stable merge sort driven by an elisp less-than predicate. `pred` is called as
+/// `(pred a b)`; a non-nil result means `a` precedes `b`. Equal elements keep
+/// their input order (the merge takes from the left run on ties).
+fn merge_sort_by(items: &mut Vec<Value>, pred: &Value) -> Result<(), String> {
+    let n = items.len();
+    if n < 2 {
+        return Ok(());
+    }
+    let mid = n / 2;
+    let mut right = items.split_off(mid);
+    merge_sort_by(items, pred)?;
+    merge_sort_by(&mut right, pred)?;
+    let left = std::mem::take(items);
+    let (mut i, mut j) = (0, 0);
+    items.reserve(left.len() + right.len());
+    while i < left.len() && j < right.len() {
+        // Take from the right only when right[j] strictly precedes left[i].
+        let rhs_first = call_function(pred, &[right[j].clone(), left[i].clone()])?;
+        if matches!(rhs_first, Value::Undef | Value::Bool(false)) {
+            items.push(left[i].clone());
+            i += 1;
+        } else {
+            items.push(right[j].clone());
+            j += 1;
+        }
+    }
+    items.extend_from_slice(&left[i..]);
+    items.extend_from_slice(&right[j..]);
+    Ok(())
 }
 
 /// Open a lexical scope (child of the closure's captured `env`), bind `args` to

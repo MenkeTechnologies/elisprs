@@ -115,9 +115,38 @@ pub const PRELUDE: &str = r#"
 
 ;;; ---- control macros ----
 (defmacro prog2 (a b &rest body) (list (quote progn) a (cons (quote prog1) (cons b body))))
-(defmacro incf (place) (list (quote setq) place (list (quote 1+) place)))
-(defmacro decf (place) (list (quote setq) place (list (quote 1-) place)))
+(defmacro incf (place &rest amt) (if amt `(setq ,place (+ ,place ,(car amt))) `(setq ,place (1+ ,place))))
+(defmacro decf (place &rest amt) (if amt `(setq ,place (- ,place ,(car amt))) `(setq ,place (1- ,place))))
 (defmacro push (x place) (list (quote setq) place (list (quote cons) x place)))
+;; setf: assign to a generalized place. Supports a plain variable and the
+;; common cons/sequence/hash/symbol places; multiple place/value pairs expand
+;; left-to-right.
+(defmacro setf (&rest pairs)
+  (if (null pairs)
+      nil
+    (let ((place (car pairs)) (val (cadr pairs)) (rest (cddr pairs)))
+      (let ((exp
+             (if (consp place)
+                 (let ((head (car place)) (args (cdr place)))
+                   (cond
+                    ((eq head 'car) `(setcar ,(car args) ,val))
+                    ((eq head 'cdr) `(setcdr ,(car args) ,val))
+                    ((eq head 'caar) `(setcar (car ,(car args)) ,val))
+                    ((eq head 'cadr) `(setcar (cdr ,(car args)) ,val))
+                    ((eq head 'cddr) `(setcdr (cdr ,(car args)) ,val))
+                    ((eq head 'nth) `(setcar (nthcdr ,(car args) ,(cadr args)) ,val))
+                    ((eq head 'nthcdr) `(setcdr (nthcdr (1- ,(car args)) ,(cadr args)) ,val))
+                    ((eq head 'elt)
+                     `(if (listp ,(car args))
+                          (setcar (nthcdr ,(cadr args) ,(car args)) ,val)
+                        (aset ,(car args) ,(cadr args) ,val)))
+                    ((eq head 'aref) `(aset ,(car args) ,(cadr args) ,val))
+                    ((eq head 'gethash) `(puthash ,(car args) ,val ,(cadr args)))
+                    ((eq head 'symbol-value) `(set ,(car args) ,val))
+                    ((eq head 'alist-get) `(setcdr (assq ,(car args) ,(cadr args)) ,val))
+                    (t (error "setf: unsupported place: %S" place))))
+               `(setq ,place ,val))))
+        (if rest `(progn ,exp (setf ,@rest)) exp)))))
 (defmacro pop (place) (list (quote prog1) (list (quote car) place) (list (quote setq) place (list (quote cdr) place))))
 (defmacro dolist (spec &rest body)
   (let ((var (car spec)) (lst (cadr spec)))

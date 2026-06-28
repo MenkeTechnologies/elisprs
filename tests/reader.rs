@@ -63,6 +63,18 @@ fn string_escapes() {
 }
 
 #[test]
+fn vector_literals() {
+    // [..] reads as a self-evaluating vector; elements are read verbatim,
+    // not evaluated.
+    assert_eq!(eval("[1 2 3]"), "[1 2 3]");
+    assert_eq!(eval("[(+ 1 2) foo \"s\"]"), "[(+ 1 2) foo \"s\"]");
+    assert_eq!(eval("(aref [10 20 30] 1)"), "20");
+    assert_eq!(eval("(length [1 2 3 4])"), "4");
+    assert_eq!(eval("(equal [1 2 3] (vector 1 2 3))"), "t");
+    assert_eq!(eval("[]"), "[]");
+}
+
+#[test]
 fn backquote_with_unquote_and_splice() {
     assert_eq!(
         eval("(let ((x 3)) `(a ,(+ x 1) ,@(list 5 6) b))"),

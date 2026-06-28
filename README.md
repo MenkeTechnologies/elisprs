@@ -106,8 +106,8 @@ elisp --version
 | Predicates | `eq eql equal null not numberp integerp floatp stringp symbolp consp listp atom functionp` |
 | Symbols/cells | `set symbol-value symbol-function fset boundp fboundp symbol-name intern make-symbol` |
 | Strings | `concat string= string-equal string< upcase downcase number-to-string string-to-number` |
-| IO/format | `format message princ prin1 print terpri` |
-| Functional | `funcall apply mapcar mapc identity` |
+| IO/format | `format message princ prin1 prin1-to-string print terpri` |
+| Functional | `funcall apply mapcar mapc sort identity` |
 | Regexp | `string-match string-match-p match-beginning match-end match-string match-data set-match-data replace-regexp-in-string regexp-quote` (+ `save-match-data`) |
 
 `defun`/`defmacro`/`lambda` support `&optional` and `&rest`; macros expand and re-evaluate; `condition-case` matches the `error` umbrella and specific error symbols.
@@ -135,6 +135,9 @@ elisp --version
 - **Backquote / unquote.** `` ` ``, `,`, and `,@` are read and expanded.
 - **`setcar` / `setcdr`** mutate cons cells in place.
 - **Regexps.** `string-match` & friends translate elisp regexp syntax (`\(` `\|` `\{`, `\<`/`\>`, `\w`/`\s-`) to a backing engine and record char-indexed match data; `replace-regexp-in-string` expands `\&`/`\N` templates. (Pattern backreferences `\1` are rejected — the engine doesn't backtrack.)
+- **Vector literals.** `[1 2 3]` reads as a self-evaluating vector (elements unevaluated); `aref` / `elt` / `length` / `append` / `sort` operate on it.
+- **Generalized `setf`** over the common places: `car`, `cdr`, `nth`, `elt`, `aref`, `gethash`, `symbol-value`, plus plain variables and multiple place/value pairs.
+- **`format` field specs.** `%[-][0][width][.prec]` with `s S d o x X c e f g`, e.g. `(format "%05d" 42)` → `00042`.
 
 **Known limitations** — surfaced loudly rather than silently misread:
 

@@ -65,6 +65,33 @@ fn symbol_plumbing() {
 }
 
 #[test]
+fn make_symbol_is_uninterned() {
+    // make-symbol allocates a *fresh* symbol each call (not in the obarray), so
+    // two same-named results are distinct objects — unlike intern.
+    assert_eq!(eval("(eq (make-symbol \"g\") (make-symbol \"g\"))"), "nil");
+    assert_eq!(eval("(symbolp (make-symbol \"g\"))"), "t");
+    assert_eq!(eval("(symbol-name (make-symbol \"g\"))"), "\"g\"");
+}
+
+#[test]
+fn sort_by_predicate() {
+    assert_eq!(eval("(sort (list 3 1 2 5 4) #'<)"), "(1 2 3 4 5)");
+    assert_eq!(eval("(sort (list 3 1 2 5 4) #'>)"), "(5 4 3 2 1)");
+    // ties keep input order (stable) and a vector sorts to a vector.
+    assert_eq!(eval("(sort (list 3 1 2 1 3) #'<)"), "(1 1 2 3 3)");
+    assert_eq!(eval("(sort (vector 5 3 1 4 2) #'<)"), "[1 2 3 4 5]");
+}
+
+#[test]
+fn prin1_to_string_roundtrip() {
+    assert_eq!(
+        eval("(prin1-to-string '(1 \"two\" 3))"),
+        "\"(1 \\\"two\\\" 3)\""
+    );
+    assert_eq!(eval("(prin1-to-string 42)"), "\"42\"");
+}
+
+#[test]
 fn cons_mutation_setcdr() {
     assert_eq!(eval("(let ((p (cons 1 2))) (setcdr p 9) p)"), "(1 . 9)");
     assert_eq!(eval("(setcdr (cons 1 2) 9)"), "9"); // setcdr returns the new cdr
@@ -106,6 +133,30 @@ fn format_directives() {
     assert_eq!(eval("(format \"%s\" t)"), "\"t\"");
     // %S of a list yields its read syntax.
     assert_eq!(eval("(format \"%S\" '(a b))"), "\"(a b)\"");
+}
+
+#[test]
+fn format_width_flags_and_radix() {
+    // width, left-justify (-), and zero-pad (0) flags.
+    assert_eq!(
+        eval("(format \"%5d|%-5d|%05d\" 42 42 42)"),
+        "\"   42|42   |00042\""
+    );
+    // zero-pad keeps the sign in front.
+    assert_eq!(eval("(format \"%05d\" -42)"), "\"-0042\"");
+    // octal and upper/lower hex.
+    assert_eq!(eval("(format \"%o %x %X\" 8 255 255)"), "\"10 ff FF\"");
+    // float precision and field width.
+    assert_eq!(eval("(format \"%.2f\" 3.14159)"), "\"3.14\"");
+    assert_eq!(eval("(format \"[%8.2f]\" 3.14159)"), "\"[    3.14]\"");
+}
+
+#[test]
+fn append_accepts_vectors_and_strings() {
+    // append flattens vectors and strings (chars → ints), not just lists.
+    assert_eq!(eval("(append [1 2 3] nil)"), "(1 2 3)");
+    assert_eq!(eval("(append [1 2] '(3 4))"), "(1 2 3 4)");
+    assert_eq!(eval("(append \"ab\" nil)"), "(97 98)");
 }
 
 #[test]

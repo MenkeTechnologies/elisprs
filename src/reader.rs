@@ -6,7 +6,7 @@
 //! (incl. `1+`, `<=`, `:keywords`), `'quote`, `#'function`, `?c` char literals,
 //! `;` comments, backquote/unquote (`` ` `` `,` `,@`), and dotted pairs (`a . b`).
 
-use crate::host::ElispHost;
+use crate::host::{ElispHost, Obj};
 use fusevm::Value;
 
 pub fn read_all(h: &mut ElispHost, src: &str) -> Result<Vec<Value>, String> {
@@ -31,7 +31,7 @@ struct Reader {
 }
 
 fn is_delim(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\'' | '`' | ',' | ';')
+    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '"' | '\'' | '`' | ',' | ';')
 }
 
 impl Reader {
@@ -64,6 +64,8 @@ impl Reader {
         match c {
             '(' => self.read_list(h),
             ')' => Err("unexpected )".to_string()),
+            '[' => self.read_vector(h),
+            ']' => Err("unexpected ]".to_string()),
             '`' => {
                 self.pos += 1;
                 let f = self.read_form(h)?;
@@ -126,6 +128,25 @@ impl Reader {
             }
         }
         Ok(h.list_from(items))
+    }
+
+    fn read_vector(&mut self, h: &mut ElispHost) -> Result<Value, String> {
+        self.pos += 1; // consume '['
+        let mut items = Vec::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => return Err("unclosed vector".to_string()),
+                Some(']') => {
+                    self.pos += 1;
+                    break;
+                }
+                // A vector literal is self-evaluating; its elements are read
+                // verbatim (not evaluated), matching elisp `[a b c]` semantics.
+                _ => items.push(self.read_form(h)?),
+            }
+        }
+        Ok(h.alloc(Obj::Vector(items)))
     }
 
     fn read_string(&mut self) -> Result<Value, String> {
