@@ -531,7 +531,10 @@ fn make_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
         }
         i += 2;
     }
-    Ok(h.alloc(Obj::HashTable { test, entries: Vec::new() }))
+    Ok(h.alloc(Obj::HashTable {
+        test,
+        entries: Vec::new(),
+    }))
 }
 fn ht_view(h: &ElispHost, v: &Value) -> Result<(u8, Vec<(Value, Value)>), String> {
     match h.obj(v) {
@@ -651,10 +654,20 @@ fn string_join(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn char_to_string(_h: &mut ElispHost, a: &[Value]) -> R {
     let n = as_int(&a[0])?;
-    Ok(Value::str(char::from_u32(n as u32).map(|c| c.to_string()).unwrap_or_default()))
+    Ok(Value::str(
+        char::from_u32(n as u32)
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+    ))
 }
 fn string_to_char(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Int(as_string(&a[0])?.chars().next().map(|c| c as i64).unwrap_or(0)))
+    Ok(Value::Int(
+        as_string(&a[0])?
+            .chars()
+            .next()
+            .map(|c| c as i64)
+            .unwrap_or(0),
+    ))
 }
 fn make_string(_h: &mut ElispHost, a: &[Value]) -> R {
     let n = as_int(&a[0])?.max(0) as usize;
@@ -671,7 +684,10 @@ fn string_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::str(s))
 }
 fn string_to_list(h: &mut ElispHost, a: &[Value]) -> R {
-    let items: Vec<Value> = as_string(&a[0])?.chars().map(|c| Value::Int(c as i64)).collect();
+    let items: Vec<Value> = as_string(&a[0])?
+        .chars()
+        .map(|c| Value::Int(c as i64))
+        .collect();
     Ok(h.list_from(items))
 }
 fn string_search(_h: &mut ElispHost, a: &[Value]) -> R {

@@ -53,7 +53,10 @@ pub type Lex = Option<Rc<Scope>>;
 
 impl Scope {
     fn child(parent: Lex) -> Rc<Scope> {
-        Rc::new(Scope { vars: RefCell::new(Vec::new()), parent })
+        Rc::new(Scope {
+            vars: RefCell::new(Vec::new()),
+            parent,
+        })
     }
     fn lookup(self: &Rc<Scope>, sym: u32) -> Option<Value> {
         let mut cur = Some(self.clone());
@@ -337,12 +340,14 @@ impl ElispHost {
     // ── lexical scope management ──
     /// Push a new lexical scope as a child of the current one.
     pub fn open_scope(&mut self) {
-        self.frame_stack.push((self.lex.clone(), self.specstack.len()));
+        self.frame_stack
+            .push((self.lex.clone(), self.specstack.len()));
         self.lex = Some(Scope::child(self.lex.clone()));
     }
     /// Push a new lexical scope as a child of `env` (a closure's captured env).
     pub fn open_scope_in(&mut self, env: Lex) {
-        self.frame_stack.push((self.lex.clone(), self.specstack.len()));
+        self.frame_stack
+            .push((self.lex.clone(), self.specstack.len()));
         self.lex = Some(Scope::child(env));
     }
     /// Pop the innermost scope: restore the prior lexical env and unwind any
@@ -375,10 +380,21 @@ impl ElispHost {
     /// Instantiate a closure from a compile-time template, capturing the current
     /// lexical environment. Templates are stored with `env: None`.
     pub fn instantiate_closure(&mut self, template: &Value) -> Value {
-        if let Some(Obj::Closure { params, body, is_macro, .. }) = self.obj(template) {
+        if let Some(Obj::Closure {
+            params,
+            body,
+            is_macro,
+            ..
+        }) = self.obj(template)
+        {
             let (params, body, is_macro) = (params.clone(), body.clone(), *is_macro);
             let env = self.lex.clone();
-            return self.alloc(Obj::Closure { params, body, is_macro, env });
+            return self.alloc(Obj::Closure {
+                params,
+                body,
+                is_macro,
+                env,
+            });
         }
         template.clone()
     }

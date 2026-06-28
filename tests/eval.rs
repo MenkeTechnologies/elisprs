@@ -220,7 +220,10 @@ fn hash_tables() {
         eval("(let ((h (make-hash-table)) (s 0)) (puthash 1 10 h) (puthash 2 20 h) (maphash (lambda (k v) (setq s (+ s v))) h) s)"),
         "30"
     );
-    assert_eq!(eval("(gethash 'missing (make-hash-table) 'default)"), "default");
+    assert_eq!(
+        eval("(gethash 'missing (make-hash-table) 'default)"),
+        "default"
+    );
 }
 
 #[test]
@@ -228,9 +231,15 @@ fn string_ops() {
     assert_eq!(eval("(substring \"hello world\" 0 5)"), "\"hello\"");
     assert_eq!(eval("(substring \"hello\" -3)"), "\"llo\"");
     assert_eq!(eval("(split-string \"a b  c\")"), "(\"a\" \"b\" \"c\")");
-    assert_eq!(eval("(split-string \"a,b,c\" \",\")"), "(\"a\" \"b\" \"c\")");
+    assert_eq!(
+        eval("(split-string \"a,b,c\" \",\")"),
+        "(\"a\" \"b\" \"c\")"
+    );
     assert_eq!(eval("(string-prefix-p \"foo\" \"foobar\")"), "t");
-    assert_eq!(eval("(string-join (list \"a\" \"b\" \"c\") \"-\")"), "\"a-b-c\"");
+    assert_eq!(
+        eval("(string-join (list \"a\" \"b\" \"c\") \"-\")"),
+        "\"a-b-c\""
+    );
     assert_eq!(eval("(make-string 3 65)"), "\"AAA\"");
     assert_eq!(eval("(string-search \"lo\" \"hello\")"), "3");
 }
