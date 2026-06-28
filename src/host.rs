@@ -15,7 +15,7 @@
 //! operations.
 
 use fusevm::{Chunk, Value, VMResult, VM};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -67,6 +67,9 @@ pub struct ElispHost {
     /// Dynamic-binding save stack: (symbol handle, previous value cell).
     specstack: Vec<(u32, Option<Value>)>,
     pub(crate) error: Option<String>,
+    /// A pending `throw`: (tag, value). Set by `throw`, consumed by `catch`.
+    /// Distinguishes a non-local `throw` from an ordinary error during unwinding.
+    pub(crate) pending_throw: Option<(Value, Value)>,
 }
 
 impl Default for ElispHost {
@@ -82,6 +85,7 @@ impl ElispHost {
             obarray: HashMap::new(),
             specstack: Vec::new(),
             error: None,
+            pending_throw: None,
         };
         crate::builtins::install(&mut h);
         h
@@ -387,6 +391,7 @@ pub fn el_truthy(v: &Value) -> bool {
 
 thread_local! {
     static HOST: RefCell<ElispHost> = RefCell::new(ElispHost::new());
+    static PRELUDE_LOADED: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn with_host<R>(f: impl FnOnce(&mut ElispHost) -> R) -> R {
@@ -394,6 +399,13 @@ pub fn with_host<R>(f: impl FnOnce(&mut ElispHost) -> R) -> R {
 }
 pub fn reset_host() {
     HOST.with(|h| *h.borrow_mut() = ElispHost::new());
+    PRELUDE_LOADED.with(|c| c.set(false));
+}
+pub fn prelude_loaded() -> bool {
+    PRELUDE_LOADED.with(|c| c.get())
+}
+pub fn set_prelude_loaded(b: bool) {
+    PRELUDE_LOADED.with(|c| c.set(b));
 }
 
 /// Call a function designator with already-evaluated args. The single
@@ -444,12 +456,68 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             if is_macro {
                 return Err("macro called as a function (use it in a macro position)".to_string());
             }
-            let depth = with_host(|h| h.bind_params(&params, args))?;
-            let result = run_chunk((*body).clone());
-            with_host(|h| h.unbind_to(depth));
-            result
+            run_closure(&params, &body, args)
         }
     }
+}
+
+/// Bind a closure's params to `args`, run its body on a nested fusevm VM, unwind.
+/// Used by both function application and macro expansion (where `args` are the
+/// unevaluated argument forms). Holds no host borrow across the nested run.
+fn run_closure(params: &Rc<Params>, body: &Rc<Chunk>, args: &[Value]) -> Result<Value, String> {
+    let depth = with_host(|h| h.bind_params(params, args))?;
+    let result = run_chunk((**body).clone());
+    with_host(|h| h.unbind_to(depth));
+    result
+}
+
+/// One step of macro expansion: if `form` is `(macro-name . arg-forms)`, run the
+/// macro on the *unevaluated* arg forms and return the expansion. Else `None`.
+pub fn macroexpand_1(form: &Value) -> Result<Option<Value>, String> {
+    let info = with_host(|h| {
+        let elems = h.list_vec(form)?;
+        if elems.is_empty() {
+            return None;
+        }
+        match h.resolve_function(&elems[0]) {
+            Ok(Resolved::Closure { params, body, is_macro: true }) => {
+                Some((params, body, elems[1..].to_vec()))
+            }
+            _ => None,
+        }
+    });
+    match info {
+        Some((params, body, args)) => Ok(Some(run_closure(&params, &body, &args)?)),
+        None => Ok(None),
+    }
+}
+
+/// Fully expand macros in `form` (top-level to fixpoint, then recursively into
+/// sub-forms), without descending into quoted data. Run before lowering.
+pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
+    let mut f = form.clone();
+    while let Some(e) = macroexpand_1(&f)? {
+        f = e;
+    }
+    let elems = with_host(|h| {
+        if matches!(h.obj(&f), Some(Obj::Cons(..))) {
+            h.list_vec(&f)
+        } else {
+            None
+        }
+    });
+    let Some(elems) = elems else { return Ok(f) };
+    if elems.is_empty() {
+        return Ok(f);
+    }
+    if with_host(|h| h.sym_name(&elems[0])).as_deref() == Some("quote") {
+        return Ok(f);
+    }
+    let mut out = Vec::with_capacity(elems.len());
+    for e in &elems {
+        out.push(macroexpand_all(e)?);
+    }
+    Ok(with_host(|h| h.list_from(out)))
 }
 
 /// fusevm extension handler. Non-capturing (satisfies `Send`); reaches the heap

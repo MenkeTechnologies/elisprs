@@ -115,6 +115,37 @@ fn higher_order_reentrancy() {
 }
 
 #[test]
+fn backquote_and_user_macros() {
+    assert_eq!(eval("(let ((x 5)) `(a ,x c))"), "(a 5 c)");
+    assert_eq!(eval("(let ((xs (list 2 3))) `(1 ,@xs 4))"), "(1 2 3 4)");
+    // defmacro must be a prior top-level form (as in real elisp loading).
+    assert_eq!(
+        eval("(defmacro my-when (c &rest body) `(if ,c (progn ,@body) nil)) (my-when t 1 2 3)"),
+        "3"
+    );
+    // a macro that generates a defun
+    assert_eq!(
+        eval("(defmacro defk (n k) `(defun ,n () ,k)) (defk answer 42) (answer)"),
+        "42"
+    );
+}
+
+#[test]
+fn prelude_derived_surface() {
+    assert_eq!(eval("(cadr (list 1 2 3))"), "2");
+    assert_eq!(eval("(nthcdr 2 (list 10 20 30 40))"), "(30 40)");
+    assert_eq!(eval("(seq-filter (lambda (x) (> x 2)) (list 1 2 3 4 5))"), "(3 4 5)");
+    assert_eq!(eval("(seq-reduce (lambda (a b) (+ a b)) (list 1 2 3 4) 0)"), "10");
+    assert_eq!(eval("(mapconcat (lambda (x) (number-to-string x)) (list 1 2 3) \"-\")"), "\"1-2-3\"");
+    assert_eq!(eval("(let ((s 0)) (dolist (x (list 1 2 3 4)) (setq s (+ s x))) s)"), "10");
+    assert_eq!(eval("(let ((s 0)) (dotimes (i 5) (setq s (+ s i))) s)"), "10");
+    assert_eq!(eval("(let ((l (list 1 2))) (push 0 l) l)"), "(0 1 2)");
+    assert_eq!(eval("(max 3 7 2 9 1)"), "9");
+    assert_eq!(eval("(abs -5)"), "5");
+    assert_eq!(eval("(delete-dups (list 1 2 1 3 2 4))"), "(1 2 3 4)");
+}
+
+#[test]
 fn nonlocal_exits_still_pending() {
     // These await the nonlocal-exit milestone; they must fail loudly.
     reset_host();

@@ -16,10 +16,10 @@
 
 > *"The editor's language — without the editor."*
 
-`elisprs` runs **Emacs Lisp** (`.el`) as standalone programs from the command line: a **Lisp-2** obarray (separate value/function cells) with dynamic binding and an elisp-correct reader, built on the [`rust_lisp`](https://crates.io/crates/rust_lisp) value model and engineered to be lowered onto the [`fusevm`](https://github.com/MenkeTechnologies/fusevm) bytecode VM — the same engine behind `zshrs`, `stryke`, `awkrs`, and `vimlrs`.
+`elisprs` runs **Emacs Lisp** (`.el`) as standalone programs from the command line: a **Lisp-2** obarray (separate value/function cells) with dynamic binding and an elisp-correct reader, built on the [`rust_lisp`](https://crates.io/crates/rust_lisp) value model and lowered to — and run on — the [`fusevm`](https://github.com/MenkeTechnologies/fusevm) bytecode VM, the same engine behind `zshrs`, `stryke`, `awkrs`, and `vimlrs`. elisprs is a **pure frontend**: no bespoke VM or JIT — it compiles each form to a `fusevm::Chunk` and fusevm executes it, calling back into the elisp object heap through fusevm's extension handler.
 
  ┌──────────────────────────────────────────────────────────────┐
- │ STATUS: MILESTONE 1 &nbsp; ENGINE: TREE-WALK &nbsp; TARGET: FUSEVM &nbsp; ███░░░░░ │
+ │ STATUS: MILESTONE 1 &nbsp; ENGINE: FUSEVM &nbsp; FRONTEND: PURE &nbsp; ████░░░░ │
  └──────────────────────────────────────────────────────────────┘
 
 ### [`Read the Docs`](https://menketechnologies.github.io/elisprs/) &middot; [`Engineering Report`](https://menketechnologies.github.io/elisprs/report.html) · [`strykelang`](https://github.com/MenkeTechnologies/strykelang) · [`zshrs`](https://github.com/MenkeTechnologies/zshrs) · [`fusevm`](https://github.com/MenkeTechnologies/fusevm)
@@ -34,7 +34,7 @@
 - [\[0x03\] Language Coverage](#0x03-language-coverage)
 - [\[0x04\] Architecture](#0x04-architecture--reuse-own-split)
 - [\[0x05\] Status](#0x05-status--component-grid)
-- [\[0x06\] Roadmap](#0x06-roadmap--path-to-fusevm)
+- [\[0x06\] Roadmap](#0x06-roadmap)
 - [\[0x07\] Build](#0x07-build--compile-the-payload)
 - [\[0x08\] Test](#0x08-test--integrity-verification)
 - [\[0x09\] Documentation](#0x09-documentation--rendered-html--markdown)
@@ -54,7 +54,7 @@
 | Reader (`1+`/`1-`, `#'foo`, `?c`, `:kw`) | **ours** — `rust_lisp`'s parser mis-tokenizes elisp syntax |
 | Lisp-2 obarray, dynamic binding, special forms, subrs | **ours** — `rust_lisp`'s Lisp-1/lexical `eval` is not used |
 
-**Milestone status:** Today elisp runs on a self-contained **tree-walk evaluator**. The `fusevm` lowering (`src/compiler.rs`) is the milestone-2 seam and is not wired yet — so, unlike `vimlrs`, elisprs is *being lowered onto* fusevm, not yet hosted on it. See [§0x06](#0x06-roadmap--path-to-fusevm).
+**Milestone status:** elisp is **hosted on `fusevm`** — like `vimlrs`, elisprs is a pure frontend with no bespoke VM or JIT. Each top-level form is read, macro-expanded, and lowered to a `fusevm::Chunk` (`src/compiler.rs`); fusevm executes it and calls back into the elisp object heap (`src/host.rs`) through a registered extension handler, with cons/symbol/vector cells riding the VM as `Value::Obj` heap handles. Remaining work is coverage plus turning on the JIT/AOT tiers fusevm already provides — see [§0x06](#0x06-roadmap).
 
 ---
 
@@ -62,7 +62,7 @@
 
 - **Rust** 2021 edition (stable). Builds on `rustc` 1.96+.
 - **Platforms:** macOS (aarch64 / x86_64) and Linux (x86_64 / aarch64).
-- **Dependencies:** one direct dependency at milestone 1 — `rust_lisp` (MIT) — so the crate builds offline and fast. `fusevm` is added at milestone 2 when lowering begins.
+- **Dependencies:** two core dependencies — `rust_lisp` (MIT, the `Value` model) and `fusevm` (the bytecode VM elisp executes on). The crate still builds offline and fast.
 
 ---
 
@@ -81,7 +81,7 @@ elisp -e "(+ 1 2)"       # evaluate an expression, print its value
 elisp                    # REPL (balanced-paren continuation, Ctrl-D to exit)
 elisp --lsp              # language server over stdio        (stub — see roadmap)
 elisp --dap              # debug adapter over stdio          (stub — see roadmap)
-elisp --aot FILE -o a.o  # AOT-compile to a native object    (milestone 2)
+elisp --aot FILE -o a.o  # lower to a fusevm chunk (native object pending)
 elisp --version
 ```
 
@@ -138,20 +138,19 @@ This is a useful elisp core, **not** the ~1000-subr GNU Emacs surface, and it is
 ## [0x04] ARCHITECTURE // REUSE-OWN SPLIT
 
 ```
-.el source  →  reader.rs  →  Value (rust_lisp model)  →  eval (Lisp-2 + dynamic)   [milestone 1]
-                                                      ↘  compiler.rs → fusevm::Chunk [milestone 2]
+.el source  →  reader.rs  →  forms on the ElispHost heap  →  compiler.rs → fusevm::Chunk  →  fusevm executes (calls back into host.rs)
 ```
 
-Function objects (closures, macros, subrs) ride in `Value::Foreign(Rc<dyn Any>)` and are downcast on the way out, so elisprs gets elisp function semantics without forking `rust_lisp`'s `Value` enum.
+elisp cells (cons / symbol / vector / closure / macro / subr) live in the `ElispHost` object heap and ride the VM as `Value::Obj(u32)` handles, so elisprs gets full elisp semantics — including dynamic scope and Lisp-2 cells — without forking either `rust_lisp`'s `Value` enum or the `fusevm` core.
 
 | File | Role |
 |---|---|
-| `src/reader.rs` | Elisp-correct S-expression reader → `rust_lisp` `Value`s |
-| `src/interp.rs` | Lisp-2 obarray, dynamic binding, `eval`, special forms, printer |
-| `src/builtins.rs` | The subr standard library |
-| `src/callable.rs` | `Callable` (subr/closure/macro), stored in `Value::Foreign` |
-| `src/compiler.rs` | **Seam:** lower elisp forms to `fusevm::Chunk` (milestone 2) |
-| `src/aot.rs` | `--aot` driver over `compiler::lower` + `fusevm::aot` |
+| `src/reader.rs` | Elisp-correct S-expression reader → forms on the `ElispHost` heap |
+| `src/host.rs` | `ElispHost`: the object heap, Lisp-2 obarray, dynamic binding, and the `fusevm` extension handler that runs elisp ops |
+| `src/compiler.rs` | Lowers elisp forms to a `fusevm::Chunk`; lambda bodies become sub-chunks |
+| `src/builtins.rs` | The subr standard library (reached host-side from the `CALL` extension op) |
+| `src/prelude.rs` | The `[DERIVED]` elisp prelude — breadth written in elisp on top of the primitives |
+| `src/aot.rs` | `--aot` driver: lowers a `.el` file to a `fusevm::Chunk` (native object via `fusevm::aot` pending) |
 | `src/lsp.rs` / `src/dap.rs` | `--lsp` / `--dap` servers (stubs) |
 | `src/main.rs` | The `elisp` CLI + REPL |
 
@@ -171,22 +170,25 @@ The grid reflects the current state of the tree, not aspiration — planned item
 | Subr standard library (~65) | Working |
 | `elisp` CLI — file / `-e` / REPL | Working |
 | `--lsp` / `--dap` servers | Stub (planned) |
-| `--aot` → `fusevm::aot::compile_object` | Planned (milestone 2) |
-| AST → `fusevm::Chunk` lowering (`compiler.rs`) | Seam (milestone 2) |
+| elisp → `fusevm::Chunk` lowering + execution (`compiler.rs` / `host.rs`) | Working |
+| `--aot` → native object via `fusevm::aot::compile_object` | Planned (lowering works; native emit pending) |
 | Dotted pairs, backquote, lexical binding, `setcar`/`setcdr` | Not yet |
 
 ---
 
-## [0x06] ROADMAP // PATH TO FUSEVM
+## [0x06] ROADMAP
 
-**Milestone 2 — execute on `fusevm`** (the reason elisprs exists), the same frontend pattern as `strykelang/strykelang/fusevm_native.rs`:
+**Done — elisp executes on `fusevm`** (the reason elisprs exists), the same frontend pattern as the sibling languages:
 
-1. Add `Value::{Cons, Symbol}` to `fusevm/src/value.rs` and a dynamic-binding stack to the `VM` struct — the one genuinely invasive core change (the other fusevm frontends never needed dynamic scope or Lisp cells).
-2. Reserve an elisp `Op::Extended(id, arg)` range; register a handler via `vm.set_extension_handler(...)` for quote / funcall / special-var bind / cons navigation.
-3. Lower each top-level form in `compiler.rs`; lambda bodies become sub-chunks.
-4. Bind the subr library through `vm.register_builtin(...)`.
+1. ✅ elisp cells (cons / symbol / vector / closure) live in the `ElispHost` heap (`src/host.rs`) and ride the VM as `Value::Obj` handles — no invasive `fusevm` core change was needed (it never had to learn dynamic scope or Lisp cells).
+2. ✅ An elisp `Op::Extended(id, arg)` range dispatches quote / funcall / special-var bind / cons navigation through a handler registered with `vm.set_extension_handler(...)`.
+3. ✅ Every top-level form lowers in `compiler.rs`; lambda bodies become sub-chunks.
+4. ✅ The subr library is reachable host-side from the `CALL` extension op.
 
-Then the three-tier Cranelift JIT and `--aot` (via `fusevm::aot::compile_object`) come for free, the way they do for the sibling frontends.
+**Next:**
+
+- **JIT / AOT tiers.** Build `fusevm` with the `jit` feature so elisp chunks pick up the three-tier Cranelift JIT, and wire `--aot` native-object emission through `fusevm::aot::compile_object` (today `--aot` lowers to a chunk; native emission needs fusevm's `aot` feature). Both come essentially for free, the way they do for the sibling frontends.
+- **Coverage.** Broaden special-form / macro / backquote lowering toward full milestone-2 elisp.
 
 **Tooling.** `--lsp` (completion/hover/definition/diagnostics over the obarray, mirroring `awkrs --lsp`), `--dap` (breakpoints/stepping off `eval` + the dynamic specstack, reusing `zemacs-dap` transport), and editor plugins (`vscode-elisp` / `vim-elisp` / `emacs-elisp`).
 
@@ -208,7 +210,7 @@ cargo build --release
 cargo test
 ```
 
-Coverage spans `reader.rs` unit tests (number-vs-symbol tokenization, `#'` desugaring, `?c` char literals, dotted-pair rejection) and the end-to-end evaluation suite in [`tests/eval.rs`](tests/eval.rs) — arithmetic, recursion, higher-order functions, special forms, macros, and error handling driven through the public `Interp` API.
+Coverage spans `reader.rs` unit tests (number-vs-symbol tokenization, `#'` desugaring, `?c` char literals, dotted-pair rejection) and the end-to-end evaluation suite in [`tests/eval.rs`](tests/eval.rs) — arithmetic, recursion, higher-order functions, special forms, macros, and error handling driven through the public `eval_str` API.
 
 ---
 
@@ -219,7 +221,7 @@ Coverage spans `reader.rs` unit tests (number-vs-symbol tokenization, `#'` desug
 | Doc | Source | Live URL |
 |---|---|---|
 | User reference (architecture, coverage, status, taste) | [`docs/index.html`](docs/index.html) | <https://menketechnologies.github.io/elisprs/> |
-| Engineering report (reuse/own split, path to fusevm, dependency posture) | [`docs/report.html`](docs/report.html) | <https://menketechnologies.github.io/elisprs/report.html> |
+| Engineering report (reuse/own split, fusevm frontend design, dependency posture) | [`docs/report.html`](docs/report.html) | <https://menketechnologies.github.io/elisprs/report.html> |
 
 The HUD-themed HTML docs share `hud-static.css`, `hud-theme.js`, and `tutorial.css` — open them locally via `file://` or browse the GitHub Pages URL above.
 

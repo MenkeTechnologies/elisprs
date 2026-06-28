@@ -159,8 +159,15 @@ fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     Ok(())
 }
 
+/// lsp-types `Uri` has interior mutability, so we key documents by its string
+/// form (clippy's "mutable key type") and keep the `Uri` only where the
+/// protocol needs it.
+fn uri_key(uri: &Uri) -> String {
+    uri.as_str().to_string()
+}
+
 fn main_loop(c: &Connection) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-    let mut docs: HashMap<Uri, String> = HashMap::new();
+    let mut docs: HashMap<String, String> = HashMap::new();
     for msg in &c.receiver {
         match msg {
             Message::Request(req) => {
@@ -174,21 +181,21 @@ fn main_loop(c: &Connection) -> Result<(), Box<dyn std::error::Error + Sync + Se
                 DidOpenTextDocument::METHOD => {
                     let p: DidOpenTextDocumentParams = serde_json::from_value(not.params)?;
                     let uri = p.text_document.uri.clone();
-                    docs.insert(uri.clone(), p.text_document.text.clone());
+                    docs.insert(uri_key(&uri), p.text_document.text.clone());
                     publish(c, &uri, &p.text_document.text)?;
                 }
                 DidChangeTextDocument::METHOD => {
                     let p: DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
                     if let Some(change) = p.content_changes.into_iter().last() {
                         let uri = p.text_document.uri.clone();
-                        docs.insert(uri.clone(), change.text.clone());
+                        docs.insert(uri_key(&uri), change.text.clone());
                         publish(c, &uri, &change.text)?;
                     }
                 }
                 DidCloseTextDocument::METHOD => {
                     let p: lsp_types::DidCloseTextDocumentParams =
                         serde_json::from_value(not.params)?;
-                    docs.remove(&p.text_document.uri);
+                    docs.remove(&uri_key(&p.text_document.uri));
                 }
                 _ => {}
             },
@@ -202,7 +209,7 @@ fn ok_response(id: RequestId, value: serde_json::Value) -> Response {
     Response { id, result: Some(value), error: None }
 }
 
-fn handle_request(req: &Request, docs: &HashMap<Uri, String>) -> Response {
+fn handle_request(req: &Request, docs: &HashMap<String, String>) -> Response {
     let id = req.id.clone();
     let result = match req.method.as_str() {
         Completion::METHOD => serde_json::to_value(completion()).ok(),
@@ -211,14 +218,16 @@ fn handle_request(req: &Request, docs: &HashMap<Uri, String>) -> Response {
             p.ok().and_then(|p| {
                 let uri = &p.text_document_position_params.text_document.uri;
                 let pos = p.text_document_position_params.position;
-                docs.get(uri).and_then(|t| hover(t, pos)).and_then(|h| serde_json::to_value(h).ok())
+                docs.get(&uri_key(uri))
+                    .and_then(|t| hover(t, pos))
+                    .and_then(|h| serde_json::to_value(h).ok())
             })
         }
         DocumentSymbolRequest::METHOD => {
             let p: Result<lsp_types::DocumentSymbolParams, _> =
                 serde_json::from_value(req.params.clone());
             p.ok().and_then(|p| {
-                docs.get(&p.text_document.uri)
+                docs.get(&uri_key(&p.text_document.uri))
                     .map(|t| serde_json::to_value(document_symbols(&p.text_document.uri, t)).unwrap())
             })
         }
@@ -227,7 +236,7 @@ fn handle_request(req: &Request, docs: &HashMap<Uri, String>) -> Response {
             p.ok().and_then(|p| {
                 let uri = &p.text_document_position_params.text_document.uri;
                 let pos = p.text_document_position_params.position;
-                docs.get(uri)
+                docs.get(&uri_key(uri))
                     .and_then(|t| signature_help(t, pos))
                     .and_then(|h| serde_json::to_value(h).ok())
             })

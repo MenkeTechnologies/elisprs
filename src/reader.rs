@@ -61,7 +61,22 @@ impl Reader {
         match c {
             '(' => self.read_list(h),
             ')' => Err("unexpected )".to_string()),
-            '`' | ',' => Err("backquote/unquote not supported yet".to_string()),
+            '`' => {
+                self.pos += 1;
+                let f = self.read_form(h)?;
+                Ok(bq_expand(h, &f))
+            }
+            ',' => {
+                self.pos += 1;
+                if self.peek() == Some('@') {
+                    self.pos += 1;
+                    let f = self.read_form(h)?;
+                    Ok(marker(h, "unquote-splicing", f))
+                } else {
+                    let f = self.read_form(h)?;
+                    Ok(marker(h, "unquote", f))
+                }
+            }
             '"' => self.read_string(),
             '?' => self.read_char_literal(),
             '\'' => {
@@ -165,6 +180,68 @@ impl Reader {
 fn quoted(h: &mut ElispHost, head: &str, form: Value) -> Value {
     let q = h.intern(head);
     h.list_from(vec![q, form])
+}
+
+/// Build `(NAME FORM)` — the internal unquote / unquote-splicing markers.
+fn marker(h: &mut ElispHost, name: &str, form: Value) -> Value {
+    let s = h.intern(name);
+    h.list_from(vec![s, form])
+}
+
+/// Recognize an unquote marker: returns ("unquote"|"unquote-splicing", payload).
+fn unquote_kind(h: &ElispHost, e: &Value) -> Option<(String, Value)> {
+    let v = h.list_vec(e)?;
+    if v.len() == 2 {
+        if let Some(name) = h.sym_name(&v[0]) {
+            if name == "unquote" || name == "unquote-splicing" {
+                return Some((name, v[1].clone()));
+            }
+        }
+    }
+    None
+}
+
+fn call_form(h: &mut ElispHost, fname: &str, a: Value, b: Value) -> Value {
+    let f = h.intern(fname);
+    h.list_from(vec![f, a, b])
+}
+
+/// Expand `` `FORM `` at read time into `cons`/`append`/`quote` calls (the
+/// standard backquote decomposition from the manual). The result is ordinary
+/// elisp that builds the templated structure at run time.
+fn bq_expand(h: &mut ElispHost, form: &Value) -> Value {
+    // `,x  →  x   (a top-level unquote)
+    if let Some((kind, payload)) = unquote_kind(h, form) {
+        if kind == "unquote" {
+            return payload;
+        }
+        // `,@x at top level is ill-formed; fall through to quoting.
+    }
+    // A proper list: fold right, splicing where `,@` appears.
+    if let Some(elems) = h.list_vec(form) {
+        // (unquote x) was handled above; here elems are template elements.
+        let mut rest = Value::Undef; // nil
+        for e in elems.iter().rev() {
+            match unquote_kind(h, e) {
+                Some((kind, payload)) if kind == "unquote-splicing" => {
+                    rest = call_form(h, "append", payload, rest);
+                }
+                Some((_unquote, payload)) => {
+                    rest = call_form(h, "cons", payload, rest);
+                }
+                None => {
+                    let sub = bq_expand(h, e);
+                    rest = call_form(h, "cons", sub, rest);
+                }
+            }
+        }
+        return rest;
+    }
+    // Atom: symbols must be quoted; self-evaluating atoms can stand as-is.
+    match form {
+        Value::Obj(_) => quoted(h, "quote", form.clone()),
+        _ => form.clone(),
+    }
 }
 
 fn unescape(e: char) -> char {

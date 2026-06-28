@@ -1,0 +1,181 @@
+<idea-plugin>
+    <id>com.menketechnologies.elisprs</id>
+    <name>Elisprs</name>
+    <vendor email="linux.dev25@gmail.com" url="https://github.com/MenkeTechnologies/elisprs">MenkeTechnologies</vendor>
+
+    <!-- BEGIN-CANONICAL: plugin-description -->
+    <description><![CDATA[
+        <p>JetBrains IDE support for <b>elisprs</b> — a standalone Emacs Lisp
+        interpreter that lowers <code>.el</code> to the fusevm bytecode VM.</p>
+
+        <ul>
+            <li><b>.el</b> files (plus the <b>.emacs</b> / <b>_emacs</b> init
+                family) with syntax highlighting: special forms, core subrs,
+                <code>:keyword</code> and <code>t</code> / <code>nil</code>
+                constants, character literals, numbers, strings, and the
+                <code>'</code> / <code>#'</code> / <code>`</code> / <code>,</code>
+                reader prefixes.</li>
+            <li><b>LSP integration</b> via <code>elisp --lsp</code>: completion,
+                hover docs, document symbols, signature help, and diagnostics.</li>
+            <li><b>Run configurations</b> for any Emacs Lisp script — runs
+                <code>elisp FILE.el</code> with a working directory and optional
+                interpreter / script args.</li>
+            <li><b>Debugger</b> wired to <code>elisp --dap</code> over stdio:
+                line breakpoints, stepping, frames, scopes, variables, evaluate.</li>
+            <li><b>Color settings page</b> with a slot for every token category.</li>
+            <li><b>Settings → Tools → Elisprs</b> to point at a non-PATH
+                <code>elisp</code> binary and tune LSP args / environment.</li>
+            <li><b>Comments</b> with the Emacs Lisp <code>;;</code> form and
+                paren/bracket balancing.</li>
+        </ul>
+
+        <p><b>Requirements:</b> a paid JetBrains IDE on 2025.2+ (RustRover, IDEA
+        Ultimate, GoLand, PyCharm Pro, WebStorm, etc.) because elisprs uses the
+        platform LSP API. Community editions are not supported.</p>
+    ]]></description>
+    <!-- END-CANONICAL: plugin-description -->
+
+    <change-notes><![CDATA[
+        <h3>0.1.0</h3>
+        <ul>
+            <li>Initial release. .el + .emacs-family file types, hand-rolled
+                lexer-based highlighting, LSP client over <code>elisp --lsp</code>,
+                DAP debugger over <code>elisp --dap</code>, run configurations,
+                color scheme, <code>;;</code> line comments.</li>
+        </ul>
+    ]]></change-notes>
+
+    <!-- Platform LSP API (paid IDEs) -->
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.ultimate</depends>
+    <!-- Plugin model v2 dependencies block (2025.2+). Bundled modules
+         like `intellij.spellchecker` are V2 modules with their own
+         classloader, NOT separately-installable plugin IDs — they must be
+         declared as `<module name="..."/>` here, not via the legacy
+         `<depends>com.intellij.spellchecker</depends>` tag. build.gradle.kts
+         has the matching `bundledModule("intellij.spellchecker")` for
+         compile-time class resolution.
+
+         Required for the `spellchecker.support` EP registration below to
+         actually wire up at runtime — without it the SpellcheckingStrategy
+         class loads but the EP no-ops and TypoInspection still fires on every
+         STRING_DQ / STRING_SQ / COMMENT / SHEBANG token. -->
+    <dependencies>
+        <module name="intellij.spellchecker"/>
+    </dependencies>
+
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- File types. `.el` by extension, plus the classic Emacs init
+             dotfiles by exact filename (these have no `.el` extension).
+             Settings.isSupportedFile mirrors this set for the LSP / run /
+             debug code paths. -->
+        <fileType
+            name="Emacs Lisp"
+            implementationClass="com.menketechnologies.elisprs.ElisprsFileType"
+            fieldName="INSTANCE"
+            language="elisprs"
+            extensions="el"
+            fileNames=".emacs;_emacs;.gnus;.spacemacs"/>
+
+        <!-- Parser definition (flat — token-stream PSI, no nested AST). Required
+             for line-comment toggle, brace match, refactoring keymaps, and LSP
+             code actions surfacing via Alt-Enter. -->
+        <lang.parserDefinition
+            language="elisprs"
+            implementationClass="com.menketechnologies.elisprs.ElisprsParserDefinition"/>
+
+        <!-- Highlighter -->
+        <lang.syntaxHighlighterFactory
+            language="elisprs"
+            implementationClass="com.menketechnologies.elisprs.ElisprsSyntaxHighlighterFactory"/>
+
+        <!-- Color settings page -->
+        <colorSettingsPage implementation="com.menketechnologies.elisprs.ElisprsColorSettingsPage"/>
+
+        <!-- Spell-check strategy: suppress TypoInspection on string / comment /
+             shebang tokens. Emacs Lisp is full of option names, key-notation
+             (<C-R>, <leader>), highlight groups, and one-letter identifiers
+             that the platform dictionary flags as typos by default. -->
+        <spellchecker.support
+            language="elisprs"
+            implementationClass="com.menketechnologies.elisprs.ElisprsSpellcheckingStrategy"/>
+
+        <!-- Commenter (line comment with the leading `"`) -->
+        <lang.commenter language="elisprs" implementationClass="com.menketechnologies.elisprs.ElisprsCommenter"/>
+
+        <!-- Complete Current Statement (Cmd-Shift-Enter):
+             `if cond|` → `if cond\n    |\nendif`,
+             `function Foo()|` → `function Foo()\n    |\nendfunction`,
+             plus bracket balance. -->
+        <lang.smartEnterProcessor language="elisprs"
+            implementationClass="com.menketechnologies.elisprs.ElisprsSmartEnterProcessor"/>
+
+        <!-- Brace / quote auto-pairing -->
+        <lang.braceMatcher language="elisprs" implementationClass="com.menketechnologies.elisprs.ElisprsBraceMatcher"/>
+        <lang.quoteHandler language="elisprs" implementationClass="com.menketechnologies.elisprs.ElisprsQuoteHandler"/>
+        <!-- Skip-over `)` `]` `}` when the next char already matches. -->
+        <typedHandler implementation="com.menketechnologies.elisprs.ElisprsTypedHandler"/>
+
+        <!-- Refactoring bridge: hooks Cmd-Opt-M / Cmd-Opt-V / Cmd-Opt-C / Ctrl-T
+             into LSP code actions; hooks Shift-F6 into LSP rename. -->
+        <lang.refactoringSupport
+            language="elisprs"
+            implementationClass="com.menketechnologies.elisprs.refactor.ElisprsRefactoringSupportProvider"/>
+        <renameHandler implementation="com.menketechnologies.elisprs.refactor.ElisprsRenameHandler"/>
+
+        <!-- LSP server provider -->
+        <platform.lsp.serverSupportProvider
+            implementation="com.menketechnologies.elisprs.lsp.ElisprsLspServerSupportProvider"/>
+
+        <!-- Cmd-B (Go To → Declaration or Usages) bridge for the flat-PSI
+             LSP-backed language. -->
+        <gotoDeclarationHandler implementation="com.menketechnologies.elisprs.navigate.ElisprsGotoDeclarationHandler"/>
+
+        <!-- Settings -->
+        <applicationService serviceImplementation="com.menketechnologies.elisprs.ElisprsSettings"/>
+        <applicationConfigurable
+            parentId="tools"
+            instance="com.menketechnologies.elisprs.ElisprsSettingsConfigurable"
+            id="com.menketechnologies.elisprs.settings"
+            displayName="Elisprs"/>
+
+        <!-- Run configuration -->
+        <configurationType implementation="com.menketechnologies.elisprs.run.ElisprsRunConfigurationType"/>
+        <runConfigurationProducer
+            implementation="com.menketechnologies.elisprs.run.ElisprsRunConfigurationProducer"/>
+        <programRunner implementation="com.menketechnologies.elisprs.run.ElisprsProgramRunner"/>
+        <programRunner implementation="com.menketechnologies.elisprs.run.ElisprsDebugRunner"/>
+
+        <!-- Debugger: line-breakpoint type -->
+        <xdebugger.breakpointType implementation="com.menketechnologies.elisprs.dap.ElisprsBreakpointType"/>
+
+        <!-- Notifications for refactoring failure modes (no LSP, no matching
+             code action, etc.). Without this registration
+             `NotificationGroupManager.getNotificationGroup` returns null and
+             balloons silently no-op. -->
+        <notificationGroup id="elisprs Refactoring" displayType="BALLOON"/>
+    </extensions>
+
+    <actions>
+        <action
+            id="elisprs.RunFile"
+            class="com.menketechnologies.elisprs.actions.RunElisprsFileAction"
+            text="Run with elisprs"
+            description="Run the selected Emacs Lisp script with the elisprs interpreter"
+            icon="com.menketechnologies.elisprs.ElisprsIcons.FILE">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+        </action>
+
+        <!-- File > New > Emacs Lisp File (and right-click in Project view → New). -->
+        <action
+            id="elisprs.NewFile"
+            class="com.menketechnologies.elisprs.actions.CreateElisprsFileAction"
+            text="Emacs Lisp File"
+            description="Create a new Emacs Lisp / elisprs script"
+            icon="com.menketechnologies.elisprs.ElisprsIcons.FILE">
+            <add-to-group group-id="NewGroup" anchor="before" relative-to-action="NewFile"/>
+        </action>
+    </actions>
+</idea-plugin>
