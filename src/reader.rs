@@ -181,7 +181,7 @@ fn unescape(e: char) -> char {
 fn classify(h: &mut ElispHost, tok: &str) -> Value {
     match tok {
         "nil" => return Value::Undef,
-        "t" => return Value::T,
+        "t" => return Value::Bool(true),
         _ => {}
     }
     if !tok.starts_with(':') {

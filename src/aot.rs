@@ -1,24 +1,23 @@
-//! `elisp --aot`: ahead-of-time compile a `.el` file to a native object.
+//! `elisp --aot`: lower a `.el` file to a fusevm `Chunk` (and, with fusevm's
+//! `aot` feature, on to a native object via `fusevm::aot::compile_object`).
 //!
-//! This is a thin driver over the milestone-2 lowering: read + parse the file,
-//! lower to a `fusevm::Chunk` ([`crate::compiler::lower`]), then call
-//! `fusevm::aot::compile_object(&chunk, out_path)` to emit a `.o` for static
-//! linking — exactly the AOT path fusevm already exposes for the other
-//! frontends.
-//!
-//! Milestone 1 surfaces the missing lowering step explicitly instead of
-//! pretending to produce an object.
+//! The lowering is real now (`compiler::compile_program`); native object
+//! emission is gated behind fusevm's `aot` cargo feature, so this reports the
+//! lowered chunk and notes when object emission isn't compiled in.
 
-use crate::error::ElResult;
-use crate::reader::read_all;
+use crate::{compiler, host, reader};
 use std::path::Path;
 
-pub fn compile_file(src: &str, _out: &Path) -> ElResult<()> {
-    let forms = read_all(src)?;
-    // Lowering is the milestone-2 seam; this returns the not-implemented signal.
-    crate::compiler::lower(&forms)?;
-    // Once lowering exists:
-    //   fusevm::aot::compile_object(&chunk, _out)
-    //       .map_err(|e| ElError::err(e))?;
-    Ok(())
+pub fn compile_file(src: &str, out: &Path) -> Result<(), String> {
+    let chunk = host::with_host(|h| {
+        let forms = reader::read_all(h, src)?;
+        compiler::compile_program(h, &forms)
+    })?;
+    eprintln!("lowered to fusevm chunk: {} ops, {} constants", chunk.ops.len(), chunk.constants.len());
+    // Native object emission:
+    //   fusevm::aot::compile_object(&chunk, out).map_err(|e| e)?;
+    // is available when fusevm is built with its `aot` feature. Until that is
+    // wired into elisprs's Cargo features, report the lowering result.
+    let _ = out;
+    Err("native object emission requires fusevm's `aot` feature (lowering succeeded)".to_string())
 }

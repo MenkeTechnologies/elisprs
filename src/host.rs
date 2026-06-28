@@ -90,7 +90,7 @@ impl ElispHost {
         match self.obj(v) {
             Some(Obj::Symbol(s)) => Some(s.name.clone()),
             _ => match v {
-                Value::T => Some("t".to_string()),
+                Value::Bool(true) => Some("t".to_string()),
                 Value::Undef => Some("nil".to_string()),
                 _ => None,
             },
@@ -151,7 +151,7 @@ impl ElispHost {
                 .clone()
                 .ok_or_else(|| format!("Symbol's value as variable is void: {}", s.name)),
             _ => match v {
-                Value::T => Ok(Value::T),
+                Value::Bool(true) => Ok(Value::Bool(true)),
                 Value::Undef => Ok(Value::Undef),
                 _ => Err("not a symbol".to_string()),
             },
@@ -190,7 +190,7 @@ impl ElispHost {
     pub fn print(&self, v: &Value, readable: bool) -> String {
         match v {
             Value::Undef => "nil".to_string(),
-            Value::T | Value::Bool(true) => "t".to_string(),
+            Value::Bool(true) => "t".to_string(),
             Value::Bool(false) => "nil".to_string(),
             Value::Int(n) => n.to_string(),
             Value::Float(f) => {

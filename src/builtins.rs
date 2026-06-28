@@ -8,7 +8,7 @@ use fusevm::Value;
 type R = Result<Value, String>;
 
 fn nil_or(b: bool) -> Value {
-    if b { Value::T } else { Value::Undef }
+    if b { Value::Bool(true) } else { Value::Undef }
 }
 fn is_nil(v: &Value) -> bool {
     matches!(v, Value::Undef | Value::Bool(false))
@@ -102,7 +102,7 @@ fn cmp(a: &[Value], pred: fn(f64, f64) -> bool) -> R {
             return Ok(Value::Undef);
         }
     }
-    Ok(Value::T)
+    Ok(Value::Bool(true))
 }
 fn num_eq(_h: &mut ElispHost, a: &[Value]) -> R {
     cmp(a, |x, y| x == y)
@@ -129,7 +129,7 @@ fn el_eq(h: &ElispHost, a: &Value, b: &Value) -> bool {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
         (Value::Obj(x), Value::Obj(y)) => x == y,
-        (Value::T, Value::T) | (Value::Bool(true), Value::Bool(true)) => true,
+        (Value::Bool(true), Value::Bool(true)) => true,
         _ => {
             let _ = h;
             false
@@ -250,7 +250,8 @@ fn atom(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn symbolp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(
-        matches!(a[0], Value::T | Value::Undef) || matches!(h.obj(&a[0]), Some(Obj::Symbol(_))),
+        matches!(a[0], Value::Bool(true) | Value::Undef)
+            || matches!(h.obj(&a[0]), Some(Obj::Symbol(_))),
     ))
 }
 fn stringp(_h: &mut ElispHost, a: &[Value]) -> R {

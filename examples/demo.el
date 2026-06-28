@@ -1,33 +1,30 @@
-;;; demo.el --- a milestone-1 elisprs smoke test  -*- lexical-binding: nil -*-
+;;; demo.el --- elisprs on fusevm: a smoke test of the current pipe
 
-;; Recursion + arithmetic.
-(defun fact (n)
-  (if (<= n 1) 1 (* n (fact (1- n)))))
+;; Everything here is read by elisprs, lowered to a fusevm Chunk, and executed
+;; on fusevm itself — there is no elisp interpreter. The ElispHost (reached from
+;; fusevm's extension handler) supplies cons cells, symbols, and the subrs.
 
-(message "6! = %d" (fact 6))
+;; Arithmetic on the fusevm value stack.
+(message "sum = %d" (+ 1 2 3 4 5))
 
-;; Higher-order functions.
-(message "squares: %S" (mapcar (lambda (x) (* x x)) '(1 2 3 4 5)))
+;; Real cons cells (heap objects with identity), including dotted pairs.
+(message "pair = %S" (cons 1 2))
+(message "list = %S" (list 1 2 3))
 
-;; Iterative accumulation with dynamic let + while.
-(defun sum-to (n)
-  (let ((acc 0) (i 1))
-    (while (<= i n)
-      (setq acc (+ acc i))
-      (setq i (1+ i)))
-    acc))
+;; In-place mutation — impossible under the old rust_lisp list model.
+(setq p (cons 1 2))
+(setcar p 99)
+(message "after setcar = %S" p)
 
-(message "sum 1..10 = %d" (sum-to 10))
+;; Conditionals (elisp truthiness, only nil is false).
+(message "branch = %s" (if (eq 1 1) "yes" "no"))
+(message "guard = %S" (when (consp p) (quote ok)))
 
-;; Macros.
-(defmacro my-unless (cond &rest body)
-  (list 'if cond nil (cons 'progn body)))
+;; Vectors.
+(message "vec[1] = %d" (aref (vector 10 20 30) 1))
 
-(message "my-unless: %S" (my-unless nil 'reached))
+;; Dynamic variables.
+(setq counter 41)
+(message "counter+1 = %d" (1+ counter))
 
-;; Error handling.
-(message "caught: %S"
-         (condition-case e (/ 1 0)
-           (arith-error (format "%s" e))))
-
-(message "done.")
+(message "done — ran on fusevm.")
