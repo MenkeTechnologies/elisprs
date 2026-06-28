@@ -16,10 +16,10 @@
 
 > *"The editor's language — without the editor."*
 
-`elisprs` runs **Emacs Lisp** (`.el`) as standalone programs from the command line: a **Lisp-2** obarray (separate value/function cells) with dynamic binding and an elisp-correct reader, built on the [`rust_lisp`](https://crates.io/crates/rust_lisp) value model and lowered to — and run on — the [`fusevm`](https://github.com/MenkeTechnologies/fusevm) bytecode VM, the same engine behind `zshrs`, `stryke`, `awkrs`, and `vimlrs`. elisprs is a **pure frontend**: no bespoke VM or JIT — it compiles each form to a `fusevm::Chunk` and fusevm executes it, calling back into the elisp object heap through fusevm's extension handler.
+`elisprs` runs **Emacs Lisp** (`.el`) as standalone programs from the command line: a **Lisp-2** obarray (separate value/function cells) with **lexical *and* dynamic binding** and an elisp-correct reader, **compiled to** — and run on — the [`fusevm`](https://github.com/MenkeTechnologies/fusevm) bytecode VM, the same engine behind `zshrs`, `stryke`, `awkrs`, and `vimlrs`. elisprs is a **pure frontend**: no bespoke VM or JIT — each form lowers to a `fusevm::Chunk`, hot arithmetic/comparison lowers to **native fusevm ops** (JIT/AOT-able), and the elisp object heap rides the VM as `Value::Obj` handles reached through fusevm's extension handler. It **AOT-compiles to standalone native binaries** (`--aot-exe`) and caches lowered bytecode in an **rkyv** shard at `~/.elisprs`.
 
  ┌──────────────────────────────────────────────────────────────┐
- │ STATUS: MILESTONE 1 &nbsp; ENGINE: FUSEVM &nbsp; FRONTEND: PURE &nbsp; ████░░░░ │
+ │ ENGINE: FUSEVM &nbsp; FRONTEND: PURE &nbsp; AOT: STANDALONE BIN &nbsp; CACHE: RKYV │
  └──────────────────────────────────────────────────────────────┘
 
 ### [`Read the Docs`](https://menketechnologies.github.io/elisprs/) &middot; [`Engineering Report`](https://menketechnologies.github.io/elisprs/report.html) · [`strykelang`](https://github.com/MenkeTechnologies/strykelang) · [`zshrs`](https://github.com/MenkeTechnologies/zshrs) · [`fusevm`](https://github.com/MenkeTechnologies/fusevm)
@@ -46,15 +46,16 @@
 
 **Positioning:** Emacs Lisp has only ever run inside Emacs. `elisprs` takes the language out of the editor and runs `.el` as ordinary programs — with a REPL, no Emacs process required. It is built to become the fifth language hosted on [`fusevm`](https://github.com/MenkeTechnologies/fusevm), after `zshrs`, `stryke`, `awkrs`, and `vimlrs`.
 
-**Why it's built this way:** Emacs Lisp is a **Lisp-2** (every symbol carries a separate *value* cell and *function* cell) and is, by default, **dynamically scoped**. Those two facts are the whole personality of the language, and no general-purpose embeddable Lisp gives them to you for free — so the crate reuses a value model and owns the semantics:
+**Why it's built this way:** Emacs Lisp is a **Lisp-2** (every symbol carries a separate *value* cell and *function* cell) and supports both **lexical and dynamic** scoping. Those facts are the whole personality of the language, so elisprs owns the value model and the semantics, and leans on `fusevm` purely for execution:
 
-| Layer | Source |
+| Layer | Where |
 |---|---|
-| `Value` / `List` / `Symbol` data model | **reused** from `rust_lisp` (MIT) |
-| Reader (`1+`/`1-`, `#'foo`, `?c`, `:kw`) | **ours** — `rust_lisp`'s parser mis-tokenizes elisp syntax |
-| Lisp-2 obarray, dynamic binding, special forms, subrs | **ours** — `rust_lisp`'s Lisp-1/lexical `eval` is not used |
+| Value model — interned symbols, real cons cells (dotted), vectors, hash tables, closures | **ours** — an `ElispHost` object heap; objects ride the VM as `Value::Obj(u32)` handles |
+| Reader (`1+`/`1-`, `#'foo`, `?c`, `:kw`, backquote, dotted pairs) | **ours** — an elisp-correct S-expression reader |
+| Lisp-2 obarray, lexical+dynamic binding, special forms, macros, subrs | **ours** — `src/host.rs` + `src/compiler.rs` |
+| Bytecode execution, JIT, AOT | **`fusevm`** — elisprs has no VM/JIT of its own |
 
-**Milestone status:** elisp is **hosted on `fusevm`** — like `vimlrs`, elisprs is a pure frontend with no bespoke VM or JIT. Each top-level form is read, macro-expanded, and lowered to a `fusevm::Chunk` (`src/compiler.rs`); fusevm executes it and calls back into the elisp object heap (`src/host.rs`) through a registered extension handler, with cons/symbol/vector cells riding the VM as `Value::Obj` heap handles. Remaining work is coverage plus turning on the JIT/AOT tiers fusevm already provides — see [§0x06](#0x06-roadmap).
+**Status:** self-hosting elisp on `fusevm`. Each top-level form is read, macro-expanded, and lowered to a `fusevm::Chunk` (`src/compiler.rs`); fusevm executes it and calls back into the object heap (`src/host.rs`) through a registered extension handler. Core arithmetic/comparison lower to **native fusevm ops** so hot loops are JIT/AOT-able; `--aot-exe` emits **standalone native binaries**; lowered bytecode + a heap image are cached in an **rkyv** shard at `~/.elisprs`. (An earlier bootstrap built on the `rust_lisp` crate; it was replaced by this own value model — `rust_lisp` is no longer a dependency.)
 
 ---
 
@@ -62,7 +63,7 @@
 
 - **Rust** 2021 edition (stable). Builds on `rustc` 1.96+.
 - **Platforms:** macOS (aarch64 / x86_64) and Linux (x86_64 / aarch64).
-- **Dependencies:** two core dependencies — `rust_lisp` (MIT, the `Value` model) and `fusevm` (the bytecode VM elisp executes on). The crate still builds offline and fast.
+- **Dependencies:** `fusevm` (the bytecode VM elisp executes on, with `jit-disk-cache` + `aot`), `rkyv` + `bincode` (the `~/.elisprs` bytecode cache), `serde`/`serde_json`, and `lsp-server`/`lsp-types` (the `--lsp` server). No `rust_lisp`.
 
 ---
 
