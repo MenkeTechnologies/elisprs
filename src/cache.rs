@@ -79,7 +79,11 @@ pub fn get(path: &str, mtime_ns: i64) -> Option<(Vec<Chunk>, Vec<SerObj>)> {
 
 /// Store a compiled script. Best-effort — any failure just skips caching.
 pub fn put(path: &str, mtime_ns: i64, chunks: &[Chunk], heap: &[SerObj]) {
-    let Ok(forms) = chunks.iter().map(bincode::serialize).collect::<Result<Vec<_>, _>>() else {
+    let Ok(forms) = chunks
+        .iter()
+        .map(bincode::serialize)
+        .collect::<Result<Vec<_>, _>>()
+    else {
         return;
     };
     let Ok(heap_blob) = bincode::serialize(heap) else {
@@ -87,9 +91,17 @@ pub fn put(path: &str, mtime_ns: i64, chunks: &[Chunk], heap: &[SerObj]) {
     };
     let mut shard = read_shard()
         .filter(|s| s.version == env!("CARGO_PKG_VERSION"))
-        .unwrap_or_else(|| Shard { version: env!("CARGO_PKG_VERSION").to_string(), entries: HashMap::new() });
-    shard
-        .entries
-        .insert(path.to_string(), Entry { mtime_ns, forms, heap: heap_blob });
+        .unwrap_or_else(|| Shard {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            entries: HashMap::new(),
+        });
+    shard.entries.insert(
+        path.to_string(),
+        Entry {
+            mtime_ns,
+            forms,
+            heap: heap_blob,
+        },
+    );
     let _ = write_shard(&shard);
 }

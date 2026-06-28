@@ -100,9 +100,8 @@ fn should_failure_explains_subform_values() {
     // A failing `should` on a known predicate reports the form and each
     // sub-form's evaluated value (ERT-style explanation), reachable as the
     // `ert-test-failed` signal's data.
-    let s = failures(
-        r#"(condition-case e (should (= (+ 1 2) 4)) (ert-test-failed (car (cdr e))))"#,
-    );
+    let s =
+        failures(r#"(condition-case e (should (= (+ 1 2) 4)) (ert-test-failed (car (cdr e))))"#);
     assert!(s.contains("should (= (+ 1 2) 4)"), "missing form: {s}");
     assert!(s.contains("(+ 1 2) . 3"), "missing explained value: {s}");
 }

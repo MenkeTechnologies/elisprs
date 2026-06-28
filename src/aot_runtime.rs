@@ -26,7 +26,7 @@ use fusevm::VM;
 /// `vm` must be a valid, exclusively-borrowable pointer (fusevm's AOT entry
 /// passes one).
 #[no_mangle]
-pub extern "C" fn fusevm_aot_register_builtins(vm: *mut VM) {
+pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut VM) {
     let vm = unsafe { &mut *vm };
     // Rebuild the user/prelude heap from the image embedded in `chunk.names`.
     // (The image already contains the prelude, so we do NOT load it separately —

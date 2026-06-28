@@ -29,10 +29,24 @@ pub const HEAP_IMAGE_TAG: &str = "\u{0}ELHEAP\u{0}";
 #[derive(Serialize, Deserialize)]
 pub enum SerObj {
     Cons(Value, Value),
-    Symbol { name: String, value: Option<Value>, function: Option<Value>, special: bool },
+    Symbol {
+        name: String,
+        value: Option<Value>,
+        function: Option<Value>,
+        special: bool,
+    },
     Vector(Vec<Value>),
-    HashTable { test: u8, entries: Vec<(Value, Value)> },
-    Closure { required: Vec<u32>, optional: Vec<u32>, rest: Option<u32>, body: Chunk, is_macro: bool },
+    HashTable {
+        test: u8,
+        entries: Vec<(Value, Value)>,
+    },
+    Closure {
+        required: Vec<u32>,
+        optional: Vec<u32>,
+        rest: Option<u32>,
+        body: Chunk,
+        is_macro: bool,
+    },
 }
 
 /// Extension-op IDs emitted by the compiler and dispatched here.
@@ -435,10 +449,16 @@ impl ElispHost {
                     special: s.special,
                 },
                 Obj::Vector(v) => SerObj::Vector(v.clone()),
-                Obj::HashTable { test, entries } => {
-                    SerObj::HashTable { test: *test, entries: entries.clone() }
-                }
-                Obj::Closure { params, body, is_macro, .. } => SerObj::Closure {
+                Obj::HashTable { test, entries } => SerObj::HashTable {
+                    test: *test,
+                    entries: entries.clone(),
+                },
+                Obj::Closure {
+                    params,
+                    body,
+                    is_macro,
+                    ..
+                } => SerObj::Closure {
                     required: params.required.clone(),
                     optional: params.optional.clone(),
                     rest: params.rest,
@@ -489,7 +509,11 @@ impl ElispHost {
     /// so re-running cached chunks reproduces the original execution exactly
     /// (no double-applied global mutations). Symbols below `prelude_end` get
     /// their `baseline` value; user symbols (≥ prelude_end) reset to unbound.
-    pub fn export_heap_image_clean(&self, prelude_end: usize, baseline: &[Option<Value>]) -> Vec<SerObj> {
+    pub fn export_heap_image_clean(
+        &self,
+        prelude_end: usize,
+        baseline: &[Option<Value>],
+    ) -> Vec<SerObj> {
         self.arena[self.builtin_count..]
             .iter()
             .enumerate()
@@ -511,10 +535,16 @@ impl ElispHost {
                     }
                     Obj::Cons(a, b) => SerObj::Cons(a.clone(), b.clone()),
                     Obj::Vector(v) => SerObj::Vector(v.clone()),
-                    Obj::HashTable { test, entries } => {
-                        SerObj::HashTable { test: *test, entries: entries.clone() }
-                    }
-                    Obj::Closure { params, body, is_macro, .. } => SerObj::Closure {
+                    Obj::HashTable { test, entries } => SerObj::HashTable {
+                        test: *test,
+                        entries: entries.clone(),
+                    },
+                    Obj::Closure {
+                        params,
+                        body,
+                        is_macro,
+                        ..
+                    } => SerObj::Closure {
                         required: params.required.clone(),
                         optional: params.optional.clone(),
                         rest: params.rest,
@@ -538,14 +568,34 @@ impl ElispHost {
             let id = self.arena.len() as u32;
             let obj = match ser {
                 SerObj::Cons(a, b) => Obj::Cons(a, b),
-                SerObj::Symbol { name, value, function, special } => {
+                SerObj::Symbol {
+                    name,
+                    value,
+                    function,
+                    special,
+                } => {
                     self.obarray.insert(name.clone(), id);
-                    Obj::Symbol(SymbolData { name, value, function, special })
+                    Obj::Symbol(SymbolData {
+                        name,
+                        value,
+                        function,
+                        special,
+                    })
                 }
                 SerObj::Vector(v) => Obj::Vector(v),
                 SerObj::HashTable { test, entries } => Obj::HashTable { test, entries },
-                SerObj::Closure { required, optional, rest, body, is_macro } => Obj::Closure {
-                    params: Rc::new(Params { required, optional, rest }),
+                SerObj::Closure {
+                    required,
+                    optional,
+                    rest,
+                    body,
+                    is_macro,
+                } => Obj::Closure {
+                    params: Rc::new(Params {
+                        required,
+                        optional,
+                        rest,
+                    }),
                     body: Rc::new(body),
                     is_macro,
                     env: None,

@@ -31,7 +31,9 @@ pub fn compile_file(src: &str, out: &Path) -> Result<(), String> {
         chunk.constants.len(),
         image.len()
     );
-    chunk.names.push(format!("{}{}", host::HEAP_IMAGE_TAG, json));
+    chunk
+        .names
+        .push(format!("{}{}", host::HEAP_IMAGE_TAG, json));
     // fusevm bincode-serializes the chunk into the object plus a native entry
     // that deserializes and runs it on the VM. A standalone binary links this
     // object against the elisprs runtime (aot_runtime::fusevm_aot_register_builtins).
@@ -60,7 +62,14 @@ pub fn compile_executable(src: &str, out: &Path) -> Result<(), String> {
     cmd.arg(&main_c).arg(&obj).arg(&lib).arg("-o").arg(out);
     // Platform libraries the Rust staticlib needs.
     if cfg!(target_os = "macos") {
-        cmd.args(["-framework", "CoreFoundation", "-framework", "Security", "-liconv", "-lc++"]);
+        cmd.args([
+            "-framework",
+            "CoreFoundation",
+            "-framework",
+            "Security",
+            "-liconv",
+            "-lc++",
+        ]);
     } else {
         cmd.args(["-lpthread", "-ldl", "-lm", "-lrt"]);
     }
