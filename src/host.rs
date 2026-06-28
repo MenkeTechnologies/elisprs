@@ -26,9 +26,11 @@ pub mod ops {
     pub const GETVAR: u16 = 2; // pop sym; push value cell
     pub const SETVAR: u16 = 3; // pop val, pop sym; set value cell; push val
     pub const FSET: u16 = 4; // pop def, pop sym; set function cell; push sym
-    pub const SPECBIND: u16 = 5; // pop sym, pop val; dynamic-bind; push nothing
-    pub const LETBIND: u16 = 6; // wide n: pop n (val,sym) pairs; dynamic-bind all
-    pub const UNBIND: u16 = 7; // wide n: unwind n dynamic binds (keep stack value)
+    pub const SPECBIND: u16 = 5; // pop sym, pop val; bind into current scope (BIND1)
+    pub const LETBIND: u16 = 6; // wide n: open scope; pop n (val,sym) pairs; bind all
+    pub const UNBIND: u16 = 7; // wide: close the innermost scope (keep stack value)
+    pub const SCOPE_OPEN: u16 = 8; // open an empty lexical scope (for let*)
+    pub const MAKE_CLOSURE: u16 = 9; // pop a closure template; push one capturing the env
 }
 
 pub type SubrFn = fn(&mut ElispHost, &[Value]) -> Result<Value, String>;
@@ -124,6 +126,7 @@ pub enum Resolved {
         params: Rc<Params>,
         body: Rc<Chunk>,
         is_macro: bool,
+        env: Lex,
     },
 }
 
@@ -132,6 +135,10 @@ pub struct ElispHost {
     obarray: HashMap<String, u32>,
     /// Dynamic-binding save stack: (symbol handle, previous value cell).
     specstack: Vec<(u32, Option<Value>)>,
+    /// Current lexical environment (the chain of `let`/closure frames).
+    lex: Lex,
+    /// Per-scope unwind info: (saved lexical env, specstack depth at entry).
+    frame_stack: Vec<(Lex, usize)>,
     pub(crate) error: Option<String>,
     /// A pending `throw`: (tag, value). Set by `throw`, consumed by `catch`.
     /// Distinguishes a non-local `throw` from an ordinary error during unwinding.
@@ -150,6 +157,8 @@ impl ElispHost {
             arena: Vec::new(),
             obarray: HashMap::new(),
             specstack: Vec::new(),
+            lex: None,
+            frame_stack: Vec::new(),
             error: None,
             pending_throw: None,
         };
@@ -235,12 +244,21 @@ impl ElispHost {
     // ── symbol cells (dynamic / value cell) ──
     pub fn set_value(&mut self, v: &Value, val: Value) -> Result<(), String> {
         let id = self.sym_handle(v).ok_or("set: not a symbol")?;
+        // A lexical binding shadows the value cell.
+        if self.lex.as_ref().is_some_and(|s| s.set(id, &val)) {
+            return Ok(());
+        }
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.value = Some(val);
         }
         Ok(())
     }
     pub fn get_value(&self, v: &Value) -> Result<Value, String> {
+        if let Some(id) = self.sym_handle(v) {
+            if let Some(val) = self.lex.as_ref().and_then(|s| s.lookup(id)) {
+                return Ok(val);
+            }
+        }
         match self.obj(v) {
             Some(Obj::Symbol(s)) => s
                 .value
@@ -252,6 +270,17 @@ impl ElispHost {
                 _ => Err("not a symbol".to_string()),
             },
         }
+    }
+    /// Mark a symbol special (dynamically scoped) — used by `defvar`/`defconst`.
+    pub fn set_special(&mut self, v: &Value) {
+        if let Some(id) = self.sym_handle(v) {
+            if let Obj::Symbol(s) = &mut self.arena[id as usize] {
+                s.special = true;
+            }
+        }
+    }
+    fn is_special(&self, id: u32) -> bool {
+        matches!(self.arena.get(id as usize), Some(Obj::Symbol(s)) if s.special)
     }
     pub fn set_function_value(&mut self, sym: &Value, def: Value) -> Result<(), String> {
         let id = self.sym_handle(sym).ok_or("fset: not a symbol")?;
@@ -305,8 +334,60 @@ impl ElispHost {
             }
         }
     }
-    /// Bind a closure's params to args (dynamic). Returns the pre-bind depth.
-    pub fn bind_params(&mut self, params: &Params, args: &[Value]) -> Result<usize, String> {
+    // ── lexical scope management ──
+    /// Push a new lexical scope as a child of the current one.
+    pub fn open_scope(&mut self) {
+        self.frame_stack.push((self.lex.clone(), self.specstack.len()));
+        self.lex = Some(Scope::child(self.lex.clone()));
+    }
+    /// Push a new lexical scope as a child of `env` (a closure's captured env).
+    pub fn open_scope_in(&mut self, env: Lex) {
+        self.frame_stack.push((self.lex.clone(), self.specstack.len()));
+        self.lex = Some(Scope::child(env));
+    }
+    /// Pop the innermost scope: restore the prior lexical env and unwind any
+    /// dynamic (special-var) bindings made within it.
+    pub fn close_scope(&mut self) {
+        if let Some((saved, depth)) = self.frame_stack.pop() {
+            self.unbind_to(depth);
+            self.lex = saved;
+        }
+    }
+    /// Bind `id` to `val` in the current scope — lexically, unless the symbol is
+    /// special (`defvar`'d), in which case dynamically (saved on the specstack).
+    pub fn bind_here(&mut self, id: u32, val: Value) {
+        if self.is_special(id) {
+            let _ = self.specbind(&Value::Obj(id), val);
+        } else if let Some(scope) = &self.lex {
+            scope.vars.borrow_mut().push((id, val));
+        } else {
+            if let Obj::Symbol(s) = &mut self.arena[id as usize] {
+                s.value = Some(val);
+            }
+        }
+    }
+    /// Bind a symbol value into the current scope (lexical/dynamic per special).
+    pub fn bind_value(&mut self, symv: &Value, val: Value) {
+        if let Some(id) = self.sym_handle(symv) {
+            self.bind_here(id, val);
+        }
+    }
+    /// Instantiate a closure from a compile-time template, capturing the current
+    /// lexical environment. Templates are stored with `env: None`.
+    pub fn instantiate_closure(&mut self, template: &Value) -> Value {
+        if let Some(Obj::Closure { params, body, is_macro, .. }) = self.obj(template) {
+            let (params, body, is_macro) = (params.clone(), body.clone(), *is_macro);
+            let env = self.lex.clone();
+            return self.alloc(Obj::Closure { params, body, is_macro, env });
+        }
+        template.clone()
+    }
+    /// Bind a closure's params into the already-open current scope.
+    pub fn bind_params_into_scope(
+        &mut self,
+        params: &Params,
+        args: &[Value],
+    ) -> Result<(), String> {
         if args.len() < params.required.len() {
             return Err("wrong-number-of-arguments".to_string());
         }
@@ -314,23 +395,22 @@ impl ElispHost {
         if params.rest.is_none() && args.len() > max {
             return Err("wrong-number-of-arguments".to_string());
         }
-        let depth = self.specstack.len();
         let mut i = 0;
-        for &h in &params.required {
-            self.specbind(&Value::Obj(h), args[i].clone())?;
+        for &id in &params.required {
+            self.bind_here(id, args[i].clone());
             i += 1;
         }
-        for &h in &params.optional {
+        for &id in &params.optional {
             let v = args.get(i).cloned().unwrap_or(Value::Undef);
-            self.specbind(&Value::Obj(h), v)?;
+            self.bind_here(id, v);
             i += 1;
         }
-        if let Some(h) = params.rest {
+        if let Some(id) = params.rest {
             let rest = args.get(i..).map(|s| s.to_vec()).unwrap_or_default();
             let lst = self.list_from(rest);
-            self.specbind(&Value::Obj(h), lst)?;
+            self.bind_here(id, lst);
         }
-        Ok(depth)
+        Ok(())
     }
 
     /// Parse a lambda list form into structured params (interning the symbols).
@@ -376,11 +456,13 @@ impl ElispHost {
                     params,
                     body,
                     is_macro,
+                    env,
                 }) => {
                     return Ok(Resolved::Closure {
                         params: params.clone(),
                         body: body.clone(),
                         is_macro: *is_macro,
+                        env: env.clone(),
                     })
                 }
                 Some(Obj::Symbol(s)) => match &s.function {
@@ -586,22 +668,36 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             params,
             body,
             is_macro,
+            env,
         } => {
             if is_macro {
                 return Err("macro called as a function (use it in a macro position)".to_string());
             }
-            run_closure(&params, &body, args)
+            run_closure(&params, &body, env, args)
         }
     }
 }
 
-/// Bind a closure's params to `args`, run its body on a nested fusevm VM, unwind.
-/// Used by both function application and macro expansion (where `args` are the
+/// Open a lexical scope (child of the closure's captured `env`), bind `args` to
+/// the params, run the body on a nested fusevm VM, then close the scope. Used by
+/// both function application and macro expansion (where `args` are the
 /// unevaluated argument forms). Holds no host borrow across the nested run.
-fn run_closure(params: &Rc<Params>, body: &Rc<Chunk>, args: &[Value]) -> Result<Value, String> {
-    let depth = with_host(|h| h.bind_params(params, args))?;
+fn run_closure(
+    params: &Rc<Params>,
+    body: &Rc<Chunk>,
+    env: Lex,
+    args: &[Value],
+) -> Result<Value, String> {
+    let setup = with_host(|h| {
+        h.open_scope_in(env.clone());
+        h.bind_params_into_scope(params, args)
+    });
+    if let Err(e) = setup {
+        with_host(|h| h.close_scope());
+        return Err(e);
+    }
     let result = run_chunk((**body).clone());
-    with_host(|h| h.unbind_to(depth));
+    with_host(|h| h.close_scope());
     result
 }
 
@@ -618,12 +714,13 @@ pub fn macroexpand_1(form: &Value) -> Result<Option<Value>, String> {
                 params,
                 body,
                 is_macro: true,
-            }) => Some((params, body, elems[1..].to_vec())),
+                env,
+            }) => Some((params, body, env, elems[1..].to_vec())),
             _ => None,
         }
     });
     match info {
-        Some((params, body, args)) => Ok(Some(run_closure(&params, &body, &args)?)),
+        Some((params, body, env, args)) => Ok(Some(run_closure(&params, &body, env, &args)?)),
         None => Ok(None),
     }
 }
@@ -774,11 +871,18 @@ pub fn ext_dispatch(vm: &mut VM, id: u16, arg: u8) {
             vm.push(symv);
         }
         ops::SPECBIND => {
+            // BIND1: bind into the current (already-open) scope; used by let*.
             let symv = vm.pop();
             let val = vm.pop();
-            if let Err(e) = with_host(|h| h.specbind(&symv, val)) {
-                with_host(|h| h.error = Some(e));
-            }
+            with_host(|h| h.bind_value(&symv, val));
+        }
+        ops::SCOPE_OPEN => {
+            with_host(|h| h.open_scope());
+        }
+        ops::MAKE_CLOSURE => {
+            let template = vm.pop();
+            let clo = with_host(|h| h.instantiate_closure(&template));
+            vm.push(clo);
         }
         _ => {}
     }
@@ -788,7 +892,8 @@ pub fn ext_dispatch(vm: &mut VM, id: u16, arg: u8) {
 pub fn ext_dispatch_wide(vm: &mut VM, id: u16, n: usize) {
     match id {
         ops::LETBIND => {
-            // stack: val1,sym1,...,valn,symn  (symn on top)
+            // stack: val1,sym1,...,valn,symn  (symn on top). Inits were evaluated
+            // in the outer scope; now open a fresh scope and bind them in parallel.
             let mut pairs = Vec::with_capacity(n);
             for _ in 0..n {
                 let sym = vm.pop();
@@ -796,16 +901,15 @@ pub fn ext_dispatch_wide(vm: &mut VM, id: u16, n: usize) {
                 pairs.push((sym, val));
             }
             with_host(|h| {
+                h.open_scope();
                 for (sym, val) in pairs.into_iter().rev() {
-                    let _ = h.specbind(&sym, val);
+                    h.bind_value(&sym, val);
                 }
             });
         }
         ops::UNBIND => {
-            with_host(|h| {
-                let target = h.specdepth().saturating_sub(n);
-                h.unbind_to(target);
-            });
+            let _ = n;
+            with_host(|h| h.close_scope());
         }
         _ => {}
     }
@@ -825,6 +929,9 @@ pub fn run_chunk(chunk: Chunk) -> Result<Value, String> {
     let mut vm = VM::new(chunk);
     vm.set_extension_handler(Box::new(ext_dispatch));
     vm.set_extension_wide_handler(Box::new(ext_dispatch_wide));
+    // Hot loops trace-compile through fusevm's Cranelift JIT; with the
+    // `jit-disk-cache` feature, compiled native code is persisted across runs.
+    vm.enable_tracing_jit();
     let outcome = vm.run();
     if let Some(e) = with_host(|h| h.take_error()) {
         return Err(e);

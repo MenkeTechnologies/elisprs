@@ -197,12 +197,15 @@ fn compile_lambda(
     let arglist = elems.get(1).cloned().unwrap_or(Value::Undef);
     let params = h.parse_params(&arglist)?;
     let body = compile_body_chunk(h, elems.get(2..).unwrap_or(&[]))?;
-    let clo = h.alloc(Obj::Closure {
+    let template = h.alloc(Obj::Closure {
         params: Rc::new(params),
         body: Rc::new(body),
         is_macro,
+        env: None,
     });
-    load_const(b, clo);
+    load_const(b, template);
+    // Capture the current lexical environment into a fresh closure at runtime.
+    b.emit(Op::Extended(ops::MAKE_CLOSURE, 0), 0);
     Ok(())
 }
 
@@ -219,20 +222,26 @@ fn compile_defun(
     let arglist = elems.get(2).cloned().unwrap_or(Value::Undef);
     let params = h.parse_params(&arglist)?;
     let body = compile_body_chunk(h, elems.get(3..).unwrap_or(&[]))?;
-    let clo = h.alloc(Obj::Closure {
+    let template = h.alloc(Obj::Closure {
         params: Rc::new(params),
         body: Rc::new(body),
         is_macro,
+        env: None,
     });
     load_const(b, name); // symbol
-    load_const(b, clo); // definition
+    load_const(b, template); // definition template
+    if !is_macro {
+        // A defun captures its defining lexical env; a macro does not.
+        b.emit(Op::Extended(ops::MAKE_CLOSURE, 0), 0);
+    }
     b.emit(Op::Extended(ops::FSET, 0), 0); // sets function cell, leaves the symbol
     Ok(())
 }
 
 fn compile_defvar(h: &mut ElispHost, b: &mut ChunkBuilder, elems: &[Value]) -> Result<(), String> {
     let name = elems.get(1).cloned().ok_or("defvar: missing name")?;
-    // Milestone simplification: set the value (always) and return the symbol.
+    // defvar/defconst declare a dynamically-scoped (special) variable.
+    h.set_special(&name);
     if let Some(init) = elems.get(2) {
         load_const(b, name.clone());
         compile_form(h, b, init)?;
@@ -270,7 +279,8 @@ fn compile_let(
         .collect::<Result<_, _>>()?;
     let n = parsed.len();
     if sequential {
-        // let*: bind each before evaluating the next init
+        // let*: open one scope, then bind each var before the next init is evaluated
+        b.emit(Op::Extended(ops::SCOPE_OPEN, 0), 0);
         for (sym, init) in &parsed {
             compile_form(h, b, init)?;
             load_const(b, sym.clone());

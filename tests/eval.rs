@@ -183,6 +183,30 @@ fn prelude_derived_surface() {
 }
 
 #[test]
+fn lexical_and_dynamic_binding() {
+    // Lexical closures capture their defining environment (modern-elisp default).
+    assert_eq!(
+        eval("(defun make-adder (n) (lambda (x) (+ x n))) (funcall (make-adder 10) 5)"),
+        "15"
+    );
+    // Each closure captures its own binding.
+    assert_eq!(
+        eval("(list (funcall (let ((i 1)) (lambda () i))) (funcall (let ((i 2)) (lambda () i))))"),
+        "(1 2)"
+    );
+    // Capture is by reference: setq through the closure persists.
+    assert_eq!(
+        eval("(let ((c 0)) (defun bump () (setq c (1+ c))) (bump) (bump) (bump) c)"),
+        "3"
+    );
+    // A defvar'd (special) variable is dynamically scoped: the callee sees the let.
+    assert_eq!(
+        eval("(defvar *dyn* 1) (defun rd () *dyn*) (let ((*dyn* 42)) (rd))"),
+        "42"
+    );
+}
+
+#[test]
 fn hash_tables() {
     assert_eq!(
         eval("(let ((h (make-hash-table :test 'equal))) (puthash \"a\" 1 h) (gethash \"a\" h))"),
