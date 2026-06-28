@@ -96,6 +96,20 @@ fn skip_unless_skips_without_failing() {
 }
 
 #[test]
+fn fail_pass_info_primitives() {
+    // The primitives under `should`: `ert-fail` signals `ert-test-failed`
+    // (a failing test); `ert-pass` is a no-op leaving the test passing;
+    // `ert-info` annotates without failing. One failure expected.
+    let n = failures(
+        r#"
+(ert-deftest explicit-fail () (ert-fail "nope"))
+(ert-deftest explicit-pass () (ert-info "noting") (ert-pass) (should t))
+(ert-run-tests-batch)"#,
+    );
+    assert_eq!(n, "1");
+}
+
+#[test]
 fn should_failure_explains_subform_values() {
     // A failing `should` on a known predicate reports the form and each
     // sub-form's evaluated value (ERT-style explanation), reachable as the
