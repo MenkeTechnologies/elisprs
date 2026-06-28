@@ -746,7 +746,17 @@ impl ElispHost {
             Value::Bool(false) => "nil".to_string(),
             Value::Int(n) => n.to_string(),
             Value::Float(f) => {
-                if f.fract() == 0.0 && f.is_finite() {
+                // Emacs's read syntax for the non-finite floats.
+                if f.is_nan() {
+                    if f.is_sign_negative() {
+                        "-0.0e+NaN"
+                    } else {
+                        "0.0e+NaN"
+                    }
+                    .to_string()
+                } else if f.is_infinite() {
+                    if *f < 0.0 { "-1.0e+INF" } else { "1.0e+INF" }.to_string()
+                } else if f.fract() == 0.0 {
                     format!("{f:.1}")
                 } else {
                     format!("{f}")

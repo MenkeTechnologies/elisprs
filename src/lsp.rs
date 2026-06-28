@@ -546,6 +546,13 @@ const SUBRS: &[Entry] = &[
         sig: "(save-match-data &rest BODY)",
         doc: "Eval BODY, preserving the caller's regexp match data.",
     },
+    Entry {
+        name: "pcase",
+        kind: Kind::Function,
+        sig: "(pcase EXPR (PATTERN BODY...)...)",
+        doc:
+            "Structural dispatch: _, literals, 'x, binders, (pred FN), (guard E), (and …), (or …).",
+    },
 ];
 
 fn lookup(name: &str) -> Option<&'static Entry> {

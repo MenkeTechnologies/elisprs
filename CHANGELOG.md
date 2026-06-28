@@ -14,8 +14,35 @@ All notable changes to elisprs are documented here. The format follows
 - `split-string` honors OMIT-NULLS (3rd arg); default separators omit implicitly.
 - `dotimes` / `dolist` evaluate and return their optional RESULT form.
 - `capitalize` upcases the first letter of every word, not just the first.
+- `expt` returns a float for negative/fractional exponents (`(expt 2 -1)` => `0.5`,
+  `(expt 2.0 0.5)`), integer power otherwise. Now a primitive subr.
+- `string-to-number` parses floats and scientific notation, and takes an optional
+  BASE argument (`(string-to-number "ff" 16)` => `255`). Now a primitive subr.
+- Added missing core functions: `type-of`, `functionp`, `char-or-string-p`,
+  `sqrt`, `fround`, `ffloor`, `fceiling`, `ftruncate`, `isnan`, `char-equal`.
+- `floor` / `ceiling` / `round` / `truncate` accept an optional DIVISOR
+  (`(floor 7 2)` => `3`), with exact integer division for integer operands.
+- `last` / `butlast` accept an optional N (`(last '(1 2 3) 2)` => `(2 3)`).
+- `reverse` works on any sequence (string / vector / list); `downcase` / `upcase`
+  accept a string or a character (`(downcase ?A)` => `97`). Now primitive subrs.
+- `append`'s final argument is the tail as-is, so a non-list last arg yields a
+  dotted result: `(append '(1 2) 3)` => `(1 2 . 3)`.
+- Non-finite floats print in Emacs read syntax: `1.0e+INF`, `-1.0e+INF`, `0.0e+NaN`.
+- A `(lambda …)` form in operator (head) position is now applied directly:
+  `((lambda (x) x) 5)` => `5` (previously `invalid-function`).
+- `1+` / `1-` preserve float contagion (`(1+ 1.0)` => `2.0`): they lower to the
+  float-aware native `Add`/`Sub` ops instead of integer `Inc`/`Dec`, keeping the
+  fast path for integer loop counters.
 
 ### Added
+- `pcase` — structural dispatch (non-backquote subset): `_` wildcard,
+  self-quoting literals, `'x` / `(quote x)`, symbol binders, `(pred FN)` /
+  `(pred (FN ARGS...))`, `(guard EXPR)`, `(and …)`, `(or …)`. Plus a minimal
+  `pcase-let`. Backquote patterns (`` `(,a ,b) ``) are not yet supported — this
+  reader expands backquote eagerly at read time, so they need lazy backquote
+  first. Expands to a `cond` (the `cl-case` shape) rather than `catch`/`throw`,
+  which expands cleanly when nested inside a macro-produced `defun` (e.g. an ERT
+  `should`).
 - Regexp support: `string-match` / `string-match-p`, `match-beginning` /
   `match-end` / `match-string`, `match-data` / `set-match-data`,
   `replace-regexp-in-string` (with `\&` / `\N` template expansion),

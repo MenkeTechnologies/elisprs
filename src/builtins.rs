@@ -2,7 +2,7 @@
 //! ~irreducible core; the large derived surface (caar.., seq-*, cl-*, alist
 //! helpers) will be defined in an elisp prelude on top of these.
 
-use crate::host::{ElispHost, MatchData, Obj};
+use crate::host::{ElispHost, MatchData, Obj, Resolved};
 use fusevm::Value;
 
 type R = Result<Value, String>;
@@ -271,12 +271,17 @@ fn list_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.list_from(a.to_vec()))
 }
 fn append_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    if a.is_empty() {
+        return Ok(Value::Undef);
+    }
+    // The final argument becomes the tail as-is (shared, any type) — so a
+    // non-list last arg yields a dotted result: (append '(1 2) 3) => (1 2 . 3).
+    // Every preceding argument must be a sequence and is flattened.
     let mut out = Vec::new();
-    for v in a {
+    for v in &a[..a.len() - 1] {
         if is_nil(v) {
             continue;
         }
-        // Lists, vectors, and strings are all sequences `append` can flatten.
         match h.obj(v) {
             Some(Obj::Vector(items)) => out.extend(items.clone()),
             _ => match v {
@@ -288,12 +293,59 @@ fn append_fn(h: &mut ElispHost, a: &[Value]) -> R {
             },
         }
     }
-    Ok(h.list_from(out))
+    let mut tail = a[a.len() - 1].clone();
+    for item in out.into_iter().rev() {
+        tail = h.cons(item, tail);
+    }
+    Ok(tail)
 }
 fn reverse_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let mut v = h.list_vec(&a[0]).ok_or("wrong-type-argument: listp")?;
+    // `reverse` works on any sequence: list, string, or vector.
+    if let Value::Str(s) = &a[0] {
+        return Ok(Value::str(s.chars().rev().collect::<String>()));
+    }
+    let vec_items = match h.obj(&a[0]) {
+        Some(Obj::Vector(items)) => Some(items.clone()),
+        _ => None,
+    };
+    if let Some(mut items) = vec_items {
+        items.reverse();
+        return Ok(h.alloc(Obj::Vector(items)));
+    }
+    let mut v = h.list_vec(&a[0]).ok_or("wrong-type-argument: sequencep")?;
     v.reverse();
     Ok(h.list_from(v))
+}
+/// `(downcase OBJ)` / `(upcase OBJ)` — case-fold a string, or a single character
+/// (an integer), returning the same kind. Unicode-aware via Rust's case mapping.
+fn case_fold(a: &[Value], upper: bool) -> R {
+    match &a[0] {
+        Value::Int(c) => {
+            let mapped = char::from_u32(*c as u32)
+                .map(|ch| {
+                    if upper {
+                        ch.to_uppercase().next()
+                    } else {
+                        ch.to_lowercase().next()
+                    }
+                    .unwrap_or(ch) as i64
+                })
+                .unwrap_or(*c);
+            Ok(Value::Int(mapped))
+        }
+        Value::Str(s) => Ok(Value::str(if upper {
+            s.to_uppercase()
+        } else {
+            s.to_lowercase()
+        })),
+        _ => Err("wrong-type-argument: char-or-string-p".to_string()),
+    }
+}
+fn downcase_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    case_fold(a, false)
+}
+fn upcase_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    case_fold(a, true)
 }
 fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
     match &a[0] {
@@ -1082,22 +1134,67 @@ fn replace_regexp_in_string(_h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── numeric: float → integer rounding, and integer bit ops ──
+/// Rounding mode for `floor`/`ceiling`/`round`/`truncate`.
+#[derive(Clone, Copy)]
+enum Rm {
+    Floor,
+    Ceil,
+    Trunc,
+    Round,
+}
+/// `(OP NUMBER &optional DIVISOR)` — round NUMBER (or NUMBER/DIVISOR) to an
+/// integer under `rm`. Integer operands use exact integer division so large
+/// magnitudes don't lose precision; a float operand routes through `f64`.
+fn quotient(a: &[Value], rm: Rm) -> R {
+    let (xi, xf, xisf) = as_num(&a[0])?;
+    match a.get(1) {
+        Some(d) if !is_nil(d) => {
+            let (di, df, disf) = as_num(d)?;
+            if !xisf && !disf {
+                if di == 0 {
+                    return Err("arith-error: division by zero".to_string());
+                }
+                return Ok(Value::Int(int_div(xi, di, rm)));
+            }
+            if df == 0.0 {
+                return Err("arith-error: division by zero".to_string());
+            }
+            Ok(Value::Int(apply_rm(xf / df, rm) as i64))
+        }
+        _ => Ok(Value::Int(if xisf { apply_rm(xf, rm) as i64 } else { xi })),
+    }
+}
+fn apply_rm(f: f64, rm: Rm) -> f64 {
+    match rm {
+        Rm::Floor => f.floor(),
+        Rm::Ceil => f.ceil(),
+        Rm::Trunc => f.trunc(),
+        Rm::Round => f.round_ties_even(),
+    }
+}
+fn int_div(x: i64, y: i64, rm: Rm) -> i64 {
+    let q = x / y;
+    let r = x % y;
+    match rm {
+        Rm::Trunc => q,
+        Rm::Floor if r != 0 && (r < 0) != (y < 0) => q - 1,
+        Rm::Ceil if r != 0 && (r < 0) == (y < 0) => q + 1,
+        Rm::Round => (x as f64 / y as f64).round_ties_even() as i64,
+        _ => q,
+    }
+}
 fn floor_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (i, f, isf) = as_num(&a[0])?;
-    Ok(Value::Int(if isf { f.floor() as i64 } else { i }))
+    quotient(a, Rm::Floor)
 }
 fn ceiling_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (i, f, isf) = as_num(&a[0])?;
-    Ok(Value::Int(if isf { f.ceil() as i64 } else { i }))
+    quotient(a, Rm::Ceil)
 }
 fn round_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     // Emacs rounds half to even (banker's rounding): (round 2.5) => 2, (round 0.5) => 0.
-    let (i, f, isf) = as_num(&a[0])?;
-    Ok(Value::Int(if isf { f.round_ties_even() as i64 } else { i }))
+    quotient(a, Rm::Round)
 }
 fn truncate_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (i, f, isf) = as_num(&a[0])?;
-    Ok(Value::Int(if isf { f.trunc() as i64 } else { i }))
+    quotient(a, Rm::Trunc)
 }
 fn float_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     let (_i, f, _isf) = as_num(&a[0])?;
@@ -1135,6 +1232,154 @@ fn ash_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     } else {
         n >> (-c) as u32
     }))
+}
+
+// ── parity: float math / numeric parsing / introspection ──
+
+/// `(expt BASE EXP)` — integer power when BASE is an integer and EXP a
+/// non-negative integer; otherwise float `BASE**EXP` (covers negative and
+/// fractional exponents). `(expt 2 10)`=>1024, `(expt 2 -1)`=>0.5, `(expt 2.0 0.5)`.
+fn expt_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let (bi, bf, bisf) = as_num(&a[0])?;
+    let (ei, ef, eisf) = as_num(&a[1])?;
+    if !bisf && !eisf && ei >= 0 {
+        Ok(Value::Int(bi.wrapping_pow(ei as u32)))
+    } else {
+        Ok(Value::Float(bf.powf(ef)))
+    }
+}
+fn sqrt_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(&a[0])?.1.sqrt()))
+}
+fn isnan_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(matches!(a[0], Value::Float(f) if f.is_nan())))
+}
+fn fround_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(&a[0])?.1.round_ties_even()))
+}
+fn ffloor_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(&a[0])?.1.floor()))
+}
+fn fceiling_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(&a[0])?.1.ceil()))
+}
+fn ftruncate_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(&a[0])?.1.trunc()))
+}
+
+/// `(string-to-number STRING &optional BASE)` — parse a leading number. With
+/// BASE (2–16) parse an integer in that radix; otherwise parse an int, or a
+/// float when a `.` or exponent is present. Non-numeric input yields 0.
+fn string_to_number(_h: &mut ElispHost, a: &[Value]) -> R {
+    let raw = as_string(&a[0])?;
+    let s = raw.trim_start();
+    if let Some(bv) = a.get(1) {
+        if !is_nil(bv) {
+            let base = as_int(bv)?.clamp(2, 16) as u32;
+            let mut chars = s.chars().peekable();
+            let mut sign = 1i64;
+            match chars.peek() {
+                Some('+') => {
+                    chars.next();
+                }
+                Some('-') => {
+                    sign = -1;
+                    chars.next();
+                }
+                _ => {}
+            }
+            let (mut n, mut seen) = (0i64, false);
+            for c in chars {
+                match c.to_digit(base) {
+                    Some(d) => {
+                        n = n.wrapping_mul(base as i64) + d as i64;
+                        seen = true;
+                    }
+                    None => break,
+                }
+            }
+            return Ok(Value::Int(if seen { sign * n } else { 0 }));
+        }
+    }
+    let b: Vec<char> = s.chars().collect();
+    let (mut i, n) = (0usize, b.len());
+    let start = i;
+    if i < n && (b[i] == '+' || b[i] == '-') {
+        i += 1;
+    }
+    let (mut has_digit, mut is_float) = (false, false);
+    while i < n && b[i].is_ascii_digit() {
+        i += 1;
+        has_digit = true;
+    }
+    if i < n && b[i] == '.' {
+        is_float = true;
+        i += 1;
+        while i < n && b[i].is_ascii_digit() {
+            i += 1;
+            has_digit = true;
+        }
+    }
+    if has_digit && i < n && (b[i] == 'e' || b[i] == 'E') {
+        let mut j = i + 1;
+        if j < n && (b[j] == '+' || b[j] == '-') {
+            j += 1;
+        }
+        if j < n && b[j].is_ascii_digit() {
+            is_float = true;
+            i = j;
+            while i < n && b[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+    }
+    if !has_digit {
+        return Ok(Value::Int(0));
+    }
+    let tok: String = b[start..i].iter().collect();
+    Ok(if is_float {
+        Value::Float(tok.parse().unwrap_or(0.0))
+    } else {
+        Value::Int(tok.parse().unwrap_or(0))
+    })
+}
+
+/// `(type-of OBJECT)` — the symbol naming OBJECT's primitive type.
+fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
+    let name = match &a[0] {
+        Value::Int(_) => "integer",
+        Value::Float(_) => "float",
+        Value::Str(_) => "string",
+        Value::Bool(_) | Value::Undef => "symbol",
+        Value::Obj(_) => match h.obj(&a[0]) {
+            Some(Obj::Cons(..)) => "cons",
+            Some(Obj::Symbol(_)) => "symbol",
+            Some(Obj::Vector(_)) => "vector",
+            Some(Obj::Subr { .. }) => "subr",
+            Some(Obj::Closure { .. }) => "function",
+            Some(Obj::HashTable { .. }) => "hash-table",
+            None => "symbol",
+        },
+        _ => "symbol",
+    };
+    Ok(h.intern(name))
+}
+
+/// `(functionp OBJECT)` — non-nil if OBJECT can be called as a function (a subr,
+/// a non-macro closure, or a symbol whose function cell resolves to one).
+fn functionp(h: &mut ElispHost, a: &[Value]) -> R {
+    let ok = match h.resolve_function(&a[0]) {
+        Ok(Resolved::Subr { .. }) => true,
+        Ok(Resolved::Closure { is_macro, .. }) => !is_macro,
+        Err(_) => false,
+    };
+    Ok(nil_or(ok))
+}
+fn char_or_string_p(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(matches!(a[0], Value::Int(_) | Value::Str(_))))
+}
+fn char_equal(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(as_int(&a[0])? == as_int(&a[1])?))
 }
 
 /// Install the primitive subr set.
@@ -1262,4 +1507,19 @@ pub fn install(h: &mut ElispHost) {
     s("lognot", 1, Some(1), lognot_fn);
     s("ash", 2, Some(2), ash_fn);
     s("lsh", 2, Some(2), ash_fn);
+    // parity: float math / parsing / introspection
+    s("expt", 2, Some(2), expt_fn);
+    s("sqrt", 1, Some(1), sqrt_fn);
+    s("isnan", 1, Some(1), isnan_fn);
+    s("fround", 1, Some(1), fround_fn);
+    s("ffloor", 1, Some(1), ffloor_fn);
+    s("fceiling", 1, Some(1), fceiling_fn);
+    s("ftruncate", 1, Some(1), ftruncate_fn);
+    s("string-to-number", 1, Some(2), string_to_number);
+    s("downcase", 1, Some(1), downcase_fn);
+    s("upcase", 1, Some(1), upcase_fn);
+    s("type-of", 1, Some(1), type_of);
+    s("functionp", 1, Some(1), functionp);
+    s("char-or-string-p", 1, Some(1), char_or_string_p);
+    s("char-equal", 2, Some(2), char_equal);
 }

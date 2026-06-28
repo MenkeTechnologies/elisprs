@@ -115,8 +115,23 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
                     return Ok(());
                 }
             }
-            // generic function call
-            load_const(b, head);
+            // Push the operator. A `(lambda ...)` form in head position is
+            // compiled to a closure (so `((lambda (x) x) 5)` works); any other
+            // head is loaded as-is for the CALL handler to resolve.
+            let head_elems = match h.obj(&head) {
+                Some(Obj::Cons(..)) => h.list_vec(&head),
+                _ => None,
+            };
+            let head_is_lambda = head_elems
+                .as_ref()
+                .and_then(|e| e.first())
+                .map(|f| h.sym_name(f).as_deref() == Some("lambda"))
+                .unwrap_or(false);
+            if head_is_lambda {
+                compile_lambda(h, b, &head_elems.unwrap(), false)?;
+            } else {
+                load_const(b, head);
+            }
             let argc = elems.len() - 1;
             for arg in &elems[1..] {
                 compile_form(h, b, arg)?;
@@ -167,13 +182,18 @@ fn try_native_op(
                 }
             }
         }
+        // Lower to native Add/Sub with a constant 1 (not Inc/Dec): Add/Sub are
+        // float-contagious like elisp `+`/`-`, so (1+ 1.0) => 2.0, whereas the
+        // integer Inc/Dec opcodes would truncate the float.
         "1+" if args.len() == 1 => {
             compile_form(h, b, &args[0])?;
-            b.emit(Op::Inc, 0);
+            b.emit(Op::LoadInt(1), 0);
+            b.emit(Op::Add, 0);
         }
         "1-" if args.len() == 1 => {
             compile_form(h, b, &args[0])?;
-            b.emit(Op::Dec, 0);
+            b.emit(Op::LoadInt(1), 0);
+            b.emit(Op::Sub, 0);
         }
         "<" if args.len() == 2 => binop(h, b, Op::NumLt)?,
         ">" if args.len() == 2 => binop(h, b, Op::NumGt)?,

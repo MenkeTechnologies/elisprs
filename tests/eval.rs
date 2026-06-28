@@ -422,3 +422,80 @@ fn emacs_parity_value_fixes() {
     assert_eq!(eval("(capitalize \"hello world\")"), "\"Hello World\"");
     assert_eq!(eval("(capitalize \"foo-bar baz\")"), "\"Foo-Bar Baz\"");
 }
+
+#[test]
+fn emacs_parity_math_and_introspection() {
+    // expt: integer power, but float for negative or fractional exponents.
+    assert_eq!(eval("(expt 2 10)"), "1024");
+    assert_eq!(eval("(expt 2 -1)"), "0.5");
+    assert_eq!(eval("(expt 2.0 0.5)"), "1.4142135623730951");
+    assert_eq!(eval("(sqrt 16)"), "4.0");
+    // string-to-number: floats, scientific notation, optional base.
+    assert_eq!(eval("(string-to-number \"1.5e3\")"), "1500.0");
+    assert_eq!(eval("(string-to-number \"ff\" 16)"), "255");
+    assert_eq!(eval("(string-to-number \"-3.14\")"), "-3.14");
+    assert_eq!(eval("(string-to-number \"x\")"), "0");
+    // type-of names the primitive type.
+    assert_eq!(eval("(type-of 5)"), "integer");
+    assert_eq!(eval("(type-of 1.5)"), "float");
+    assert_eq!(eval("(type-of \"s\")"), "string");
+    assert_eq!(eval("(type-of '(1))"), "cons");
+    assert_eq!(eval("(type-of [1])"), "vector");
+    // functionp: subrs / non-macro closures / function-bound symbols only.
+    assert_eq!(eval("(functionp 'car)"), "t");
+    assert_eq!(eval("(functionp 5)"), "nil");
+    assert_eq!(eval("(functionp 'when)"), "nil"); // macros are not functions
+                                                  // misc predicates / float ops.
+    assert_eq!(eval("(char-or-string-p ?a)"), "t");
+    assert_eq!(eval("(char-equal ?A ?A)"), "t");
+    assert_eq!(eval("(isnan (/ 0.0 0.0))"), "t");
+    assert_eq!(eval("(fround 2.5)"), "2.0");
+    assert_eq!(eval("(ffloor 2.7)"), "2.0");
+}
+
+#[test]
+fn emacs_parity_rounding_coercion_printing() {
+    // floor/ceiling/round/truncate take an optional DIVISOR (exact integer division).
+    assert_eq!(eval("(floor 7 2)"), "3");
+    assert_eq!(eval("(floor -7 2)"), "-4");
+    assert_eq!(eval("(floor 7 -2)"), "-4");
+    assert_eq!(eval("(ceiling 7 2)"), "4");
+    assert_eq!(eval("(truncate 7 2)"), "3");
+    assert_eq!(eval("(round 7 2)"), "4");
+    assert_eq!(eval("(round 5 2)"), "2"); // ties to even
+                                          // last / butlast take an optional N.
+    assert_eq!(eval("(last (list 1 2 3) 2)"), "(2 3)");
+    assert_eq!(eval("(butlast (list 1 2 3) 2)"), "(1)");
+    assert_eq!(eval("(butlast (list 1 2 3))"), "(1 2)");
+    // reverse on any sequence; downcase/upcase on a string or a character.
+    assert_eq!(eval("(reverse \"abc\")"), "\"cba\"");
+    assert_eq!(eval("(reverse [1 2 3])"), "[3 2 1]");
+    assert_eq!(eval("(downcase ?A)"), "97");
+    assert_eq!(eval("(upcase ?a)"), "65");
+    assert_eq!(eval("(downcase \"ABC\")"), "\"abc\"");
+    // append: the final argument is the tail as-is (dotted when not a list).
+    assert_eq!(eval("(append '(1 2) '(3 4) 5)"), "(1 2 3 4 . 5)");
+    assert_eq!(eval("(append '(1 2) 3)"), "(1 2 . 3)");
+    assert_eq!(eval("(append nil 3)"), "3");
+    assert_eq!(eval("(append '(1 2) '(3 4))"), "(1 2 3 4)");
+    // Non-finite floats print in Emacs read syntax.
+    assert_eq!(eval("(/ 1.0 0)"), "1.0e+INF");
+    assert_eq!(eval("(/ -1.0 0)"), "-1.0e+INF");
+    assert_eq!(eval("(/ 0.0 0.0)"), "0.0e+NaN");
+}
+
+#[test]
+fn emacs_parity_compiler_fixes() {
+    // A (lambda ...) form in operator (head) position is applied directly.
+    assert_eq!(eval("((lambda (x) x) 5)"), "5");
+    assert_eq!(eval("((lambda (a b) (+ a b)) 3 4)"), "7");
+    assert_eq!(eval("((lambda (x &optional y) (list x y)) 1)"), "(1 nil)");
+    assert_eq!(eval("((lambda (&rest xs) xs) 1 2 3)"), "(1 2 3)");
+    // 1+ / 1- preserve float contagion (lowered to Add/Sub, not int Inc/Dec).
+    assert_eq!(eval("(1+ 1.0)"), "2.0");
+    assert_eq!(eval("(1- 1.0)"), "0.0");
+    assert_eq!(eval("(1+ -1.5)"), "-0.5");
+    // ...while the integer fast path still works (loop counters).
+    assert_eq!(eval("(1+ 41)"), "42");
+    assert_eq!(eval("(let ((i 0)) (while (< i 5) (setq i (1+ i))) i)"), "5");
+}

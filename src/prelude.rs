@@ -36,7 +36,11 @@ pub const PRELUDE: &str = r#"
 
 ;;; ---- list construction / access ----
 (defun nthcdr (n l) (while (and (> n 0) l) (setq l (cdr l)) (setq n (1- n))) l)
-(defun last (l) (while (cdr l) (setq l (cdr l))) l)
+(defun last (l &optional n)
+  ;; The last N cons cells of L (default 1): (last '(1 2 3) 2) => (2 3).
+  (if (or (null n) (= n 1))
+      (progn (while (cdr l) (setq l (cdr l))) l)
+    (nthcdr (max 0 (- (length l) n)) l)))
 (defun make-list (n x) (let ((r nil)) (while (> n 0) (setq r (cons x r)) (setq n (1- n))) r))
 (defun number-sequence (from to &optional inc)
   (setq inc (or inc 1))
@@ -200,7 +204,7 @@ pub const PRELUDE: &str = r#"
     (if (null x) n nil)))
 
 ;;; ---- numbers ----
-(defun expt (base e) (let ((r 1)) (while (> e 0) (setq r (* r base)) (setq e (1- e))) r))
+;; `expt` is a primitive subr (integer power; float for fractional/negative exp).
 (defun gcd (a b)
   (setq a (abs a)) (setq b (abs b))
   (while (> b 0) (let ((tmp b)) (setq b (% a b)) (setq a tmp)))
@@ -210,14 +214,7 @@ pub const PRELUDE: &str = r#"
 (defun cl-signum (x) (cond ((> x 0) 1) ((< x 0) -1) (t 0)))
 (defun cl-evenp (n) (= (% n 2) 0))
 (defun cl-oddp (n) (= (% n 2) 1))
-(defun string-to-number (s)
-  (let ((chars (string-to-list s)) (sign 1) (n 0) (seen nil))
-    (while (and chars (or (= (car chars) 32) (= (car chars) 9))) (setq chars (cdr chars)))
-    (when (and chars (= (car chars) ?-)) (setq sign -1) (setq chars (cdr chars)))
-    (when (and chars (= (car chars) ?+)) (setq chars (cdr chars)))
-    (while (and chars (>= (car chars) ?0) (<= (car chars) ?9))
-      (setq n (+ (* n 10) (- (car chars) ?0))) (setq seen t) (setq chars (cdr chars)))
-    (if seen (* sign n) 0)))
+;; `string-to-number` is a primitive subr (floats, scientific notation, BASE arg).
 
 ;;; ---- strings (ASCII) ----
 (defun string= (a b) (equal a b))
@@ -233,13 +230,8 @@ pub const PRELUDE: &str = r#"
     res))
 (defun string-lessp (a b) (string< a b))
 (defun string-greaterp (a b) (string< b a))
-(defun string-reverse (s) (apply (function string) (reverse (string-to-list s))))
-(defun upcase (s)
-  (apply (function string)
-         (mapcar (lambda (c) (if (and (>= c ?a) (<= c ?z)) (- c 32) c)) (string-to-list s))))
-(defun downcase (s)
-  (apply (function string)
-         (mapcar (lambda (c) (if (and (>= c ?A) (<= c ?Z)) (+ c 32) c)) (string-to-list s))))
+(defun string-reverse (s) (reverse s))
+;; `upcase` / `downcase` are primitive subrs (accept a string or a character).
 (defun capitalize (s)
   ;; Upcase the first letter of every word (run of alphanumerics), downcase the
   ;; rest: (capitalize "hello world") => "Hello World".
@@ -268,7 +260,12 @@ pub const PRELUDE: &str = r#"
   (if (string-suffix-p suffix s) (substring s 0 (- (length s) (length suffix))) s))
 
 ;;; ---- lists ----
-(defun butlast (lst) (reverse (cdr (reverse lst))))
+(defun butlast (lst &optional n)
+  ;; All but the last N elements of LST (default 1): (butlast '(1 2 3) 2) => (1).
+  (setq n (or n 1))
+  (let ((keep (- (length lst) n)) (r nil) (i 0))
+    (while (< i keep) (setq r (cons (nth i lst) r)) (setq i (1+ i)))
+    (reverse r)))
 (defun take (n lst)
   (let ((out nil))
     (while (and (> n 0) lst) (setq out (cons (car lst) out)) (setq lst (cdr lst)) (setq n (1- n)))
@@ -445,6 +442,42 @@ pub const PRELUDE: &str = r#"
                         ((listp key) (cons (list 'memq '--cl-case-v-- (list 'quote key)) body))
                         (t (cons (list 'eql '--cl-case-v-- (list 'quote key)) body)))))
               clauses))))
+
+;; ---- setf: generalized-variable assignment ----
+;; Expands (setf PLACE VALUE) to the right mutator for PLACE. Supported places
+;; (those whose setter primitives exist): a plain variable, car/cdr and the
+;; two-level c[ad][ad]r accessors, nth, elt, aref, gethash, and symbol-value.
+;; Each setter returns VALUE, so (setf …) yields the last assigned value, as in
+;; Emacs. Backquote-pattern places (cl-struct slots, alist-get) wait on more
+;; setter primitives / lazy backquote.
+(defun setf--expand (place val)
+  (if (symbolp place)
+      (list 'setq place val)
+    (let ((head (car place)) (args (cdr place)))
+      (cond
+       ((eq head 'car) (list 'setcar (car args) val))
+       ((eq head 'cdr) (list 'setcdr (car args) val))
+       ((eq head 'caar) (list 'setcar (list 'car (car args)) val))
+       ((eq head 'cadr) (list 'setcar (list 'cdr (car args)) val))
+       ((eq head 'cdar) (list 'setcdr (list 'car (car args)) val))
+       ((eq head 'cddr) (list 'setcdr (list 'cdr (car args)) val))
+       ((eq head 'nth) (list 'setcar (list 'nthcdr (car args) (car (cdr args))) val))
+       ((eq head 'elt)
+        ;; Bind the sequence + index once: list → setcar, array → aset.
+        (list 'let (list (list '--setf-s-- (car args)) (list '--setf-n-- (car (cdr args))))
+              (list 'if (list 'listp '--setf-s--)
+                    (list 'setcar (list 'nthcdr '--setf-n-- '--setf-s--) val)
+                    (list 'aset '--setf-s-- '--setf-n-- val))))
+       ((eq head 'aref) (list 'aset (car args) (car (cdr args)) val))
+       ((eq head 'gethash) (list 'puthash (car args) val (car (cdr args))))
+       ((eq head 'symbol-value) (list 'set (car args) val))
+       (t (error "setf: unsupported place %S" place))))))
+(defmacro setf (&rest pairs)
+  (let ((forms nil))
+    (while pairs
+      (setq forms (cons (setf--expand (car pairs) (car (cdr pairs))) forms))
+      (setq pairs (cdr (cdr pairs))))
+    (cons 'progn (reverse forms))))
 
 ;; ---- pcase: structural `cond` (non-backquote subset) ----
 ;; Supported patterns (compiled to tests + bindings at macroexpansion time):
