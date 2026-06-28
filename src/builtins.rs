@@ -2,7 +2,7 @@
 //! ~irreducible core; the large derived surface (caar.., seq-*, cl-*, alist
 //! helpers) will be defined in an elisp prelude on top of these.
 
-use crate::host::{ElispHost, Func, Obj};
+use crate::host::{ElispHost, Obj};
 use fusevm::Value;
 
 type R = Result<Value, String>;
@@ -328,15 +328,9 @@ fn symbol_value(h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── functional ──
-fn funcall(h: &mut ElispHost, a: &[Value]) -> R {
-    h.apply(&a[0], &a[1..])
-}
-fn apply_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let mut args = a[1..a.len() - 1].to_vec();
-    let tail = h.list_vec(&a[a.len() - 1]).ok_or("wrong-type-argument: listp")?;
-    args.extend(tail);
-    h.apply(&a[0], &args)
-}
+// `funcall`/`apply`/`mapcar`/`mapc` are intercepted in `host::call_function`
+// (they re-enter elisp, so they can't run inside a host borrow) — they are not
+// plain subrs here.
 fn identity(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(a[0].clone())
 }
@@ -444,7 +438,7 @@ fn number_to_string(h: &mut ElispHost, a: &[Value]) -> R {
 /// Install the primitive subr set.
 pub fn install(h: &mut ElispHost) {
     let mut s = |n: &str, min: usize, max: Option<usize>, f: crate::host::SubrFn| {
-        h.set_function(n, Func::Subr { name: n.to_string(), min, max, f });
+        h.defsubr(n, min, max, f);
     };
     // arithmetic
     s("+", 0, None, add);
@@ -497,9 +491,7 @@ pub fn install(h: &mut ElispHost) {
     s("make-symbol", 1, Some(1), intern_fn);
     s("set", 2, Some(2), set_fn);
     s("symbol-value", 1, Some(1), symbol_value);
-    // functional
-    s("funcall", 1, None, funcall);
-    s("apply", 2, None, apply_fn);
+    // functional (funcall/apply/mapcar/mapc are handled in host::call_function)
     s("identity", 1, Some(1), identity);
     // strings / IO
     s("concat", 0, None, concat_fn);

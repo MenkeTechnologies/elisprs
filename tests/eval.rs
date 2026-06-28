@@ -77,11 +77,46 @@ fn strings_and_format() {
 }
 
 #[test]
-fn unsupported_special_forms_error_clearly() {
-    // defun/let/lambda await the calling-convention milestone; they must fail
-    // loudly, not miscompile.
+fn functions_and_recursion() {
+    assert_eq!(
+        eval("(progn (defun fact (n) (if (<= n 1) 1 (* n (fact (1- n))))) (fact 6))"),
+        "720"
+    );
+    assert_eq!(eval("(progn (defun add3 (a b c) (+ a b c)) (add3 10 20 30))"), "60");
+    assert_eq!(eval("(funcall (lambda (x) (1+ x)) 41)"), "42");
+}
+
+#[test]
+fn let_binding() {
+    assert_eq!(eval("(let ((x 10) (y 20)) (+ x y))"), "30");
+    assert_eq!(eval("(let* ((x 2) (y (* x 3))) (+ x y))"), "8");
+    assert_eq!(eval("(let ((x 1)) (let ((x 2)) x))"), "2"); // shadowing
+}
+
+#[test]
+fn iteration_and_cond() {
+    assert_eq!(
+        eval("(let ((acc 0) (i 1)) (while (<= i 5) (setq acc (+ acc i)) (setq i (1+ i))) acc)"),
+        "15"
+    );
+    assert_eq!(eval("(cond ((eq 1 2) (quote a)) ((eq 1 1) (quote b)) (t (quote c)))"), "b");
+    assert_eq!(eval("(cond (nil 1) (42))"), "42"); // clause with no body returns the test
+}
+
+#[test]
+fn higher_order_reentrancy() {
+    // mapcar over a lambda, and a user-defined recursive higher-order function —
+    // both re-enter elisp from a closure body running on a nested fusevm VM.
+    assert_eq!(eval("(mapcar (lambda (n) (* n n)) (list 1 2 3 4))"), "(1 4 9 16)");
+    assert_eq!(
+        eval("(progn (defun my-map (f xs) (if (null xs) nil (cons (funcall f (car xs)) (my-map f (cdr xs))))) (my-map (lambda (n) (1+ n)) (list 10 20 30)))"),
+        "(11 21 31)"
+    );
+}
+
+#[test]
+fn nonlocal_exits_still_pending() {
+    // These await the nonlocal-exit milestone; they must fail loudly.
     reset_host();
-    assert!(eval_str("(defun f (x) x)").is_err());
-    reset_host();
-    assert!(eval_str("(let ((x 1)) x)").is_err());
+    assert!(eval_str("(catch 'x (throw 'x 1))").is_err());
 }
