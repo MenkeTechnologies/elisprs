@@ -455,6 +455,68 @@ impl ElispHost {
             })
             .collect()
     }
+    pub fn builtin_count(&self) -> usize {
+        self.builtin_count
+    }
+    pub fn arena_len(&self) -> usize {
+        self.arena.len()
+    }
+    /// Snapshot the value cells of symbols in `[start, end)` (used to capture the
+    /// post-prelude baseline before running a user script for the cache).
+    pub fn snapshot_values(&self, start: usize, end: usize) -> Vec<Option<Value>> {
+        (start..end)
+            .map(|i| match self.arena.get(i) {
+                Some(Obj::Symbol(s)) => s.value.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+    /// Like `export_heap_image`, but reset symbol value cells to a clean baseline
+    /// so re-running cached chunks reproduces the original execution exactly
+    /// (no double-applied global mutations). Symbols below `prelude_end` get
+    /// their `baseline` value; user symbols (≥ prelude_end) reset to unbound.
+    pub fn export_heap_image_clean(&self, prelude_end: usize, baseline: &[Option<Value>]) -> Vec<SerObj> {
+        self.arena[self.builtin_count..]
+            .iter()
+            .enumerate()
+            .map(|(off, o)| {
+                let idx = self.builtin_count + off;
+                match o {
+                    Obj::Symbol(s) => {
+                        let value = if idx < prelude_end {
+                            baseline.get(idx - self.builtin_count).cloned().flatten()
+                        } else {
+                            None
+                        };
+                        SerObj::Symbol {
+                            name: s.name.clone(),
+                            value,
+                            function: s.function.clone(),
+                            special: s.special,
+                        }
+                    }
+                    Obj::Cons(a, b) => SerObj::Cons(a.clone(), b.clone()),
+                    Obj::Vector(v) => SerObj::Vector(v.clone()),
+                    Obj::HashTable { test, entries } => {
+                        SerObj::HashTable { test: *test, entries: entries.clone() }
+                    }
+                    Obj::Closure { params, body, is_macro, .. } => SerObj::Closure {
+                        required: params.required.clone(),
+                        optional: params.optional.clone(),
+                        rest: params.rest,
+                        body: (**body).clone(),
+                        is_macro: *is_macro,
+                    },
+                    Obj::Subr { .. } => SerObj::Symbol {
+                        name: "--unexpected-subr--".to_string(),
+                        value: None,
+                        function: None,
+                        special: false,
+                    },
+                }
+            })
+            .collect()
+    }
     /// Rebuild the user/prelude heap from an image. Must be called on a fresh
     /// host (arena == builtins only) so handles line up with compile time.
     pub fn import_heap_image(&mut self, image: Vec<SerObj>) {

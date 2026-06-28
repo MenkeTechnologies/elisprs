@@ -8,6 +8,7 @@
 pub mod aot;
 pub mod aot_runtime;
 pub mod builtins;
+pub mod cache;
 pub mod compiler;
 pub mod dap;
 pub mod host;
@@ -63,4 +64,55 @@ fn load_prelude() {
 /// Render a value (prin1 style when `readable`).
 pub fn print(v: &Value, readable: bool) -> String {
     host::with_host(|h| h.print(v, readable))
+}
+
+/// Run a `.el` file, using the rkyv bytecode cache at `~/.elisprs/scripts.rkyv`.
+/// On a fresh hit, the per-form chunks + a clean heap image are loaded and run
+/// directly — skipping read / macro-expand / lower AND the prelude rebuild.
+pub fn eval_file(path: &str) -> Result<Value, String> {
+    let mtime_ns = std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+
+    let debug = std::env::var_os("ELISPRS_CACHE_DEBUG").is_some();
+    if let Some((chunks, heap)) = cache::get(path, mtime_ns) {
+        if debug {
+            eprintln!("elisprs: cache HIT  {path} ({} chunks)", chunks.len());
+        }
+        host::reset_host();
+        host::with_host(|h| h.import_heap_image(heap));
+        let mut last = Value::Undef;
+        for chunk in chunks {
+            last = host::run_chunk(chunk)?;
+        }
+        return Ok(last);
+    }
+    if debug {
+        eprintln!("elisprs: cache MISS {path}");
+    }
+
+    // Cache miss: compile + run form-by-form (so an in-file defmacro is in effect
+    // before later forms), capturing each chunk and a clean heap image.
+    let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    host::reset_host();
+    load_prelude();
+    let builtin_count = host::with_host(|h| h.builtin_count());
+    let prelude_end = host::with_host(|h| h.arena_len());
+    let baseline = host::with_host(|h| h.snapshot_values(builtin_count, prelude_end));
+
+    let forms = host::with_host(|h| reader::read_all(h, &src))?;
+    let mut chunks = Vec::with_capacity(forms.len());
+    let mut last = Value::Undef;
+    for form in &forms {
+        let expanded = host::macroexpand_all(form)?;
+        let chunk = host::with_host(|h| compiler::compile_top(h, &expanded))?;
+        chunks.push(chunk.clone());
+        last = host::run_chunk(chunk)?;
+    }
+    let heap = host::with_host(|h| h.export_heap_image_clean(prelude_end, &baseline));
+    cache::put(path, mtime_ns, &chunks, &heap);
+    Ok(last)
 }

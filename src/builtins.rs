@@ -385,6 +385,14 @@ fn symbol_value(h: &mut ElispHost, a: &[Value]) -> R {
 fn identity(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(a[0].clone())
 }
+fn terpri(_h: &mut ElispHost, _a: &[Value]) -> R {
+    println!();
+    Ok(Value::Bool(true))
+}
+fn print_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    println!("{}", h.print(&a[0], true));
+    Ok(a[0].clone())
+}
 
 // ── nonlocal exits ──
 // `throw` records the (tag, value) and aborts via the error channel; `catch`
@@ -757,6 +765,8 @@ pub fn install(h: &mut ElispHost) {
     s("symbol-value", 1, Some(1), symbol_value);
     // functional (funcall/apply/mapcar/mapc are handled in host::call_function)
     s("identity", 1, Some(1), identity);
+    s("terpri", 0, Some(1), terpri);
+    s("print", 1, Some(2), print_fn);
     // nonlocal exits (catch/unwind-protect/condition-case are compiler intrinsics)
     s("throw", 2, Some(2), throw_fn);
     s("error", 1, None, error_fn);

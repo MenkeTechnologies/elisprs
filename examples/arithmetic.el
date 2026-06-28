@@ -1,25 +1,31 @@
-;;; arithmetic.el --- integer math lowered to fusevm ops, self-checked  -*- lexical-binding: nil; -*-
+;;; arithmetic.el --- integer math lowered to fusevm ops, ERT-tested  -*- lexical-binding: nil; -*-
 
 ;; Every form here is read by elisprs, lowered to a fusevm Chunk, and run on
-;; fusevm itself. The file is a self-test: `expect` raises an elisp `error` (→
-;; non-zero exit) the moment a result drifts, so CI's example stage fails loudly.
+;; fusevm itself. The ERT suite is the regression gate:
+;; `ert-run-tests-batch-and-exit` errors (→ non-zero exit) if any test fails.
+(message "== arithmetic demo ==")
 
-(defun expect (label got want)
-  (if (equal got want)
-      (message "ok   %s" label)
-    (error "FAIL %s: got %S, want %S" label got want)))
+(ert-deftest arith-basic ()
+  "Sum, product, difference, quotient, remainder."
+  (should (= (+ 1 2 3 4 5) 15))
+  (should (= (* 2 3 4) 24))
+  (should (= (- 10 3 2) 5))
+  (should (= (/ 20 4) 5))
+  (should (= (% 17 5) 2))
+  (should (= (+ 1 (* 2 (- 5 2))) 7)))
 
-(expect "sum"      (+ 1 2 3 4 5) 15)
-(expect "product"  (* 2 3 4) 24)
-(expect "subtract" (- 10 3 2) 5)
-(expect "divide"   (/ 20 4) 5)
-(expect "modulo"   (% 17 5) 2)
-(expect "nested"   (+ 1 (* 2 (- 5 2))) 7)
-(expect "inc"      (1+ 41) 42)
-(expect "dec"      (1- 1) 0)
-(expect "abs"      (abs -7) 7)
-(expect "max"      (max 3 9 2) 9)
-(expect "min"      (min 3 9 2) 2)
-(expect "mod-fn"   (mod -1 5) 4)
+(ert-deftest arith-unary-and-helpers ()
+  "Increment/decrement, abs, max/min, floored mod."
+  (should (= (1+ 41) 42))
+  (should (= (1- 1) 0))
+  (should (= (abs -7) 7))
+  (should (= (max 3 9 2) 9))
+  (should (= (min 3 9 2) 2))
+  (should (= (mod -1 5) 4)))
 
-(message "arithmetic: all checks passed on fusevm")
+(ert-deftest arith-errors ()
+  "Division by zero signals arith-error."
+  (should-error (/ 1 0) :type 'arith-error)
+  (should-error (% 1 0) :type 'arith-error))
+
+(ert-run-tests-batch-and-exit)

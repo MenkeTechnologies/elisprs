@@ -1,22 +1,26 @@
-;;; strings.el --- string building & formatting on fusevm  -*- lexical-binding: nil; -*-
+;;; strings.el --- string building & formatting on fusevm, ERT-tested  -*- lexical-binding: nil; -*-
 
 ;; Strings flow through fusevm as values; format/concat/mapconcat run host-side
-;; via the subr table. A failed `expect` raises an error → non-zero exit.
+;; via the subr table.
+(message "== strings demo ==")
 
-(defun expect (label got want)
-  (if (equal got want)
-      (message "ok   %s" label)
-    (error "FAIL %s: got %S, want %S" label got want)))
+(ert-deftest strings-concat ()
+  "concat / length."
+  (should (equal (concat "foo" "bar" "baz") "foobarbaz"))
+  (should (equal (concat "" "x" "") "x"))
+  (should (= (length "hello") 5)))
 
-(expect "concat"     (concat "foo" "bar" "baz") "foobarbaz")
-(expect "concat-empty" (concat "" "x" "") "x")
-(expect "length"     (length "hello") 5)
-(expect "format-d"   (format "%d + %d = %d" 2 3 5) "2 + 3 = 5")
-(expect "format-s"   (format "<%s>" "x") "<x>")
-(expect "format-S"   (format "%S" (list 1 2)) "(1 2)")
-(expect "num->str"   (number-to-string 42) "42")
-(expect "symbol-name" (symbol-name 'hello) "hello")
-(expect "join"       (mapconcat 'identity (list "a" "b" "c") ", ") "a, b, c")
-(expect "join-nums"  (mapconcat 'number-to-string (number-sequence 1 4) "") "1234")
+(ert-deftest strings-format ()
+  "format directives %d / %s / %S, and number-to-string / symbol-name."
+  (should (equal (format "%d + %d = %d" 2 3 5) "2 + 3 = 5"))
+  (should (equal (format "<%s>" "x") "<x>"))
+  (should (equal (format "%S" (list 1 2)) "(1 2)"))
+  (should (equal (number-to-string 42) "42"))
+  (should (equal (symbol-name 'hello) "hello")))
 
-(message "strings: all checks passed on fusevm")
+(ert-deftest strings-join ()
+  "mapconcat as string join."
+  (should (equal (mapconcat 'identity (list "a" "b" "c") ", ") "a, b, c"))
+  (should (equal (mapconcat 'number-to-string (number-sequence 1 4) "") "1234")))
+
+(ert-run-tests-batch-and-exit)

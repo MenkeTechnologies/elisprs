@@ -136,4 +136,80 @@ pub const PRELUDE: &str = r#"
 ;;; ---- error handling ----
 (defmacro ignore-errors (&rest body) `(condition-case nil (progn ,@body) (error nil)))
 (defmacro with-demoted-errors (fmt &rest body) `(condition-case --err-- (progn ,@body) (error (message ,fmt --err--) nil)))
+
+;;; ---- ERT: Emacs Lisp Regression Testing (subset) ----
+;; Ported from ERT: `should` / `should-not` / `should-error` / `skip-unless`
+;; assertions, `ert-fail` / `ert-pass`, and `ert-deftest` with an optional
+;; docstring plus `:expected-result` and `:tags` keyword args. Assertions signal
+;; `ert-test-failed`; `skip-unless` signals `ert-test-skipped`. The runner
+;; classifies each test as pass / fail / skip / expected-fail (XFAIL) /
+;; unexpected-pass and returns the number of UNEXPECTED results (0 = all as
+;; expected). `ert-run-tests-batch-and-exit` errors out on any unexpected one.
+
+(defvar ert--tests nil)   ; alist of (name . expected-result), :passed | :failed
+
+(defmacro should (form)
+  `(if ,form t (signal 'ert-test-failed (list 'should ',form))))
+
+(defmacro should-not (form)
+  `(if ,form (signal 'ert-test-failed (list 'should-not ',form)) t))
+
+(defmacro should-error (form &rest keys)
+  (let* ((type (plist-get keys :type))
+         (check (if type (list 'not (list 'eq (list 'car '--ert-c--) type)) nil)))
+    `(let ((--ert-c-- (condition-case --ert-e-- (progn ,form 'ert--no-error)
+                        (error --ert-e--))))
+       (cond
+        ((eq --ert-c-- 'ert--no-error)
+         (signal 'ert-test-failed (list 'should-error :no-error ',form)))
+        (,check
+         (signal 'ert-test-failed (list 'should-error :wrong-type --ert-c--)))
+        (t --ert-c--)))))
+
+(defmacro skip-unless (form)
+  `(unless ,form (signal 'ert-test-skipped (list 'skip-unless ',form))))
+
+(defun ert-fail (data) (signal 'ert-test-failed data))
+(defun ert-pass () t)
+
+(defmacro ert-deftest (name arglist &rest body)
+  ;; Strip an optional docstring, then leading :expected-result / :tags args.
+  (if (stringp (car body)) (setq body (cdr body)))
+  (let ((expected :passed))
+    (while (memq (car body) '(:expected-result :tags))
+      (if (eq (car body) :expected-result) (setq expected (car (cdr body))))
+      (setq body (cdr (cdr body))))
+    `(progn
+       (defun ,name ,arglist ,@body)
+       (setq ert--tests (cons (cons ',name ,expected) ert--tests))
+       ',name)))
+
+(defun ert-run-tests-batch ()
+  (let ((tests (reverse ert--tests)) (total 0) (unexpected 0) (skipped 0))
+    (while tests
+      (let* ((entry (car tests)) (name (car entry)) (expected (cdr entry)))
+        (setq total (1+ total))
+        (condition-case --ert-err--
+            (progn
+              (funcall name)
+              (if (eq expected :failed)
+                  (progn (setq unexpected (1+ unexpected))
+                         (message "  UNEXPECTED-OK  %s" name))
+                (message "  PASS   %s" name)))
+          (ert-test-skipped
+           (setq skipped (1+ skipped))
+           (message "  SKIP   %s" name))
+          (error
+           (if (eq expected :failed)
+               (message "  XFAIL  %s" name)
+             (progn (setq unexpected (1+ unexpected))
+                    (message "  FAIL   %s -- %S" name --ert-err--))))))
+      (setq tests (cdr tests)))
+    (message "Ran %d tests: %d unexpected, %d skipped." total unexpected skipped)
+    unexpected))
+
+(defun ert-run-tests-batch-and-exit ()
+  "Run all tests; raise an error (→ non-zero exit) on any unexpected result."
+  (let ((bad (ert-run-tests-batch)))
+    (if (> bad 0) (error "%d unexpected ERT result(s)" bad) t)))
 "#;

@@ -44,4 +44,9 @@ lsp-server = "0.7.9"
 lsp-types = "0.97.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# rkyv-backed bytecode cache at ~/.elisprs/scripts.rkyv (mirrors zshrs/strykelang):
+# the outer shard is a zero-copy rkyv archive; the inner per-form fusevm::Chunk
+# and heap image are bincode (fusevm::Chunk is serde-owned, not rkyv::Archive).
+rkyv = { version = "0.7", features = ["validation", "archive_le", "size_32"] }
+bincode = "1"
 libc = "0.2"

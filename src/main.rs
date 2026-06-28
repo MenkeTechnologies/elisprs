@@ -31,8 +31,11 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--dap") {
         return ExitCode::from(elisprs::dap::run_stdio() as u8);
     }
+    if args.iter().any(|a| a == "--aot-exe") {
+        return run_aot(&args, true);
+    }
     if args.iter().any(|a| a == "--aot") {
-        return run_aot(&args);
+        return run_aot(&args, false);
     }
     if let Some(pos) = args.iter().position(|a| a == "-e" || a == "--eval") {
         let Some(expr) = args.get(pos + 1) else {
@@ -52,14 +55,7 @@ fn main() -> ExitCode {
     }
 
     if let Some(file) = args.iter().find(|a| !a.starts_with('-')) {
-        let src = match std::fs::read_to_string(file) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("elisp: cannot read {file}: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        return match elisprs::eval_str(&src) {
+        return match elisprs::eval_file(file) {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -71,17 +67,18 @@ fn main() -> ExitCode {
     repl()
 }
 
-fn run_aot(args: &[String]) -> ExitCode {
+fn run_aot(args: &[String], exe: bool) -> ExitCode {
     let Some(file) = args.iter().find(|a| a.ends_with(".el")) else {
         eprintln!("elisp --aot: expected a .el file");
         return ExitCode::FAILURE;
     };
+    let default = if exe { "a.out" } else { "out.o" };
     let out = args
         .iter()
         .position(|a| a == "-o")
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("out.o"));
+        .unwrap_or_else(|| PathBuf::from(default));
     let src = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -89,7 +86,12 @@ fn run_aot(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match elisprs::aot::compile_file(&src, &out) {
+    let result = if exe {
+        elisprs::aot::compile_executable(&src, &out)
+    } else {
+        elisprs::aot::compile_file(&src, &out)
+    };
+    match result {
         Ok(()) => {
             println!("wrote {}", out.display());
             ExitCode::SUCCESS
