@@ -179,6 +179,20 @@ pub struct ElispHost {
     /// A pending `throw`: (tag, value). Set by `throw`, consumed by `catch`.
     /// Distinguishes a non-local `throw` from an ordinary error during unwinding.
     pub(crate) pending_throw: Option<(Value, Value)>,
+    /// Regexp match data from the last successful `string-match`: the subject
+    /// string plus char-position spans for the whole match (group 0) and each
+    /// capture group. `match-beginning`/`match-end`/`match-string` read it.
+    pub(crate) match_data: Option<MatchData>,
+}
+
+/// Result of the most recent `string-match`, in *character* positions (elisp
+/// indexes strings by character, not byte).
+#[derive(Clone, Debug)]
+pub struct MatchData {
+    pub subject: String,
+    /// `spans[0]` is the whole match; `spans[n]` is capture group `n`. A group
+    /// that did not participate is `None`.
+    pub spans: Vec<Option<(usize, usize)>>,
 }
 
 impl Default for ElispHost {
@@ -198,6 +212,7 @@ impl ElispHost {
             frame_stack: Vec::new(),
             error: None,
             pending_throw: None,
+            match_data: None,
         };
         crate::builtins::install(&mut h);
         h.builtin_count = h.arena.len();
@@ -477,6 +492,22 @@ impl ElispHost {
     }
     pub fn builtin_count(&self) -> usize {
         self.builtin_count
+    }
+    /// A fingerprint of the builtin object layout: the ordered names of every
+    /// interned builtin symbol. Compiled chunks bake in builtin arena handles, so
+    /// adding / removing / reordering subrs must invalidate the on-disk bytecode
+    /// cache; folding this into the cache key makes that automatic (see
+    /// `cache::schema_key`).
+    pub fn builtin_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.builtin_count.hash(&mut hasher);
+        for obj in &self.arena[..self.builtin_count] {
+            if let Obj::Symbol(s) = obj {
+                s.name.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
     }
     /// True if `name`'s function cell still holds its original primitive subr
     /// (not redefined by the user). The compiler only lowers `+`/`<`/… to native

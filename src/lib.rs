@@ -15,6 +15,7 @@ pub mod host;
 pub mod lsp;
 pub mod prelude;
 pub mod reader;
+pub mod regexp;
 
 pub use fusevm::Value;
 pub use host::{reset_host, run_chunk, with_host};
@@ -77,8 +78,16 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
 
+    // Schema key folds the builtin layout + prelude into the version, so editing
+    // either invalidates stale bytecode without a manual version bump. Computed
+    // on a builtins-only host (no user file loaded yet) so it's stable per build.
+    let schema_key = {
+        host::reset_host();
+        cache::schema_key(host::with_host(|h| h.builtin_fingerprint()))
+    };
+
     let debug = std::env::var_os("ELISPRS_CACHE_DEBUG").is_some();
-    if let Some((chunks, heap)) = cache::get(path, mtime_ns) {
+    if let Some((chunks, heap)) = cache::get(path, mtime_ns, &schema_key) {
         if debug {
             eprintln!("elisprs: cache HIT  {path} ({} chunks)", chunks.len());
         }
@@ -113,6 +122,6 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
         last = host::run_chunk(chunk)?;
     }
     let heap = host::with_host(|h| h.export_heap_image_clean(prelude_end, &baseline));
-    cache::put(path, mtime_ns, &chunks, &heap);
+    cache::put(path, mtime_ns, &schema_key, &chunks, &heap);
     Ok(last)
 }

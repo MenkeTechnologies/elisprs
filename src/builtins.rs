@@ -2,7 +2,7 @@
 //! ~irreducible core; the large derived surface (caar.., seq-*, cl-*, alist
 //! helpers) will be defined in an elisp prelude on top of these.
 
-use crate::host::{ElispHost, Obj};
+use crate::host::{ElispHost, MatchData, Obj};
 use fusevm::Value;
 
 type R = Result<Value, String>;
@@ -707,6 +707,256 @@ fn string_search(_h: &mut ElispHost, a: &[Value]) -> R {
     })
 }
 
+// ── regexp ──
+
+/// Char index ↔ byte offset on a UTF-8 string. elisp counts characters; the
+/// `regex` crate reports bytes, so every boundary crosses this conversion.
+fn byte_of_char(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+fn char_of_byte(s: &str, byte_idx: usize) -> usize {
+    s[..byte_idx].chars().count()
+}
+
+/// Compile an elisp regexp to a `regex::Regex`, surfacing both translation and
+/// compilation failures as elisp-style `invalid-regexp` errors.
+fn compile(pat: &str) -> Result<regex::Regex, String> {
+    let translated = crate::regexp::translate(pat)?;
+    regex::Regex::new(&translated).map_err(|e| format!("invalid-regexp: {e}"))
+}
+
+/// Run `re` against `subject` starting at char index `start`, returning the
+/// capture spans in *char* positions (group 0 = whole match).
+fn run_match(
+    re: &regex::Regex,
+    subject: &str,
+    start: usize,
+) -> Option<Vec<Option<(usize, usize)>>> {
+    let start_byte = byte_of_char(subject, start);
+    let caps = re.captures_at(subject, start_byte)?;
+    let spans = (0..caps.len())
+        .map(|i| {
+            caps.get(i).map(|m| {
+                (
+                    char_of_byte(subject, m.start()),
+                    char_of_byte(subject, m.end()),
+                )
+            })
+        })
+        .collect();
+    Some(spans)
+}
+
+/// `(string-match REGEXP STRING &optional START)` — search STRING for REGEXP,
+/// set the match data, and return the char index where the match begins (nil if
+/// no match).
+fn string_match(h: &mut ElispHost, a: &[Value]) -> R {
+    let pat = as_string(&a[0])?;
+    let subject = as_string(&a[1])?;
+    let start = match a.get(2) {
+        Some(Value::Undef) | Some(Value::Bool(false)) | None => 0,
+        Some(v) => as_int(v)?.max(0) as usize,
+    };
+    let re = compile(&pat)?;
+    match run_match(&re, &subject, start) {
+        Some(spans) => {
+            let begin = spans[0].map(|(b, _)| b as i64).unwrap_or(0);
+            h.match_data = Some(MatchData { subject, spans });
+            Ok(Value::Int(begin))
+        }
+        None => Ok(Value::Undef),
+    }
+}
+
+/// `(string-match-p REGEXP STRING &optional START)` — like `string-match` but
+/// preserves the existing match data.
+fn string_match_p(h: &mut ElispHost, a: &[Value]) -> R {
+    let saved = h.match_data.take();
+    let result = string_match(h, a);
+    h.match_data = saved;
+    result
+}
+
+/// `(match-beginning N)` / `(match-end N)` — the char position of the start/end
+/// of the Nth subexpression of the last match, or nil.
+fn match_edge(h: &mut ElispHost, a: &[Value], end: bool) -> R {
+    let n = as_int(&a[0])?.max(0) as usize;
+    let edge = h
+        .match_data
+        .as_ref()
+        .and_then(|m| m.spans.get(n).copied().flatten())
+        .map(|(b, e)| if end { e } else { b });
+    Ok(match edge {
+        Some(pos) => Value::Int(pos as i64),
+        None => Value::Undef,
+    })
+}
+fn match_beginning(h: &mut ElispHost, a: &[Value]) -> R {
+    match_edge(h, a, false)
+}
+fn match_end(h: &mut ElispHost, a: &[Value]) -> R {
+    match_edge(h, a, true)
+}
+
+/// `(match-string N &optional STRING)` — the text matched by the Nth
+/// subexpression. STRING defaults to the subject of the last `string-match`.
+fn match_string(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_int(&a[0])?.max(0) as usize;
+    let Some(md) = h.match_data.as_ref() else {
+        return Ok(Value::Undef);
+    };
+    let subject = match a.get(1) {
+        Some(Value::Str(s)) => s.to_string(),
+        _ => md.subject.clone(),
+    };
+    match md.spans.get(n).copied().flatten() {
+        Some((b, e)) => {
+            let bb = byte_of_char(&subject, b);
+            let eb = byte_of_char(&subject, e);
+            Ok(Value::str(subject.get(bb..eb).unwrap_or("").to_string()))
+        }
+        None => Ok(Value::Undef),
+    }
+}
+
+/// `(match-data)` — the last match's positions as a flat list
+/// `(beg0 end0 beg1 end1 …)`, with `nil nil` for groups that did not match.
+/// Pairs with `set-match-data` to save/restore around inner searches.
+fn match_data_fn(h: &mut ElispHost, _a: &[Value]) -> R {
+    let spans = match &h.match_data {
+        Some(md) => md.spans.clone(),
+        None => return Ok(Value::Undef),
+    };
+    let mut items = Vec::with_capacity(spans.len() * 2);
+    for span in spans {
+        match span {
+            Some((b, e)) => {
+                items.push(Value::Int(b as i64));
+                items.push(Value::Int(e as i64));
+            }
+            None => {
+                items.push(Value::Undef);
+                items.push(Value::Undef);
+            }
+        }
+    }
+    Ok(h.list_from(items))
+}
+
+/// `(set-match-data LIST)` — restore match positions from a `match-data` list.
+/// Integer positions carry no subject, so a later `match-string` must be given
+/// its STRING argument (matching Emacs's behaviour for integer match data).
+fn set_match_data(h: &mut ElispHost, a: &[Value]) -> R {
+    if is_nil(&a[0]) {
+        h.match_data = None;
+        return Ok(Value::Undef);
+    }
+    let flat = h.list_vec(&a[0]).ok_or("set-match-data: not a list")?;
+    let subject = h
+        .match_data
+        .as_ref()
+        .map(|m| m.subject.clone())
+        .unwrap_or_default();
+    let mut spans = Vec::with_capacity(flat.len() / 2);
+    for pair in flat.chunks(2) {
+        match (pair.first(), pair.get(1)) {
+            (Some(Value::Int(b)), Some(Value::Int(e))) => {
+                spans.push(Some((*b.max(&0) as usize, *e.max(&0) as usize)))
+            }
+            _ => spans.push(None),
+        }
+    }
+    h.match_data = Some(MatchData { subject, spans });
+    Ok(Value::Undef)
+}
+
+/// `(regexp-quote STRING)` — STRING with every regexp-special character escaped
+/// so it matches literally under elisp regexp rules.
+fn regexp_quote(_h: &mut ElispHost, a: &[Value]) -> R {
+    let s = as_string(&a[0])?;
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        // The set Emacs's own `regexp-quote` escapes.
+        if matches!(c, '.' | '*' | '+' | '?' | '[' | ']' | '^' | '$' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Ok(Value::str(out))
+}
+
+/// Expand a `replace-regexp-in-string` template against one match: `\&` is the
+/// whole match, `\1`..`\9` are capture groups, `\\` is a literal backslash.
+fn expand_replacement(rep: &str, caps: &regex::Captures, subject: &str) -> String {
+    let mut out = String::with_capacity(rep.len());
+    let mut it = rep.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('&') => {
+                if let Some(m) = caps.get(0) {
+                    out.push_str(&subject[m.start()..m.end()]);
+                }
+            }
+            Some(d @ '0'..='9') => {
+                let idx = d as usize - '0' as usize;
+                if let Some(m) = caps.get(idx) {
+                    out.push_str(&subject[m.start()..m.end()]);
+                }
+            }
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// `(replace-regexp-in-string REGEXP REP STRING &optional FIXEDCASE LITERAL)` —
+/// replace every match of REGEXP in STRING with REP. REP is a template (`\&`,
+/// `\N` backrefs) unless LITERAL is non-nil. Function-valued REP is not yet
+/// supported (string templates cover the common case without re-entering the VM).
+fn replace_regexp_in_string(_h: &mut ElispHost, a: &[Value]) -> R {
+    let pat = as_string(&a[0])?;
+    let rep = as_string(&a[1])?;
+    let subject = as_string(&a[2])?;
+    let literal = !matches!(
+        a.get(4),
+        Some(Value::Undef) | Some(Value::Bool(false)) | None
+    );
+    let re = compile(&pat)?;
+    let mut out = String::with_capacity(subject.len());
+    let mut last = 0usize;
+    for caps in re.captures_iter(&subject) {
+        let m = caps.get(0).unwrap();
+        out.push_str(&subject[last..m.start()]);
+        if literal {
+            out.push_str(&rep);
+        } else {
+            out.push_str(&expand_replacement(&rep, &caps, &subject));
+        }
+        last = m.end();
+        // Avoid an infinite loop on a zero-width match.
+        if m.start() == m.end() {
+            if let Some(c) = subject[last..].chars().next() {
+                out.push(c);
+                last += c.len_utf8();
+            }
+        }
+    }
+    out.push_str(&subject[last.min(subject.len())..]);
+    Ok(Value::str(out))
+}
+
 // ── numeric: float → integer rounding, and integer bit ops ──
 fn floor_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     let (i, f, isf) = as_num(&a[0])?;
@@ -851,6 +1101,21 @@ pub fn install(h: &mut ElispHost) {
     s("string", 0, None, string_fn);
     s("string-to-list", 1, Some(1), string_to_list);
     s("string-search", 2, Some(3), string_search);
+    // regexp
+    s("string-match", 2, Some(3), string_match);
+    s("string-match-p", 2, Some(3), string_match_p);
+    s("match-beginning", 1, Some(1), match_beginning);
+    s("match-end", 1, Some(1), match_end);
+    s("match-string", 1, Some(2), match_string);
+    s("match-data", 0, Some(3), match_data_fn);
+    s("set-match-data", 1, Some(2), set_match_data);
+    s("regexp-quote", 1, Some(1), regexp_quote);
+    s(
+        "replace-regexp-in-string",
+        3,
+        Some(6),
+        replace_regexp_in_string,
+    );
     // strings / IO
     s("concat", 0, None, concat_fn);
     s("format", 1, None, format_fn);

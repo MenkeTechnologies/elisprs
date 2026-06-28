@@ -485,6 +485,67 @@ const SUBRS: &[Entry] = &[
         sig: "(number-to-string NUMBER)",
         doc: "Return NUMBER rendered as a string.",
     },
+    Entry {
+        name: "string-match",
+        kind: Kind::Function,
+        sig: "(string-match REGEXP STRING &optional START)",
+        doc: "Search STRING for REGEXP from START; set match data, return match index or nil.",
+    },
+    Entry {
+        name: "string-match-p",
+        kind: Kind::Function,
+        sig: "(string-match-p REGEXP STRING &optional START)",
+        doc: "Like string-match but preserve the existing match data.",
+    },
+    Entry {
+        name: "match-beginning",
+        kind: Kind::Function,
+        sig: "(match-beginning N)",
+        doc: "Char position where the Nth subexpression of the last match began.",
+    },
+    Entry {
+        name: "match-end",
+        kind: Kind::Function,
+        sig: "(match-end N)",
+        doc: "Char position where the Nth subexpression of the last match ended.",
+    },
+    Entry {
+        name: "match-string",
+        kind: Kind::Function,
+        sig: "(match-string N &optional STRING)",
+        doc: "Text matched by the Nth subexpression of the last match.",
+    },
+    Entry {
+        name: "match-data",
+        kind: Kind::Function,
+        sig: "(match-data)",
+        doc: "Last match's positions as a flat list (beg0 end0 beg1 end1 …).",
+    },
+    Entry {
+        name: "set-match-data",
+        kind: Kind::Function,
+        sig: "(set-match-data LIST)",
+        doc: "Restore match positions from a match-data list.",
+    },
+    Entry {
+        name: "replace-regexp-in-string",
+        kind: Kind::Function,
+        sig: "(replace-regexp-in-string REGEXP REP STRING &optional FIXEDCASE LITERAL)",
+        doc:
+            "Replace every match of REGEXP in STRING with REP (\\& / \\N templates unless LITERAL).",
+    },
+    Entry {
+        name: "regexp-quote",
+        kind: Kind::Function,
+        sig: "(regexp-quote STRING)",
+        doc: "Return STRING with regexp metacharacters escaped to match literally.",
+    },
+    Entry {
+        name: "save-match-data",
+        kind: Kind::Function,
+        sig: "(save-match-data &rest BODY)",
+        doc: "Eval BODY, preserving the caller's regexp match data.",
+    },
 ];
 
 fn lookup(name: &str) -> Option<&'static Entry> {

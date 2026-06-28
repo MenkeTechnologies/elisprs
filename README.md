@@ -94,7 +94,7 @@ elisp --version
 
 **Special forms (21).** `quote` `function` `lambda` `progn` `prog1` `if` `when` `unless` `cond` `and` `or` `while` `setq` `let` `let*` `defun` `defmacro` `defvar` `defconst` `condition-case` `unwind-protect`.
 
-**Subrs (~80).**
+**Subrs (~90).**
 
 | Group | Functions |
 |---|---|
@@ -108,6 +108,7 @@ elisp --version
 | Strings | `concat string= string-equal string< upcase downcase number-to-string string-to-number` |
 | IO/format | `format message princ prin1 print terpri` |
 | Functional | `funcall apply mapcar mapc identity` |
+| Regexp | `string-match string-match-p match-beginning match-end match-string match-data set-match-data replace-regexp-in-string regexp-quote` (+ `save-match-data`) |
 
 `defun`/`defmacro`/`lambda` support `&optional` and `&rest`; macros expand and re-evaluate; `condition-case` matches the `error` umbrella and specific error symbols.
 
@@ -133,6 +134,7 @@ elisp --version
 - **Dotted pairs.** `(cons 1 2)` / `(a . b)` read, print (`(1 . 2)`), and round-trip; alists may use `(key . value)`.
 - **Backquote / unquote.** `` ` ``, `,`, and `,@` are read and expanded.
 - **`setcar` / `setcdr`** mutate cons cells in place.
+- **Regexps.** `string-match` & friends translate elisp regexp syntax (`\(` `\|` `\{`, `\<`/`\>`, `\w`/`\s-`) to a backing engine and record char-indexed match data; `replace-regexp-in-string` expands `\&`/`\N` templates. (Pattern backreferences `\1` are rejected — the engine doesn't backtrack.)
 
 **Known limitations** — surfaced loudly rather than silently misread:
 

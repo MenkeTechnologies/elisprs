@@ -50,3 +50,7 @@ serde_json = "1"
 rkyv = { version = "0.7", features = ["validation", "archive_le", "size_32"] }
 bincode = "1"
 libc = "0.2"
+# Emacs-Lisp regexps (string-match / replace-regexp-in-string / match-string).
+# elisp regexp syntax is translated to the `regex` crate's dialect in
+# src/regexp.rs; the matching engine itself is reused rather than hand-rolled.
+regex = "1"

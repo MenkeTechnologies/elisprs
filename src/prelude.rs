@@ -137,6 +137,13 @@ pub const PRELUDE: &str = r#"
 (defmacro ignore-errors (&rest body) `(condition-case nil (progn ,@body) (error nil)))
 (defmacro with-demoted-errors (fmt &rest body) `(condition-case --err-- (progn ,@body) (error (message ,fmt --err--) nil)))
 
+;; Evaluate BODY with the regexp match data preserved: any `string-match` inside
+;; BODY won't clobber the caller's match state.
+(defmacro save-match-data (&rest body)
+  `(let ((--save-match-- (match-data)))
+     (unwind-protect (progn ,@body)
+       (set-match-data --save-match--))))
+
 ;;; ====================================================================
 ;;; Standard library — subr / subr-x / seq / cl-lib written in elisp on
 ;;; top of the primitives, the way Emacs bootstraps. (Buffer/marker ops,
@@ -393,6 +400,73 @@ pub const PRELUDE: &str = r#"
                         ((listp key) (cons (list 'memq '--cl-case-v-- (list 'quote key)) body))
                         (t (cons (list 'eql '--cl-case-v-- (list 'quote key)) body)))))
               clauses))))
+
+;; ---- pcase: structural `cond` (non-backquote subset) ----
+;; Supported patterns (compiled to tests + bindings at macroexpansion time):
+;;   _              wildcard — always matches
+;;   nil / t / :kw  self-quoting literals (matched with `equal`)
+;;   NUMBER STRING  self-quoting literals
+;;   SYMBOL         binds SYMBOL to the value (anything not a literal above)
+;;   'X / (quote X) literal X
+;;   (pred FN)      matches when (FN VALUE) is non-nil; (pred (FN ARGS...)) →
+;;                  (FN ARGS... VALUE), as in Emacs
+;;   (guard EXPR)   matches when EXPR — which can read earlier bindings — is non-nil
+;;   (and PAT...)   matches when every PAT matches (bindings accumulate)
+;;   (or PAT...)    matches when any PAT matches
+;; Backquote patterns (`(,a ,b)) are NOT supported here: this reader expands
+;; backquote eagerly at read time, so no `\`' form survives for pcase to
+;; destructure. They need lazy backquote first.
+(defun pcase--literal-p (pat)
+  (or (numberp pat) (stringp pat) (keywordp pat) (eq pat t) (null pat)))
+(defun pcase--compile (pat val)
+  ;; Return (TESTS . BINDS): TESTS a list of boolean forms over VAL, BINDS a
+  ;; list of (SYM ACCESSOR) let*-bindings. In this subset every binder captures
+  ;; VAL whole, so accessors never car/cdr an atom.
+  (cond
+   ((eq pat '_) (cons nil nil))
+   ((pcase--literal-p pat) (cons (list (list 'equal val (list 'quote pat))) nil))
+   ((symbolp pat) (cons nil (list (list pat val))))
+   ((consp pat)
+    (let ((head (car pat)))
+      (cond
+       ((eq head 'quote) (cons (list (list 'equal val pat)) nil))
+       ((eq head 'pred)
+        (let ((fn (car (cdr pat))))
+          (cons (list (if (consp fn) (append fn (list val)) (list fn val))) nil)))
+       ((eq head 'guard) (cons (list (car (cdr pat))) nil))
+       ((eq head 'and)
+        (let ((tests nil) (binds nil))
+          (dolist (p (cdr pat))
+            (let ((r (pcase--compile p val)))
+              (setq tests (append tests (car r)))
+              (setq binds (append binds (cdr r)))))
+          (cons tests binds)))
+       ((eq head 'or)
+        (let ((alts nil) (binds nil))
+          (dolist (p (cdr pat))
+            (let ((r (pcase--compile p val)))
+              (setq alts (append alts (list (cons 'and (car r)))))
+              (setq binds (append binds (cdr r)))))
+          (cons (list (cons 'or alts)) binds)))
+       (t (error "pcase: unsupported pattern %S" pat)))))
+   (t (error "pcase: unsupported pattern %S" pat))))
+(defmacro pcase (expr &rest clauses)
+  `(let ((--pcase-v-- ,expr))
+     (catch 'pcase--done
+       ,@(mapcar
+          (lambda (clause)
+            (let* ((r (pcase--compile (car clause) '--pcase-v--))
+                   (tests (car r))
+                   (binds (cdr r)))
+              `(let* ,binds
+                 (when ,(if tests (cons 'and tests) t)
+                   (throw 'pcase--done (progn ,@(cdr clause)))))))
+          clauses)
+       nil)))
+(defmacro pcase-let (bindings &rest body)
+  ;; Only the simple `(SYM VALUE)` binding form is supported (full pcase-let
+  ;; destructuring needs backquote patterns).
+  `(let ,bindings ,@body))
 
 ;;; ---- ERT: Emacs Lisp Regression Testing (subset) ----
 ;; Ported from ERT: `should` / `should-not` / `should-error` / `skip-unless`

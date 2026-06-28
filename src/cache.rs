@@ -8,13 +8,32 @@
 //! Layout: the *outer* container is a zero-copy rkyv archive (validated via
 //! `check_archived_root`); the *inner* per-form `Chunk` blobs and heap image are
 //! bincode, because `fusevm::Chunk`/`Value` are serde-owned, not `rkyv::Archive`
-//! (the same split zshrs uses). Keyed by absolute path + mtime + elisprs version.
+//! (the same split zshrs uses). Keyed by absolute path + mtime + a *schema key*.
+//!
+//! The schema key (`schema_key`) is the elisprs version combined with a
+//! fingerprint of the builtin object layout and the prelude source. Compiled
+//! chunks bake in builtin arena handles and macro-expansions, so any change to
+//! the registered subrs or the prelude must invalidate cached bytecode even
+//! within a single released version — otherwise stale chunks resolve handles to
+//! the wrong builtins. Folding the fingerprint into the key makes that automatic.
 
 use crate::host::SerObj;
 use fusevm::Chunk;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
+/// shard built under a different key is ignored (and overwritten on the next
+/// `put`), so editing `builtins::install` or the prelude never serves a stale
+/// chunk.
+pub fn schema_key(builtin_fingerprint: u64) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    builtin_fingerprint.hash(&mut hasher);
+    crate::prelude::PRELUDE.hash(&mut hasher);
+    format!("{}-{:016x}", env!("CARGO_PKG_VERSION"), hasher.finish())
+}
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
@@ -58,9 +77,10 @@ fn write_shard(shard: &Shard) -> std::io::Result<()> {
 }
 
 /// Cache lookup. Returns the per-form chunks + clean heap image on a fresh hit.
-pub fn get(path: &str, mtime_ns: i64) -> Option<(Vec<Chunk>, Vec<SerObj>)> {
+/// `schema_key` must match the key the entry was written under (see `schema_key`).
+pub fn get(path: &str, mtime_ns: i64, schema_key: &str) -> Option<(Vec<Chunk>, Vec<SerObj>)> {
     let shard = read_shard()?;
-    if shard.version != env!("CARGO_PKG_VERSION") {
+    if shard.version != schema_key {
         return None;
     }
     let entry = shard.entries.get(path)?;
@@ -78,7 +98,7 @@ pub fn get(path: &str, mtime_ns: i64) -> Option<(Vec<Chunk>, Vec<SerObj>)> {
 }
 
 /// Store a compiled script. Best-effort — any failure just skips caching.
-pub fn put(path: &str, mtime_ns: i64, chunks: &[Chunk], heap: &[SerObj]) {
+pub fn put(path: &str, mtime_ns: i64, schema_key: &str, chunks: &[Chunk], heap: &[SerObj]) {
     let Ok(forms) = chunks
         .iter()
         .map(bincode::serialize)
@@ -89,10 +109,12 @@ pub fn put(path: &str, mtime_ns: i64, chunks: &[Chunk], heap: &[SerObj]) {
     let Ok(heap_blob) = bincode::serialize(heap) else {
         return;
     };
+    // A shard built under a different schema key is discarded wholesale: its
+    // chunks reference a builtin layout that no longer exists.
     let mut shard = read_shard()
-        .filter(|s| s.version == env!("CARGO_PKG_VERSION"))
+        .filter(|s| s.version == schema_key)
         .unwrap_or_else(|| Shard {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: schema_key.to_string(),
             entries: HashMap::new(),
         });
     shard.entries.insert(

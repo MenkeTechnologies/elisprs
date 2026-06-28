@@ -295,3 +295,93 @@ fn nonlocal_exits() {
         "5"
     );
 }
+
+#[test]
+fn regexp_search_and_match_data() {
+    // string-match returns the char index of the match and records match data.
+    assert_eq!(eval("(string-match \"world\" \"hello world\")"), "6");
+    assert_eq!(eval("(string-match \"zzz\" \"hello\")"), "nil");
+    // Capture groups: match-string / match-beginning / match-end read group N.
+    assert_eq!(
+        eval(
+            "(progn (string-match \"\\\\([a-z]+\\\\)-\\\\([0-9]+\\\\)\" \"  abc-123 \") \
+             (list (match-string 1 \"  abc-123 \") (match-string 2 \"  abc-123 \") \
+             (match-beginning 1) (match-end 2)))"
+        ),
+        "(\"abc\" \"123\" 2 9)"
+    );
+    // elisp counts characters, not bytes: positions are correct across UTF-8.
+    assert_eq!(
+        eval("(progn (string-match \"é\" \"aébé\") (list (match-beginning 0) (match-end 0)))"),
+        "(1 2)"
+    );
+    // The optional START argument bounds where searching begins.
+    assert_eq!(eval("(string-match \"a\" \"banana\" 2)"), "3");
+    // Backreferences in the pattern have no analogue in a non-backtracking engine.
+    reset_host();
+    assert!(eval_str("(string-match \"\\\\(a\\\\)\\\\1\" \"aa\")").is_err());
+}
+
+#[test]
+fn regexp_replace_and_quote() {
+    // Template replacement expands \& (whole match) and \N (group N) backrefs.
+    assert_eq!(
+        eval("(replace-regexp-in-string \"\\\\([a-z]+\\\\)=\\\\([0-9]+\\\\)\" \"\\\\2:\\\\1\" \"x=1 yy=22\")"),
+        "\"1:x 22:yy\""
+    );
+    // LITERAL non-nil inserts REP verbatim.
+    assert_eq!(
+        eval("(replace-regexp-in-string \"[0-9]+\" \"#\" \"a1b22c333\" nil t)"),
+        "\"a#b#c#\""
+    );
+    // regexp-quote escapes the regexp metacharacters so the text matches literally.
+    assert_eq!(eval("(regexp-quote \"a.b*c\")"), "\"a\\\\.b\\\\*c\"");
+}
+
+#[test]
+fn regexp_save_match_data() {
+    // save-match-data shields the caller's match state from an inner search.
+    assert_eq!(
+        eval("(progn (string-match \"b\" \"abc\") (save-match-data (string-match \"x\" \"xyz\")) (match-beginning 0))"),
+        "1"
+    );
+    // match-data round-trips through set-match-data.
+    assert_eq!(
+        eval(
+            "(progn (string-match \"\\\\([a-z]+\\\\)-\\\\([0-9]+\\\\)\" \"abc-123\") (match-data))"
+        ),
+        "(0 7 0 3 4 7)"
+    );
+    // string-match-p leaves existing match data untouched.
+    assert_eq!(
+        eval("(progn (string-match \"b\" \"abc\") (string-match-p \"x\" \"xyz\") (match-beginning 0))"),
+        "1"
+    );
+}
+
+#[test]
+fn pcase_non_backquote_subset() {
+    // Literal dispatch with a wildcard fallthrough.
+    assert_eq!(eval("(pcase 2 (1 'one) (2 'two) (_ 'other))"), "two");
+    assert_eq!(eval("(pcase 99 (1 'a) (2 'b))"), "nil"); // no clause matches → nil
+                                                         // A bare symbol binds the value; nil/t/keywords stay literals.
+    assert_eq!(eval("(pcase 42 (x (list 'got x)))"), "(got 42)");
+    assert_eq!(
+        eval("(list (pcase :k (:k 'kw)) (pcase nil (nil 'n)) (pcase t (t 'tt)))"),
+        "(kw n tt)"
+    );
+    // 'X / (quote X) match literally.
+    assert_eq!(eval("(pcase 'foo ('bar 1) ('foo 2) (_ 3))"), "2");
+    // pred: function symbol, and (FN ARGS...) appending the value last.
+    assert_eq!(
+        eval("(pcase 7 ((pred stringp) 'str) ((pred integerp) 'int))"),
+        "int"
+    );
+    assert_eq!(eval("(pcase 5 ((pred (< 10)) 'big) (_ 'small))"), "small");
+    // and binds + guards over the binding; or matches any branch.
+    assert_eq!(
+        eval("(pcase 8 ((and n (guard (> n 5))) (list 'big n)) (_ 'small))"),
+        "(big 8)"
+    );
+    assert_eq!(eval("(pcase 3 ((or 1 2 3) 'low) (_ 'high))"), "low");
+}
