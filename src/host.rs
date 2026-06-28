@@ -40,6 +40,46 @@ pub struct Params {
     pub rest: Option<u32>,
 }
 
+/// A lexical scope frame: symbol→value bindings plus a parent link. Closures
+/// capture the scope active at their definition (indefinite extent). Mutation
+/// (via interior `RefCell`) lets `setq` update a lexical slot in place.
+pub struct Scope {
+    vars: RefCell<Vec<(u32, Value)>>,
+    parent: Lex,
+}
+pub type Lex = Option<Rc<Scope>>;
+
+impl Scope {
+    fn child(parent: Lex) -> Rc<Scope> {
+        Rc::new(Scope { vars: RefCell::new(Vec::new()), parent })
+    }
+    fn lookup(self: &Rc<Scope>, sym: u32) -> Option<Value> {
+        let mut cur = Some(self.clone());
+        while let Some(s) = cur {
+            for (k, v) in s.vars.borrow().iter() {
+                if *k == sym {
+                    return Some(v.clone());
+                }
+            }
+            cur = s.parent.clone();
+        }
+        None
+    }
+    fn set(self: &Rc<Scope>, sym: u32, val: &Value) -> bool {
+        let mut cur = Some(self.clone());
+        while let Some(s) = cur {
+            for (k, v) in s.vars.borrow_mut().iter_mut() {
+                if *k == sym {
+                    *v = val.clone();
+                    return true;
+                }
+            }
+            cur = s.parent.clone();
+        }
+        false
+    }
+}
+
 pub struct SymbolData {
     pub name: String,
     pub value: Option<Value>,
@@ -61,6 +101,8 @@ pub enum Obj {
         params: Rc<Params>,
         body: Rc<Chunk>,
         is_macro: bool,
+        /// Captured lexical environment (`None` for a template / dynamic macro).
+        env: Lex,
     },
     /// An elisp hash table. `test`: 0 = eq, 1 = eql, 2 = equal. Association-vector
     /// storage (linear scan) — fine for the table sizes elisp config uses.

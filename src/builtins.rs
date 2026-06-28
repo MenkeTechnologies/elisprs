@@ -26,6 +26,19 @@ fn as_num(v: &Value) -> Result<(i64, f64, bool), String> {
         _ => Err(format!("wrong-type-argument: numberp {}", v.as_str_cow())),
     }
 }
+fn as_int(v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Int(n) => Ok(*n),
+        Value::Float(f) => Ok(*f as i64),
+        _ => Err(format!("wrong-type-argument: integerp {}", v.as_str_cow())),
+    }
+}
+fn as_string(v: &Value) -> Result<String, String> {
+    match v {
+        Value::Str(s) => Ok(s.to_string()),
+        _ => Err(format!("wrong-type-argument: stringp {}", v.as_str_cow())),
+    }
+}
 fn num_result(i: i64, f: f64, isf: bool) -> Value {
     if isf {
         Value::Float(f)
@@ -497,6 +510,179 @@ fn number_to_string(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::str(h.print(&a[0], false)))
 }
 
+// ── hash tables ──
+fn hash_eq(h: &ElispHost, test: u8, a: &Value, b: &Value) -> bool {
+    if test == 2 {
+        el_equal(h, a, b)
+    } else {
+        el_eq(h, a, b)
+    }
+}
+fn make_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
+    let mut test = 1u8; // eql default
+    let mut i = 0;
+    while i + 1 < a.len() {
+        if h.sym_name(&a[i]).as_deref() == Some(":test") {
+            test = match h.sym_name(&a[i + 1]).as_deref() {
+                Some("eq") => 0,
+                Some("equal") => 2,
+                _ => 1,
+            };
+        }
+        i += 2;
+    }
+    Ok(h.alloc(Obj::HashTable { test, entries: Vec::new() }))
+}
+fn ht_view(h: &ElispHost, v: &Value) -> Result<(u8, Vec<(Value, Value)>), String> {
+    match h.obj(v) {
+        Some(Obj::HashTable { test, entries }) => Ok((*test, entries.clone())),
+        _ => Err("wrong-type-argument: hash-table-p".to_string()),
+    }
+}
+fn gethash(h: &mut ElispHost, a: &[Value]) -> R {
+    let (test, entries) = ht_view(h, &a[1])?;
+    for (k, v) in &entries {
+        if hash_eq(h, test, &a[0], k) {
+            return Ok(v.clone());
+        }
+    }
+    Ok(a.get(2).cloned().unwrap_or(Value::Undef))
+}
+fn puthash(h: &mut ElispHost, a: &[Value]) -> R {
+    let (test, entries) = ht_view(h, &a[2])?;
+    let found = entries.iter().position(|(k, _)| hash_eq(h, test, &a[0], k));
+    if let Value::Obj(id) = &a[2] {
+        if let Some(Obj::HashTable { entries, .. }) = h.arena.get_mut(*id as usize) {
+            match found {
+                Some(i) => entries[i].1 = a[1].clone(),
+                None => entries.push((a[0].clone(), a[1].clone())),
+            }
+        }
+    }
+    Ok(a[1].clone())
+}
+fn remhash(h: &mut ElispHost, a: &[Value]) -> R {
+    let (test, entries) = ht_view(h, &a[1])?;
+    let found = entries.iter().position(|(k, _)| hash_eq(h, test, &a[0], k));
+    if let (Some(i), Value::Obj(id)) = (found, &a[1]) {
+        if let Some(Obj::HashTable { entries, .. }) = h.arena.get_mut(*id as usize) {
+            entries.remove(i);
+        }
+    }
+    Ok(Value::Undef) // remhash always returns nil
+}
+fn clrhash(h: &mut ElispHost, a: &[Value]) -> R {
+    if let Value::Obj(id) = &a[0] {
+        if let Some(Obj::HashTable { entries, .. }) = h.arena.get_mut(*id as usize) {
+            entries.clear();
+        }
+    }
+    Ok(a[0].clone())
+}
+fn hash_table_count(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Int(ht_view(h, &a[0])?.1.len() as i64))
+}
+fn hash_table_p(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::HashTable { .. }))))
+}
+fn hash_table_keys(h: &mut ElispHost, a: &[Value]) -> R {
+    let keys: Vec<Value> = ht_view(h, &a[0])?.1.into_iter().map(|(k, _)| k).collect();
+    Ok(h.list_from(keys))
+}
+fn hash_table_values(h: &mut ElispHost, a: &[Value]) -> R {
+    let vals: Vec<Value> = ht_view(h, &a[0])?.1.into_iter().map(|(_, v)| v).collect();
+    Ok(h.list_from(vals))
+}
+fn copy_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
+    let (test, entries) = ht_view(h, &a[0])?;
+    Ok(h.alloc(Obj::HashTable { test, entries }))
+}
+
+// ── strings ──
+fn substring(_h: &mut ElispHost, a: &[Value]) -> R {
+    let s = as_string(&a[0])?;
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i64;
+    let norm = |i: i64| -> usize { (if i < 0 { (len + i).max(0) } else { i.min(len) }) as usize };
+    let start = match a.get(1) {
+        Some(v) if !is_nil(v) => norm(as_int(v)?),
+        _ => 0,
+    };
+    let end = match a.get(2) {
+        Some(v) if !is_nil(v) => norm(as_int(v)?),
+        _ => len as usize,
+    };
+    if start > end {
+        return Err("args-out-of-range".to_string());
+    }
+    Ok(Value::str(chars[start..end].iter().collect::<String>()))
+}
+fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
+    let s = as_string(&a[0])?;
+    let parts: Vec<Value> = if a.len() < 2 || is_nil(&a[1]) {
+        s.split_whitespace().map(Value::str).collect()
+    } else {
+        let sep = as_string(&a[1])?;
+        if sep.is_empty() {
+            s.chars().map(|c| Value::str(c.to_string())).collect()
+        } else {
+            s.split(sep.as_str()).map(Value::str).collect()
+        }
+    };
+    Ok(h.list_from(parts))
+}
+fn string_prefix_p(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(as_string(&a[1])?.starts_with(&as_string(&a[0])?)))
+}
+fn string_suffix_p(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(as_string(&a[1])?.ends_with(&as_string(&a[0])?)))
+}
+fn string_empty_p(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(as_string(&a[0])?.is_empty()))
+}
+fn string_join(h: &mut ElispHost, a: &[Value]) -> R {
+    let items = h.list_vec(&a[0]).ok_or("string-join: not a list")?;
+    let sep = match a.get(1) {
+        Some(v) if !is_nil(v) => as_string(v)?,
+        _ => String::new(),
+    };
+    let strs: Result<Vec<String>, String> = items.iter().map(as_string).collect();
+    Ok(Value::str(strs?.join(&sep)))
+}
+fn char_to_string(_h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_int(&a[0])?;
+    Ok(Value::str(char::from_u32(n as u32).map(|c| c.to_string()).unwrap_or_default()))
+}
+fn string_to_char(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Int(as_string(&a[0])?.chars().next().map(|c| c as i64).unwrap_or(0)))
+}
+fn make_string(_h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_int(&a[0])?.max(0) as usize;
+    let c = char::from_u32(as_int(&a[1])? as u32).unwrap_or(' ');
+    Ok(Value::str(c.to_string().repeat(n)))
+}
+fn string_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let mut s = String::new();
+    for v in a {
+        if let Some(c) = char::from_u32(as_int(v)? as u32) {
+            s.push(c);
+        }
+    }
+    Ok(Value::str(s))
+}
+fn string_to_list(h: &mut ElispHost, a: &[Value]) -> R {
+    let items: Vec<Value> = as_string(&a[0])?.chars().map(|c| Value::Int(c as i64)).collect();
+    Ok(h.list_from(items))
+}
+fn string_search(_h: &mut ElispHost, a: &[Value]) -> R {
+    let needle = as_string(&a[0])?;
+    let hay = as_string(&a[1])?;
+    Ok(match hay.find(&needle) {
+        Some(byte_idx) => Value::Int(hay[..byte_idx].chars().count() as i64),
+        None => Value::Undef,
+    })
+}
+
 /// Install the primitive subr set.
 pub fn install(h: &mut ElispHost) {
     let mut s = |n: &str, min: usize, max: Option<usize>, f: crate::host::SubrFn| {
@@ -560,6 +746,30 @@ pub fn install(h: &mut ElispHost) {
     s("error", 1, None, error_fn);
     s("user-error", 1, None, error_fn);
     s("signal", 2, Some(2), signal_fn);
+    // hash tables (maphash is intercepted in host::call_function)
+    s("make-hash-table", 0, None, make_hash_table);
+    s("gethash", 2, Some(3), gethash);
+    s("puthash", 3, Some(3), puthash);
+    s("remhash", 2, Some(2), remhash);
+    s("clrhash", 1, Some(1), clrhash);
+    s("hash-table-count", 1, Some(1), hash_table_count);
+    s("hash-table-p", 1, Some(1), hash_table_p);
+    s("hash-table-keys", 1, Some(1), hash_table_keys);
+    s("hash-table-values", 1, Some(1), hash_table_values);
+    s("copy-hash-table", 1, Some(1), copy_hash_table);
+    // strings
+    s("substring", 1, Some(3), substring);
+    s("split-string", 1, Some(4), split_string);
+    s("string-prefix-p", 2, Some(3), string_prefix_p);
+    s("string-suffix-p", 2, Some(3), string_suffix_p);
+    s("string-empty-p", 1, Some(1), string_empty_p);
+    s("string-join", 1, Some(2), string_join);
+    s("char-to-string", 1, Some(1), char_to_string);
+    s("string-to-char", 1, Some(1), string_to_char);
+    s("make-string", 2, Some(3), make_string);
+    s("string", 0, None, string_fn);
+    s("string-to-list", 1, Some(1), string_to_list);
+    s("string-search", 2, Some(3), string_search);
     // strings / IO
     s("concat", 0, None, concat_fn);
     s("format", 1, None, format_fn);

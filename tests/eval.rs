@@ -183,6 +183,35 @@ fn prelude_derived_surface() {
 }
 
 #[test]
+fn hash_tables() {
+    assert_eq!(
+        eval("(let ((h (make-hash-table :test 'equal))) (puthash \"a\" 1 h) (gethash \"a\" h))"),
+        "1"
+    );
+    assert_eq!(
+        eval("(let ((h (make-hash-table))) (puthash 'k 42 h) (puthash 'k 99 h) (gethash 'k h))"),
+        "99"
+    );
+    assert_eq!(
+        eval("(let ((h (make-hash-table)) (s 0)) (puthash 1 10 h) (puthash 2 20 h) (maphash (lambda (k v) (setq s (+ s v))) h) s)"),
+        "30"
+    );
+    assert_eq!(eval("(gethash 'missing (make-hash-table) 'default)"), "default");
+}
+
+#[test]
+fn string_ops() {
+    assert_eq!(eval("(substring \"hello world\" 0 5)"), "\"hello\"");
+    assert_eq!(eval("(substring \"hello\" -3)"), "\"llo\"");
+    assert_eq!(eval("(split-string \"a b  c\")"), "(\"a\" \"b\" \"c\")");
+    assert_eq!(eval("(split-string \"a,b,c\" \",\")"), "(\"a\" \"b\" \"c\")");
+    assert_eq!(eval("(string-prefix-p \"foo\" \"foobar\")"), "t");
+    assert_eq!(eval("(string-join (list \"a\" \"b\" \"c\") \"-\")"), "\"a-b-c\"");
+    assert_eq!(eval("(make-string 3 65)"), "\"AAA\"");
+    assert_eq!(eval("(string-search \"lo\" \"hello\")"), "3");
+}
+
+#[test]
 fn nonlocal_exits() {
     assert_eq!(eval("(catch 'done (throw 'done 42))"), "42");
     assert_eq!(eval("(catch 'x (+ 1 (throw 'x 99)) 999)"), "99"); // throw aborts mid-expr
