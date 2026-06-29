@@ -361,13 +361,34 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 fn nth_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    // `(nth n list)` = `(car (nthcdr n list))`: walk the cons spine n times, then
+    // take the car. Improper lists are fine (`(nth 0 '(a . 1))` => a); only when
+    // we actually need the car/cdr of a non-list does Emacs signal listp.
     let n = as_num(&a[0])?.0;
-    let v = h.list_vec(&a[1]).unwrap_or_default();
-    Ok(if n < 0 {
-        Value::Undef
-    } else {
-        v.get(n as usize).cloned().unwrap_or(Value::Undef)
-    })
+    let mut cur = a[1].clone();
+    let mut i = 0;
+    while i < n {
+        let next = match h.obj(&cur) {
+            Some(Obj::Cons(_, d)) => d.clone(),
+            _ if is_nil(&cur) => return Ok(Value::Undef),
+            _ => {
+                return Err(format!(
+                    "wrong-type-argument: listp {}",
+                    h.print(&cur, true)
+                ))
+            }
+        };
+        cur = next;
+        i += 1;
+    }
+    match h.obj(&cur) {
+        Some(Obj::Cons(car, _)) => Ok(car.clone()),
+        _ if is_nil(&cur) => Ok(Value::Undef),
+        _ => Err(format!(
+            "wrong-type-argument: listp {}",
+            h.print(&cur, true)
+        )),
+    }
 }
 
 // ── predicates ──
@@ -524,13 +545,22 @@ fn boundp(h: &mut ElispHost, a: &[Value]) -> R {
 fn identity(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(a[0].clone())
 }
-fn terpri(_h: &mut ElispHost, _a: &[Value]) -> R {
-    println!();
+fn terpri(h: &mut ElispHost, _a: &[Value]) -> R {
+    h.emit("\n");
     Ok(Value::Bool(true))
 }
 fn print_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    println!("{}", h.print(&a[0], true));
+    let s = h.print(&a[0], true);
+    h.emit(&s);
+    h.emit("\n");
     Ok(a[0].clone())
+}
+fn push_output_capture(h: &mut ElispHost, _a: &[Value]) -> R {
+    h.output_capture.push(String::new());
+    Ok(Value::Undef)
+}
+fn pop_output_capture(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::str(h.output_capture.pop().unwrap_or_default()))
 }
 fn prin1_to_string(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::str(h.print(&a[0], true)))
@@ -880,15 +910,13 @@ fn message_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::str(s))
 }
 fn princ_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    print!("{}", h.print(&a[0], false));
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
+    let s = h.print(&a[0], false);
+    h.emit(&s);
     Ok(a[0].clone())
 }
 fn prin1_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    print!("{}", h.print(&a[0], true));
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
+    let s = h.print(&a[0], true);
+    h.emit(&s);
     Ok(a[0].clone())
 }
 fn number_to_string(h: &mut ElispHost, a: &[Value]) -> R {
@@ -997,23 +1025,38 @@ fn copy_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── strings ──
-fn substring(_h: &mut ElispHost, a: &[Value]) -> R {
+fn substring(h: &mut ElispHost, a: &[Value]) -> R {
     let s = as_string(&a[0])?;
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len() as i64;
-    let norm = |i: i64| -> usize { (if i < 0 { (len + i).max(0) } else { i.min(len) }) as usize };
+    // Negative indices count from the end; Emacs then bounds-checks rather than
+    // clamping, signalling args-out-of-range for anything outside [0, len].
+    let adj = |i: i64| -> i64 {
+        if i < 0 {
+            len + i
+        } else {
+            i
+        }
+    };
     let start = match a.get(1) {
-        Some(v) if !is_nil(v) => norm(as_int(v)?),
+        Some(v) if !is_nil(v) => adj(as_int(v)?),
         _ => 0,
     };
     let end = match a.get(2) {
-        Some(v) if !is_nil(v) => norm(as_int(v)?),
-        _ => len as usize,
+        Some(v) if !is_nil(v) => adj(as_int(v)?),
+        _ => len,
     };
-    if start > end {
-        return Err("args-out-of-range".to_string());
+    if start < 0 || end > len || start > end {
+        return Err(format!(
+            "args-out-of-range: {} {start} {end}",
+            h.print(&a[0], true)
+        ));
     }
-    Ok(Value::str(chars[start..end].iter().collect::<String>()))
+    Ok(Value::str(
+        chars[start as usize..end as usize]
+            .iter()
+            .collect::<String>(),
+    ))
 }
 fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
     let s = as_string(&a[0])?;
@@ -1925,6 +1968,307 @@ fn compare_strings(_h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 
+// ── time ──
+fn now_secs() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Convert an elisp TIME value to epoch seconds (float). Accepts nil (= now), an
+/// integer/float of seconds, a `(TICKS . HZ)` pair, or a `(HIGH LOW [USEC ...])`
+/// legacy list.
+fn time_arg_secs(h: &ElispHost, v: Option<&Value>) -> Result<f64, String> {
+    match v {
+        None => Ok(now_secs()),
+        Some(t) if is_nil(t) => Ok(now_secs()),
+        Some(Value::Int(n)) => Ok(*n as f64),
+        Some(Value::Float(f)) => Ok(*f),
+        Some(t) => {
+            // (TICKS . HZ): a cons whose cdr is a number.
+            if let Some(Obj::Cons(car, Value::Int(hz))) = h.obj(t) {
+                if *hz != 0 {
+                    return Ok(as_num(car)?.1 / (*hz as f64));
+                }
+            }
+            // (HIGH LOW [USEC [PSEC]]).
+            let parts = h.list_vec(t).ok_or("invalid time value")?;
+            let get = |i: usize| parts.get(i).and_then(|v| as_num(v).ok()).map(|x| x.1);
+            let high = get(0).unwrap_or(0.0);
+            let low = get(1).unwrap_or(0.0);
+            let usec = get(2).unwrap_or(0.0);
+            Ok(high * 65536.0 + low + usec / 1.0e6)
+        }
+    }
+}
+
+/// Decompose epoch seconds into a `struct tm` for the given ZONE (nil = local,
+/// non-nil non-number = UTC, integer = fixed offset seconds east of UTC).
+fn time_decompose(secs: f64, zone: Option<&Value>) -> libc::tm {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    match zone {
+        None | Some(Value::Undef) | Some(Value::Bool(false)) => {
+            let t = secs.floor() as libc::time_t;
+            unsafe { libc::localtime_r(&t, &mut tm) };
+        }
+        Some(Value::Int(off)) => {
+            // Fixed offset: read as UTC at secs+off, then stamp the offset.
+            let t = (secs.floor() as libc::time_t) + *off as libc::time_t;
+            unsafe { libc::gmtime_r(&t, &mut tm) };
+            tm.tm_gmtoff = *off as libc::c_long;
+        }
+        _ => {
+            let t = secs.floor() as libc::time_t;
+            unsafe { libc::gmtime_r(&t, &mut tm) };
+        }
+    }
+    tm
+}
+
+const WD_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const WD_FULL: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+const MON_ABBR: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const MON_FULL: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+fn fmt_time_string(fmt: &str, tm: &libc::tm, secs: f64) -> String {
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= chars.len() {
+            out.push('%');
+            break;
+        }
+        // Optional flags (-_0^#) then optional field width.
+        let mut flag: Option<char> = None;
+        while i < chars.len() && matches!(chars[i], '-' | '_' | '0' | '^' | '#') {
+            if matches!(chars[i], '-' | '_' | '0') {
+                flag = Some(chars[i]);
+            }
+            i += 1;
+        }
+        let mut wbuf = String::new();
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            wbuf.push(chars[i]);
+            i += 1;
+        }
+        let user_w: Option<usize> = wbuf.parse().ok();
+        if i >= chars.len() {
+            break;
+        }
+        let d = chars[i];
+        i += 1;
+        // Numeric field with default width/pad, honoring flags.
+        let numpad = |val: i64, deftw: usize, defpad: char| -> String {
+            if flag == Some('-') {
+                return val.to_string();
+            }
+            let width = user_w.unwrap_or(deftw);
+            let pad = match flag {
+                Some('_') => ' ',
+                Some('0') => '0',
+                _ => defpad,
+            };
+            let s = val.abs().to_string();
+            let body = if s.len() < width {
+                format!("{}{}", pad.to_string().repeat(width - s.len()), s)
+            } else {
+                s
+            };
+            if val < 0 {
+                format!("-{body}")
+            } else {
+                body
+            }
+        };
+        let year = tm.tm_year as i64 + 1900;
+        match d {
+            'Y' => out.push_str(&numpad(year, 1, '0')),
+            'y' => out.push_str(&numpad(year.rem_euclid(100), 2, '0')),
+            'm' => out.push_str(&numpad(tm.tm_mon as i64 + 1, 2, '0')),
+            'd' => out.push_str(&numpad(tm.tm_mday as i64, 2, '0')),
+            'e' => out.push_str(&numpad(tm.tm_mday as i64, 2, ' ')),
+            'H' => out.push_str(&numpad(tm.tm_hour as i64, 2, '0')),
+            'k' => out.push_str(&numpad(tm.tm_hour as i64, 2, ' ')),
+            'I' => out.push_str(&numpad(((tm.tm_hour as i64 + 11) % 12) + 1, 2, '0')),
+            'l' => out.push_str(&numpad(((tm.tm_hour as i64 + 11) % 12) + 1, 2, ' ')),
+            'M' => out.push_str(&numpad(tm.tm_min as i64, 2, '0')),
+            'S' => out.push_str(&numpad(tm.tm_sec as i64, 2, '0')),
+            'j' => out.push_str(&numpad(tm.tm_yday as i64 + 1, 3, '0')),
+            'w' => out.push_str(&numpad(tm.tm_wday as i64, 1, '0')),
+            'u' => out.push_str(&numpad(
+                if tm.tm_wday == 0 {
+                    7
+                } else {
+                    tm.tm_wday as i64
+                },
+                1,
+                '0',
+            )),
+            's' => out.push_str(&(secs.floor() as i64).to_string()),
+            'p' => out.push_str(if tm.tm_hour < 12 { "AM" } else { "PM" }),
+            'P' => out.push_str(if tm.tm_hour < 12 { "am" } else { "pm" }),
+            'a' => out.push_str(WD_ABBR[(tm.tm_wday as usize) % 7]),
+            'A' => out.push_str(WD_FULL[(tm.tm_wday as usize) % 7]),
+            'b' | 'h' => out.push_str(MON_ABBR[(tm.tm_mon as usize) % 12]),
+            'B' => out.push_str(MON_FULL[(tm.tm_mon as usize) % 12]),
+            'Z' => {
+                if !tm.tm_zone.is_null() {
+                    let cs = unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) };
+                    out.push_str(&cs.to_string_lossy());
+                }
+            }
+            'z' => {
+                let off = tm.tm_gmtoff;
+                let sign = if off < 0 { '-' } else { '+' };
+                let a = off.unsigned_abs();
+                out.push_str(&format!("{sign}{:02}{:02}", a / 3600, (a % 3600) / 60));
+            }
+            'F' => out.push_str(&fmt_time_string("%Y-%m-%d", tm, secs)),
+            'T' => out.push_str(&fmt_time_string("%H:%M:%S", tm, secs)),
+            'R' => out.push_str(&fmt_time_string("%H:%M", tm, secs)),
+            'D' => out.push_str(&fmt_time_string("%m/%d/%y", tm, secs)),
+            'c' => out.push_str(&fmt_time_string("%a %b %e %H:%M:%S %Y", tm, secs)),
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            '%' => out.push('%'),
+            other => {
+                out.push('%');
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
+fn float_time(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(time_arg_secs(h, a.first())?))
+}
+
+fn current_time(_h: &mut ElispHost, _a: &[Value]) -> R {
+    let secs = now_secs();
+    let isec = secs.floor() as i64;
+    let usec = ((secs - secs.floor()) * 1.0e6) as i64;
+    Ok(_h.list_from(vec![
+        Value::Int(isec >> 16),
+        Value::Int(isec & 0xffff),
+        Value::Int(usec),
+        Value::Int(0),
+    ]))
+}
+
+fn format_time_string(h: &mut ElispHost, a: &[Value]) -> R {
+    let fmt = as_string(&a[0])?;
+    let secs = time_arg_secs(h, a.get(1))?;
+    let tm = time_decompose(secs, a.get(2));
+    Ok(Value::str(fmt_time_string(&fmt, &tm, secs)))
+}
+
+fn current_time_string(h: &mut ElispHost, a: &[Value]) -> R {
+    let secs = time_arg_secs(h, a.first())?;
+    let tm = time_decompose(secs, a.get(1));
+    Ok(Value::str(fmt_time_string(
+        "%a %b %e %H:%M:%S %Y",
+        &tm,
+        secs,
+    )))
+}
+
+// `tm_gmtoff` is `c_long`; `i64::from` is needed on 32-bit but a no-op here.
+#[allow(clippy::useless_conversion)]
+fn decode_time(h: &mut ElispHost, a: &[Value]) -> R {
+    let secs = time_arg_secs(h, a.first())?;
+    let tm = time_decompose(secs, a.get(1));
+    let dst = match tm.tm_isdst {
+        0 => Value::Undef,
+        n if n > 0 => Value::Bool(true),
+        _ => Value::Int(-1),
+    };
+    Ok(h.list_from(vec![
+        Value::Int(tm.tm_sec as i64),
+        Value::Int(tm.tm_min as i64),
+        Value::Int(tm.tm_hour as i64),
+        Value::Int(tm.tm_mday as i64),
+        Value::Int(tm.tm_mon as i64 + 1),
+        Value::Int(tm.tm_year as i64 + 1900),
+        Value::Int(tm.tm_wday as i64),
+        dst,
+        Value::Int(i64::from(tm.tm_gmtoff)),
+    ]))
+}
+
+fn encode_time(h: &mut ElispHost, a: &[Value]) -> R {
+    // Two conventions: (encode-time DECODED-LIST) where the list is
+    // (SEC MIN HOUR DAY MON YEAR [DOW] [DST] [ZONE]); or the spread form
+    // (encode-time SEC MIN HOUR DAY MON YEAR &optional ZONE).
+    let single_list = a.len() == 1 && h.list_vec(&a[0]).is_some();
+    let (parts, zone) = if single_list {
+        let p = h.list_vec(&a[0]).unwrap();
+        let z = p.get(8).cloned();
+        (p, z)
+    } else {
+        (a.to_vec(), a.get(6).cloned())
+    };
+    let g = |i: usize| {
+        parts
+            .get(i)
+            .and_then(|v| as_num(v).ok())
+            .map(|x| x.0)
+            .unwrap_or(0)
+    };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_sec = g(0) as libc::c_int;
+    tm.tm_min = g(1) as libc::c_int;
+    tm.tm_hour = g(2) as libc::c_int;
+    tm.tm_mday = g(3) as libc::c_int;
+    tm.tm_mon = (g(4) - 1) as libc::c_int;
+    tm.tm_year = (g(5) - 1900) as libc::c_int;
+    tm.tm_isdst = -1;
+    let secs: i64 = match zone.as_ref() {
+        None | Some(Value::Undef) | Some(Value::Bool(false)) => unsafe {
+            libc::mktime(&mut tm) as i64
+        },
+        // Components are stated in a fixed offset east of UTC: read as UTC, then back out the offset.
+        Some(Value::Int(off)) => unsafe { libc::timegm(&mut tm) as i64 - *off },
+        _ => unsafe { libc::timegm(&mut tm) as i64 },
+    };
+    Ok(h.list_from(vec![
+        Value::Int(secs.div_euclid(65536)),
+        Value::Int(secs.rem_euclid(65536)),
+    ]))
+}
+
 /// Install the primitive subr set.
 pub fn install(h: &mut ElispHost) {
     let mut s = |n: &str, min: usize, max: Option<usize>, f: crate::host::SubrFn| {
@@ -2009,6 +2353,13 @@ pub fn install(h: &mut ElispHost) {
     s("hash-table-keys", 1, Some(1), hash_table_keys);
     s("hash-table-values", 1, Some(1), hash_table_values);
     s("copy-hash-table", 1, Some(1), copy_hash_table);
+    // time
+    s("float-time", 0, Some(1), float_time);
+    s("current-time", 0, Some(0), current_time);
+    s("format-time-string", 1, Some(3), format_time_string);
+    s("current-time-string", 0, Some(2), current_time_string);
+    s("decode-time", 0, Some(3), decode_time);
+    s("encode-time", 1, None, encode_time);
     // strings
     s("substring", 1, Some(3), substring);
     s("split-string", 1, Some(4), split_string);
@@ -2043,6 +2394,8 @@ pub fn install(h: &mut ElispHost) {
     s("message", 1, None, message_fn);
     s("princ", 1, Some(2), princ_fn);
     s("prin1", 1, Some(2), prin1_fn);
+    s("--push-output-capture--", 0, Some(0), push_output_capture);
+    s("--pop-output-capture--", 0, Some(0), pop_output_capture);
     s("number-to-string", 1, Some(1), number_to_string);
     // numeric: float→int rounding + integer bit ops
     s("floor", 1, Some(2), floor_fn);

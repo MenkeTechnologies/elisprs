@@ -378,6 +378,42 @@ const SUBRS: &[Entry] = &[
         doc: "Return the Nth element of LIST.",
     },
     Entry {
+        name: "format-time-string",
+        kind: Kind::Function,
+        sig: "(format-time-string FORMAT &optional TIME ZONE)",
+        doc: "Format TIME (default now) per FORMAT. ZONE nil=local, t=UTC, integer=offset secs.",
+    },
+    Entry {
+        name: "float-time",
+        kind: Kind::Function,
+        sig: "(float-time &optional TIME)",
+        doc: "Return TIME (default now) as seconds since the epoch, a float.",
+    },
+    Entry {
+        name: "current-time",
+        kind: Kind::Function,
+        sig: "(current-time)",
+        doc: "Return the current time as (HIGH LOW USEC PSEC).",
+    },
+    Entry {
+        name: "current-time-string",
+        kind: Kind::Function,
+        sig: "(current-time-string &optional TIME ZONE)",
+        doc: "Return TIME (default now) as a string like \"Sun Jun 29 12:00:00 2025\".",
+    },
+    Entry {
+        name: "decode-time",
+        kind: Kind::Function,
+        sig: "(decode-time &optional TIME ZONE)",
+        doc: "Decompose TIME into (SEC MIN HOUR DAY MON YEAR DOW DST UTCOFF).",
+    },
+    Entry {
+        name: "encode-time",
+        kind: Kind::Function,
+        sig: "(encode-time TIME) or (encode-time SEC MIN HOUR DAY MON YEAR &optional ZONE)",
+        doc: "Inverse of decode-time: turn decoded components into a (HIGH LOW) time value.",
+    },
+    Entry {
         name: "vector",
         kind: Kind::Function,
         sig: "(vector &rest OBJECTS)",

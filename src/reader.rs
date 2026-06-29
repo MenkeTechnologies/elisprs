@@ -307,15 +307,34 @@ impl Reader {
     }
 
     fn read_atom(&mut self, h: &mut ElispHost) -> Result<Value, String> {
-        let start = self.pos;
+        let mut tok = String::new();
+        // A `\` escapes the next char into the symbol name (so `foo\ bar`, `\,`,
+        // `\#x` are single symbols). Any escape also forces the token to be a
+        // symbol — never a number or `nil`/`t`.
+        let mut had_escape = false;
         while let Some(c) = self.peek() {
-            if is_delim(c) {
+            if c == '\\' {
+                self.pos += 1;
+                match self.peek() {
+                    Some(e) => {
+                        tok.push(e);
+                        self.pos += 1;
+                        had_escape = true;
+                    }
+                    None => return Err("trailing backslash in symbol".to_string()),
+                }
+            } else if is_delim(c) {
                 break;
+            } else {
+                tok.push(c);
+                self.pos += 1;
             }
-            self.pos += 1;
         }
-        let tok: String = self.chars[start..self.pos].iter().collect();
-        Ok(classify(h, &tok))
+        if had_escape {
+            Ok(h.intern(&tok))
+        } else {
+            Ok(classify(h, &tok))
+        }
     }
 }
 
@@ -514,6 +533,15 @@ fn classify(h: &mut ElispHost, tok: &str) -> Value {
         }
     }
     h.intern(tok)
+}
+
+/// Does this token read back as an elisp number (integer or float)? Used by the
+/// printer to decide whether a symbol name needs a leading escape.
+pub(crate) fn token_is_number(tok: &str) -> bool {
+    if tok.parse::<i64>().is_ok() {
+        return true;
+    }
+    looks_numeric(tok) && tok.parse::<f64>().is_ok()
 }
 
 fn looks_numeric(tok: &str) -> bool {

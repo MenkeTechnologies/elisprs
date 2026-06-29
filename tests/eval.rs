@@ -424,6 +424,257 @@ fn emacs_parity_value_fixes() {
 }
 
 #[test]
+fn emacs_parity_seq_substring_nth_butlast() {
+    // seq-empty-p works on any sequence, not just lists.
+    assert_eq!(eval("(seq-empty-p \"\")"), "t");
+    assert_eq!(eval("(seq-empty-p [])"), "t");
+    assert_eq!(eval("(seq-empty-p '(1))"), "nil");
+    // string-blank-p returns the match position (0), not t.
+    assert_eq!(eval("(string-blank-p \"  \")"), "0");
+    assert_eq!(eval("(string-blank-p \"x\")"), "nil");
+    // butlast with negative/zero N keeps the whole list (no trailing nil).
+    assert_eq!(eval("(butlast (list 1 2 3) -1)"), "(1 2 3)");
+    assert_eq!(eval("(butlast (list 1 2 3))"), "(1 2)");
+    assert_eq!(eval("(butlast (list 1 2 3) 5)"), "nil");
+    // substring bounds-checks rather than clamping.
+    assert_eq!(eval("(substring \"abc\" 1 3)"), "\"bc\"");
+    assert!(eval_str("(substring \"abc\" 0 10)").is_err());
+    // nth walks the cons spine: improper lists work, vectors signal listp.
+    assert_eq!(eval("(nth 0 '(a . 1))"), "a");
+    assert_eq!(eval("(nth -1 '(a b c))"), "a");
+    assert_eq!(eval("(nth 5 '(a b c))"), "nil");
+    assert!(eval_str("(nth 0 [1 2 3])").is_err());
+    // last stops at an improper tail instead of erroring.
+    assert_eq!(eval("(last '(1 2 . 3))"), "(2 . 3)");
+    assert_eq!(eval("(last '(1 2 3))"), "(3)");
+    assert_eq!(eval("(last '(1 2 3) 2)"), "(2 3)");
+    assert_eq!(eval("(last nil)"), "nil");
+}
+
+#[test]
+fn emacs_parity_printer_condcase_setqdefault() {
+    // Printer abbreviates the two-element quote/function forms (R4-G).
+    assert_eq!(eval("(prin1-to-string '(quote a))"), "\"'a\"");
+    assert_eq!(eval("(prin1-to-string '(function f))"), "\"#'f\"");
+    assert_eq!(eval("(prin1-to-string '(a (quote b) c))"), "\"(a 'b c)\"");
+    // …but not three-element lists headed by quote.
+    assert_eq!(eval("(prin1-to-string '(quote a b))"), "\"(quote a b)\"");
+    // condition-case :success handler runs on normal return with VAR bound (R4-E).
+    assert_eq!(eval("(condition-case x 5 (:success (1+ x)))"), "6");
+    assert_eq!(
+        eval("(condition-case x (+ 2 3) (:success (* x x)) (error 0))"),
+        "25"
+    );
+    assert_eq!(eval("(condition-case x 7 (error 0))"), "7");
+    // setq-default behaves as a global set in this no-buffer-local model (R2-F).
+    assert_eq!(eval("(setq-default x 5)"), "5");
+    assert_eq!(eval("(progn (setq-default a 1 b 2) (list a b))"), "(1 2)");
+}
+
+#[test]
+fn emacs_parity_print_length_level() {
+    // print-length truncates lists and vectors with `...` (R3-D).
+    assert_eq!(
+        eval("(let ((print-length 3)) (prin1-to-string '(1 2 3 4 5)))"),
+        "\"(1 2 3 ...)\""
+    );
+    assert_eq!(
+        eval("(let ((print-length 3)) (prin1-to-string [1 2 3 4 5]))"),
+        "\"[1 2 3 ...]\""
+    );
+    assert_eq!(
+        eval("(let ((print-length 2)) (prin1-to-string '(1 2 3 . 4)))"),
+        "\"(1 2 ...)\""
+    );
+    // print-level replaces over-deep nesting with `...`.
+    assert_eq!(
+        eval("(let ((print-level 2)) (prin1-to-string '(1 (2 (3 (4))))))"),
+        "\"(1 (2 ...))\""
+    );
+    assert_eq!(
+        eval("(let ((print-level 1)) (prin1-to-string '(1 (2))))"),
+        "\"(1 ...)\""
+    );
+    // unset (nil) means no limit.
+    assert_eq!(eval("(prin1-to-string '(1 2 3 4 5))"), "\"(1 2 3 4 5)\"");
+}
+
+#[test]
+fn emacs_parity_symbol_read_print_escapes() {
+    // Printer escapes so a symbol reads back unchanged (R3-C); empty => `##`.
+    assert_eq!(eval("(prin1-to-string (intern \"\"))"), "\"##\"");
+    assert_eq!(eval("(prin1-to-string (intern \"a b\"))"), "\"a\\\\ b\"");
+    assert_eq!(eval("(prin1-to-string (intern \"a#b\"))"), "\"a\\\\#b\"");
+    assert_eq!(eval("(prin1-to-string (intern \"123\"))"), "\"\\\\123\"");
+    assert_eq!(eval("(prin1-to-string (intern \".foo\"))"), "\"\\\\.foo\"");
+    // …but ordinary symbols and mid-symbol dots/`+` are untouched.
+    assert_eq!(eval("(prin1-to-string (intern \"a.b\"))"), "\"a.b\"");
+    assert_eq!(eval("(prin1-to-string (intern \"1+\"))"), "\"1+\"");
+    // princ stays raw (no escaping).
+    assert_eq!(eval("(symbol-name (intern \"a b\"))"), "\"a b\"");
+    // Reader honors `\` escapes (R3-B): builds one symbol, never a number.
+    assert_eq!(eval("(symbol-name 'foo\\ bar)"), "\"foo bar\"");
+    assert_eq!(eval("(symbol-name '\\,)"), "\",\"");
+    assert_eq!(eval("(symbol-name '\\123)"), "\"123\"");
+    assert_eq!(eval("(eq 'foo\\ bar (intern \"foo bar\"))"), "t");
+    // Round-trip: read . prin1 = identity for awkward names.
+    assert_eq!(
+        eval("(eq (read (prin1-to-string (intern \"x(y\"))) (intern \"x(y\"))"),
+        "t"
+    );
+}
+
+#[test]
+fn emacs_parity_error_data_elements() {
+    // wrong-type-argument DATA is (PREDICATE VALUE) as separate elements (R2-B).
+    assert_eq!(
+        eval("(condition-case e (car 5) (error e))"),
+        "(wrong-type-argument listp 5)"
+    );
+    assert_eq!(eval("(condition-case e (car 5) (error (caddr e)))"), "5");
+    assert_eq!(eval("(condition-case e (car 5) (error (cadr e)))"), "listp");
+    // The value re-reads even with awkward content (strings with spaces).
+    assert_eq!(
+        eval("(condition-case e (car \"a b\") (error e))"),
+        "(wrong-type-argument listp \"a b\")"
+    );
+    // args-out-of-range DATA is (ARRAY START END).
+    assert_eq!(
+        eval("(condition-case e (substring \"abc\" 0 10) (error e))"),
+        "(args-out-of-range \"abc\" 0 10)"
+    );
+    // Plain `error` still carries a message string, and explicit `signal` data
+    // is preserved unchanged.
+    assert_eq!(
+        eval("(condition-case e (error \"plain %d\" 7) (error e))"),
+        "(error \"plain 7\")"
+    );
+    assert_eq!(
+        eval("(condition-case e (signal 'arith-error '(1 2)) (error e))"),
+        "(arith-error 1 2)"
+    );
+}
+
+#[test]
+fn map_el_generic_api() {
+    // map-elt dispatches on type; lists default to an `equal` key test.
+    assert_eq!(eval("(map-elt '((a . 1) (b . 2)) 'b)"), "2");
+    assert_eq!(eval("(map-elt (list (cons \"a\" 1)) \"a\")"), "1");
+    assert_eq!(eval("(map-elt '((a . 1)) 'z 'def)"), "def");
+    assert_eq!(eval("(map-elt \"abc\" 1)"), "98");
+    assert_eq!(eval("(map-elt [10 20 30] 1)"), "20");
+    // queries
+    assert_eq!(eval("(map-keys '((a . 1) (b . 2)))"), "(a b)");
+    assert_eq!(eval("(map-values '((a . 1) (b . 2)))"), "(1 2)");
+    assert_eq!(eval("(map-length [1 2 3])"), "3");
+    assert_eq!(eval("(map-empty-p nil)"), "t");
+    assert_eq!(eval("(map-contains-key '((a . 1)) 'a)"), "t");
+    assert_eq!(eval("(map-nested-elt '((a . ((b . 42)))) '(a b))"), "42");
+    // conversion / merge preserve first-seen order
+    assert_eq!(
+        eval("(map-merge 'list '((a . 1)) '((b . 2)))"),
+        "((a . 1) (b . 2))"
+    );
+    assert_eq!(
+        eval("(map-merge-with 'list #'+ '((a . 1) (b . 5)) '((b . 2) (c . 3)))"),
+        "((a . 1) (b . 7) (c . 3))"
+    );
+    // setf (map-elt …) grows an alist at the head and updates in place.
+    assert_eq!(
+        eval("(let ((m (list))) (setf (map-elt m 'x) 5) m)"),
+        "((x . 5))"
+    );
+    assert_eq!(
+        eval("(let ((m '((a . 1)))) (setf (map-elt m 'a) 9) m)"),
+        "((a . 9))"
+    );
+    assert_eq!(eval("(map-delete '((a . 1) (b . 2)) 'a)"), "((b . 2))");
+}
+
+#[test]
+fn seq_take_drop_while_and_iteration() {
+    // seq-take-while / seq-drop-while preserve the input sequence's type.
+    assert_eq!(eval("(seq-take-while #'cl-oddp '(1 3 2 5))"), "(1 3)");
+    assert_eq!(eval("(seq-take-while #'cl-oddp [1 3 2 5])"), "[1 3]");
+    assert_eq!(eval("(seq-drop-while #'cl-oddp '(1 3 2 5))"), "(2 5)");
+    assert_eq!(
+        eval("(seq-drop-while (lambda (c) (= c ?a)) \"aab\")"),
+        "\"b\""
+    );
+    assert_eq!(eval("(seq-take-while #'cl-oddp '(2 4))"), "nil");
+    // seq-contains returns the matching element (testfn gets (ELT E)).
+    assert_eq!(eval("(seq-contains '(1 2 3) 2)"), "2");
+    assert_eq!(eval("(seq-contains '(1 2 3) 9)"), "nil");
+    assert_eq!(
+        eval("(seq-contains '(1 2 3) 2 (lambda (a b) (= a (* 2 b))))"),
+        "1"
+    );
+    // seq-setq destructures into existing places; seq-doseq iterates any seq.
+    assert_eq!(
+        eval("(let (a b) (seq-setq (a &rest b) '(1 2 3)) (list a b))"),
+        "(1 (2 3))"
+    );
+    assert_eq!(
+        eval("(let (acc) (seq-doseq (x [1 2 3]) (push x acc)) acc)"),
+        "(3 2 1)"
+    );
+    assert_eq!(
+        eval("(let (acc) (seq-doseq (c \"ab\") (push c acc)) acc)"),
+        "(98 97)"
+    );
+}
+
+#[test]
+fn seq_take_drop_min_max_nonlist_sequences() {
+    // seq-take / seq-drop work on any sequence and preserve its type.
+    assert_eq!(eval("(seq-take [1 2 3 4] 2)"), "[1 2]");
+    assert_eq!(eval("(seq-take \"abcd\" 2)"), "\"ab\"");
+    assert_eq!(eval("(seq-take [1 2] 5)"), "[1 2]");
+    assert_eq!(eval("(seq-drop [1 2 3 4] 2)"), "[3 4]");
+    assert_eq!(eval("(seq-drop \"abcd\" 2)"), "\"cd\"");
+    // seq-mapn accepts mixed sequence types, returns a list.
+    assert_eq!(eval("(seq-mapn #'+ '(1 2) [10 20])"), "(11 22)");
+    // seq-min / seq-max over vectors and strings.
+    assert_eq!(eval("(seq-min [3 1 2])"), "1");
+    assert_eq!(eval("(seq-max \"abc\")"), "99");
+    // seq-position / seq-first / seq-rest / seq-sort / seq-group-by on vectors.
+    assert_eq!(eval("(seq-position [10 20 30] 20)"), "1");
+    assert_eq!(eval("(seq-first [10 20])"), "10");
+    assert_eq!(eval("(seq-first nil)"), "nil");
+    assert_eq!(eval("(seq-rest [10 20 30])"), "[20 30]"); // preserves type
+    assert_eq!(eval("(seq-sort #'< [3 1 2])"), "[1 2 3]"); // preserves type
+    assert_eq!(eval("(seq-sort #'< \"cab\")"), "\"abc\"");
+    assert_eq!(
+        eval("(seq-group-by #'cl-evenp [1 2 3 4])"),
+        "((nil 1 3) (t 2 4))"
+    );
+}
+
+#[test]
+fn cl_seq_filters_preserve_type() {
+    // cl-remove-if / -if-not / cl-delete-if / cl-remove-duplicates keep SEQ's type.
+    assert_eq!(eval("(cl-remove-if #'cl-evenp [1 2 3 4])"), "[1 3]");
+    assert_eq!(eval("(cl-remove-if-not #'cl-evenp [1 2 3 4])"), "[2 4]");
+    assert_eq!(eval("(cl-remove-if #'cl-evenp '(1 2 3 4))"), "(1 3)");
+    assert_eq!(
+        eval("(cl-remove-if (lambda (c) (= c ?a)) \"banana\")"),
+        "\"bnn\""
+    );
+    assert_eq!(eval("(cl-delete-if #'cl-evenp [1 2 3 4])"), "[1 3]");
+    assert_eq!(eval("(cl-delete-if-not #'cl-evenp '(1 2 3 4))"), "(2 4)");
+    assert_eq!(eval("(cl-remove-duplicates [1 2 1 3])"), "[2 1 3]");
+    assert_eq!(
+        eval("(cl-remove-duplicates [1 2 1 3] :from-end t)"),
+        "[1 2 3]"
+    );
+    // :count still honored, type preserved.
+    assert_eq!(
+        eval("(cl-remove-if #'cl-evenp [1 2 3 4 5 6] :count 1)"),
+        "[1 3 4 5 6]"
+    );
+}
+
+#[test]
 fn emacs_parity_math_and_introspection() {
     // expt: integer power, but float for negative or fractional exponents.
     assert_eq!(eval("(expt 2 10)"), "1024");
@@ -1396,6 +1647,297 @@ fn emacs_parity_cl_count_if_and_string_fill() {
         eval("(string-fill \"one two three\" 100)"),
         "\"one two three\""
     );
+    // string-limit: first/last N chars, whole string when short enough.
+    assert_eq!(eval("(string-limit \"abcdef\" 3)"), "\"abc\"");
+    assert_eq!(eval("(string-limit \"abcdef\" 3 t)"), "\"def\"");
+    assert_eq!(eval("(string-limit \"abcdef\" 10)"), "\"abcdef\"");
+    assert_eq!(eval("(string-limit \"abcdef\" 0)"), "\"\"");
+}
+
+#[test]
+fn cl_letf_function_cell_and_hash_empty() {
+    // cl-letf / cl-letf* can temporarily rebind a function cell and restore it.
+    assert_eq!(
+        eval("(cl-letf (((symbol-function 'foo) (lambda () 1))) (foo))"),
+        "1"
+    );
+    assert_eq!(
+        eval("(cl-letf* (((symbol-function 'foo) (lambda () 42))) (foo))"),
+        "42"
+    );
+    assert_eq!(
+        eval("(progn (defun bar () 1) (cl-letf (((symbol-function 'bar) (lambda () 2))) (bar)) (bar))"),
+        "1"
+    );
+    // hash-table-empty-p
+    assert_eq!(eval("(hash-table-empty-p (make-hash-table))"), "t");
+    assert_eq!(
+        eval("(let ((h (make-hash-table))) (puthash 'k 1 h) (hash-table-empty-p h))"),
+        "nil"
+    );
+}
+
+#[test]
+fn plist_optional_predicate() {
+    // plist-get/member/put accept the Emacs-29 optional PREDICATE (default eq).
+    assert_eq!(eval("(plist-get '(\"a\" 1 \"b\" 2) \"b\" #'equal)"), "2");
+    assert_eq!(eval("(plist-member '(\"a\" 1) \"a\" #'equal)"), "(\"a\" 1)");
+    assert_eq!(eval("(plist-put '(\"a\" 1) \"a\" 9 #'equal)"), "(\"a\" 9)");
+    // default behavior unchanged
+    assert_eq!(eval("(plist-get '(:a 1 :b 2) :b)"), "2");
+    assert_eq!(eval("(plist-put (list :a 1) :b 2)"), "(:a 1 :b 2)");
+}
+
+#[test]
+fn cl_loop_vconcat_concat_and_string_replace_empty() {
+    // cl-loop vconcat/concat accumulation clauses (+ `into`).
+    assert_eq!(
+        eval("(cl-loop for i below 3 vconcat (vector i))"),
+        "[0 1 2]"
+    );
+    assert_eq!(
+        eval("(cl-loop for s in '(\"a\" \"b\" \"c\") concat s)"),
+        "\"abc\""
+    );
+    assert_eq!(
+        eval("(cl-loop for s in '(\"a\" \"b\") concat s into r finally return r)"),
+        "\"ab\""
+    );
+    assert_eq!(
+        eval("(cl-loop for i to 2 vconcat (vector i i))"),
+        "[0 0 1 1 2 2]"
+    );
+    // string-replace signals on an empty FROMSTRING (matches Emacs).
+    assert!(eval_str("(string-replace \"\" \"x\" \"ab\")").is_err());
+    assert_eq!(
+        eval("(string-replace \"a\" \"X\" \"banana\")"),
+        "\"bXnXnX\""
+    );
+}
+
+#[test]
+fn time_functions_utc() {
+    // Deterministic UTC formatting (ZONE = t) against known epochs.
+    assert_eq!(
+        eval("(format-time-string \"%Y-%m-%d %H:%M:%S\" 0 t)"),
+        "\"1970-01-01 00:00:00\""
+    );
+    assert_eq!(
+        eval("(format-time-string \"%A %B %e, %Y\" 0 t)"),
+        "\"Thursday January  1, 1970\""
+    );
+    assert_eq!(
+        eval("(format-time-string \"%F %T %z\" 1700000000 t)"),
+        "\"2023-11-14 22:13:20 +0000\""
+    );
+    assert_eq!(
+        eval("(format-time-string \"%I:%M %p\" 0 t)"),
+        "\"12:00 AM\""
+    );
+    assert_eq!(
+        eval("(format-time-string \"%j (%a)\" 0 t)"),
+        "\"001 (Thu)\""
+    );
+    assert_eq!(
+        eval("(current-time-string 0 t)"),
+        "\"Thu Jan  1 00:00:00 1970\""
+    );
+    assert_eq!(eval("(decode-time 0 t)"), "(0 0 0 1 1 1970 4 nil 0)");
+    assert_eq!(eval("(float-time 5)"), "5.0");
+    // fixed numeric ZONE offset (seconds east of UTC)
+    assert_eq!(
+        eval("(format-time-string \"%H:%M %z\" 0 3600)"),
+        "\"01:00 +0100\""
+    );
+    // current-time and float-time agree on "now" (within a couple seconds).
+    assert_eq!(
+        eval("(< (abs (- (float-time (current-time)) (float-time))) 5)"),
+        "t"
+    );
+    // encode-time: inverse of decode, both calling conventions, UTC.
+    assert_eq!(
+        eval("(encode-time (list 0 0 0 1 1 1970 nil nil t))"),
+        "(0 0)"
+    );
+    assert_eq!(
+        eval("(float-time (encode-time (list 0 0 0 1 1 2024 nil nil t)))"),
+        "1704067200.0"
+    );
+    assert_eq!(
+        eval("(format-time-string \"%F %T\" (encode-time 0 0 12 1 1 2000 t) t)"),
+        "\"2000-01-01 12:00:00\""
+    );
+    // fixed-offset components: +0100 stated time is one hour earlier in UTC.
+    assert_eq!(
+        eval("(format-time-string \"%F\" (encode-time (list 0 0 0 1 1 1970 nil nil 3600)) t)"),
+        "\"1969-12-31\""
+    );
+}
+
+#[test]
+fn safe_length_and_struct_copier() {
+    // safe-length counts cons cells, stopping at an improper tail.
+    assert_eq!(eval("(safe-length '(1 2 . 3))"), "2");
+    assert_eq!(eval("(safe-length '(1 2 3))"), "3");
+    assert_eq!(eval("(safe-length nil)"), "0");
+    assert_eq!(eval("(safe-length 5)"), "0");
+    // cl-defstruct (:copier NAME) and (:copier nil).
+    assert_eq!(
+        eval("(progn (cl-defstruct (q (:constructor mq) (:copier cq)) v) (q-v (cq (mq :v 7))))"),
+        "7"
+    );
+    assert_eq!(
+        eval("(progn (cl-defstruct (r (:copier nil)) v) (fboundp 'copy-r))"),
+        "nil"
+    );
+    assert_eq!(
+        eval("(progn (cl-defstruct s2 v) (s2-v (copy-s2 (make-s2 :v 4))))"),
+        "4"
+    );
+}
+
+#[test]
+fn cl_defstruct_include_and_predicate() {
+    // :include inherits parent slots (prepended) and accessors line up.
+    assert_eq!(
+        eval("(progn (cl-defstruct animal name) (cl-defstruct (dog (:include animal)) breed) (animal-name (make-dog :name \"Rex\" :breed \"Lab\")))"),
+        "\"Rex\""
+    );
+    // Subtype satisfies the parent predicate; a parent is not the subtype.
+    assert_eq!(
+        eval("(progn (cl-defstruct an3 name) (cl-defstruct (cat (:include an3)) c) (list (an3-p (make-cat)) (cat-p (make-an3))))"),
+        "(t nil)"
+    );
+    // Multi-level inheritance: predicates and inherited slots both work.
+    assert_eq!(
+        eval("(progn (cl-defstruct an5 n) (cl-defstruct (b5 (:include an5)) x) (cl-defstruct (c5 (:include b5)) y) (list (an5-p (make-c5)) (b5-p (make-c5)) (c5-n (make-c5 :n 1 :x 2 :y 3))))"),
+        "(t t 1)"
+    );
+    // :predicate renames the predicate.
+    assert_eq!(
+        eval("(progn (cl-defstruct (p3 (:predicate is-p3)) x) (is-p3 (make-p3)))"),
+        "t"
+    );
+}
+
+#[test]
+fn cl_defstruct_boa_constructor() {
+    // BOA (positional) constructor: arg order = ARGLIST, not slot order.
+    assert_eq!(
+        eval("(progn (cl-defstruct (v5 (:constructor nv5 (y x))) x y) (list (v5-x (nv5 100 200)) (v5-y (nv5 100 200))))"),
+        "(200 100)"
+    );
+    // &optional, and slots absent from ARGLIST take their default.
+    assert_eq!(
+        eval("(progn (cl-defstruct (v6 (:constructor nv6 (a))) (x 9) a) (list (v6-x (nv6 5)) (v6-a (nv6 5))))"),
+        "(9 5)"
+    );
+    // &rest, plus a BOA and a keyword constructor coexisting.
+    assert_eq!(
+        eval("(progn (cl-defstruct (v7 (:constructor nv7 (&rest xs)) (:constructor mk-v7)) xs) (list (v7-xs (nv7 1 2 3)) (v7-xs (mk-v7 :xs '(9)))))"),
+        "((1 2 3) (9))"
+    );
+    // (:constructor nil) suppresses the default; another constructor still works.
+    assert_eq!(
+        eval("(progn (cl-defstruct (v9 (:constructor nil) (:constructor nv9 (a))) a) (list (fboundp 'make-v9) (v9-a (nv9 7))))"),
+        "(nil 7)"
+    );
+}
+
+#[test]
+fn cl_defun_and_destructuring_keys() {
+    // cl-defun with &key (defaults), &optional defaults, &rest.
+    assert_eq!(
+        eval("(progn (cl-defun f2 (a &key (b 10)) (list a b)) (f2 1 :b 2))"),
+        "(1 2)"
+    );
+    assert_eq!(
+        eval("(progn (cl-defun f3 (a &key (b 10)) (list a b)) (f3 1))"),
+        "(1 10)"
+    );
+    assert_eq!(eval("(progn (cl-defun f4 (&optional (x 5)) x) (f4))"), "5");
+    assert_eq!(
+        eval("(progn (cl-defun f7 (a &optional (b (* a 2))) (list a b)) (f7 5))"),
+        "(5 10)"
+    );
+    assert_eq!(
+        eval("(progn (cl-defun f5 (a &rest r) (list a r)) (f5 1 2 3))"),
+        "(1 (2 3))"
+    );
+    // cl-destructuring-bind with real &optional/&key defaults.
+    assert_eq!(
+        eval("(cl-destructuring-bind (a &optional (b 9)) '(1) (list a b))"),
+        "(1 9)"
+    );
+    assert_eq!(
+        eval("(cl-destructuring-bind (a &key (b 9) c) '(1 :c 3) (list a b c))"),
+        "(1 9 3)"
+    );
+    // multiple values are lists.
+    assert_eq!(
+        eval("(cl-multiple-value-bind (a b) (list 1 2) (+ a b))"),
+        "3"
+    );
+    assert_eq!(eval("(cl-values 1 2 3)"), "(1 2 3)");
+}
+
+#[test]
+fn assoc_delete_all_and_completion() {
+    // assoc-delete-all removes every matching entry (default `equal` test).
+    assert_eq!(
+        eval("(assoc-delete-all \"a\" (list (cons \"a\" 1) (cons \"b\" 2)))"),
+        "((\"b\" . 2))"
+    );
+    assert_eq!(
+        eval("(assoc-delete-all 2 (list (cons 1 'x) (cons 2 'y) (cons 2 'z)))"),
+        "((1 . x))"
+    );
+    // completion API over lists and alists.
+    assert_eq!(eval("(try-completion \"foo\" '(\"foo\"))"), "t");
+    assert_eq!(
+        eval("(try-completion \"fo\" '(\"foo\" \"foobar\"))"),
+        "\"foo\""
+    );
+    assert_eq!(eval("(try-completion \"x\" '(\"foo\"))"), "nil");
+    assert_eq!(
+        eval("(try-completion \"fo\" '((\"foo\" . 1) (\"fox\" . 2)))"),
+        "\"fo\""
+    );
+    assert_eq!(
+        eval("(all-completions \"fo\" '(\"foo\" \"foobar\" \"baz\"))"),
+        "(\"foo\" \"foobar\")"
+    );
+    assert_eq!(eval("(test-completion \"foo\" '(\"foo\" \"bar\"))"), "t");
+    assert_eq!(eval("(test-completion \"fo\" '(\"foo\"))"), "nil");
+    // predicate filters candidates.
+    assert_eq!(
+        eval("(all-completions \"fo\" '(\"foo\" \"fox\") (lambda (e) (string= e \"foo\")))"),
+        "(\"foo\")"
+    );
+}
+
+#[test]
+fn with_output_to_string_captures() {
+    // princ / prin1 / terpri output is captured into the returned string.
+    assert_eq!(
+        eval("(with-output-to-string (princ \"hi\") (princ 42))"),
+        "\"hi42\""
+    );
+    assert_eq!(
+        eval("(with-output-to-string (prin1 '(1 2)) (terpri) (princ \"x\"))"),
+        "\"(1 2)\nx\""
+    );
+    assert_eq!(eval("(with-output-to-string)"), "\"\"");
+    // Nested captures are independent (inner output doesn't reach the outer).
+    assert_eq!(
+        eval("(with-output-to-string (princ \"a\") (with-output-to-string (princ \"in\")) (princ \"b\"))"),
+        "\"ab\""
+    );
+    // An error inside still pops the capture (no leak): the next capture is clean.
+    assert_eq!(
+        eval("(progn (ignore-errors (with-output-to-string (princ \"x\") (error \"boom\"))) (with-output-to-string (princ \"ok\")))"),
+        "\"ok\""
+    );
 }
 
 #[test]
@@ -1800,14 +2342,26 @@ fn emacs_parity_rx_macro() {
     assert_eq!(eval("(rx (+ digit))"), "\"[[:digit:]]+\"");
     assert_eq!(eval("(rx bol \"x\" eol)"), "\"^x$\"");
     assert_eq!(eval("(rx (any \"a-z\"))"), "\"[a-z]\"");
-    assert_eq!(eval("(rx (or \"cat\" \"dog\"))"), "\"\\\\(?:cat\\\\|dog\\\\)\"");
+    assert_eq!(
+        eval("(rx (or \"cat\" \"dog\"))"),
+        "\"\\\\(?:cat\\\\|dog\\\\)\""
+    );
     assert_eq!(eval("(rx (or \"a\" \"b\" \"c\"))"), "\"[abc]\"");
     assert_eq!(eval("(rx (group (+ alpha)))"), "\"\\\\([[:alpha:]]+\\\\)\"");
     assert_eq!(eval("(rx (= 3 digit))"), "\"[[:digit:]]\\\\{3\\\\}\"");
     assert_eq!(eval("(rx (not (any \"0-9\")))"), "\"[^0-9]\"");
     assert_eq!(eval("(rx (** 2 4 \"a\"))"), "\"a\\\\{2,4\\\\}\"");
     // rx as a pcase pattern.
-    assert_eq!(eval("(pcase \"hello\" ((rx \"he\" (+ alpha)) 'match))"), "match");
-    assert_eq!(eval("(pcase \"123\" ((rx bos (+ digit) eos) 'allnum) (_ 'no))"), "allnum");
-    assert_eq!(eval("(pcase \"a1b\" ((rx bos (+ digit) eos) 'allnum) (_ 'no))"), "no");
+    assert_eq!(
+        eval("(pcase \"hello\" ((rx \"he\" (+ alpha)) 'match))"),
+        "match"
+    );
+    assert_eq!(
+        eval("(pcase \"123\" ((rx bos (+ digit) eos) 'allnum) (_ 'no))"),
+        "allnum"
+    );
+    assert_eq!(
+        eval("(pcase \"a1b\" ((rx bos (+ digit) eos) 'allnum) (_ 'no))"),
+        "no"
+    );
 }

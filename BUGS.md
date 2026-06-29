@@ -260,12 +260,17 @@ parity bugs (they'd need `(require 'cl-lib)`).
 - `(* 2 "x")` → Emacs signals, elisprs `0.0`; `(+ 1 'sym)` → elisprs `1.0`
 - Most dangerous: arithmetic on bad data never errors and returns silent wrong numbers.
 
-### R2-B. `wrong-type-argument` error data is one string, not separate elements
-- `(condition-case e (car 5) (error e))` → Emacs `(wrong-type-argument listp 5)`,
-  elisprs `(wrong-type-argument "listp 5")`
-- Predicate+value collapsed into a single string; breaks handlers reading `(cadr e)`/`(caddr e)`.
+### R2-B. ✅ FIXED — `wrong-type-argument` error data is one string, not separate elements
+(host.rs `make_error_object`: for `wrong-type-argument`/`args-out-of-range` it re-reads the rendered
+message into separate value elements via `read_all_forms`+reader — `(car 5)` → `(wrong-type-argument
+listp 5)`, `(caddr e)` → `5`. Works for awkward values (strings with spaces re-read as one form).
+Fixed `substring` to render its array readably (`h.print` not `as_str_cow`).
+Known residual: the host-less coercion helpers `as_num`/`as_int`/`as_string` still render their bad
+value via `as_str_cow`, so e.g. `(aref "abc" 'x)` yields `(wrong-type-argument numberp (obj:N))`
+instead of `(… fixnump x)`; fixing needs threading `h` into those helpers — separate sweep.)
 
-### R2-C. `user-error` signals the `error` symbol, not `user-error`
+### R2-C. ✅ FIXED — `user-error` signals the `error` symbol, not `user-error`
+(now signals the `user-error` symbol; verified `(condition-case e (user-error "nope") (error e))` → `(user-error "nope")`)
 - `(condition-case e (user-error "nope") (error e))` → Emacs `(user-error "nope")`,
   elisprs `(error "nope")` — the two conditions can't be distinguished.
 
@@ -276,11 +281,13 @@ parity bugs (they'd need `(require 'cl-lib)`).
 
 ## Macros / special forms
 
-### R2-E. `cl-incf` / `cl-decf` only accept a bare symbol, not a generalized place
+### R2-E. ✅ FIXED — `cl-incf` / `cl-decf` only accept a bare symbol, not a generalized place
+(verified `(cl-incf (car l))`, `(cl-incf (aref v 1) 10)`, `(cl-incf (gethash …))` all work via setf)
 - `(let ((l (list 1 2))) (cl-incf (car l)) l)` → Emacs `(2 2)`, elisprs `error: setq: expected a symbol`
 - `setf` itself works on places, so the cl-incf/decf macros just don't expand through it.
 
-### R2-F. `setq-default` is broken
+### R2-F. ✅ FIXED — `setq-default` is broken
+(prelude: added `set-default` + `setq-default` macro; no buffer-local model so both are global sets)
 - `(setq-default x 5)` → Emacs `5`, elisprs `error: Symbol's value as variable is void: x`
 
 ### R2-G. ✅ FIXED — `pcase` backquote patterns
@@ -296,10 +303,12 @@ parity bugs (they'd need `(require 'cl-lib)`).
 - `(mapcar #'1+ [1 2 3])` → Emacs `(2 3 4)`, elisprs `error: mapcar: not a list`
 - `(mapcar #'1+ "abc")` → Emacs `(98 99 100)`, elisprs errors. (Broader than #22.)
 
-### R2-I. `seq-empty-p` wrong on the empty string
+### R2-I. ✅ FIXED — `seq-empty-p` wrong on the empty string
+(prelude: `(= 0 (length l))` so vectors/strings count too)
 - `(seq-empty-p "")` → Emacs `t`, elisprs `nil`
 
-### R2-J. `string-blank-p` returns `t` instead of the match position
+### R2-J. ✅ FIXED — `string-blank-p` returns `t` instead of the match position
+(prelude: `(string-match-p "\\`[ \t\n\r]*\\'" s)`)
 - `(string-blank-p "  ")` → Emacs `0`, elisprs `t`
 
 ### R2-K. `string-pad` 4-arg form (PADDING + START) unsupported
@@ -355,14 +364,19 @@ literal letter, and multi-char numeric escapes aren't consumed.
 - `src/reader.rs` `unescape` (~401-410), shared by string (~169) and char (~229) paths.
   Round-1 #14 covered only `\C-`/`\M-` modifiers — this is the rest.
 
-### R3-B. Symbol read-escape (`\`) unsupported
+### R3-B. ✅ FIXED — Symbol read-escape (`\`) unsupported
+(reader.rs `read_atom`: `\` escapes the next char into the symbol name and forces a symbol — never a number/nil/t)
 - `'foo\ bar` → Emacs symbol `foo bar`, elisprs `error: …void: bar`
 
-### R3-C. Symbol printing doesn't escape; empty symbol mis-prints
+### R3-C. ✅ FIXED — Symbol printing doesn't escape; empty symbol mis-prints
+(host.rs `print_symbol_readable`: prin1 escapes special chars/control/space, leading `?`/`.`/number;
+empty name => `##`; princ stays raw. Round-trips with R3-B.)
 - `(prin1-to-string (intern "a b"))` → Emacs `"a\\ b"`, elisprs `"a b"` (round-trips wrong)
 - `(prin1-to-string (intern ""))` → Emacs `"##"`, elisprs `""`
 
-### R3-D. `print-length` / `print-level` ignored
+### R3-D. ✅ FIXED — `print-length` / `print-level` ignored
+(prelude `defvar`s them special; host.rs printer threads depth + reads the limits via `print_limit`,
+truncating lists/vectors with `...` for length and over-deep nesting for level)
 - `(let ((print-length 3)) (prin1-to-string '(1 2 3 4 5)))` → Emacs `"(1 2 3 ...)"`, elisprs `"(1 2 3 4 5)"`
 - `(let ((print-level 2)) (prin1-to-string '(1 (2 (3)))))` → Emacs `"(1 (2 ...))"`, elisprs full
 
@@ -370,17 +384,21 @@ literal letter, and multi-char numeric escapes aren't consumed.
 - `(format "%x" -1)` → Emacs `"-1"`, elisprs `"ffffffffffffffff"`
 - `(format "%o" -8)` → Emacs `"-10"`, elisprs `"1777777777777777777770"`
 
-### R3-F. `format` `#` flag unsupported (returned literally)
+### R3-F. ✅ FIXED — `format` `#` flag unsupported (returned literally)
+(verified `(format "%#x" 255)` → `"0xff"`, `(format "%#o" 8)` → `"010"`)
 - `(format "%#x" 255)` → Emacs `"0xff"`, elisprs `"%#x"`
 
-### R3-G. `substring` doesn't bounds-check END
+### R3-G. ✅ FIXED — `substring` doesn't bounds-check END
+(builtins.rs: adjust negatives, then signal `args-out-of-range` outside `[0,len]`)
 - `(substring "abc" 1 10)` → Emacs signals `args-out-of-range ("abc" 1 10)`, elisprs `"bc"`
   (round 1 checked negative indices, not over-range)
 
-### R3-H. `nth` on a vector returns nil instead of signaling
+### R3-H. ✅ FIXED — `nth` on a vector returns nil instead of signaling
+(builtins.rs: `nth` now walks the cons spine — improper lists work, non-cons signals listp)
 - `(nth 1 [1 2 3])` → Emacs signals `wrong-type-argument listp [1 2 3]`, elisprs `nil`
 
-### R3-I. `last` on an improper (dotted) list errors instead of returning
+### R3-I. ✅ FIXED — `last` on an improper (dotted) list errors instead of returning
+(prelude: walk while `(consp (cdr l))` so the dotted tail stops the loop)
 - `(last '(1 2 . 3))` → Emacs `(2 . 3)`, elisprs `error: wrong-type-argument: listp 3`
 
 ### R3-J. `char-equal` ignores `case-fold-search`
@@ -451,17 +469,20 @@ Fourth pass against the current binary. Ground truth = bare `emacs -Q --batch`;
 - `(seq-let (a b) (list 1 2 3) (list a b))` → Emacs `(1 2)`, elisprs `error: …void: b`
   (also the vector-pattern form). Destructuring binder not implemented.
 
-### R4-E. `condition-case` ignores the `:success` handler
+### R4-E. ✅ FIXED — `condition-case` ignores the `:success` handler
+(host.rs `intrinsic_condition_case` Ok-branch: run a `:success` handler with VAR bound to the value)
 - `(condition-case x 5 (:success (* x 2)))` → Emacs `10`, elisprs `5`
 - The `:success` clause (run when BODY returns normally, VAR bound to the result) is dropped.
   `src/compiler.rs:257` / `src/host.rs:1126`.
 
-### R4-F. `butlast` with negative N appends a spurious `nil`
+### R4-F. ✅ FIXED — `butlast` with negative N appends a spurious `nil`
+(prelude: clamp `keep` to `(min (length lst) (- (length lst) n))`)
 - `(butlast '(1 2 3) -1)` → Emacs `(1 2 3)`, elisprs `(1 2 3 nil)`
 - `src/prelude.rs:283` computes `keep = len - n` = 4 for n=-1 and walks `(nth 3 …)`→nil.
   Emacs returns a full copy for any N ≤ 0. (N=0 happens to work.)
 
-### R4-G. Printer doesn't abbreviate `quote` / `function`
+### R4-G. ✅ FIXED — Printer doesn't abbreviate `quote` / `function`
+(host.rs `print_list`: two-element `(quote X)`/`(function X)`/`` (` X) `` print as `'X`/`#'X`/`` `X ``)
 - `(prin1-to-string '(quote a))` → Emacs `"'a"`, elisprs `"(quote a)"`
 - `'(function f)` → Emacs `"#'f"`, elisprs `"(function f)"`; same under `princ`/`format "%S"`.
   `print-quoted` defaults non-nil; two-element quote/function/backquote/unquote lists should

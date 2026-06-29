@@ -46,8 +46,10 @@ pub const PRELUDE: &str = r#"
 (defun nthcdr (n l) (while (and (> n 0) l) (setq l (cdr l)) (setq n (1- n))) l)
 (defun last (l &optional n)
   ;; The last N cons cells of L (default 1): (last '(1 2 3) 2) => (2 3).
+  ;; Guard on consp so an improper tail stops the walk instead of erroring:
+  ;; (last '(1 2 . 3)) => (2 . 3).
   (if (or (null n) (= n 1))
-      (progn (while (cdr l) (setq l (cdr l))) l)
+      (progn (while (consp (cdr l)) (setq l (cdr l))) l)
     (nthcdr (max 0 (- (length l) n)) l)))
 (defun make-list (n x) (let ((r nil)) (while (> n 0) (setq r (cons x r)) (setq n (1- n))) r))
 (defun number-sequence (from to &optional inc)
@@ -58,7 +60,10 @@ pub const PRELUDE: &str = r#"
       (while (<= from to) (setq r (cons from r)) (setq from (+ from inc))))
     (reverse r)))
 (defun elt (seq n) (if (listp seq) (nth n seq) (aref seq n)))
-(defun safe-length (l) (length l))
+(defun safe-length (l)
+  ;; Count cons cells in the spine, stopping at any non-cons tail (so improper
+  ;; lists don't error): (safe-length '(1 2 . 3)) => 2.
+  (let ((n 0)) (while (consp l) (setq n (1+ n)) (setq l (cdr l))) n))
 (defun length= (seq n) (= (length seq) n))
 (defun length< (seq n) (< (length seq) n))
 (defun length> (seq n) (> (length seq) n))
@@ -95,10 +100,12 @@ pub const PRELUDE: &str = r#"
   ;; Value associated with K in alist AL (DEFAULT if absent); TESTFN overrides eq.
   (let ((p (if testfn (assoc k al testfn) (assq k al))))
     (if p (cdr p) default)))
-(defun plist-get (pl k)
-  (let ((r nil)) (while pl (if (eq (car pl) k) (progn (setq r (cadr pl)) (setq pl nil)) (setq pl (cddr pl)))) r))
-(defun plist-member (pl k)
-  (let ((r nil)) (while pl (if (eq (car pl) k) (progn (setq r pl) (setq pl nil)) (setq pl (cddr pl)))) r))
+(defun plist-get (pl k &optional predicate)
+  (let ((test (or predicate #'eq)) (r nil))
+    (while pl (if (funcall test (car pl) k) (progn (setq r (cadr pl)) (setq pl nil)) (setq pl (cddr pl)))) r))
+(defun plist-member (pl k &optional predicate)
+  (let ((test (or predicate #'eq)) (r nil))
+    (while pl (if (funcall test (car pl) k) (progn (setq r pl) (setq pl nil)) (setq pl (cddr pl)))) r))
 
 ;;; ---- higher-order / sequence ----
 ;; seq-* accept any sequence; coerce list/vector/string to a list to iterate.
@@ -115,7 +122,7 @@ pub const PRELUDE: &str = r#"
 (defun seq-some (pred l) (setq l (append l nil)) (let ((r nil)) (while (and l (not r)) (setq r (funcall pred (car l))) (setq l (cdr l))) r))
 (defun seq-every-p (pred l) (setq l (append l nil)) (let ((r t)) (while (and l r) (setq r (funcall pred (car l))) (setq l (cdr l))) r))
 (defun seq-count (pred l) (setq l (append l nil)) (let ((n 0)) (while l (if (funcall pred (car l)) (setq n (1+ n))) (setq l (cdr l))) n))
-(defun seq-empty-p (l) (null l))
+(defun seq-empty-p (l) (= 0 (length l)))
 (defun seq-length (l) (length l))
 (defun seq-elt (l n) (elt l n))
 (defun seq-do (f l) (mapc f l))
@@ -180,9 +187,11 @@ pub const PRELUDE: &str = r#"
           (setq n (1+ n))
         (setq r (cons (car lst) r)))
       (setq lst (cdr lst)))
-    (nreverse r)))
+    (cl--like (nreverse r) seq)))
 (defun cl-remove-if-not (pred seq &rest keys)
   (apply 'cl-remove-if (lambda (x) (not (funcall pred x))) seq keys))
+(defun cl-delete-if (pred seq &rest keys) (apply (function cl-remove-if) pred seq keys))
+(defun cl-delete-if-not (pred seq &rest keys) (apply (function cl-remove-if-not) pred seq keys))
 (defun cl-find-if (pred l) (seq-find pred l))
 (defun cl-find-if-not (pred l) (seq-find (lambda (x) (not (funcall pred x))) l))
 (defun cl-sort (seq pred &rest keys)
@@ -260,8 +269,20 @@ pub const PRELUDE: &str = r#"
 ;;; ---- misc functions ----
 (defun ignore (&rest _args) nil)
 (defun always (&rest _args) t)
-;; No buffer-local bindings in this model, so default-value == symbol-value.
+;; No buffer-local bindings in this model, so default-value == symbol-value and
+;; set-default / setq-default are just the global setters.
 (defun default-value (sym) (symbol-value sym))
+(defun set-default (sym val) (set sym val))
+(defmacro setq-default (&rest args)
+  (let ((forms nil))
+    (while args
+      (setq forms (cons (list 'set-default (list 'quote (car args)) (cadr args)) forms))
+      (setq args (cddr args)))
+    (cons 'progn (nreverse forms))))
+;; Printer limits: special so `(let ((print-length N)) …)` binds them dynamically
+;; where the Rust printer can read them.
+(defvar print-length nil)
+(defvar print-level nil)
 (defvar gensym-counter 0)
 (defun gensym (&optional prefix)
   (let ((n gensym-counter))
@@ -330,6 +351,15 @@ pub const PRELUDE: &str = r#"
 (defmacro ignore-error (condition &rest body) `(condition-case nil (progn ,@body) (,condition nil)))
 (defmacro with-suppressed-warnings (_warnings &rest body) `(progn ,@body))
 (defmacro with-demoted-errors (fmt &rest body) `(condition-case --err-- (progn ,@body) (error (message ,fmt --err--) nil)))
+;; with-output-to-string: capture princ/prin1/print/terpri output into a string.
+;; (No buffer model — standard-output redirection isn't supported; this captures
+;; the standard print builtins via an output-capture stack in the host.)
+(defmacro with-output-to-string (&rest body)
+  `(let ((--wots-- nil))
+     (--push-output-capture--)
+     (unwind-protect (progn ,@body)
+       (setq --wots-- (--pop-output-capture--)))
+     --wots--))
 
 ;; Evaluate BODY with the regexp match data preserved: any `string-match` inside
 ;; BODY won't clobber the caller's match state.
@@ -459,7 +489,7 @@ pub const PRELUDE: &str = r#"
     (if (string-match re s) (substring s 0 (match-beginning 0)) s)))
 (defun string-trim (s &optional trim-left trim-right)
   (string-trim-right (string-trim-left s trim-left) trim-right))
-(defun string-blank-p (s) (string-empty-p (string-trim s)))
+(defun string-blank-p (s) (string-match-p "\\`[ \t\n\r]*\\'" s))
 (defun string-clean-whitespace (s)
   ;; Collapse internal whitespace runs to a single space and trim the ends.
   (string-trim (replace-regexp-in-string "[ \t\n\r]+" " " s)))
@@ -472,7 +502,8 @@ pub const PRELUDE: &str = r#"
 (defun butlast (lst &optional n)
   ;; All but the last N elements of LST (default 1): (butlast '(1 2 3) 2) => (1).
   (setq n (or n 1))
-  (let ((keep (- (length lst) n)) (r nil) (i 0))
+  ;; Negative or zero N keeps the whole list; clamp so we never index past the end.
+  (let ((keep (min (length lst) (- (length lst) n))) (r nil) (i 0))
     (while (< i keep) (setq r (cons (nth i lst) r)) (setq i (1+ i)))
     (reverse r)))
 (defun nbutlast (lst &optional n) (butlast lst n))
@@ -503,6 +534,46 @@ pub const PRELUDE: &str = r#"
       (unless (and (consp (car alist)) (eq (car (car alist)) key)) (setq out (cons (car alist) out)))
       (setq alist (cdr alist)))
     (reverse out)))
+(defun assoc-delete-all (key alist &optional test)
+  ;; Like assq-delete-all but compares with TEST (default `equal').
+  (let ((tf (or test #'equal)) (out nil))
+    (while alist
+      (unless (and (consp (car alist)) (funcall tf (car (car alist)) key))
+        (setq out (cons (car alist) out)))
+      (setq alist (cdr alist)))
+    (reverse out)))
+;; Minimal completion API over a list (plain or alist), or a hash-table's keys.
+;; (Function collections, obarrays, and completion-ignore-case are unsupported.)
+(defun completion--str (e)
+  (let ((c (if (consp e) (car e) e)))
+    (cond ((symbolp c) (symbol-name c)) ((stringp c) c) (t (format "%s" c)))))
+(defun completion--common-prefix (a b)
+  (let ((n (min (length a) (length b))) (i 0))
+    (while (and (< i n) (eq (aref a i) (aref b i))) (setq i (1+ i)))
+    (substring a 0 i)))
+(defun completion--elements (collection)
+  (if (hash-table-p collection) (hash-table-keys collection) collection))
+(defun all-completions (string collection &optional predicate)
+  (let ((out nil))
+    (dolist (e (completion--elements collection))
+      (let ((c (completion--str e)))
+        (when (and (string-prefix-p string c) (or (null predicate) (funcall predicate e)))
+          (setq out (cons c out)))))
+    (nreverse out)))
+(defun try-completion (string collection &optional predicate)
+  (let ((cands (all-completions string collection predicate)))
+    (cond
+     ((null cands) nil)
+     ((and (null (cdr cands)) (string= (car cands) string)) t)
+     (t (let ((common (car cands)))
+          (dolist (c (cdr cands)) (setq common (completion--common-prefix common c)))
+          common)))))
+(defun test-completion (string collection &optional predicate)
+  (let ((res nil))
+    (dolist (e (completion--elements collection))
+      (when (and (string= (completion--str e) string) (or (null predicate) (funcall predicate e)))
+        (setq res t)))
+    res))
 (defun nreverse (lst) (reverse lst))
 
 ;;; ---- sort (stable merge sort, lists) ----
@@ -522,8 +593,9 @@ pub const PRELUDE: &str = r#"
       (std--merge (sort (car h) pred) (sort (cdr h) pred) pred))))
 
 ;;; ---- seq.el (list-oriented) ----
-(defun seq-take (seq n) (take n seq))
-(defun seq-drop (seq n) (nthcdr n seq))
+;; seq-generic: coerce to a list, then restore SEQ's own type (vector/string).
+(defun seq-take (seq n) (seq-into (take n (append seq nil)) (seq--type-of seq)))
+(defun seq-drop (seq n) (seq-into (nthcdr n (append seq nil)) (seq--type-of seq)))
 (defun seq-subseq (seq start &optional end)
   ;; Sequence-generic, returning SEQ's type; START/END may be negative.
   (let* ((lst (append seq nil)) (len (length lst))
@@ -534,12 +606,13 @@ pub const PRELUDE: &str = r#"
           ((vectorp seq) (vconcat sub))
           (t sub))))
 (defun seq-uniq (seq) (delete-dups (append seq nil)))
-(defun seq-min (seq) (apply (function min) seq))
-(defun seq-max (seq) (apply (function max) seq))
-(defun seq-first (seq) (car seq))
-(defun seq-rest (seq) (cdr seq))
+(defun seq-min (seq) (apply (function min) (append seq nil)))
+(defun seq-max (seq) (apply (function max) (append seq nil)))
+(defun seq-first (seq) (elt seq 0))
+(defun seq-rest (seq) (seq-drop seq 1))
 (defun seq-position (seq elt)
   (let ((i 0) (res nil))
+    (setq seq (append seq nil))
     (while (and seq (null res)) (if (equal (car seq) elt) (setq res i)) (setq seq (cdr seq)) (setq i (1+ i)))
     res))
 (defun seq-into (seq type)
@@ -550,7 +623,7 @@ pub const PRELUDE: &str = r#"
 (defun seq-difference (a b) (seq-filter (lambda (x) (not (seq-contains-p b x))) a))
 (defun seq-intersection (a b) (seq-filter (lambda (x) (seq-contains-p b x)) a))
 (defun seq-union (a b) (append a (seq-difference b a)))
-(defun seq-sort (pred seq) (sort (append seq nil) pred))
+(defun seq-sort (pred seq) (seq-into (sort (append seq nil) pred) (seq--type-of seq)))
 (defun seq-partition (seq n)
   (let ((out nil) (vec (vectorp seq)) (l (append seq nil)))
     (while l
@@ -571,6 +644,29 @@ pub const PRELUDE: &str = r#"
   (let ((i 0) (out nil) (l (append seq nil)))
     (while l (unless (= i n) (setq out (cons (car l) out))) (setq i (1+ i) l (cdr l)))
     (let ((r (nreverse out))) (if (vectorp seq) (vconcat r) r))))
+(defun seq--type-of (seq)
+  (cond ((listp seq) 'list) ((vectorp seq) 'vector) ((stringp seq) 'string) (t 'list)))
+(defun seq-take-while (pred seq)
+  ;; Leading run of SEQ for which PRED holds, returned as SEQ's own type.
+  (let ((lst (append seq nil)) (acc nil) (go t))
+    (while (and lst go)
+      (if (funcall pred (car lst))
+          (setq acc (cons (car lst) acc) lst (cdr lst))
+        (setq go nil)))
+    (seq-into (nreverse acc) (seq--type-of seq))))
+(defun seq-drop-while (pred seq)
+  ;; SEQ with its leading PRED-satisfying run removed, in SEQ's own type.
+  (let ((lst (append seq nil)) (go t))
+    (while (and lst go)
+      (if (funcall pred (car lst)) (setq lst (cdr lst)) (setq go nil)))
+    (seq-into lst (seq--type-of seq))))
+(defun seq-contains (seq elt &optional testfn)
+  ;; Deprecated in Emacs but still provided: returns the matching element.
+  (let ((test (or testfn #'equal)) (l (append seq nil)) (res nil))
+    (while (and l (null res))
+      (when (funcall test elt (car l)) (setq res (car l)))
+      (setq l (cdr l)))
+    res))
 
 ;;; ---- cl-lib (subset) ----
 (defun cl-mapcar (fn &rest seqs)
@@ -628,8 +724,8 @@ pub const PRELUDE: &str = r#"
   ;; Default keeps the LAST occurrence of each `equal' element; with :from-end
   ;; non-nil, keeps the FIRST.
   (if (plist-get keys :from-end)
-      (delete-dups (append seq nil))
-    (reverse (delete-dups (reverse (append seq nil))))))
+      (cl--like (delete-dups (append seq nil)) seq)
+    (cl--like (reverse (delete-dups (reverse (append seq nil)))) seq)))
 (defun cl-pairlis (the-keys the-values &optional alist)
   (let ((ks (reverse the-keys)) (vs (reverse the-values)) (res alist))
     (while ks
@@ -692,6 +788,16 @@ pub const PRELUDE: &str = r#"
 (defmacro cl-pushnew (x place &rest _keys)
   ;; Add X to the front of PLACE unless already present (by eql).
   `(if (memql ,x ,place) ,place (setf ,place (cons ,x ,place))))
+;; cl-defstruct registries: --slots maps NAME -> full slot specs (read at
+;; macroexpansion to inherit via :include); --parent maps child-tag -> parent-tag
+;; (walked at runtime so a subtype satisfies a parent's predicate).
+(defvar cl-struct--slots nil)
+(defvar cl-struct--parent nil)
+(defun cl-struct--is-a (tag target)
+  (let ((res nil))
+    (while (and tag (not res))
+      (if (eq tag target) (setq res t) (setq tag (cdr (assq tag cl-struct--parent)))))
+    res))
 ;; cl-defstruct: a struct is a vector [cl-struct-NAME slot1 slot2 ...]. Generates
 ;; the `make-NAME' keyword constructor (with per-slot defaults), `NAME-p'
 ;; predicate, `NAME-SLOT' accessors (setf-able), and `copy-NAME' copier. (Printing
@@ -702,12 +808,19 @@ pub const PRELUDE: &str = r#"
          (tag (intern (concat "cl-struct-" sname)))
          ;; Options: (:constructor NAME) renames the make-NAME constructor;
          ;; (:conc-name P) overrides the NAME- accessor prefix.
-         (ctor (let ((c (concat "make-" sname)))
-                 (when (consp name-spec)
-                   (dolist (opt (cdr name-spec))
-                     (when (and (consp opt) (eq (car opt) :constructor) (car (cdr opt)))
-                       (setq c (symbol-name (car (cdr opt)))))))
-                 c))
+         ;; Constructors: each (:constructor NAME) is a keyword ctor; (:constructor
+         ;; NAME ARGLIST) is a BOA (positional) ctor; default is make-NAME. A bare
+         ;; (:constructor nil) suppresses the default without adding one.
+         (constructors
+          (let ((cs nil) (saw nil))
+            (when (consp name-spec)
+              (dolist (opt (cdr name-spec))
+                (when (and (consp opt) (eq (car opt) :constructor))
+                  (setq saw t)
+                  (let ((nm (car (cdr opt))) (al (cdr (cdr opt))))
+                    (when nm
+                      (setq cs (cons (cons nm (if al (list 'boa (car al)) 'kw)) cs)))))))
+            (if saw (reverse cs) (list (cons (intern (concat "make-" sname)) 'kw)))))
          (conc (let ((p (concat sname "-")))
                  (when (consp name-spec)
                    (dolist (opt (cdr name-spec))
@@ -715,8 +828,33 @@ pub const PRELUDE: &str = r#"
                        (let ((v (car (cdr opt))))
                          (setq p (cond ((null v) "") ((symbolp v) (symbol-name v)) (t v)))))))
                  p))
-         (snames (mapcar (lambda (s) (if (consp s) (car s) s)) slots))
-         (defaults (mapcar (lambda (s) (if (consp s) (car (cdr s)) nil)) slots))
+         ;; (:copier NAME) renames the copy-NAME copier; (:copier nil) suppresses it.
+         (copier (let ((c (concat "copy-" sname)))
+                   (when (consp name-spec)
+                     (dolist (opt (cdr name-spec))
+                       (when (and (consp opt) (eq (car opt) :copier))
+                         (setq c (and (car (cdr opt)) (symbol-name (car (cdr opt))))))))
+                   c))
+         ;; (:predicate NAME) renames the NAME-p predicate.
+         (pred (let ((c (concat sname "-p")))
+                 (when (consp name-spec)
+                   (dolist (opt (cdr name-spec))
+                     (when (and (consp opt) (eq (car opt) :predicate) (car (cdr opt)))
+                       (setq c (symbol-name (car (cdr opt)))))))
+                 c))
+         ;; (:include PARENT) inherits PARENT's slots (prepended, same order) and
+         ;; records the tag parentage so the predicate accepts subtypes.
+         (parent (let ((p nil))
+                   (when (consp name-spec)
+                     (dolist (opt (cdr name-spec))
+                       (when (and (consp opt) (eq (car opt) :include))
+                         (setq p (car (cdr opt))))))
+                   p))
+         (parent-slots (and parent (boundp 'cl-struct--slots)
+                            (cdr (assq parent cl-struct--slots))))
+         (all-slots (append parent-slots slots))
+         (snames (mapcar (lambda (s) (if (consp s) (car s) s)) all-slots))
+         (defaults (mapcar (lambda (s) (if (consp s) (car (cdr s)) nil)) all-slots))
          (forms nil)
          ;; constructor: vector of defaults, then apply :keyword overrides.
          (kw-clauses (let ((j 1) (cs nil))
@@ -726,19 +864,50 @@ pub const PRELUDE: &str = r#"
                                         cs))
                          (setq j (1+ j)))
                        (reverse cs))))
-    (setq forms
-          (cons `(defun ,(intern ctor) (&rest --args--)
-                   (let ((--v-- (vector ',tag ,@defaults)) (--a-- --args--))
-                     (while --a--
-                       (let ((--k-- (car --a--)) (--val-- (car (cdr --a--))))
-                         (cond ,@kw-clauses))
-                       (setq --a-- (cdr (cdr --a--))))
-                     --v--))
-                forms))
-    (setq forms (cons `(defun ,(intern (concat sname "-p")) (--o--)
-                         (and (vectorp --o--) (> (length --o--) 0) (eq (aref --o-- 0) ',tag)))
+    ;; Record this struct's full (inherited + own) slot specs at macroexpansion
+    ;; time so a later (:include this) can read them.
+    (setq cl-struct--slots (cons (cons name all-slots) cl-struct--slots))
+    (dolist (cspec constructors)
+      (let ((cname (car cspec)) (ckind (cdr cspec)))
+        (if (eq ckind 'kw)
+            (setq forms
+                  (cons `(defun ,cname (&rest --args--)
+                           (let ((--v-- (vector ',tag ,@defaults)) (--a-- --args--))
+                             (while --a--
+                               (let ((--k-- (car --a--)) (--val-- (car (cdr --a--))))
+                                 (cond ,@kw-clauses))
+                               (setq --a-- (cdr (cdr --a--))))
+                             --v--))
+                        forms))
+          ;; BOA: ckind = (boa ARGLIST). Each slot takes the like-named arg if it
+          ;; appears in ARGLIST, else its default. Per-arg defaults like (y 10)
+          ;; are reduced to plain params (the var binds to nil if unsupplied).
+          (let* ((arglist (car (cdr ckind)))
+                 (avars (let ((r nil))
+                          (dolist (p arglist)
+                            (cond ((and (symbolp p) (> (length (symbol-name p)) 0)
+                                        (eq (aref (symbol-name p) 0) ?&)) nil)
+                                  ((consp p) (setq r (cons (car p) r)))
+                                  (t (setq r (cons p r)))))
+                          (reverse r)))
+                 (defargs (mapcar (lambda (p) (if (consp p) (car p) p)) arglist))
+                 (vals (let ((vs nil) (sn snames) (df defaults))
+                         (while sn
+                           (setq vs (cons (if (memq (car sn) avars) (car sn) (car df)) vs))
+                           (setq sn (cdr sn) df (cdr df)))
+                         (reverse vs))))
+            (setq forms (cons `(defun ,cname ,defargs (vector ',tag ,@vals)) forms))))))
+    (setq forms (cons `(defun ,(intern pred) (--o--)
+                         (and (vectorp --o--) (> (length --o--) 0)
+                              (cl-struct--is-a (aref --o-- 0) ',tag)))
                       forms))
-    (setq forms (cons `(defun ,(intern (concat "copy-" sname)) (--s--) (vconcat --s--)) forms))
+    (when parent
+      (setq forms (cons `(setq cl-struct--parent
+                               (cons (cons ',tag ',(intern (concat "cl-struct-" (symbol-name parent))))
+                                     cl-struct--parent))
+                        forms)))
+    (when copier
+      (setq forms (cons `(defun ,(intern copier) (--s--) (vconcat --s--)) forms)))
     (let ((j 1))
       (dolist (sn snames)
         (let ((acc (intern (concat conc (symbol-name sn)))))
@@ -821,6 +990,11 @@ pub const PRELUDE: &str = r#"
     `(let ,(reverse saves)
        (unwind-protect (progn ,@(reverse sets) ,@body)
          ,@(reverse restores)))))
+(defmacro cl-letf* (bindings &rest body)
+  ;; Sequential cl-letf: each binding's place is set before the next is saved.
+  (if (null bindings)
+      `(progn ,@body)
+    `(cl-letf (,(car bindings)) (cl-letf* ,(cdr bindings) ,@body))))
 (defmacro thread-first (x &rest forms)
   (let ((acc x))
     (while forms
@@ -913,8 +1087,9 @@ pub const PRELUDE: &str = r#"
   (apply 'seq-concatenate (or type 'list) (mapcar fn (append seq nil))))
 (defun seq-mapn (fn &rest seqs)
   ;; Apply FN across N sequences in parallel, stopping at the shortest:
-  ;; (seq-mapn #'+ '(1 2) '(3 4)) => (4 6).
+  ;; (seq-mapn #'+ '(1 2) '(3 4)) => (4 6). Accepts any sequence types.
   (let ((r nil))
+    (setq seqs (mapcar (lambda (s) (append s nil)) seqs))
     (while (not (memq nil seqs))
       (setq r (cons (apply fn (mapcar (function car) seqs)) r))
       (setq seqs (mapcar (function cdr) seqs)))
@@ -972,25 +1147,26 @@ pub const PRELUDE: &str = r#"
                 (mapconcat (lambda (x) (if (stringp x) x (format "%S" x))) data ", "))))))
 (defun seq-group-by (fn seq)
   (let ((result nil))
-    (dolist (x seq)
+    (dolist (x (append seq nil))
       (let* ((key (funcall fn x)) (cell (assoc key result)))
         (if cell (setcdr cell (cons x (cdr cell)))
           (setq result (cons (cons key (list x)) result)))))
     ;; Reverse so groups appear in first-encounter order, items in order.
     (nreverse (mapcar (lambda (c) (cons (car c) (reverse (cdr c)))) result))))
 
-(defun plist-put (plist prop val)
+(defun plist-put (plist prop val &optional predicate)
   ;; Mutate PLIST in place: overwrite an existing PROP, or append (PROP VAL) to
   ;; the tail via setcdr. Only a nil PLIST yields a fresh list (can't mutate nil).
-  (if (null plist)
+  (let ((test (or predicate #'eq)))
+   (if (null plist)
       (list prop val)
     (let ((p plist) (done nil))
       (while (not done)
         (cond
-         ((eq (car p) prop) (setcar (cdr p) val) (setq done t))
+         ((funcall test (car p) prop) (setcar (cdr p) val) (setq done t))
          ((cddr p) (setq p (cddr p)))
          (t (setcdr (cdr p) (list prop val)) (setq done t))))
-      plist)))
+      plist))))
 ;; Symbol property lists, backed by a hash table (we have no per-symbol plist
 ;; slot). Enough for `get`/`put`/`define-error` and the error-condition system.
 (defvar symbol-plist--table (make-hash-table :test 'eq))
@@ -1109,6 +1285,15 @@ pub const PRELUDE: &str = r#"
     (if (>= cur len) s
       (let ((fill (make-string (- len cur) pad)))
         (if start (concat fill s) (concat s fill))))))
+(defun string-limit (string length &optional end _coding-system)
+  ;; First LENGTH chars of STRING (or last LENGTH when END is non-nil); the whole
+  ;; string if it is already short enough. (Byte-based CODING-SYSTEM unsupported.)
+  (let ((len (length string)))
+    (if (<= len length)
+        string
+      (if end
+          (substring string (- len length) len)
+        (substring string 0 length)))))
 (defun string-fill (s len)
   ;; Greedily wrap S so no line exceeds LEN columns, breaking only at spaces.
   (let ((words (split-string s)) (lines nil) (cur ""))
@@ -1131,7 +1316,8 @@ pub const PRELUDE: &str = r#"
         (setq in-word alnum)))
     (apply (function string) (reverse out))))
 (defun string-replace (from to s)
-  (if (string-empty-p from) s
+  ;; Emacs signals on an empty FROMSTRING rather than looping forever.
+  (if (string-empty-p from) (signal 'wrong-length-argument (list 0))
     (let ((out "") (pos (string-search from s)))
       (while pos
         (setq out (concat out (substring s 0 pos) to))
@@ -1191,6 +1377,12 @@ pub const PRELUDE: &str = r#"
       (setq kind 'ext)
       (let ((tgt (or var '--clacc--)) (fn (if (member kw '("maximize" "maximizing")) 'max 'min)))
         (setq form (list 'setq tgt (list 'if tgt (list fn tgt expr) expr)))))
+     ((member kw '("vconcat" "vconcating" "concat" "concating"))
+      (when (equal (cl-loop--kw (car rr)) "into") (setq var (nth 1 rr) rr (nthcdr 2 rr)))
+      (let ((tgt (or var '--clacc--)))
+        (if (member kw '("concat" "concating"))
+            (setq kind 'str init "" form (list 'setq tgt (list 'concat tgt expr)))
+          (setq kind 'vec init [] form (list 'setq tgt (list 'vconcat tgt expr))))))
      ((member kw '("do" "doing"))
       (let ((forms nil) (r (cdr c)))
         (while (and r (not (cl-loop--clause-p (car r)))) (setq forms (cons (car r) forms) r (cdr r)))
@@ -1352,7 +1544,8 @@ pub const PRELUDE: &str = r#"
          ;; direct accumulation / do
          ((member kw '("collect" "collecting" "append" "appending" "nconc" "nconcing"
                        "sum" "summing" "count" "counting" "maximize" "maximizing"
-                       "minimize" "minimizing" "do" "doing"))
+                       "minimize" "minimizing" "vconcat" "vconcating" "concat" "concating"
+                       "do" "doing"))
           (let ((a (cl-loop--accum c)))
             (if (nth 3 a) (setq binds (cons (list (nth 3 a) (nth 4 a)) binds))
               (when (nth 2 a) (setq acc-kind (nth 2 a))))
@@ -1370,7 +1563,7 @@ pub const PRELUDE: &str = r#"
               (while (and c (not (cl-loop--clause-p (car c)))) (setq fs (cons (car c) fs)) (setq c (cdr c)))
               (setq finally (reverse fs)))))
          (t (error "cl-loop: unsupported clause %S" (car c))))))
-    (let ((init (if (eq acc-kind 'num) 0 nil))
+    (let ((init (cond ((eq acc-kind 'num) 0) ((eq acc-kind 'str) "") ((eq acc-kind 'vec) []) (t nil)))
           (result (cond (finally (cons 'progn finally))
                         (acc-kind '--clacc--)
                         (bool-result t)
@@ -1553,14 +1746,36 @@ pub const PRELUDE: &str = r#"
          ,@(cdr endclause)))))
 ;; Build let* bindings that positionally destructure VALEXPR (a symbol holding a
 ;; list) against a flat ARGLIST, honoring &optional and &rest.
+(defun cl-db--plist-get (plist key default)
+  ;; plist-get with a fallback when KEY is absent (for &key defaults).
+  (let ((m (plist-member plist key))) (if m (car (cdr m)) default)))
 (defun cl-db--binds (arglist v)
+  ;; Supports &optional / &rest / &key with per-arg defaults `(VAR DEFAULT)` and
+  ;; nested patterns in required position. &key reads the plist tail at position i.
   (let ((binds nil) (i 0) (mode 'req))
     (while (consp arglist)
       (let ((a (car arglist)))
         (cond
          ((eq a '&optional) (setq mode 'opt))
          ((eq a '&rest) (setq mode 'rest))
+         ((eq a '&key) (setq mode 'key))
+         ((eq a '&aux) (setq mode 'aux))
          ((eq mode 'rest) (setq binds (cons (list a (list 'nthcdr i v)) binds)))
+         ((eq mode 'aux)
+          (let ((var (if (consp a) (car a) a)) (def (and (consp a) (car (cdr a)))))
+            (setq binds (cons (list var def) binds))))
+         ((eq mode 'key)
+          (let* ((var (if (consp a) (car a) a))
+                 (def (and (consp a) (car (cdr a))))
+                 (kw (intern (concat ":" (symbol-name var)))))
+            (setq binds (cons (list var (list 'cl-db--plist-get (list 'nthcdr i v)
+                                              (list 'quote kw) def))
+                              binds))))
+         ((eq mode 'opt)
+          (let ((var (if (consp a) (car a) a)) (def (and (consp a) (car (cdr a)))))
+            (setq binds (cons (list var (list 'if (list 'nthcdr i v) (list 'nth i v) def))
+                              binds))
+            (setq i (1+ i))))
          ((consp a)
           ;; Nested pattern: bind a temp to the element, then destructure it.
           (let ((tv (make-symbol "db")))
@@ -1576,6 +1791,27 @@ pub const PRELUDE: &str = r#"
 (defmacro cl-destructuring-bind (arglist expr &rest body)
   `(let ((--cl-db-v-- ,expr))
      (let* ,(cl-db--binds arglist '--cl-db-v--) ,@body)))
+;; cl-defun/cl-defmacro: defun/defmacro accepting a full cl-lambda-list
+;; (&optional/&key/&rest/&aux with per-arg defaults), via cl-destructuring-bind.
+(defmacro cl-defun (name arglist &rest body)
+  `(defun ,name (&rest --cl-args--)
+     (cl-destructuring-bind ,arglist --cl-args-- ,@body)))
+(defmacro cl-defmacro (name arglist &rest body)
+  `(defmacro ,name (&rest --cl-args--)
+     (cl-destructuring-bind ,arglist --cl-args-- ,@body)))
+;; cl multiple values are just lists in this model.
+(defun cl-values (&rest vals) vals)
+(defun cl-values-list (l) l)
+(defmacro cl-multiple-value-bind (vars form &rest body)
+  `(cl-destructuring-bind ,vars ,form ,@body))
+(defmacro cl-multiple-value-setq (vars form)
+  (let ((tmp (make-symbol "mv")))
+    `(let ((,tmp ,form))
+       ,@(let ((sets nil) (i 0) (vs vars))
+           (while vs
+             (setq sets (cons (list 'setq (car vs) (list 'nth i tmp)) sets) i (1+ i) vs (cdr vs)))
+           (reverse sets))
+       ,tmp)))
 
 ;; ---- setf: generalized-variable assignment ----
 ;; Expands (setf PLACE VALUE) to the right mutator for PLACE. Supported places
@@ -1609,6 +1845,7 @@ pub const PRELUDE: &str = r#"
        ((eq head 'aref) (list 'aset (car args) (car (cdr args)) val))
        ((eq head 'gethash) (list 'puthash (car args) val (car (cdr args))))
        ((eq head 'symbol-value) (list 'set (car args) val))
+       ((eq head 'symbol-function) (list 'fset (car args) val))
        ;; (setf (alist-get K AL) V): setcdr an existing pair, else prepend.
        ((eq head 'alist-get)
         (list 'let (list (list '--ag-p-- (list 'assq (car args) (car (cdr args)))))
@@ -1627,6 +1864,11 @@ pub const PRELUDE: &str = r#"
        ;; A cl-defstruct accessor: (setf (NAME-SLOT s) v) -> (aset s INDEX v).
        ((assq head cl-struct--slot-index)
         (list 'aset (car args) (cdr (assq head cl-struct--slot-index)) val))
+       ;; (setf (map-elt MAP KEY) V): rebind MAP to a copy with KEY updated/added
+       ;; (hash-tables/arrays mutate in place; alists may grow at the head).
+       ((eq head 'map-elt)
+        (setf--expand (car args)
+                      (list 'map--put (car args) (car (cdr args)) val)))
        (t (error "setf: unsupported place %S" place))))))
 (defmacro setf (&rest pairs)
   (let ((forms nil))
@@ -1889,8 +2131,138 @@ pub const PRELUDE: &str = r#"
           (setq binds (cons (list a (list 'elt s i)) binds) i (1+ i))))
       (setq args (cdr args)))
     `(let* ((,s ,seq) ,@(reverse binds)) ,@body)))
+(defmacro seq-setq (args seq)
+  ;; Like `seq-let` but assigns to existing places with `setq` (positional, plus
+  ;; `&rest` for the tail).
+  (let ((s (make-symbol "seq")) (sets nil) (i 0) (more t) (rest args))
+    (while (and rest more)
+      (let ((a (car rest)))
+        (if (eq a '&rest)
+            (setq sets (cons (list 'setq (car (cdr rest)) (list 'seq-drop s i)) sets) more nil)
+          (setq sets (cons (list 'setq a (list 'elt s i)) sets) i (1+ i))))
+      (setq rest (cdr rest)))
+    `(let ((,s ,seq)) ,@(reverse sets))))
+(defmacro seq-doseq (spec &rest body)
+  ;; (seq-doseq (VAR SEQUENCE) BODY...) — iterate VAR over any sequence's elements.
+  (let ((var (car spec)) (seq (car (cdr spec))))
+    `(let ((--seq-doseq-tail-- (append ,seq nil)) (,var nil))
+       (while --seq-doseq-tail--
+         (setq ,var (car --seq-doseq-tail--))
+         ,@body
+         (setq --seq-doseq-tail-- (cdr --seq-doseq-tail--)))
+       nil)))
 (defun macroexp-progn (forms) (if (cdr forms) (cons 'progn forms) (car forms)))
 (defmacro cl-function (f) (list 'function f))
+
+(defun hash-table-empty-p (h) (= 0 (hash-table-count h)))
+
+;;; ---- map.el (subset) ----
+;; A generic key/value interface over alists, hash-tables and arrays. Lists are
+;; treated strictly as alists, and (like Emacs map.el) the default test for list
+;; lookups is `equal` (not `eq`).
+(defun map-elt (map key &optional default testfn)
+  (cond
+   ((hash-table-p map) (gethash key map default))
+   ((listp map)
+    (let ((entry (assoc key map (or testfn #'equal))))
+      (if entry (cdr entry) default)))
+   ((arrayp map)
+    (if (and (integerp key) (>= key 0) (< key (length map)))
+        (aref map key)
+      default))
+   (t default)))
+(defun map-contains-key (map key &optional testfn)
+  (cond
+   ((hash-table-p map)
+    (let ((sentinel (list 'map--miss)))
+      (not (eq sentinel (gethash key map sentinel)))))
+   ((listp map) (and (assoc key map (or testfn #'equal)) t))
+   ((arrayp map) (and (integerp key) (>= key 0) (< key (length map))))
+   (t nil)))
+(defun map-keys (map) (map-apply (lambda (k _v) k) map))
+(defun map-values (map) (map-apply (lambda (_k v) v) map))
+(defun map-pairs (map) (map-apply #'cons map))
+(defun map-length (map)
+  (cond
+   ((hash-table-p map) (hash-table-count map))
+   ((listp map) (length map))
+   ((arrayp map) (length map))
+   (t 0)))
+(defun map-empty-p (map) (= 0 (map-length map)))
+(defun map-do (function map)
+  (cond
+   ((hash-table-p map) (maphash function map) nil)
+   ((listp map)
+    (dolist (pair map) (funcall function (car pair) (cdr pair)))
+    nil)
+   ((arrayp map)
+    (dotimes (i (length map)) (funcall function i (aref map i)))
+    nil)))
+(defun map-apply (function map)
+  (let ((acc nil))
+    (map-do (lambda (k v) (setq acc (cons (funcall function k v) acc))) map)
+    (nreverse acc)))
+(defun map-filter (pred map)
+  (let ((acc nil))
+    (map-do (lambda (k v) (when (funcall pred k v) (setq acc (cons (cons k v) acc)))) map)
+    (nreverse acc)))
+(defun map-remove (pred map)
+  (map-filter (lambda (k v) (not (funcall pred k v))) map))
+(defun map-some (pred map)
+  (catch 'map--some
+    (map-do (lambda (k v) (let ((r (funcall pred k v))) (when r (throw 'map--some r)))) map)
+    nil))
+(defun map-every-p (pred map)
+  (catch 'map--every
+    (map-do (lambda (k v) (unless (funcall pred k v) (throw 'map--every nil))) map)
+    t))
+(defun map-nested-elt (map keys &optional default)
+  (let ((m map))
+    (while (and keys m)
+      (setq m (map-elt m (car keys)) keys (cdr keys)))
+    (if keys default (or m default))))
+(defun map-delete (map key)
+  (cond
+   ((hash-table-p map) (remhash key map) map)
+   ((listp map)
+    (let ((res nil))
+      (dolist (pair map) (unless (equal (car pair) key) (setq res (cons pair res))))
+      (nreverse res)))
+   (t map)))
+;; Internal: return MAP updated so KEY maps to VALUE (used by setf map-elt).
+(defun map--put (map key value)
+  (cond
+   ((hash-table-p map) (puthash key value map) map)
+   ((listp map)
+    (let ((entry (assoc key map #'equal)))
+      (if entry (progn (setcdr entry value) map)
+        (cons (cons key value) map))))
+   ((arrayp map) (aset map key value) map)
+   (t (error "map--put: unsupported map type"))))
+(defun map--into (pairs type)
+  (cond
+   ((eq type 'list) (let ((acc nil)) (dolist (p pairs) (setq acc (map--put acc (car p) (cdr p)))) (nreverse acc)))
+   ((eq type 'alist) (let ((acc nil)) (dolist (p pairs) (setq acc (map--put acc (car p) (cdr p)))) (nreverse acc)))
+   ((eq type 'hash-table)
+    (let ((h (make-hash-table :test 'equal)))
+      (dolist (p pairs) (puthash (car p) (cdr p) h)) h))
+   (t (error "map-into: unsupported type %S" type))))
+(defun map-into (map type) (map--into (map-pairs map) type))
+(defun map-merge (type &rest maps)
+  (let ((pairs nil))
+    (dolist (m maps) (setq pairs (append pairs (map-pairs m))))
+    (map--into pairs type)))
+(defun map-merge-with (type function &rest maps)
+  ;; Combine values for duplicate keys with FUNCTION, preserving first-seen order.
+  (let ((result nil))
+    (dolist (m maps)
+      (map-do (lambda (k v)
+                (let ((entry (assoc k result #'equal)))
+                  (if entry
+                      (setcdr entry (funcall function (cdr entry) v))
+                    (setq result (append result (list (cons k v)))))))
+              m))
+    (map--into result type)))
 
 ;;; ---- ERT: Emacs Lisp Regression Testing (subset) ----
 ;; Ported from ERT: `should` / `should-not` / `should-error` / `skip-unless`

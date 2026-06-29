@@ -187,6 +187,9 @@ pub struct ElispHost {
     /// string plus char-position spans for the whole match (group 0) and each
     /// capture group. `match-beginning`/`match-end`/`match-string` read it.
     pub(crate) match_data: Option<MatchData>,
+    /// Output-capture stack for `with-output-to-string`: when non-empty,
+    /// `princ`/`prin1`/`print`/`terpri` append to the top buffer instead of stdout.
+    pub(crate) output_capture: Vec<String>,
 }
 
 /// Result of the most recent `string-match`, in *character* positions (elisp
@@ -218,6 +221,7 @@ impl ElispHost {
             pending_throw: None,
             pending_error: None,
             match_data: None,
+            output_capture: Vec::new(),
         };
         crate::builtins::install(&mut h);
         h.builtin_count = h.arena.len();
@@ -788,6 +792,37 @@ impl ElispHost {
 
     // ── printing ──
     pub fn print(&self, v: &Value, readable: bool) -> String {
+        self.print_inner(v, readable, 0)
+    }
+
+    /// Read a non-negative integer dynamic var (`print-length`/`print-level`) for
+    /// the printer; None when unset/nil/negative (i.e. no limit).
+    fn print_limit(&self, name: &str) -> Option<usize> {
+        let id = *self.obarray.get(name)?;
+        match self.arena.get(id as usize)? {
+            Obj::Symbol(s) => match s.value.as_ref()? {
+                Value::Int(n) if *n >= 0 => Some(*n as usize),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Print a sequence's elements honoring `print-length` (truncate with `...`).
+    fn print_seq(&self, items: &[Value], readable: bool, depth: usize) -> Vec<String> {
+        let limit = self.print_limit("print-length");
+        let mut parts = Vec::new();
+        for (i, e) in items.iter().enumerate() {
+            if limit.is_some_and(|lim| i >= lim) {
+                parts.push("...".to_string());
+                break;
+            }
+            parts.push(self.print_inner(e, readable, depth));
+        }
+        parts
+    }
+
+    fn print_inner(&self, v: &Value, readable: bool, depth: usize) -> String {
         match v {
             Value::Undef => "nil".to_string(),
             Value::Bool(true) => "t".to_string(),
@@ -810,24 +845,40 @@ impl ElispHost {
             }
             Value::Str(s) => {
                 if readable {
-                    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+                    let mut t = s.replace('\\', "\\\\").replace('"', "\\\"");
+                    // print-escape-newlines: render newline/formfeed as \n / \f.
+                    if self.print_flag("print-escape-newlines") {
+                        t = t.replace('\n', "\\n").replace('\u{c}', "\\f");
+                    }
+                    format!("\"{t}\"")
                 } else {
                     s.to_string()
                 }
             }
             Value::Obj(id) => match self.arena.get(*id as usize) {
-                Some(Obj::Symbol(s)) => s.name.clone(),
-                Some(Obj::Cons(..)) => self.print_list(v, readable),
+                Some(Obj::Symbol(s)) => {
+                    if readable {
+                        print_symbol_readable(&s.name)
+                    } else {
+                        s.name.clone()
+                    }
+                }
+                Some(Obj::Cons(..)) => self.print_list(v, readable, depth),
                 Some(Obj::Vector(items)) => {
+                    // print-level: a vector/record one level too deep prints `...`.
+                    if self
+                        .print_limit("print-level")
+                        .is_some_and(|lvl| depth + 1 > lvl)
+                    {
+                        return "...".to_string();
+                    }
                     // A cl-defstruct instance is a vector tagged `cl-struct-NAME`
                     // in slot 0; print it as Emacs's record syntax `#s(NAME …)`.
                     if let Some(name) = self.struct_tag_name(items) {
-                        let parts: Vec<String> =
-                            items[1..].iter().map(|e| self.print(e, readable)).collect();
+                        let parts = self.print_seq(&items[1..], readable, depth + 1);
                         format!("#s({name} {})", parts.join(" "))
                     } else {
-                        let parts: Vec<String> =
-                            items.iter().map(|e| self.print(e, readable)).collect();
+                        let parts = self.print_seq(items, readable, depth + 1);
                         format!("[{}]", parts.join(" "))
                     }
                 }
@@ -854,9 +905,9 @@ impl ElispHost {
                             if i > 0 {
                                 s.push(' ');
                             }
-                            s.push_str(&self.print(k, readable));
+                            s.push_str(&self.print_inner(k, readable, depth + 1));
                             s.push(' ');
-                            s.push_str(&self.print(v, readable));
+                            s.push_str(&self.print_inner(v, readable, depth + 1));
                         }
                         s.push(')');
                     }
@@ -868,16 +919,51 @@ impl ElispHost {
             other => other.as_str_cow().into_owned(),
         }
     }
-    fn print_list(&self, v: &Value, readable: bool) -> String {
+    fn print_list(&self, v: &Value, readable: bool, depth: usize) -> String {
+        // print-level: a list one level too deep prints as `...`.
+        if self
+            .print_limit("print-level")
+            .is_some_and(|lvl| depth + 1 > lvl)
+        {
+            return "...".to_string();
+        }
+        let nd = depth + 1;
+        // Emacs abbreviates the two-element forms `(quote X)`/`(function X)`/`` (` X) ``
+        // as `'X`/`#'X`/`` `X ``; longer lists with those heads print in full.
+        if let Some(Obj::Cons(head, tail)) = self.obj(v) {
+            let prefix = match self.obj(head) {
+                Some(Obj::Symbol(s)) => match s.name.as_str() {
+                    "quote" => Some("'"),
+                    "function" => Some("#'"),
+                    "`" => Some("`"),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(prefix) = prefix {
+                if let Some(Obj::Cons(arg, rest)) = self.obj(tail) {
+                    if !el_truthy(rest) {
+                        return format!("{prefix}{}", self.print_inner(arg, readable, nd));
+                    }
+                }
+            }
+        }
+        let limit = self.print_limit("print-length");
         let mut out = String::from("(");
         let mut cur = v.clone();
         let mut first = true;
+        let mut count = 0usize;
         while let Some(Obj::Cons(a, d)) = self.obj(&cur) {
             if !first {
                 out.push(' ');
             }
             first = false;
-            out.push_str(&self.print(a, readable));
+            if limit.is_some_and(|lim| count >= lim) {
+                out.push_str("...");
+                break;
+            }
+            out.push_str(&self.print_inner(a, readable, nd));
+            count += 1;
             let next = d.clone();
             match next {
                 Value::Undef => break,
@@ -886,7 +972,7 @@ impl ElispHost {
                 }
                 _ => {
                     out.push_str(" . ");
-                    out.push_str(&self.print(&next, readable));
+                    out.push_str(&self.print_inner(&next, readable, nd));
                     break;
                 }
             }
@@ -897,6 +983,17 @@ impl ElispHost {
 
     pub fn take_error(&mut self) -> Option<String> {
         self.error.take()
+    }
+
+    /// Write program output, honoring an active `with-output-to-string` capture.
+    pub fn emit(&mut self, s: &str) {
+        if let Some(buf) = self.output_capture.last_mut() {
+            buf.push_str(s);
+        } else {
+            use std::io::Write;
+            print!("{s}");
+            let _ = std::io::stdout().flush();
+        }
     }
 
     /// `eq`-style identity comparison (used for `catch`/`throw` tags).
@@ -920,9 +1017,41 @@ impl ElispHost {
             Some((s, m)) => (s.trim().to_string(), m.trim().to_string()),
             None => ("error".to_string(), e.to_string()),
         };
+        // These conditions carry a list of *values* as DATA in Emacs, not a
+        // message string: `(wrong-type-argument PREDICATE VALUE)`,
+        // `(args-out-of-range ARRAY START END)`. The Rust helpers render those
+        // values in readable form, so re-read them into separate elements.
+        if matches!(sym.as_str(), "wrong-type-argument" | "args-out-of-range") {
+            if let Some(data) = self.read_all_forms(&msg) {
+                let s = self.intern(&sym);
+                return self.cons(s, data);
+            }
+        }
         let s = self.intern(&sym);
         let m = Value::str(msg);
         self.list_from(vec![s, m])
+    }
+
+    /// Read every form in `src` into a proper list (used to reconstruct error
+    /// DATA from a rendered message). None if nothing parses.
+    fn read_all_forms(&mut self, src: &str) -> Option<Value> {
+        let len = src.chars().count();
+        let mut forms = Vec::new();
+        let mut pos = 0;
+        while pos < len {
+            match crate::reader::read_one(self, src, pos) {
+                Ok((v, next)) if next > pos => {
+                    forms.push(v);
+                    pos = next;
+                }
+                _ => break,
+            }
+        }
+        if forms.is_empty() {
+            None
+        } else {
+            Some(self.list_from(forms))
+        }
     }
 }
 
@@ -956,6 +1085,30 @@ pub fn format_float(f: f64) -> String {
 /// elisp truthiness: only `nil` (fusevm `Undef`) is false.
 pub fn el_truthy(v: &Value) -> bool {
     !matches!(v, Value::Undef | Value::Bool(false))
+}
+
+/// Render a symbol name the way `prin1` does: with `\` escapes so it reads back
+/// as the same symbol. The empty symbol prints as `##`.
+fn print_symbol_readable(name: &str) -> String {
+    if name.is_empty() {
+        return "##".to_string();
+    }
+    // A name that would read as a number, or that starts with `?`/`.`, needs a
+    // leading escape so it reads back as a symbol rather than a number/char/dot.
+    let numeric = crate::reader::token_is_number(name);
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        let needs_escape = matches!(
+            c,
+            '"' | '\\' | '\'' | ';' | '#' | '(' | ')' | ',' | '`' | '[' | ']'
+        ) || (c as u32) <= 0x20
+            || (i == 0 && (numeric || c == '?' || c == '.'));
+        if needs_escape {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 // ── thread-local host ────────────────────────────────────────────────────────
@@ -1377,7 +1530,31 @@ fn intrinsic_condition_case(args: &[Value]) -> Result<Value, String> {
     // Running the body forward: any leftover error object is stale.
     with_host(|h| h.pending_error = None);
     match call_function(&body, &[]) {
-        Ok(v) => Ok(v),
+        Ok(v) => {
+            // A `(:success BODY…)` handler runs on normal return, with VAR bound
+            // to the body's value.
+            let hlist = with_host(|h| h.list_vec(&handlers)).unwrap_or_default();
+            for hp in hlist {
+                let parts = with_host(|h| h.list_vec(&hp)).unwrap_or_default();
+                if parts.len() < 2 {
+                    continue;
+                }
+                let cname = with_host(|h| h.sym_name(&parts[0])).unwrap_or_default();
+                if cname == ":success" {
+                    let depth = with_host(|h| {
+                        let d = h.specdepth();
+                        if matches!(h.obj(&var), Some(Obj::Symbol(_))) {
+                            let _ = h.specbind(&var, v.clone());
+                        }
+                        d
+                    });
+                    let hr = call_function(&parts[1], &[]);
+                    with_host(|h| h.unbind_to(depth));
+                    return hr;
+                }
+            }
+            Ok(v)
+        }
         Err(e) => {
             // A throw is not an error — let it keep unwinding to its catch.
             if with_host(|h| h.pending_throw.is_some()) {
