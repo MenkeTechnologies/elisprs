@@ -16,6 +16,12 @@ categories = ["command-line-utilities", "compilers"]
 name = "elisp"
 path = "src/main.rs"
 
+# Offline generator for docs/reference.html — renders the LSP hover/completion
+# corpus (src/lsp.rs) as a static reference page. Run before pushing Pages.
+[[bin]]
+name = "gen-docs"
+path = "src/bin/gen_docs.rs"
+
 [lib]
 name = "elisprs"
 path = "src/lib.rs"
