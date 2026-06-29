@@ -1,8 +1,9 @@
 ;;; regexp.el --- elisp regexps on fusevm, ERT-tested  -*- lexical-binding: nil; -*-
 
 ;; Emacs regexps run host-side: the pattern is translated from elisp syntax
-;; (\\( \\| \\{ for grouping/alternation/bounds) into the `regex` crate's dialect
-;; in src/regexp.rs, then matched. Match data is char-indexed, like Emacs.
+;; (\\( \\| \\{ for grouping/alternation/bounds) into fancy-regex's dialect in
+;; src/regexp.rs, then matched. fancy-regex's backtracking handles
+;; backreferences (\\1..\\9). Match data is char-indexed, like Emacs.
 (message "== regexp demo ==")
 
 (ert-deftest regexp-string-match ()
@@ -34,6 +35,18 @@
                  "a<1>b<22>"))
   (should (equal (replace-regexp-in-string "[0-9]+" "#" "a1b22c333" nil t)
                  "a#b#c#")))
+
+(ert-deftest regexp-backreferences ()
+  "Backreferences \\1..\\9 match the same text an earlier group captured."
+  ;; Doubled character: \1 must match the SAME char, not just any char.
+  (should (= (string-match "\\(.\\)\\1" "abccba") 2))
+  (should (null (string-match "\\(.\\)\\1" "abcdef")))
+  ;; Collapse doubled words to a single copy.
+  (should (equal (replace-regexp-in-string "\\b\\(\\w+\\) \\1\\b" "\\1"
+                                           "the the cat cat sat")
+                 "the cat sat"))
+  ;; A repeated captured group.
+  (should (= (string-match "\\(ab\\)\\1+" "xabababy") 1)))
 
 (ert-deftest regexp-quote-and-save ()
   "regexp-quote escapes metacharacters; save-match-data shields match state."

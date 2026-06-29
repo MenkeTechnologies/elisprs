@@ -26,6 +26,9 @@ pub const PRELUDE: &str = r#"
 ;; Fixnum bounds match GNU Emacs on a 64-bit build (62-bit tagged integers).
 (defconst most-positive-fixnum 2305843009213693951)
 (defconst most-negative-fixnum -2305843009213693952)
+(defconst float-pi 3.141592653589793)
+(defconst float-e 2.718281828459045)
+(defconst pi 3.141592653589793)
 ;; `abs` is a primitive subr (keeps int/float type; (abs -0.0) => 0.0).
 (defun max (x &rest xs) (while xs (if (> (car xs) x) (setq x (car xs))) (setq xs (cdr xs))) x)
 (defun min (x &rest xs) (while xs (if (< (car xs) x) (setq x (car xs))) (setq xs (cdr xs))) x)
@@ -52,18 +55,31 @@ pub const PRELUDE: &str = r#"
       (progn (while (consp (cdr l)) (setq l (cdr l))) l)
     (nthcdr (max 0 (- (length l) n)) l)))
 (defun make-list (n x) (let ((r nil)) (while (> n 0) (setq r (cons x r)) (setq n (1- n))) r))
-(defun number-sequence (from to &optional inc)
-  (setq inc (or inc 1))
-  (let ((r nil))
-    (if (< inc 0)
-        (while (>= from to) (setq r (cons from r)) (setq from (+ from inc)))
-      (while (<= from to) (setq r (cons from r)) (setq from (+ from inc))))
-    (reverse r)))
-(defun elt (seq n) (if (listp seq) (nth n seq) (aref seq n)))
+(defun number-sequence (from &optional to inc)
+  ;; With only FROM, the sequence is (FROM); INC defaults to 1.
+  (if (null to)
+      (list from)
+    (setq inc (or inc 1))
+    (let ((r nil))
+      (if (< inc 0)
+          (while (>= from to) (setq r (cons from r)) (setq from (+ from inc)))
+        (while (<= from to) (setq r (cons from r)) (setq from (+ from inc))))
+      (reverse r))))
+(defun elt (seq n)
+  (cond ((listp seq) (nth n seq))
+        ((arrayp seq) (aref seq n))
+        (t (signal 'wrong-type-argument (list 'sequencep seq)))))
 (defun safe-length (l)
-  ;; Count cons cells in the spine, stopping at any non-cons tail (so improper
-  ;; lists don't error): (safe-length '(1 2 . 3)) => 2.
-  (let ((n 0)) (while (consp l) (setq n (1+ n)) (setq l (cdr l))) n))
+  ;; Count cons cells without erroring or looping forever (Floyd cycle detection,
+  ;; so a circular list terminates): (safe-length '(1 2 . 3)) => 2.
+  (let ((slow l) (fast l) (n 0))
+    (catch 'safe-length--done
+      (while t
+        (unless (consp fast) (throw 'safe-length--done n))
+        (setq fast (cdr fast) n (1+ n))
+        (unless (consp fast) (throw 'safe-length--done n))
+        (setq fast (cdr fast) n (1+ n) slow (cdr slow))
+        (when (eq fast slow) (throw 'safe-length--done n))))))
 (defun length= (seq n) (= (length seq) n))
 (defun length< (seq n) (< (length seq) n))
 (defun length> (seq n) (> (length seq) n))
@@ -126,11 +142,16 @@ pub const PRELUDE: &str = r#"
 (defun seq-length (l) (length l))
 (defun seq-elt (l n) (elt l n))
 (defun seq-do (f l) (mapc f l))
-(defun seq-contains-p (l x) (if (member x (append l nil)) t nil))
+(defun seqp (object) (sequencep object))
+(defun seq-contains-p (seq elt &optional testfn)
+  (let ((test (or testfn #'equal)) (l (append seq nil)) (r nil))
+    (while (and l (not r)) (when (funcall test elt (car l)) (setq r t)) (setq l (cdr l)))
+    r))
 (defun seq-reverse (l) (reverse l))
-(defun mapconcat (f l &optional sep)
+(defun mapconcat (f seq &optional sep)
+  ;; SEQ may be any sequence (list/vector/string); coerce to a list of elements.
   (setq sep (or sep ""))
-  (let ((r "") (first t))
+  (let ((l (append seq nil)) (r "") (first t))
     (while l
       (if first (setq first nil) (setq r (concat r sep)))
       (setq r (concat r (funcall f (car l))))
@@ -151,8 +172,24 @@ pub const PRELUDE: &str = r#"
   (let ((l (and (stringp s) (string-to-list s))) (r nil))
     (while (and l (not r)) (when (>= (car l) 128) (setq r t)) (setq l (cdr l)))
     r))
-(defun delete (x l) (remove x l))
-(defun delq (x l) (remq x l))
+;; delete/delq remove matching elements destructively (splicing cons cells) for
+;; lists; non-lists fall back to the copying remove/remq.
+(defun delete (x l)
+  (if (not (listp l)) (remove x l)
+    (while (and (consp l) (equal (car l) x)) (setq l (cdr l)))
+    (let ((tail l))
+      (while (and (consp tail) (consp (cdr tail)))
+        (if (equal (car (cdr tail)) x) (setcdr tail (cddr tail))
+          (setq tail (cdr tail)))))
+    l))
+(defun delq (x l)
+  (if (not (listp l)) (remq x l)
+    (while (and (consp l) (eq (car l) x)) (setq l (cdr l)))
+    (let ((tail l))
+      (while (and (consp tail) (consp (cdr tail)))
+        (if (eq (car (cdr tail)) x) (setcdr tail (cddr tail))
+          (setq tail (cdr tail)))))
+    l))
 (defun delete-dups (l)
   ;; Destructively remove `equal' duplicates, keeping the first occurrence.
   (let ((tail l))
@@ -192,8 +229,16 @@ pub const PRELUDE: &str = r#"
   (apply 'cl-remove-if (lambda (x) (not (funcall pred x))) seq keys))
 (defun cl-delete-if (pred seq &rest keys) (apply (function cl-remove-if) pred seq keys))
 (defun cl-delete-if-not (pred seq &rest keys) (apply (function cl-remove-if-not) pred seq keys))
-(defun cl-find-if (pred l) (seq-find pred l))
-(defun cl-find-if-not (pred l) (seq-find (lambda (x) (not (funcall pred x))) l))
+(defun cl-find-if (pred seq &rest keys)
+  (let ((key (cl--getkey keys :key 'identity))
+        (from-end (cl--getkey keys :from-end nil))
+        (lst (append seq nil)) (r nil) (found nil))
+    (while (and lst (or from-end (not found)))
+      (when (funcall pred (funcall key (car lst))) (setq r (car lst) found t))
+      (setq lst (cdr lst)))
+    r))
+(defun cl-find-if-not (pred seq &rest keys)
+  (apply 'cl-find-if (lambda (x) (not (funcall pred x))) seq keys))
 (defun cl-sort (seq pred &rest keys)
   (let ((key (cl--getkey keys :key nil)))
     (if key (sort seq (lambda (a b) (funcall pred (funcall key a) (funcall key b))))
@@ -203,6 +248,44 @@ pub const PRELUDE: &str = r#"
   (let ((n 0)) (while (consp l) (setq n (1+ n)) (setq l (cdr l))) (and (null l) (= 0 (% n 2)))))
 (defun cl-some (pred l) (seq-some pred l))
 (defun cl-every (pred l) (seq-every-p pred l))
+(defun cl-notany (pred l) (not (cl-some pred l)))
+(defun cl-notevery (pred l) (not (cl-every pred l)))
+;; cl- aliases for the 3+-level c[ad]r accessors (Emacs only prefixes these;
+;; the 2-level caar/cadr/cdar/cddr stay unprefixed).
+(defun cl-caddr (x) (caddr x))
+(defun cl-cdddr (x) (cdddr x))
+(defun cl-cadddr (x) (cadddr x))
+;; cl- list utilities.
+(defun cl-list-length (l) (length l))
+(defun cl-copy-list (l) (copy-sequence l))
+(defun cl-revappend (l tail) (append (reverse l) tail))
+(defun cl-nreconc (l tail) (nconc (nreverse l) tail))
+(defmacro cl-nth-value (n form) (list 'nth n form))
+(defun cl-search (seq1 seq2 &rest keys)
+  ;; First index in SEQ2 where SEQ1 occurs as a contiguous subsequence, else nil.
+  (let* ((test (cl--getkey keys :test 'eql)) (l1 (append seq1 nil)) (l2 (append seq2 nil))
+         (len1 (length l1)) (len2 (length l2)) (i 0) (res nil))
+    (if (= len1 0) 0
+      (while (and (null res) (<= i (- len2 len1)))
+        (let ((a l1) (b (nthcdr i l2)) (ok t))
+          (while (and ok a)
+            (if (funcall test (car a) (car b)) (setq a (cdr a) b (cdr b)) (setq ok nil)))
+          (if ok (setq res i) (setq i (1+ i)))))
+      res)))
+(defun cl-mismatch (seq1 seq2 &rest keys)
+  ;; First index where SEQ1 and SEQ2 differ (or one ends), nil if they match.
+  (let ((test (cl--getkey keys :test 'eql)) (l1 (append seq1 nil)) (l2 (append seq2 nil))
+        (i 0) (res nil) (done nil))
+    (while (not done)
+      (cond ((and (null l1) (null l2)) (setq done t))
+            ((or (null l1) (null l2)) (setq res i done t))
+            ((funcall test (car l1) (car l2)) (setq l1 (cdr l1) l2 (cdr l2) i (1+ i)))
+            (t (setq res i done t))))
+    res))
+(defun cl-set-exclusive-or (a b &rest keys)
+  (append (apply (function cl-set-difference) a b keys)
+          (apply (function cl-set-difference) b a keys)))
+(defun cl-nset-exclusive-or (a b &rest keys) (apply (function cl-set-exclusive-or) a b keys))
 (defun cl-reduce (f seq &rest keys)
   ;; Supports :initial-value, :key and :from-end. With no initial value and an
   ;; empty SEQ, calls (funcall f) for the identity element.
@@ -258,6 +341,16 @@ pub const PRELUDE: &str = r#"
         (unless (seq-some (lambda (y) (funcall test x y)) l2) (setq r (cons x r))))
       (setq a (cdr a)))
     (nreverse r)))
+(defun cl-subsetp (l1 l2 &rest keys)
+  ;; t when every element of L1 appears in L2 (under :test, with :key applied to
+  ;; elements of both lists).
+  (let ((test (cl--getkey keys :test 'eql)) (key (cl--getkey keys :key nil)) (a l1) (ok t))
+    (while (and a ok)
+      (let ((x (if key (funcall key (car a)) (car a))))
+        (unless (seq-some (lambda (y) (funcall test x (if key (funcall key y) y))) l2)
+          (setq ok nil)))
+      (setq a (cdr a)))
+    ok))
 (defun cl-merge (type l1 l2 pred &rest _keys)
   (let ((a (append l1 nil)) (b (append l2 nil)) (r nil))
     (while (and a b)
@@ -283,6 +376,8 @@ pub const PRELUDE: &str = r#"
 ;; where the Rust printer can read them.
 (defvar print-length nil)
 (defvar print-level nil)
+(defvar print-escape-newlines nil)
+(defvar print-quoted t)
 (defvar gensym-counter 0)
 (defun gensym (&optional prefix)
   (let ((n gensym-counter))
@@ -294,7 +389,12 @@ pub const PRELUDE: &str = r#"
 (defmacro prog2 (a b &rest body) (list (quote progn) a (cons (quote prog1) (cons b body))))
 (defmacro incf (place &rest amt) `(setf ,place (+ ,place ,(if amt (car amt) 1))))
 (defmacro decf (place &rest amt) `(setf ,place (- ,place ,(if amt (car amt) 1))))
-(defmacro push (x place) (list (quote setq) place (list (quote cons) x place)))
+;; push: cons X onto PLACE. A plain variable uses setq; a generalized place
+;; (e.g. (cdr l), (nth 1 l), (gethash k h)) goes through setf.
+(defmacro push (x place)
+  (if (symbolp place)
+      (list (quote setq) place (list (quote cons) x place))
+    (list (quote setf) place (list (quote cons) x place))))
 ;; setf: assign to a generalized place. Supports a plain variable and the
 ;; common cons/sequence/hash/symbol places; multiple place/value pairs expand
 ;; left-to-right.
@@ -324,7 +424,11 @@ pub const PRELUDE: &str = r#"
                     (t (error "setf: unsupported place: %S" place))))
                `(setq ,place ,val))))
         (if rest `(progn ,exp (setf ,@rest)) exp)))))
-(defmacro pop (place) (list (quote prog1) (list (quote car) place) (list (quote setq) place (list (quote cdr) place))))
+(defmacro pop (place)
+  (list (quote prog1) (list (quote car) place)
+        (if (symbolp place)
+            (list (quote setq) place (list (quote cdr) place))
+          (list (quote setf) place (list (quote cdr) place)))))
 (defmacro dolist (spec &rest body)
   ;; (dolist (VAR LIST [RESULT]) BODY...) — RESULT (with VAR bound to nil) is the
   ;; value of the form; nil if omitted.
@@ -350,6 +454,26 @@ pub const PRELUDE: &str = r#"
 (defmacro ignore-errors (&rest body) `(condition-case nil (progn ,@body) (error nil)))
 (defmacro ignore-error (condition &rest body) `(condition-case nil (progn ,@body) (,condition nil)))
 (defmacro with-suppressed-warnings (_warnings &rest body) `(progn ,@body))
+(defmacro with-no-warnings (&rest body) `(progn ,@body))
+;; declare: a no-op at runtime (specs are advisory; defun/lambda ignore them).
+(defmacro declare (&rest _specs) nil)
+;; Compile-time evaluation: elisprs interprets, so these just run BODY.
+(defmacro eval-when-compile (&rest body) (cons 'progn body))
+(defmacro eval-and-compile (&rest body) (cons 'progn body))
+(defmacro cl-eval-when (situations &rest body)
+  ;; Run BODY when a runtime situation (eval/load/:execute/:load-toplevel) applies.
+  (if (or (memq 'eval situations) (memq 'load situations)
+          (memq :execute situations) (memq :load-toplevel situations))
+      (cons 'progn body)
+    nil))
+(defun byte-code-function-p (_object) nil)
+;; A form that evaluates to V (self-quoting literals as-is, else (quote V)).
+(defun macroexp-quote (v)
+  (if (and (not (consp v)) (or (not (symbolp v)) (null v) (eq v t) (keywordp v)))
+      v
+    (list 'quote v)))
+(defmacro defvar-local (var val &optional doc)
+  `(progn (defvar ,var ,val ,doc) (make-variable-buffer-local ',var)))
 (defmacro with-demoted-errors (fmt &rest body) `(condition-case --err-- (progn ,@body) (error (message ,fmt --err--) nil)))
 ;; with-output-to-string: capture princ/prin1/print/terpri output into a string.
 ;; (No buffer model — standard-output redirection isn't supported; this captures
@@ -381,11 +505,30 @@ pub const PRELUDE: &str = r#"
 (defun sequencep (x) (or (listp x) (vectorp x) (stringp x)))
 (defun arrayp (x) (or (vectorp x) (stringp x)))
 (defun string-or-null-p (x) (or (null x) (stringp x)))
+(defun nlistp (x) (not (listp x)))
+;; ROT13: rotate ASCII letters by 13, leaving everything else unchanged.
+(defun rot13-string (string)
+  (mapconcat (lambda (c)
+               (char-to-string
+                (cond ((and (>= c ?a) (<= c ?z)) (+ ?a (% (+ (- c ?a) 13) 26)))
+                      ((and (>= c ?A) (<= c ?Z)) (+ ?A (% (+ (- c ?A) 13) 26)))
+                      (t c))))
+             (append string nil) ""))
+;; elisprs has no symbols-with-position, so a symbol is always "bare".
+(defun symbol-with-pos-p (_x) nil)
+(defun bare-symbol (sym) sym)
 (defun xor (a b) (cond ((not a) b) ((not b) a) (t nil)))
 (defun proper-list-p (x)
-  (let ((n 0))
-    (while (consp x) (setq n (1+ n)) (setq x (cdr x)))
-    (if (null x) n nil)))
+  ;; Length if X is a proper (nil-terminated, acyclic) list, else nil. Floyd
+  ;; cycle detection so a circular list returns nil instead of looping.
+  (let ((slow x) (fast x) (n 0))
+    (catch 'proper-list-p--done
+      (while t
+        (unless (consp fast) (throw 'proper-list-p--done (if (null fast) n nil)))
+        (setq fast (cdr fast) n (1+ n))
+        (unless (consp fast) (throw 'proper-list-p--done (if (null fast) n nil)))
+        (setq fast (cdr fast) n (1+ n) slow (cdr slow))
+        (when (eq fast slow) (throw 'proper-list-p--done nil))))))
 
 ;;; ---- numbers ----
 ;; `expt` is a primitive subr (integer power; float for fractional/negative exp).
@@ -396,8 +539,12 @@ pub const PRELUDE: &str = r#"
 (defun lcm (a b) (if (or (= a 0) (= b 0)) 0 (/ (abs (* a b)) (gcd a b))))
 (defun isqrt (n) (let ((r 0)) (while (<= (* (1+ r) (1+ r)) n) (setq r (1+ r))) r))
 (defun cl-signum (x) (cond ((> x 0) 1) ((< x 0) -1) (t 0)))
-(defun cl-evenp (n) (= (% n 2) 0))
-(defun cl-oddp (n) (/= (% n 2) 0))
+(defun cl-evenp (n)
+  (unless (integerp n) (signal 'wrong-type-argument (list 'integer-or-marker-p n)))
+  (= (% n 2) 0))
+(defun cl-oddp (n)
+  (unless (integerp n) (signal 'wrong-type-argument (list 'integer-or-marker-p n)))
+  (/= (% n 2) 0))
 ;; Two-value division: each returns (QUOTIENT REMAINDER) where the remainder is
 ;; X - QUOTIENT*Y, matching the single-value floor/ceiling/truncate/round builtins.
 (defun cl-floor (x &optional y)
@@ -449,11 +596,118 @@ pub const PRELUDE: &str = r#"
       x)))
 ;; `string-to-number` is a primitive subr (floats, scientific notation, BASE arg).
 
+;;; ---- key sequences (kbd) ----
+;; Control-fold a character: letters/@A-Z[\]^_ map to 0–31, ? to 127, else the
+;; control bit (2^26) is set.
+(defun kbd--ctrl (c)
+  (cond ((and (>= c ?a) (<= c ?z)) (- c 96))
+        ((eq c ??) 127)
+        ((and (>= c ?@) (<= c ?_)) (- c ?@))
+        (t (logior c (ash 1 26)))))
+;; Apply modifier flags to a character code (returns an int, possibly with
+;; meta/shift/hyper/super/alt bits set).
+(defun kbd--char (c ctrl meta shift hyper super alt)
+  (when ctrl (setq c (kbd--ctrl c)))
+  (when shift (setq c (logior c (ash 1 25))))
+  (when hyper (setq c (logior c (ash 1 24))))
+  (when super (setq c (logior c (ash 1 23))))
+  (when alt (setq c (logior c (ash 1 22))))
+  (when meta (setq c (logior c (ash 1 27))))
+  c)
+;; Build a function-key symbol, prefixing modifiers in Emacs's canonical
+;; A-C-H-M-S-s order.
+(defun kbd--sym (name ctrl meta shift hyper super alt)
+  (when super (setq name (concat "s-" name)))
+  (when shift (setq name (concat "S-" name)))
+  (when meta (setq name (concat "M-" name)))
+  (when hyper (setq name (concat "H-" name)))
+  (when ctrl (setq name (concat "C-" name)))
+  (when alt (setq name (concat "A-" name)))
+  (intern name))
+;; Parse one whitespace-delimited key token into a list of key codes/symbols.
+(defun kbd--token (tok)
+  (let ((ctrl nil) (meta nil) (shift nil) (hyper nil) (super nil) (alt nil)
+        (i 0) (n (length tok)) (hadmod nil))
+    (while (and (< (1+ i) n) (eq (aref tok (1+ i)) ?-) (memq (aref tok i) '(?C ?M ?S ?H ?s ?A)))
+      (setq hadmod t)
+      (let ((m (aref tok i)))
+        (cond ((eq m ?C) (setq ctrl t)) ((eq m ?M) (setq meta t)) ((eq m ?S) (setq shift t))
+              ((eq m ?H) (setq hyper t)) ((eq m ?s) (setq super t)) ((eq m ?A) (setq alt t))))
+      (setq i (+ i 2)))
+    (let* ((rest (substring tok i)) (rn (length rest))
+           (named (cond ((string= rest "RET") 13) ((string= rest "TAB") 9) ((string= rest "SPC") 32)
+                        ((string= rest "ESC") 27) ((string= rest "DEL") 127) ((string= rest "LFD") 10)
+                        ((string= rest "NUL") 0) (t nil)))
+           (anglesym (and (> rn 1) (eq (aref rest 0) ?<) (eq (aref rest (1- rn)) ?>))))
+      (cond
+       (anglesym (list (kbd--sym (substring rest 1 (1- rn)) ctrl meta shift hyper super alt)))
+       (named (list (kbd--char named ctrl meta shift hyper super alt)))
+       ;; A plain multi-character token is a sequence of single-character keys.
+       ((and (not hadmod) (> rn 1)) (append rest nil))
+       ((= rn 1) (list (kbd--char (aref rest 0) ctrl meta shift hyper super alt)))
+       (t (list (kbd--sym rest ctrl meta shift hyper super alt)))))))
+(defun kbd (keys)
+  "Parse a key-description string into a key sequence (string or vector)."
+  (let ((codes nil))
+    (dolist (tok (split-string keys " " t))
+      (setq codes (append codes (kbd--token tok))))
+    (if (cl-every (lambda (c) (and (integerp c) (>= c 0) (<= c 127))) codes)
+        (apply #'string codes)
+      (vconcat codes))))
+;; Describe a function-key symbol name ("C-f1" → "C-<f1>"), wrapping the base in
+;; angle brackets and keeping any modifier prefixes.
+(defun kd--sym (name)
+  (let ((i 0) (n (length name)) (mods ""))
+    (while (and (< (1+ i) n) (eq (aref name (1+ i)) ?-) (memq (aref name i) '(?C ?M ?S ?H ?s ?A)))
+      (setq mods (concat mods (substring name i (+ i 2))))
+      (setq i (+ i 2)))
+    (concat mods "<" (substring name i) ">")))
+(defun single-key-description (key &optional _no-angles)
+  "Return a textual description of KEY (an event: integer or symbol)."
+  (if (symbolp key)
+      (kd--sym (symbol-name key))
+    (let* ((alt (/= 0 (logand key (ash 1 22))))
+           (super (/= 0 (logand key (ash 1 23))))
+           (hyper (/= 0 (logand key (ash 1 24))))
+           (shift (/= 0 (logand key (ash 1 25))))
+           (meta (/= 0 (logand key (ash 1 27))))
+           ;; Strip the non-control modifier bits; what's left holds the base
+           ;; char and possibly the explicit control bit (2^26).
+           (c (logand key (lognot (+ (ash 1 22) (ash 1 23) (ash 1 24) (ash 1 25) (ash 1 27)))))
+           (ctrl nil))
+      ;; Control: explicit 2^26 bit, or a folded control char (< 32, not named).
+      (cond ((/= 0 (logand c (ash 1 26))) (setq ctrl t c (logand c (lognot (ash 1 26)))))
+            ((and (< c 32) (not (memq c '(9 13 27 10))))
+             (setq ctrl t c (if (and (>= c 1) (<= c 26)) (+ c 96) (+ c 64)))))
+      (let ((base (cond ((eq c 9) "TAB") ((eq c 13) "RET") ((eq c 27) "ESC")
+                        ((eq c 10) "LFD") ((eq c 32) "SPC") ((eq c 127) "DEL")
+                        (t (char-to-string c)))))
+        ;; Modifier prefixes in Emacs's canonical A-C-H-M-S-s order.
+        (concat (if alt "A-" "") (if ctrl "C-" "") (if hyper "H-" "") (if meta "M-" "")
+                (if shift "S-" "") (if super "s-" "") base)))))
+(defun kd--add-meta (e)
+  (if (integerp e) (logior e (ash 1 27)) (intern (concat "M-" (symbol-name e)))))
+(defun key-description (keys &optional _prefix)
+  "Return a textual description of the key sequence KEYS (a string or vector)."
+  ;; An ESC (27) prefixing another event collapses into a Meta modifier.
+  (let ((evs (append keys nil)) (parts nil))
+    (while evs
+      (let ((e (car evs)))
+        (if (and (eq e 27) (cdr evs))
+            (progn (setq evs (cdr evs))
+                   (push (single-key-description (kd--add-meta (car evs))) parts))
+          (push (single-key-description e) parts)))
+      (setq evs (cdr evs)))
+    (mapconcat #'identity (nreverse parts) " ")))
+
 ;;; ---- strings (ASCII) ----
-(defun string= (a b) (equal a b))
-(defun string-equal (a b) (equal a b))
+;; Emacs's string comparators accept symbols too, using their print names.
+(defun string--name (x) (if (symbolp x) (symbol-name x) x))
+(defun string= (a b) (equal (string--name a) (string--name b)))
+(defun string-equal (a b) (string= a b))
 (defun string< (a b)
-  (let ((la (string-to-list a)) (lb (string-to-list b)) (res nil) (done nil))
+  (let ((la (string-to-list (string--name a))) (lb (string-to-list (string--name b)))
+        (res nil) (done nil))
     (while (not done)
       (cond ((null la) (setq res (not (null lb))) (setq done t))
             ((null lb) (setq res nil) (setq done t))
@@ -463,22 +717,36 @@ pub const PRELUDE: &str = r#"
     res))
 (defun string-lessp (a b) (string< a b))
 (defun string-greaterp (a b) (string< b a))
+(defun string> (a b) (string< b a))
+;; Collation: no locale support, so this is ordinary string order (with optional
+;; case folding), matching the C-locale default.
+(defun string-collate-lessp (s1 s2 &optional _locale ignore-case)
+  (if ignore-case (string-lessp (downcase s1) (downcase s2)) (string-lessp s1 s2)))
+(defun string-collate-equalp (s1 s2 &optional _locale ignore-case)
+  (if ignore-case (string-equal (downcase s1) (downcase s2)) (string-equal s1 s2)))
+;; Curly quotes are always displayable here, so the effective style is `curve'.
+(defun text-quoting-style () 'curve)
 (defun string-reverse (s) (reverse s))
 ;; `upcase` / `downcase` are primitive subrs (accept a string or a character).
 (defun capitalize (s)
   ;; Upcase the first letter of every word (run of alphanumerics), downcase the
-  ;; rest: (capitalize "hello world") => "Hello World".
+  ;; rest: (capitalize "hello world") => "Hello World". A character argument
+  ;; capitalizes to its uppercase form (like `upcase').
+  (if (integerp s) (upcase s)
   (let ((out nil) (in-word nil))
     (dolist (c (string-to-list s))
-      (let* ((lower (and (>= c ?a) (<= c ?z)))
-             (upper (and (>= c ?A) (<= c ?Z)))
-             (alnum (or lower upper (and (>= c ?0) (<= c ?9)))))
+      ;; Word constituent: a digit, or a cased letter (upcase ≠ downcase) —
+      ;; the latter covers non-ASCII letters like é/ÿ too.
+      (let ((wordc (or (and (>= c ?0) (<= c ?9)) (/= (downcase c) (upcase c)))))
         (cond
-         ((not alnum) (setq out (cons c out)))
-         (in-word (setq out (cons (if upper (+ c 32) c) out)))
-         (t (setq out (cons (if lower (- c 32) c) out))))
-        (setq in-word alnum)))
-    (apply (function string) (reverse out))))
+         ((not wordc) (setq out (cons c out)))
+         (in-word (setq out (cons (downcase c) out)))
+         (t (setq out (cons (upcase c) out))))
+        (setq in-word wordc)))
+    (apply (function string) (reverse out)))))
+;; Text properties aren't stored (fusevm strings can't carry them), so this
+;; returns the bare string — display-string code runs; property reads still error.
+(defun propertize (string &rest _props) string)
 (defun string-trim-left (s &optional regexp)
   ;; Strip a leading match of REGEXP (default whitespace).
   (let ((re (concat "\\`\\(?:" (or regexp "[ \t\n\r]+") "\\)")))
@@ -506,7 +774,12 @@ pub const PRELUDE: &str = r#"
   (let ((keep (min (length lst) (- (length lst) n))) (r nil) (i 0))
     (while (< i keep) (setq r (cons (nth i lst) r)) (setq i (1+ i)))
     (reverse r)))
-(defun nbutlast (lst &optional n) (butlast lst n))
+(defun nbutlast (lst &optional n)
+  ;; Destructively drop the last N (default 1) elements.
+  (let ((n (or n 1)) (len (length lst)))
+    (cond ((<= len n) nil)
+          ((<= n 0) lst)
+          (t (setcdr (nthcdr (- len n 1) lst) nil) lst))))
 (defun take (n lst)
   (let ((out nil))
     (while (and (> n 0) lst) (setq out (cons (car lst) out)) (setq lst (cdr lst)) (setq n (1- n)))
@@ -574,7 +847,18 @@ pub const PRELUDE: &str = r#"
       (when (and (string= (completion--str e) string) (or (null predicate) (funcall predicate e)))
         (setq res t)))
     res))
-(defun nreverse (lst) (reverse lst))
+(defun nreverse (seq)
+  ;; Reverse a list in place by relinking its cons cells; other sequences copy.
+  (if (listp seq)
+      (let ((prev nil) (cur seq))
+        (while (consp cur)
+          (let ((next (cdr cur)))
+            (setcdr cur prev)
+            (setq prev cur cur next)))
+        prev)
+    ;; Non-list: only arrays are reversible in place; else signal arrayp (Emacs).
+    (if (arrayp seq) (reverse seq)
+      (signal 'wrong-type-argument (list 'arrayp seq)))))
 
 ;;; ---- sort (stable merge sort, lists) ----
 (defun std--merge (a b pred)
@@ -605,33 +889,50 @@ pub const PRELUDE: &str = r#"
     (cond ((stringp seq) (apply (function string) sub))
           ((vectorp seq) (vconcat sub))
           (t sub))))
-(defun seq-uniq (seq) (delete-dups (append seq nil)))
+(defun seq-uniq (seq &optional testfn)
+  (if (null testfn)
+      (delete-dups (append seq nil))
+    (let ((out nil))
+      (dolist (x (append seq nil))
+        (unless (let ((f nil)) (dolist (y out) (when (funcall testfn x y) (setq f t))) f)
+          (setq out (cons x out))))
+      (nreverse out))))
 (defun seq-min (seq) (apply (function min) (append seq nil)))
 (defun seq-max (seq) (apply (function max) (append seq nil)))
 (defun seq-first (seq) (elt seq 0))
 (defun seq-rest (seq) (seq-drop seq 1))
-(defun seq-position (seq elt)
-  (let ((i 0) (res nil))
+(defun seq-position (seq elt &optional testfn)
+  (let ((test (or testfn #'equal)) (i 0) (res nil))
     (setq seq (append seq nil))
-    (while (and seq (null res)) (if (equal (car seq) elt) (setq res i)) (setq seq (cdr seq)) (setq i (1+ i)))
+    (while (and seq (null res)) (if (funcall test (car seq) elt) (setq res i)) (setq seq (cdr seq)) (setq i (1+ i)))
     res))
 (defun seq-into (seq type)
-  (cond ((eq type 'list) (append seq nil))
-        ((eq type 'vector) (apply (function vector) seq))
-        ((eq type 'string) (apply (function string) seq))
-        (t seq)))
-(defun seq-difference (a b) (seq-filter (lambda (x) (not (seq-contains-p b x))) a))
-(defun seq-intersection (a b) (seq-filter (lambda (x) (seq-contains-p b x)) a))
-(defun seq-union (a b) (append a (seq-difference b a)))
+  ;; Coerce SEQ (list/vector/string) to a list first so any input type converts.
+  (let ((l (append seq nil)))
+    (cond ((eq type 'list) l)
+          ((eq type 'vector) (apply (function vector) l))
+          ((eq type 'string) (apply (function string) l))
+          (t seq))))
+(defun seq-difference (a b &optional testfn)
+  (seq-filter (lambda (x) (not (seq-contains-p b x testfn))) a))
+(defun seq-intersection (a b &optional testfn)
+  (seq-filter (lambda (x) (seq-contains-p b x testfn)) a))
+(defun seq-union (a b &optional testfn)
+  (append (append a nil) (seq-difference b a testfn)))
 (defun seq-sort (pred seq) (seq-into (sort (append seq nil) pred) (seq--type-of seq)))
 (defun seq-partition (seq n)
-  (let ((out nil) (vec (vectorp seq)) (l (append seq nil)))
+  ;; Each chunk keeps SEQ's type (string→strings, vector→vectors, list→lists).
+  (let ((out nil) (type (seq--type-of seq)) (l (append seq nil)))
     (while l
-      (let ((chunk (take n l)))
-        (setq out (cons (if vec (vconcat chunk) chunk) out)))
+      (setq out (cons (seq-into (take n l) type) out))
       (setq l (nthcdr n l)))
     (reverse out)))
 (defun seq-split (seq n) (seq-partition seq n))
+(defun seq-set-equal-p (seq1 seq2 &optional testfn)
+  (and (seq-every-p (lambda (x) (seq-contains-p seq2 x testfn)) seq1)
+       (seq-every-p (lambda (x) (seq-contains-p seq1 x testfn)) seq2)))
+(defun seq-into-sequence (seq)
+  (if (sequencep seq) seq (error "Cannot convert %S into a sequence" seq)))
 (defun seq-sort-by (fn pred seq)
   (seq-sort (lambda (a b) (funcall pred (funcall fn a) (funcall fn b))) seq))
 (defun seq-positions (seq elt &optional testfn)
@@ -671,13 +972,20 @@ pub const PRELUDE: &str = r#"
 ;;; ---- cl-lib (subset) ----
 (defun cl-mapcar (fn &rest seqs)
   (apply (function seq-mapn) fn (mapcar (lambda (s) (append s nil)) seqs)))
+(defun cl-map (type fn &rest seqs)
+  "Map FN over SEQS in parallel, collecting results into a sequence of TYPE.
+TYPE nil maps for side effects only and returns nil."
+  (let ((result (apply (function cl-mapcar) fn seqs)))
+    (if (null type) nil (cl-coerce result type))))
 (defun cl-subseq (seq start &optional end) (seq-subseq seq start end))
 (defun cl--in-bounds (i start end) (and (>= i start) (or (null end) (< i end))))
 (defun cl-position (item seq &rest keys)
   (let ((test (cl--getkey keys :test 'eql)) (key (cl--getkey keys :key 'identity))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
+        (from-end (cl--getkey keys :from-end nil))
         (lst (append seq nil)) (i 0) (r nil))
-    (while (and lst (not r))
+    ;; With :from-end, keep scanning so R ends up the last match.
+    (while (and lst (or from-end (not r)))
       (when (and (cl--in-bounds i start end) (funcall test item (funcall key (car lst))))
         (setq r i))
       (setq i (1+ i) lst (cdr lst)))
@@ -705,8 +1013,9 @@ pub const PRELUDE: &str = r#"
 (defun cl-position-if (pred seq &rest keys)
   (let ((key (cl--getkey keys :key 'identity))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
+        (from-end (cl--getkey keys :from-end nil))
         (lst (append seq nil)) (i 0) (r nil))
-    (while (and lst (not r))
+    (while (and lst (or from-end (not r)))
       (when (and (cl--in-bounds i start end) (funcall pred (funcall key (car lst))))
         (setq r i))
       (setq i (1+ i) lst (cdr lst)))
@@ -715,10 +1024,11 @@ pub const PRELUDE: &str = r#"
   (apply 'cl-position-if (lambda (x) (not (funcall pred x))) seq keys))
 (defun cl-find (item seq &rest keys)
   (let ((test (cl--getkey keys :test 'eql)) (key (cl--getkey keys :key 'identity))
+        (from-end (cl--getkey keys :from-end nil))
         (lst (append seq nil)) (r nil) (found nil))
-    (while (and lst (not found))
-      (if (funcall test item (funcall key (car lst))) (setq r (car lst) found t)
-        (setq lst (cdr lst))))
+    (while (and lst (or from-end (not found)))
+      (when (funcall test item (funcall key (car lst))) (setq r (car lst) found t))
+      (setq lst (cdr lst)))
     r))
 (defun cl-remove-duplicates (seq &rest keys)
   ;; Default keeps the LAST occurrence of each `equal' element; with :from-end
@@ -749,6 +1059,20 @@ pub const PRELUDE: &str = r#"
     (nreverse res)))
 (defun cl-getf (plist key &optional default)
   (let ((m (plist-member plist key))) (if m (cadr m) default)))
+;; Remove the FIRST KEY/value pair from PLIST (eq comparison), like Emacs.
+(defun cl--plist-remove-first (plist tag)
+  (let ((out nil) (removed nil))
+    (while plist
+      (if (and (not removed) (eq (car plist) tag))
+          (setq removed t)
+        (setq out (cons (cadr plist) (cons (car plist) out))))
+      (setq plist (cddr plist)))
+    (nreverse out)))
+(defmacro cl-remf (place tag)
+  "Remove the property TAG from the plist stored in PLACE; return t if present."
+  `(let ((--cl-remf-- (plist-member ,place ,tag)))
+     (when --cl-remf-- (setf ,place (cl--plist-remove-first ,place ,tag)))
+     (and --cl-remf-- t)))
 
 ;;; ---- subr-x macros ----
 ;; Build nested `(let ((VAR VAL)) (if VAR <inner> ELSE))` for a list of BINDINGS,
@@ -756,8 +1080,15 @@ pub const PRELUDE: &str = r#"
 (defun if-let--chain (bindings then else)
   (if (null bindings) then
     (let* ((b (car bindings))
-           (var (if (consp b) (car b) b))
-           (val (if (consp b) (car (cdr b)) b)))
+           ;; Clause forms: SYMBOL (test its value), (SYMBOL VALUE) (bind+test),
+           ;; or (VALUE) — a single-element list that is only tested, not bound.
+           (test-only (and (consp b) (null (cdr b))))
+           (var (cond ((not (consp b)) b)
+                      (test-only (make-symbol "if-let"))
+                      (t (car b))))
+           (val (cond ((not (consp b)) b)
+                      (test-only (car b))
+                      (t (car (cdr b))))))
       (list 'let (list (list var val))
             (list 'if var (if-let--chain (cdr bindings) then else) else)))))
 ;; Accept the old single-binding spelling `(VAR VAL)` as well as a binding list.
@@ -917,6 +1248,20 @@ pub const PRELUDE: &str = r#"
                             forms)))
         (setq j (1+ j))))
     `(progn ,@(reverse forms) ',name)))
+;; Generic struct-slot introspection. Slots are stored as bare symbols (no
+;; default) or `(NAME DEFAULT)' pairs; slot 0 of the vector is the type tag.
+(defun cl-struct-slot-offset (struct-type slot-name)
+  (let ((slots (cdr (assq struct-type cl-struct--slots))) (i 1) (idx nil))
+    (dolist (s slots)
+      (when (eq (if (consp s) (car s) s) slot-name) (setq idx i))
+      (setq i (1+ i)))
+    (or idx (error "Invalid slot name: %S, %S" struct-type slot-name))))
+(defun cl-struct-slot-value (struct-type slot-name inst)
+  (aref inst (cl-struct-slot-offset struct-type slot-name)))
+(defun cl-struct-slot-info (struct-type)
+  (cons '(cl-tag-slot)
+        (mapcar (lambda (s) (if (consp s) s (list s nil)))
+                (cdr (assq struct-type cl-struct--slots)))))
 (defmacro and-let* (bindings &rest body)
   ;; Like when-let* but with no body returns the last bound value (SRFI-2).
   (if-let--chain bindings
@@ -963,12 +1308,50 @@ pub const PRELUDE: &str = r#"
          (alist (cl-mapcar (lambda (b g) (cons (car b) g)) bindings gs)))
     `(let ,(cl-mapcar (lambda (b g) (list g (cons 'lambda (cdr b)))) bindings gs)
        ,@(cl-flet--walk body alist))))
+(defmacro cl-flet* (bindings &rest body)
+  ;; Sequential cl-flet: each local function sees the earlier ones.
+  (if (null bindings)
+      (cons 'progn body)
+    `(cl-flet (,(car bindings)) (cl-flet* ,(cdr bindings) ,@body))))
 (defmacro cl-labels (bindings &rest body)
   (let* ((gs (mapcar (lambda (b) (make-symbol (symbol-name (car b)))) bindings))
          (alist (cl-mapcar (lambda (b g) (cons (car b) g)) bindings gs)))
     `(let ,(mapcar (lambda (g) (list g nil)) gs)
        ,@(cl-mapcar (lambda (b g) (list 'setq g (cl-flet--walk (cons 'lambda (cdr b)) alist))) bindings gs)
        ,@(cl-flet--walk body alist))))
+;; cl-macrolet: local macros. Expand calls to them throughout BODY at expansion
+;; time (re-walking each expansion), then leave the rest for the normal pass.
+(defun cl-macrolet--walk (form expanders)
+  (cond
+   ((not (consp form)) form)
+   ((eq (car form) 'quote) form)
+   ((and (symbolp (car form)) (assq (car form) expanders))
+    (cl-macrolet--walk (apply (cdr (assq (car form) expanders)) (cdr form)) expanders))
+   (t (cons (cl-macrolet--walk (car form) expanders)
+            (cl-macrolet--walk (cdr form) expanders)))))
+(defmacro cl-macrolet (bindings &rest body)
+  ;; eval each local-macro lambda into a real closure (apply needs a closure,
+  ;; not a raw lambda list), then expand calls to them in BODY.
+  (let ((expanders (mapcar (lambda (b) (cons (car b) (eval (cons 'lambda (cdr b)) t))) bindings)))
+    (cons 'progn (cl-macrolet--walk body expanders))))
+;; cl-symbol-macrolet: substitute each NAME with its EXPANSION in value position
+;; throughout BODY; `(setq NAME v)` becomes `(setf EXPANSION v)`. (No shadowing
+;; handling — don't rebind a symbol-macro name with let inside the body.)
+(defun cl-symbol-macrolet--setq (pairs alist)
+  (when pairs
+    (let* ((sym (car pairs)) (a (assq sym alist)) (place (if a (car (cdr a)) sym)))
+      (cons place (cons (cl-symbol-macrolet--walk (car (cdr pairs)) alist)
+                        (cl-symbol-macrolet--setq (cdr (cdr pairs)) alist))))))
+(defun cl-symbol-macrolet--walk (form alist)
+  (cond
+   ((symbolp form) (let ((a (assq form alist))) (if a (car (cdr a)) form)))
+   ((not (consp form)) form)
+   ((eq (car form) 'quote) form)
+   ((eq (car form) 'setq) (cons 'setf (cl-symbol-macrolet--setq (cdr form) alist)))
+   (t (cons (cl-symbol-macrolet--walk (car form) alist)
+            (cl-symbol-macrolet--walk (cdr form) alist)))))
+(defmacro cl-symbol-macrolet (bindings &rest body)
+  (cons 'progn (cl-symbol-macrolet--walk body bindings)))
 (defmacro letrec (bindings &rest body)
   ;; Bind to nil, then assign — so the (by-reference) closures can recurse / refer
   ;; to each other.
@@ -1013,6 +1396,46 @@ pub const PRELUDE: &str = r#"
 ;;; ---- more cl-lib / seq / subr-x / functional ----
 (defmacro cl-incf (place &rest amt) `(setf ,place (+ ,place ,(if amt (car amt) 1))))
 (defmacro cl-decf (place &rest amt) `(setf ,place (- ,place ,(if amt (car amt) 1))))
+;; cl-callf: (cl-callf FUNC PLACE ARGS...) -> (setf PLACE (FUNC PLACE ARGS...)).
+;; cl-callf2 puts a fixed ARG1 before PLACE in the call.
+(defmacro cl-callf (func place &rest args)
+  (list 'setf place (cons func (cons place args))))
+(defmacro cl-callf2 (func arg1 place &rest args)
+  (list 'setf place (cons func (cons arg1 (cons place args)))))
+(defmacro cl-locally (&rest body) (cons 'progn body))
+;; cl-psetf: evaluate all values first, then assign all places (parallel setf).
+(defmacro cl-psetf (&rest pairs)
+  (let ((binds nil) (sets nil) (ps pairs))
+    (while ps
+      (let ((tv (make-symbol "ps")))
+        (setq binds (cons (list tv (cadr ps)) binds))
+        (setq sets (cons (list 'setf (car ps) tv) sets))
+        (setq ps (cddr ps))))
+    `(let ,(reverse binds) ,@(reverse sets) nil)))
+;; cl-rotatef: rotate place values left (last gets the first's old value).
+(defmacro cl-rotatef (&rest places)
+  (if (cdr places)
+      (let ((tv (make-symbol "rot")) (forms nil) (ps places))
+        (while (cdr ps)
+          (setq forms (cons (list 'setf (car ps) (cadr ps)) forms))
+          (setq ps (cdr ps)))
+        `(let ((,tv ,(car places)))
+           ,@(reverse forms)
+           (setf ,(car ps) ,tv)
+           nil))
+    nil))
+;; cl-shiftf: shift place values left, the last place taking NEWVAL (the final
+;; argument); returns the first place's old value.
+(defmacro cl-shiftf (&rest args)
+  (let* ((places (butlast args)) (newval (car (last args)))
+         (tv (make-symbol "shf")) (forms nil) (ps places))
+    (while (cdr ps)
+      (setq forms (cons (list 'setf (car ps) (cadr ps)) forms))
+      (setq ps (cdr ps)))
+    `(let ((,tv ,(car places)))
+       ,@(reverse forms)
+       (setf ,(car ps) ,newval)
+       ,tv)))
 (defun cl-first (x) (car x))
 (defun cl-fourth (x) (nth 3 x))
 (defun cl-fifth (x) (nth 4 x))
@@ -1041,6 +1464,38 @@ pub const PRELUDE: &str = r#"
         (if (and (consp pair) (funcall test item (funcall key (car pair))))
             (setq r pair) (setq alist (cdr alist)))))
     r))
+(defun cl-member-if (pred lst &rest keys)
+  (let ((key (cl--getkey keys :key 'identity)) (r nil))
+    (while (and lst (not r))
+      (if (funcall pred (funcall key (car lst))) (setq r lst) (setq lst (cdr lst))))
+    r))
+(defun cl-member-if-not (pred lst &rest keys)
+  (apply 'cl-member-if (lambda (x) (not (funcall pred x))) lst keys))
+(defun cl-assoc-if (pred alist &rest keys)
+  (let ((key (cl--getkey keys :key 'identity)) (r nil))
+    (while (and alist (not r))
+      (let ((pair (car alist)))
+        (if (and (consp pair) (funcall pred (funcall key (car pair))))
+            (setq r pair) (setq alist (cdr alist)))))
+    r))
+(defun cl-assoc-if-not (pred alist &rest keys)
+  (apply 'cl-assoc-if (lambda (x) (not (funcall pred x))) alist keys))
+(defun cl-rassoc (item alist &rest keys)
+  (let ((test (cl--getkey keys :test 'eql)) (key (cl--getkey keys :key 'identity)) (r nil))
+    (while (and alist (not r))
+      (let ((pair (car alist)))
+        (if (and (consp pair) (funcall test item (funcall key (cdr pair))))
+            (setq r pair) (setq alist (cdr alist)))))
+    r))
+(defun cl-rassoc-if (pred alist &rest keys)
+  (let ((key (cl--getkey keys :key 'identity)) (r nil))
+    (while (and alist (not r))
+      (let ((pair (car alist)))
+        (if (and (consp pair) (funcall pred (funcall key (cdr pair))))
+            (setq r pair) (setq alist (cdr alist)))))
+    r))
+(defun cl-rassoc-if-not (pred alist &rest keys)
+  (apply 'cl-rassoc-if (lambda (x) (not (funcall pred x))) alist keys))
 (defun cl-remove (item seq &rest keys)
   (let ((test (cl--getkey keys :test 'eql)) (key (cl--getkey keys :key 'identity))
         (count (cl--getkey keys :count nil)) (lst (append seq nil)) (out nil) (removed 0))
@@ -1071,17 +1526,46 @@ pub const PRELUDE: &str = r#"
     (cl--like (reverse out) seq)))
 (defun cl-substitute-if-not (new pred seq &rest keys)
   (apply 'cl-substitute-if new (lambda (x) (not (funcall pred x))) seq keys))
+;; Destructive substitution: elisprs rebuilds the sequence, so these match the
+;; non-destructive forms (the return value is what callers rely on).
+(defun cl-nsubstitute (new old seq &rest keys) (apply 'cl-substitute new old seq keys))
+(defun cl-nsubstitute-if (new pred seq &rest keys) (apply 'cl-substitute-if new pred seq keys))
+(defun cl-nsubstitute-if-not (new pred seq &rest keys)
+  (apply 'cl-substitute-if-not new pred seq keys))
+(defun cl-fill (seq item &rest keys)
+  "Fill SEQ with ITEM between :start (default 0) and :end (default end)."
+  (let* ((lst (append seq nil)) (n (length lst))
+         (start (cl--getkey keys :start 0)) (end (or (cl--getkey keys :end nil) n))
+         (i 0) (out nil))
+    (while lst
+      (setq out (cons (if (and (>= i start) (< i end)) item (car lst)) out))
+      (setq i (1+ i) lst (cdr lst)))
+    (cl--like (reverse out) seq)))
+(defun cl-replace (seq1 seq2 &rest keys)
+  "Copy elements of SEQ2 into SEQ1 within the :start1/:end1 range, returning SEQ1."
+  (let* ((l1 (append seq1 nil)) (l2 (append seq2 nil))
+         (start1 (cl--getkey keys :start1 0)) (end1 (or (cl--getkey keys :end1 nil) (length l1)))
+         (start2 (cl--getkey keys :start2 0)) (end2 (or (cl--getkey keys :end2 nil) (length l2)))
+         (src (cl-subseq l2 start2 end2)) (i 0) (out nil))
+    (while l1
+      (if (and (>= i start1) (< i end1) src)
+          (setq out (cons (car src) out) src (cdr src))
+        (setq out (cons (car l1) out)))
+      (setq i (1+ i) l1 (cdr l1)))
+    (cl--like (reverse out) seq1)))
 (defun cl-mapcan (fn &rest seqs) (apply 'nconc (apply 'cl-mapcar fn seqs)))
 (defun cl-acons (key val alist) (cons (cons key val) alist))
 (defun cl-list* (&rest args)
   (if (null (cdr args)) (car args) (cons (car args) (apply (function cl-list*) (cdr args)))))
 
 (defun seq-map-indexed (fn seq)
-  (let ((i 0) (out nil))
-    (while seq (setq out (cons (funcall fn (car seq) i) out)) (setq seq (cdr seq)) (setq i (1+ i)))
+  (let ((i 0) (out nil) (l (append seq nil)))
+    (while l (setq out (cons (funcall fn (car l) i) out)) (setq l (cdr l)) (setq i (1+ i)))
     (reverse out)))
 (defun seq-do-indexed (fn seq)
-  (let ((i 0)) (while seq (funcall fn (car seq) i) (setq seq (cdr seq)) (setq i (1+ i)))) nil)
+  (let ((i 0) (l (append seq nil)))
+    (while l (funcall fn (car l) i) (setq l (cdr l)) (setq i (1+ i))))
+  nil)
 (defun seq-keep (fn seq) (seq-filter (function identity) (mapcar fn seq)))
 (defun seq-mapcat (fn seq &optional type)
   (apply 'seq-concatenate (or type 'list) (mapcar fn (append seq nil))))
@@ -1100,6 +1584,33 @@ pub const PRELUDE: &str = r#"
   ;; grave accent => left single quote, apostrophe => right single quote.
   (apply (function format) (string-replace "'" "’" (string-replace "`" "‘" fmt)) args))
 (defun cl--digitp (c) (and (>= c ?0) (<= c ?9)))
+;; value<: a canonical total order within a type (numbers/strings/symbols/lists/
+;; vectors); cross-type comparison signals an error, like Emacs 30.
+(defun value<--class (x)
+  (cond ((numberp x) 'number) ((stringp x) 'string)
+        ((or (consp x) (null x)) 'list) ((symbolp x) 'symbol)
+        ((vectorp x) 'vector) (t 'other)))
+(defun value< (a b)
+  (let ((ca (value<--class a)) (cb (value<--class b)))
+    (unless (eq ca cb) (signal (quote type-mismatch) (list a b)))
+    (cond
+     ((eq ca 'number) (< a b))
+     ((eq ca 'string) (string< a b))
+     ((eq ca 'symbol) (string< (symbol-name a) (symbol-name b)))
+     ((eq ca 'list)
+      (cond ((null a) (not (null b)))
+            ((null b) nil)
+            ((value< (car a) (car b)) t)
+            ((value< (car b) (car a)) nil)
+            (t (value< (cdr a) (cdr b)))))
+     ((eq ca 'vector)
+      (let ((n (min (length a) (length b))) (i 0) (res 'eq))
+        (while (and (< i n) (eq res 'eq))
+          (cond ((value< (aref a i) (aref b i)) (setq res t))
+                ((value< (aref b i) (aref a i)) (setq res nil)))
+          (setq i (1+ i)))
+        (if (eq res 'eq) (< (length a) (length b)) res)))
+     (t (signal (quote type-mismatch) (list a b))))))
 (defun string-version-lessp (s1 s2)
   ;; Like `string-lessp' but compare embedded decimal runs numerically.
   (let ((i 0) (j 0) (n1 (length s1)) (n2 (length s2)) (res nil) (done nil))
@@ -1129,22 +1640,35 @@ pub const PRELUDE: &str = r#"
           ((eq type 'vector) (vconcat all))
           ((eq type 'string) (apply (function string) all))
           (t (error "Not a sequence type name: %S" type)))))
+(defun cl-concatenate (type &rest seqs) (apply #'seq-concatenate type seqs))
+;; cl-equalp: like equal but numbers compare with `=' (1 = 1.0) and strings
+;; case-insensitively; recurses through conses and vectors. (Characters are
+;; integers in elisp, so they compare numerically, like Emacs.)
+(defun cl-equalp (x y)
+  (cond
+   ((and (numberp x) (numberp y)) (= x y))
+   ((and (stringp x) (stringp y)) (string-equal-ignore-case x y))
+   ((and (consp x) (consp y)) (and (cl-equalp (car x) (car y)) (cl-equalp (cdr x) (cdr y))))
+   ((and (vectorp x) (vectorp y))
+    (and (= (length x) (length y)) (cl-equalp (append x nil) (append y nil))))
+   (t (equal x y))))
 (defun copy-alist (al)
   (mapcar (lambda (p) (if (consp p) (cons (car p) (cdr p)) p)) al))
 (defun substring-no-properties (s &optional from to)
   (if to (substring s (or from 0) to) (substring s (or from 0))))
 ;; The human-readable message for an error object (ERROR-SYMBOL . DATA).
 (defun error-message-string (err)
-  (let* ((sym (car err)) (data (cdr err)) (msg (get sym 'error-message)))
+  (let* ((sym (car err)) (data (cdr err)) (msg (get sym 'error-message))
+         ;; Data is printed readably (prin1), except the file-error family,
+         ;; which shows its strings verbatim.
+         (filey (memq 'file-error (get sym 'error-conditions)))
+         (render (lambda (x) (if (and filey (stringp x)) x (format "%S" x)))))
     (cond
      ;; `error'/`user-error' carry their message string as the sole datum.
      ((and (memq sym '(error user-error)) (stringp (car data))) (car data))
-     (msg (if data
-              (concat msg ": " (mapconcat (lambda (x) (if (stringp x) x (format "%S" x))) data ", "))
-            msg))
+     (msg (if data (concat msg ": " (mapconcat render data ", ")) msg))
      ((null data) (symbol-name sym))
-     (t (concat (symbol-name sym) ": "
-                (mapconcat (lambda (x) (if (stringp x) x (format "%S" x))) data ", "))))))
+     (t (concat (symbol-name sym) ": " (mapconcat render data ", "))))))
 (defun seq-group-by (fn seq)
   (let ((result nil))
     (dolist (x (append seq nil))
@@ -1175,6 +1699,20 @@ pub const PRELUDE: &str = r#"
   val)
 (defun get (sym prop) (plist-get (gethash sym symbol-plist--table) prop))
 (defun symbol-plist (sym) (gethash sym symbol-plist--table))
+(defun setplist (sym plist) (puthash sym plist symbol-plist--table) plist)
+;; Function properties share the symbol plist table.
+(defun function-get (f prop &optional _autoload) (get f prop))
+(defun function-put (f prop value) (put f prop value))
+(defun define-symbol-prop (symbol prop value) (put symbol prop value))
+;; Records: elisprs models them (and cl-defstruct instances) as vectors tagged
+;; `cl-struct-TYPE' in slot 0, so `type-of'/printing report the bare TYPE. (aref
+;; slot 0 yields the tag rather than the bare type, a known representation quirk.)
+(defun record (type &rest slots)
+  (apply #'vector (intern (concat "cl-struct-" (symbol-name type))) slots))
+(defun make-record (type slots init)
+  (let ((v (make-vector (1+ slots) init)))
+    (aset v 0 (intern (concat "cl-struct-" (symbol-name type))))
+    v))
 (defun define-error (name message &optional parent)
   ;; Register NAME as an error condition: its conditions are NAME plus PARENT's.
   (let* ((parent (or parent 'error))
@@ -1191,6 +1729,7 @@ pub const PRELUDE: &str = r#"
 (define-error 'quit "Quit" nil)
 (define-error 'args-out-of-range "Args out of range")
 (define-error 'arith-error "Arithmetic error")
+(define-error 'type-mismatch "Types do not match")
 (define-error 'wrong-type-argument "Wrong type argument")
 (define-error 'wrong-number-of-arguments "Wrong number of arguments")
 (define-error 'void-variable "Symbol's value as variable is void")
@@ -1200,9 +1739,15 @@ pub const PRELUDE: &str = r#"
 (define-error 'invalid-regexp "Invalid regexp")
 (define-error 'cl-assertion-failed "Assertion failed")
 (define-error 'end-of-file "End of file during parsing")
-(defun add-to-list (var elt)
-  (let ((cur (symbol-value var)))
-    (if (member elt cur) cur (set var (cons elt cur)))))
+(defun add-to-list (var elt &optional append compare-fn)
+  ;; Add ELT to VAR's list unless already present (COMPARE-FN, default `equal');
+  ;; prepend by default, or append to the end when APPEND is non-nil.
+  (let ((cur (symbol-value var)) (test (or compare-fn #'equal)) (found nil))
+    (dolist (x cur) (when (funcall test elt x) (setq found t)))
+    (if found cur
+      (set var (if append (append cur (list elt)) (cons elt cur))))))
+;; No text-property model, so this collapses to plain `equal'.
+(defun equal-including-properties (a b) (equal a b))
 
 (defun apply-partially (fn &rest args) (lambda (&rest more) (apply fn (append args more))))
 (defun complement (fn) (lambda (&rest args) (not (apply fn args))))
@@ -1211,6 +1756,10 @@ pub const PRELUDE: &str = r#"
 (defun string-chop-newline (s) (if (string-suffix-p "\n" s) (substring s 0 (- (length s) 1)) s))
 (defun pp-to-string (object) (concat (prin1-to-string object) "\n"))
 (defun pp (object &optional _stream) (princ (pp-to-string object)) nil)
+;; cl-print: elisprs has no special struct/closure rendering, so these fall back
+;; to the ordinary printer.
+(defun cl-prin1-to-string (object) (prin1-to-string object))
+(defun cl-prin1 (object &optional stream) (prin1 object stream))
 (defun format-spec (format specification &rest _)
   ;; Replace each %X in FORMAT with the cdr of (X . VALUE) in SPECIFICATION; %% => %.
   (let ((i 0) (n (length format)) (out nil))
@@ -1238,6 +1787,10 @@ pub const PRELUDE: &str = r#"
 (defun char-width (c)
   ;; 0 for combining marks, 2 for East-Asian wide/fullwidth, else 1.
   (cond
+   ;; Control chars: newline 0, tab tab-width (8), others display as `^X' (2).
+   ((eq c ?\n) 0)
+   ((eq c ?\t) 8)
+   ((or (< c 32) (eq c 127)) 2)
    ((or (and (>= c #x0300) (<= c #x036F)) (and (>= c #x200B) (<= c #x200F))) 0)
    ((or (and (>= c #x1100) (<= c #x115F))   ; Hangul Jamo
         (and (>= c #x2E80) (<= c #x303E))   ; CJK radicals … symbols
@@ -1249,6 +1802,9 @@ pub const PRELUDE: &str = r#"
         (and (>= c #xF900) (<= c #xFAFF))   ; CJK compat ideographs
         (and (>= c #xFF00) (<= c #xFF60))   ; Fullwidth forms
         (and (>= c #xFFE0) (<= c #xFFE6))
+        (and (>= c #x1F300) (<= c #x1F64F)) ; Misc symbols & pictographs, emoticons
+        (and (>= c #x1F900) (<= c #x1F9FF)) ; Supplemental symbols & pictographs
+        (and (>= c #x1FA70) (<= c #x1FAFF)) ; Symbols & pictographs ext A
         (and (>= c #x20000) (<= c #x3FFFD))) ; CJK ext B+
     2)
    (t 1)))
@@ -1256,18 +1812,29 @@ pub const PRELUDE: &str = r#"
   (let ((w 0) (l (string-to-list s)))
     (while l (setq w (+ w (char-width (car l))) l (cdr l)))
     w))
-(defun truncate-string-to-width (str end-column &optional start-column padding _ellipsis)
+(defun truncate-string-to-width (str end-column &optional start-column padding ellipsis)
   ;; Truncate STR so its display width is at most END-COLUMN (from START-COLUMN).
-  (let ((col 0) (start (or start-column 0)) (out nil) (l (string-to-list str)) (stop nil))
+  ;; When ELLIPSIS is non-nil and STR is truncated, append it (t means "…"),
+  ;; keeping the total width within END-COLUMN.
+  (let* ((chars (string-to-list str))
+         (total (let ((w 0)) (dolist (c chars) (setq w (+ w (char-width c)))) w))
+         (truncated (> total end-column))
+         (ell (cond ((null ellipsis) "") ((eq ellipsis t) "…") (t ellipsis)))
+         (limit (if truncated (- end-column (string-width ell)) end-column))
+         (col 0) (start (or start-column 0)) (out nil) (l chars) (stop nil))
     (while (and l (not stop))
       (let* ((c (car l)) (cw (char-width c)))
-        (if (> (+ col cw) end-column) (setq stop t)
+        (if (> (+ col cw) limit) (setq stop t)
           (when (>= col start) (setq out (cons c out)))
           (setq col (+ col cw))))
       (setq l (cdr l)))
+    (setq out (nreverse out))
+    (when truncated (setq out (append out (string-to-list ell)) col (+ col (string-width ell))))
     (when (and padding (< col end-column))
-      (while (< col end-column) (setq out (cons padding out) col (1+ col))))
-    (concat (nreverse out))))
+      (let ((pad nil))
+        (while (< col end-column) (setq pad (cons padding pad) col (1+ col)))
+        (setq out (append out pad))))
+    (concat out)))
 (defun cl-type-of (obj)
   (cond ((null obj) 'null)
         ((integerp obj) 'fixnum)
@@ -1281,10 +1848,38 @@ pub const PRELUDE: &str = r#"
 (defun string-pad (s len &optional padding start)
   ;; Pad S to LENGTH chars with PADDING (default space); pad on the left when
   ;; START is non-nil, otherwise on the right.
+  (unless (natnump len) (signal 'wrong-type-argument (list 'natnump len)))
   (let ((pad (or padding 32)) (cur (length s)))
     (if (>= cur len) s
       (let ((fill (make-string (- len cur) pad)))
         (if start (concat fill s) (concat s fill))))))
+;; A horizontal rule: LENGTH dashes (default 79, the batch text width) + newline.
+;; (Emacs returns a face-propertized string; elisprs can't store props.)
+(defun make-separator-line (&optional length)
+  (concat (make-string (or length 79) ?-) "\n"))
+(defun string-lines (string &optional omit-nulls keep-newlines)
+  ;; Split STRING into a list of lines on newline.  When OMIT-NULLS, drop empty
+  ;; lines; when KEEP-NEWLINES, retain the trailing newline on each line.
+  (if (equal string "")
+      (list "")
+    (let ((lines nil) (start 0) (len (length string)))
+      (while (< start len)
+        (let ((nl (string-search "\n" string start)))
+          (if nl
+              (progn
+                (let ((line (substring string start (if keep-newlines (1+ nl) nl))))
+                  (when (or (not omit-nulls) (not (string= line "")))
+                    (push line lines)))
+                (setq start (1+ nl)))
+            (let ((line (substring string start)))
+              (when (or (not omit-nulls) (not (string= line "")))
+                (push line lines))
+              (setq start len)))))
+      (nreverse lines))))
+(defun string-glyph-split (string)
+  ;; Split STRING into its glyphs.  Without composition tables this is a
+  ;; per-character split, which matches Emacs for non-composed text.
+  (mapcar #'char-to-string (string-to-list string)))
 (defun string-limit (string length &optional end _coding-system)
   ;; First LENGTH chars of STRING (or last LENGTH when END is non-nil); the whole
   ;; string if it is already short enough. (Byte-based CODING-SYSTEM unsupported.)
@@ -1324,6 +1919,506 @@ pub const PRELUDE: &str = r#"
         (setq s (substring s (+ pos (length from)) (length s)))
         (setq pos (string-search from s)))
       (concat out s))))
+;; Shell-like quoting (subr.el): combine strings into one quoted command line and
+;; split one back, respecting double-quoted segments (read as elisp string literals).
+(defun combine-and-quote-strings (strings &optional separator)
+  (let* ((sep (or separator " "))
+         (re (concat "[\\\"]\\|" (regexp-quote sep))))
+    (mapconcat
+     (lambda (str)
+       (if (or (= (length str) 0) (string-match re str))
+           (concat "\"" (replace-regexp-in-string "[\\\"]" "\\\\\\&" str) "\"")
+         str))
+     strings sep)))
+(defun split-string-and-unquote (string &optional separator)
+  (let ((sep (or separator "[ \t\n\r\f]+"))
+        (i (string-search "\"" string)))
+    (if (null i)
+        (split-string string sep t)
+      (append (unless (= i 0) (split-string (substring string 0 i) sep t))
+              (let ((rfs (read-from-string string i)))
+                (cons (car rfs)
+                      (split-string-and-unquote (substring string (cdr rfs)) sep)))))))
+;;; ---- json.el (encode subset) ----
+;; Encode elisp data to a JSON string (the forgiving json.el `json-encode' API,
+;; not the strict native `json-serialize'). Lists are objects when they look like
+;; an alist/plist, else arrays; nil encodes as null; symbols as their name.
+(defun json-encode-string (s)
+  (let ((out "\""))
+    (dolist (c (string-to-list s))
+      (setq out (concat out
+                        (cond ((eq c 34) "\\\"")
+                              ((eq c 92) "\\\\")
+                              ((eq c 8) "\\b")
+                              ((eq c 9) "\\t")
+                              ((eq c 10) "\\n")
+                              ((eq c 12) "\\f")
+                              ((eq c 13) "\\r")
+                              ((< c 32) (format "\\u%04x" c))
+                              (t (char-to-string c))))))
+    (concat out "\"")))
+(defun json-alist-p (l)
+  (and (consp l) (let ((ok t)) (dolist (e l) (unless (consp e) (setq ok nil))) ok)))
+(defun json-plist-p (l) (and (consp l) (keywordp (car l))))
+(defun json--encode-key (k)
+  (json-encode-string (cond ((stringp k) k)
+                            ((keywordp k) (substring (symbol-name k) 1))
+                            ((symbolp k) (symbol-name k))
+                            (t (format "%s" k)))))
+(defun json--encode-kv (k v) (concat (json--encode-key k) ":" (json-encode v)))
+(defun json-encode (object)
+  (cond
+   ((eq object t) "true")
+   ((eq object json-false) "false")
+   ((eq object json-null) "null")
+   ((null object) "null")
+   ((stringp object) (json-encode-string object))
+   ((keywordp object) (json-encode-string (substring (symbol-name object) 1)))
+   ((numberp object) (number-to-string object))
+   ((hash-table-p object)
+    (let ((parts nil))
+      (maphash (lambda (k v) (setq parts (cons (json--encode-kv k v) parts))) object)
+      (concat "{" (mapconcat (function identity) (nreverse parts) ",") "}")))
+   ((vectorp object)
+    (concat "[" (mapconcat (function json-encode) (append object nil) ",") "]"))
+   ((json-alist-p object)
+    (concat "{" (mapconcat (lambda (p) (json--encode-kv (car p) (cdr p))) object ",") "}"))
+   ((json-plist-p object)
+    (let ((parts nil) (l object))
+      (while l (setq parts (cons (json--encode-kv (car l) (car (cdr l))) parts)) (setq l (cddr l)))
+      (concat "{" (mapconcat (function identity) (nreverse parts) ",") "}")))
+   ((listp object) (concat "[" (mapconcat (function json-encode) object ",") "]"))
+   ((symbolp object) (json-encode-string (symbol-name object)))
+   (t (error "Unknown JSON object: %S" object))))
+;; json.el reading (json-read-from-string). Defaults: objects → alists with
+;; symbol keys, arrays → vectors, true→t, false→json-false, null→json-null.
+(defvar json-object-type 'alist)
+(defvar json-array-type 'vector)
+(defvar json-key-type nil)
+(defvar json-null nil)
+(defvar json-false :json-false)
+(defun json--skip-ws (s i)
+  (let ((n (length s)))
+    (while (and (< i n) (memq (aref s i) '(32 9 10 13))) (setq i (1+ i)))
+    i))
+(defun json--lookahead (s i word)
+  (and (<= (+ i (length word)) (length s)) (string= (substring s i (+ i (length word))) word)))
+(defun json--read-string (s i)
+  (setq i (1+ i))
+  (let ((out "") (done nil))
+    (while (not done)
+      (let ((c (aref s i)))
+        (cond
+         ((eq c 34) (setq i (1+ i) done t))
+         ((eq c 92)
+          (setq i (1+ i))
+          (let ((e (aref s i)))
+            (if (eq e ?u)
+                (setq out (concat out (char-to-string (string-to-number (substring s (1+ i) (+ i 5)) 16)))
+                      i (+ i 5))
+              (setq out (concat out (char-to-string
+                                     (cond ((eq e ?n) 10) ((eq e ?t) 9) ((eq e ?r) 13)
+                                           ((eq e ?b) 8) ((eq e ?f) 12) ((eq e ?/) 47)
+                                           (t e))))
+                    i (1+ i)))))
+         (t (setq out (concat out (char-to-string c)) i (1+ i))))))
+    (cons out i)))
+(defun json--read-number (s i)
+  (let ((start i) (n (length s)))
+    (while (and (< i n) (memq (aref s i) '(?- ?+ ?0 ?1 ?2 ?3 ?4 ?5 ?6 ?7 ?8 ?9 ?. ?e ?E)))
+      (setq i (1+ i)))
+    (cons (string-to-number (substring s start i)) i)))
+(defun json--read-array (s i)
+  (setq i (json--skip-ws s (1+ i)))
+  (let ((items nil))
+    (if (eq (aref s i) ?\])
+        (setq i (1+ i))
+      (let ((done nil))
+        (while (not done)
+          (let ((r (json--read s i)))
+            (setq items (cons (car r) items) i (json--skip-ws s (cdr r))))
+          (cond ((eq (aref s i) ?,) (setq i (json--skip-ws s (1+ i))))
+                ((eq (aref s i) ?\]) (setq i (1+ i) done t))
+                (t (error "json-read: malformed array"))))))
+    (setq items (nreverse items))
+    (cons (if (eq json-array-type 'list) items (vconcat items)) i)))
+(defun json--object-key (k)
+  (cond ((eq json-key-type 'string) k)
+        ((eq json-key-type 'keyword) (intern (concat ":" k)))
+        (t (intern k))))
+(defun json--build-object (pairs)
+  (cond
+   ((eq json-object-type 'hash-table)
+    (let ((h (make-hash-table :test 'equal))) (dolist (p pairs) (puthash (car p) (cdr p) h)) h))
+   ((eq json-object-type 'plist)
+    (let ((out nil)) (dolist (p pairs) (setq out (cons (cdr p) (cons (intern (concat ":" (car p))) out)))) (nreverse out)))
+   (t (mapcar (lambda (p) (cons (json--object-key (car p)) (cdr p))) pairs))))
+(defun json--read-object (s i)
+  (setq i (json--skip-ws s (1+ i)))
+  (let ((pairs nil))
+    (if (eq (aref s i) ?})
+        (setq i (1+ i))
+      (let ((done nil))
+        (while (not done)
+          (let ((kr (json--read-string s i)))
+            (setq i (json--skip-ws s (cdr kr)))
+            (setq i (json--skip-ws s (1+ i)))  ; skip the ':'
+            (let ((vr (json--read s i)))
+              (setq pairs (cons (cons (car kr) (car vr)) pairs) i (json--skip-ws s (cdr vr)))))
+          (cond ((eq (aref s i) ?,) (setq i (json--skip-ws s (1+ i))))
+                ((eq (aref s i) ?}) (setq i (1+ i) done t))
+                (t (error "json-read: malformed object"))))))
+    (cons (json--build-object (nreverse pairs)) i)))
+(defun json--read (s i)
+  (setq i (json--skip-ws s i))
+  (let ((c (aref s i)))
+    (cond
+     ((eq c ?{) (json--read-object s i))
+     ((eq c ?\[) (json--read-array s i))
+     ((eq c 34) (json--read-string s i))
+     ((or (eq c ?-) (and (>= c ?0) (<= c ?9))) (json--read-number s i))
+     ((json--lookahead s i "true") (cons t (+ i 4)))
+     ((json--lookahead s i "false") (cons json-false (+ i 5)))
+     ((json--lookahead s i "null") (cons json-null (+ i 4)))
+     (t (error "json-read: unexpected character")))))
+(defun json-read-from-string (s) (car (json--read s 0)))
+;; Native JSON API (Emacs 27+): keyword args, hash-table/string-key defaults,
+;; :null / :false objects — built on the json.el machinery via dynamic binding.
+(defun json-parse-string (string &rest args)
+  (let ((json-object-type (or (plist-get args :object-type) 'hash-table))
+        (json-array-type (or (plist-get args :array-type) 'vector))
+        (json-null (if (plist-member args :null-object) (plist-get args :null-object) :null))
+        (json-false (if (plist-member args :false-object) (plist-get args :false-object) :false)))
+    (json-read-from-string string)))
+(defun json-serialize (object &rest args)
+  (let ((json-null (if (plist-member args :null-object) (plist-get args :null-object) :null))
+        (json-false (if (plist-member args :false-object) (plist-get args :false-object) :false)))
+    (json-encode object)))
+;;; ---- file-name path manipulation (pure, no filesystem) ----
+(defun file-name--last (f ch)
+  (let ((i (length f)) (res nil))
+    (while (and (> i 0) (null res))
+      (setq i (1- i))
+      (when (eq (aref f i) ch) (setq res i)))
+    res))
+(defun file-name-directory (f)
+  (let ((i (file-name--last f ?/))) (and i (substring f 0 (1+ i)))))
+(defun file-name-nondirectory (f)
+  (let ((i (file-name--last f ?/))) (if i (substring f (1+ i)) f)))
+(defun file-name-extension (f &optional period)
+  (let* ((nd (file-name-nondirectory f)) (i (file-name--last nd ?.)))
+    (and i (> i 0) (if period (substring nd i) (substring nd (1+ i))))))
+(defun file-name-sans-extension (f)
+  (let* ((nd (file-name-nondirectory f)) (i (file-name--last nd ?.)))
+    (if (and i (> i 0)) (concat (or (file-name-directory f) "") (substring nd 0 i)) f)))
+(defun file-name-base (f) (file-name-sans-extension (file-name-nondirectory f)))
+(defun file-name-as-directory (f)
+  (cond ((string= f "") "./")
+        ((eq (aref f (1- (length f))) ?/) f)
+        (t (concat f "/"))))
+(defun directory-file-name (f)
+  (if (and (> (length f) 1) (eq (aref f (1- (length f))) ?/))
+      (substring f 0 (1- (length f)))
+    f))
+(defun file-name-concat (&rest parts)
+  (let ((out "") (first t))
+    (dolist (p parts)
+      (unless (string= p "")
+        (if first (setq out p first nil)
+          (setq out (concat out (if (eq (aref out (1- (length out))) ?/) "" "/") p)))))
+    out))
+(defun file-name-absolute-p (f)
+  (and (> (length f) 0) (or (eq (aref f 0) ?/) (eq (aref f 0) ?~)) t))
+(defun file-name-split (f) (split-string f "/"))
+(defun directory-name-p (name)
+  (and (> (length name) 0) (eq (aref name (1- (length name))) ?/)))
+(defun file-name-with-extension (filename extension)
+  (let ((extn (string-trim-left extension "[.]")))
+    (cond ((string-empty-p filename) (error "Empty filename"))
+          ((string-empty-p extn) (error "Malformed extension: %s" extension))
+          ((directory-name-p filename) (error "Filename is a directory: %s" filename))
+          (t (concat (file-name-sans-extension filename) "." extn)))))
+(defun file-name-parent-directory (filename)
+  (let* ((expanded (expand-file-name filename))
+         (parent (file-name-directory (directory-file-name expanded))))
+    (cond ((or (null parent) (equal parent expanded)) nil)
+          ((not (file-name-absolute-p filename)) (file-relative-name parent))
+          (t parent))))
+;; "/:" quoting marks a name as literal (no remote/wildcard expansion).
+(defun file-name-quote (name &optional _top)
+  (if (string-prefix-p "/:" name) name (concat "/:" name)))
+(defun file-name-unquote (name &optional _top)
+  (if (string-prefix-p "/:" name) (substring name 2) name))
+(defun file-name-quoted-p (name &optional _top) (string-prefix-p "/:" name))
+;; POSIX: standard file names need no conversion.
+(defun convert-standard-filename (filename) filename)
+(defvar default-directory (file-name-as-directory (--current-directory--)))
+(defun expand-file-name (name &optional dir)
+  ;; Expand NAME against DIR (default `default-directory'), `~/' via $HOME, and
+  ;; collapse `.', `..' and `//'. (No remote/`~user' handling.)
+  (setq dir (or dir default-directory))
+  (cond ((string-prefix-p "~/" name) (setq name (concat (or (getenv "HOME") "~") (substring name 1))))
+        ((string= name "~") (setq name (or (getenv "HOME") "~"))))
+  (let* ((combined (if (file-name-absolute-p name) name (concat (file-name-as-directory dir) name)))
+         (abs (string-prefix-p "/" combined))
+         (trail (and (> (length combined) 1) (string-suffix-p "/" combined)))
+         (out nil))
+    (dolist (c (split-string combined "/"))
+      (cond ((or (string= c "") (string= c ".")) nil)
+            ((string= c "..") (when out (setq out (cdr out))))
+            (t (setq out (cons c out)))))
+    (let ((res (concat (if abs "/" "") (mapconcat (function identity) (nreverse out) "/"))))
+      (when (and trail (not (string-suffix-p "/" res))) (setq res (concat res "/")))
+      (if (string= res "") (if abs "/" ".") res))))
+(defun file-relative-name (filename &optional dir)
+  ;; Common-prefix relativization (no `../' climb when FILENAME isn't under DIR).
+  (let ((d (file-name-as-directory (expand-file-name (or dir default-directory))))
+        (f (expand-file-name filename)))
+    (if (string-prefix-p d f) (substring f (length d)) f)))
+(defun abbreviate-file-name (filename)
+  (let ((home (getenv "HOME")))
+    (if (and home (string-prefix-p (file-name-as-directory home) filename))
+        (concat "~/" (substring filename (length (file-name-as-directory home))))
+      filename)))
+(defun directory-files (dir &optional full match nosort)
+  ;; Names in DIR (incl. "." ".."), sorted unless NOSORT, filtered by MATCH regexp;
+  ;; with FULL, each name is prefixed with DIR's expanded path (uncollapsed).
+  (let ((names (--directory-files-- dir match nosort)))
+    (if full
+        (let ((d (file-name-as-directory (expand-file-name dir))))
+          (mapcar (lambda (n) (concat d n)) names))
+      names)))
+;; with-temp-buffer: run BODY in a fresh editing buffer (text + point only — no
+;; markers/narrowing/save-excursion). Returns BODY's value, not the buffer text.
+(defmacro with-temp-buffer (&rest body)
+  `(progn (--buffer-push--) (unwind-protect (progn ,@body) (--buffer-pop--))))
+;; save-excursion: restore point after BODY. (Integer save — no marker, so it
+;; doesn't track insertions/deletions before the saved point.)
+(defmacro save-excursion (&rest body)
+  `(let ((--se-pt-- (point))) (unwind-protect (progn ,@body) (goto-char --se-pt--))))
+;; Region case conversion: rewrite [BEG,END) through FN (length-preserving, so
+;; save-excursion's integer restore stays accurate).
+(defun buffer--map-region (beg end fn)
+  (let ((lo (min beg end)) (hi (max beg end)))
+    (save-excursion
+      (let ((s (buffer-substring lo hi)))
+        (delete-region lo hi)
+        (goto-char lo)
+        (insert (funcall fn s))))))
+(defun upcase-region (beg end &optional _region) (buffer--map-region beg end #'upcase) nil)
+(defun downcase-region (beg end &optional _region) (buffer--map-region beg end #'downcase) nil)
+(defun capitalize-region (beg end &optional _region) (buffer--map-region beg end #'capitalize) nil)
+(defun subst-char-in-region (start end fromchar tochar &optional _noundo)
+  (buffer--map-region start end
+    (lambda (s)
+      (mapconcat (lambda (c) (char-to-string (if (eq c fromchar) tochar c))) (append s nil) "")))
+  nil)
+;; Case-convert ARG words forward from point, leaving point after them.
+(defun buffer--case-word (arg fn)
+  (let ((beg (point)))
+    (forward-word arg)
+    (let* ((end (point)) (lo (min beg end)) (hi (max beg end)) (s (buffer-substring lo hi)))
+      (delete-region lo hi)
+      (goto-char lo)
+      (insert (funcall fn s))
+      (goto-char (+ lo (length s))))))
+(defun upcase-word (arg) (buffer--case-word arg #'upcase) nil)
+(defun downcase-word (arg) (buffer--case-word arg #'downcase) nil)
+(defun capitalize-word (arg) (buffer--case-word arg #'capitalize) nil)
+;; kill-line: delete to end of line; at end-of-line delete the newline instead.
+;; (No kill ring in elisprs, so this only deletes — it does not save the text.)
+(defun kill-line (&optional _arg)
+  (let ((beg (point))
+        (end (if (and (eolp) (not (eobp))) (1+ (point)) (line-end-position))))
+    (delete-region beg end)
+    nil))
+;; transpose-chars: swap the characters around point and advance; at end of line
+;; swap the two preceding characters (the common Emacs behavior).
+(defun transpose-chars (_arg)
+  (when (and (eolp) (> (point) (1+ (point-min)))) (forward-char -1))
+  (when (and (> (point) (point-min)) (< (point) (point-max)))
+    (let ((a (char-before)) (b (char-after)))
+      (delete-region (1- (point)) (1+ (point)))
+      (insert b a)))
+  nil)
+;; buffer-hash: a SHA-1 of the buffer contents (BUFFER arg ignored — current only).
+(defun buffer-hash (&optional _buffer) (sha1 (buffer-string)))
+;; Character at/before point (0 at the buffer's end/start), like Emacs.
+(defun following-char () (or (char-after) 0))
+(defun preceding-char () (or (char-before) 0))
+;; Insert N newlines at point (default 1); like insert, no kill ring.
+(defun newline (&optional n _interactive) (insert (make-string (or n 1) ?\n)) nil)
+;; Insert N newlines after point, leaving point before them.
+(defun open-line (n) (save-excursion (insert (make-string n ?\n))) nil)
+;; No real markers, so this is plain insert.
+(defun insert-before-markers (&rest args) (apply #'insert args))
+(defun count-words (start end)
+  (length (split-string (buffer-substring start end) "[^[:alnum:]]+" t)))
+(defun how-many (regexp &optional start end)
+  ;; Count non-overlapping matches of REGEXP from START (or point) to END.
+  (save-excursion
+    (when start (goto-char start))
+    (let ((count 0) (limit (or end (point-max))))
+      (while (re-search-forward regexp limit t)
+        (when (= (match-beginning 0) (match-end 0))
+          (if (>= (point) limit) (goto-char (1+ limit)) (forward-char 1)))
+        (setq count (1+ count)))
+      count)))
+;;; ---- misc small subr.el helpers ----
+(defun ngettext (singular plural n) (if (= n 1) singular plural))
+;; format-seconds: ported from time-date.el. %y/%d/%h/%m/%s units (upper-case adds
+;; ---- time arithmetic (seconds-based) ----
+;; elisprs represents time values as plain seconds (integer or float) — a valid
+;; Emacs time value. (Emacs's high-precision ticks/list forms for fractional
+;; results aren't reproduced, but float-time/time-less-p etc. interoperate.)
+(defun time-to-seconds (time) (float-time time))
+(defun time--norm (s) (if (= s (truncate s)) (truncate s) s))
+(defun time-add (a b) (time--norm (+ (float-time a) (float-time b))))
+(defun time-subtract (a b) (time--norm (- (float-time a) (float-time b))))
+(defun time-less-p (a b) (< (float-time a) (float-time b)))
+(defun time-equal-p (a b) (= (float-time a) (float-time b)))
+(defun time-convert (time &optional form)
+  (cond ((eq form 'integer) (truncate (float-time time)))
+        ((eq form 'list) (let ((s (truncate (float-time time))))
+                           (list (ash s -16) (logand s #xffff))))
+        (t (time--norm (float-time time)))))
+(defun current-time-zone (&optional time zone)
+  ;; (OFFSET NAME). The local zone's offset comes from decode-time's zone field;
+  ;; the abbreviated NAME is unavailable here, so it is nil.
+  (cond ((eq zone t) (list 0 "UTC"))
+        ((integerp zone) (list zone nil))
+        (t (list (or (nth 8 (decode-time (or time (current-time)))) 0) nil))))
+;; decoded-time accessors: (sec min hour day month year weekday dst zone).
+(defun decoded-time-second (dt) (nth 0 dt))
+(defun decoded-time-minute (dt) (nth 1 dt))
+(defun decoded-time-hour (dt) (nth 2 dt))
+(defun decoded-time-day (dt) (nth 3 dt))
+(defun decoded-time-month (dt) (nth 4 dt))
+(defun decoded-time-year (dt) (nth 5 dt))
+(defun decoded-time-weekday (dt) (nth 6 dt))
+(defun decoded-time-dst (dt) (nth 7 dt))
+(defun decoded-time-zone (dt) (nth 8 dt))
+;; ---- format-seconds ----
+;; the unit name), %z chops leading zero units, %x chops trailing zero units,
+;; %,Ns gives N decimals on seconds, width/zero-pad via %N / %.N.
+(defun format-seconds (string seconds)
+  "Use format control STRING to format the number SECONDS."
+  (let ((start 0)
+        (units '(("y" "year" 31536000) ("d" "day" 86400) ("h" "hour" 3600)
+                 ("m" "minute" 60) ("s" "second" 1) ("z") ("x")))
+        (case-fold-search t)
+        spec match usedunits zeroflag larger prev name unit num
+        leading-zeropos trailing-zeropos fraction chop-leading chop-trailing)
+    (while (string-match "%\\.?[0-9]*\\(,[0-9]\\)?\\(.\\)" string start)
+      (setq start (match-end 0) spec (match-string 2 string))
+      (unless (string-equal spec "%")
+        (or (setq match (assoc (downcase spec) units))
+            (error "Bad format specifier: `%s'" spec))
+        (if (assoc (downcase spec) usedunits)
+            (error "Multiple instances of specifier: `%s'" spec))
+        (if (or (string-equal (car match) "z") (string-equal (car match) "x"))
+            (setq zeroflag t)
+          (unless larger
+            (setq unit (nth 2 match) larger (and prev (> unit prev)) prev unit)))
+        (push match usedunits)))
+    (when (and zeroflag larger) (error "Units are not in decreasing order of size"))
+    (unless (numberp seconds) (setq seconds (float-time seconds)))
+    (setq fraction (mod seconds 1) seconds (round seconds))
+    (dolist (u units)
+      (setq spec (car u) name (cadr u) unit (nth 2 u))
+      (when (string-match
+             (format "%%\\(\\.?[0-9]+\\)?\\(,[0-9]+\\)?\\(%s\\)" spec) string)
+        (cond
+         ((string-equal spec "z")
+          (setq chop-leading (if leading-zeropos
+                                 (min leading-zeropos (match-beginning 0))
+                               (+ 2 (match-beginning 0)))))
+         ((string-equal spec "x") (setq chop-trailing t))
+         (t
+          (setq num (floor seconds unit) seconds (- seconds (* num unit)))
+          (let ((is-zero (zerop (if (= unit 1) (+ num fraction) num))))
+            (when (and (not leading-zeropos) (not is-zero))
+              (setq leading-zeropos (match-beginning 0)))
+            (unless is-zero (setq trailing-zeropos nil))
+            (when (and (not trailing-zeropos) is-zero)
+              (setq trailing-zeropos (match-beginning 0))))
+          (setq string
+                (replace-match
+                 (format (if (match-string 2 string)
+                             (concat "%"
+                                     (and (match-string 1 string)
+                                          (if (= (elt (match-string 1 string) 0) ?.)
+                                              (concat "0" (substring (match-string 1 string) 1))
+                                            (match-string 1 string)))
+                                     (concat "." (substring (match-string 2 string) 1)) "f%s")
+                           (concat "%" (match-string 1 string) "d%s"))
+                         (if (= unit 1) (+ num fraction) num)
+                         (if (string-equal (match-string 3 string) spec)
+                             ""
+                           (format " %s%s" name (if (= num 1) "" "s"))))
+                 t t string))))))
+    (let ((pre string))
+      (when (and chop-trailing trailing-zeropos)
+        (setq string (substring string 0 trailing-zeropos)))
+      (when chop-leading (setq string (substring string chop-leading)))
+      (when (equal string "") (setq string pre)))
+    (setq string (replace-regexp-in-string "%[zx]" "" string)))
+  (string-trim (string-replace "%%" "%" string)))
+(defun char-displayable-p (_char &optional _display) t)
+;; Feature/module system: the libraries elisprs bundles are always "provided",
+;; so (require 'cl-lib) etc. are no-ops. There is no file loading.
+(defvar features '(emacs cl-lib cl-macs cl-seq cl-extra seq subr-x map rx pcase json gv ert))
+(defun provide (feature &optional _subfeatures)
+  (unless (memq feature features) (setq features (cons feature features)))
+  feature)
+(defun featurep (feature &optional _subfeature) (and (memq feature features) t))
+(defun require (feature &optional _filename noerror)
+  (cond ((memq feature features) feature)
+        (noerror nil)
+        (t (signal 'file-missing (list "Cannot open load file" (symbol-name feature))))))
+(defmacro bound-and-true-p (var) (list 'and (list 'boundp (list 'quote var)) var))
+;; No buffer-local model: these are no-ops returning the symbol.
+(defun make-local-variable (sym) sym)
+(defun make-variable-buffer-local (sym) sym)
+(defun set-default-toplevel-value (sym val) (set sym val))
+(defun defalias (symbol definition &optional _docstring) (fset symbol definition) symbol)
+(defalias 'string-split 'split-string)
+;; with-memoization: cache BODY's value in PLACE; reuse it on later calls.
+(defmacro with-memoization (place &rest body) `(or ,place (setf ,place (progn ,@body))))
+;; regexp-opt: a regexp matching any of STRINGS (sorted, regexp-quoted alternation).
+;; NOTE: this does NOT replicate Emacs's trie/shared-prefix optimization, so the
+;; output string differs for prefix-overlapping inputs — but it matches the same
+;; set of strings. Special cases (empty, single, PAREN variants) match Emacs.
+(defun match-string-no-properties (n &optional string)
+  ;; elisprs strings carry no text properties, so this is just match-string.
+  (match-string n string))
+(defun regexp-opt-depth (regexp)
+  ;; Count capturing groups: bare `\\(' (not the `\\(?…' shy/numbered forms).
+  (let ((count 0) (i 0) (n (length regexp)))
+    (while (< i n)
+      (if (and (eq (aref regexp i) ?\\) (< (1+ i) n) (eq (aref regexp (1+ i)) ?\())
+          (progn
+            (unless (and (< (+ i 2) n) (eq (aref regexp (+ i 2)) ??))
+              (setq count (1+ count)))
+            (setq i (+ i 2)))
+        (setq i (1+ i))))
+    count))
+(defun regexp-opt (strings &optional paren)
+  (let ((open (cond ((stringp paren) paren)
+                    ((eq paren 'words) "\\<\\(")
+                    ((eq paren 'symbols) "\\_<\\(")
+                    (paren "\\(")
+                    (t "\\(?:")))
+        (close (cond ((eq paren 'words) "\\)\\>")
+                     ((eq paren 'symbols) "\\)\\_>")
+                     (t "\\)"))))
+    (cond
+     ((null strings) "\\(?:\\`a\\`\\)")
+     ;; A single one-character string needs no group.
+     ((and (null paren) (null (cdr strings)) (= (length (car strings)) 1))
+      (regexp-quote (car strings)))
+     (t (let ((sorted (sort (copy-sequence strings) #'string<)))
+          (concat open (mapconcat #'regexp-quote sorted "\\|") close))))))
 
 (defmacro while-let (binding &rest body)
   (let ((var (car (car binding))) (val (car (cdr (car binding)))))
@@ -1393,12 +2488,16 @@ pub const PRELUDE: &str = r#"
     (list form rr kind var init)))
 (defmacro cl-loop (&rest clauses)
   (let ((binds nil) (test t) (pre nil) (steps nil) (body nil)
-        (acc-kind nil) (bool-result nil) (finally nil) (c clauses))
+        (acc-kind nil) (bool-result nil) (finally nil) (initial nil) (loop-name nil) (c clauses))
     (while c
       (let ((kw (cl-loop--kw (car c))))
         (cond
-         ;; named NAME — accepted (enables cl-return-from); no extra setup needed.
-         ((equal kw "named") (setq c (nthcdr 2 c)))
+         ;; named NAME — wrap the loop in `(cl-block NAME …)` so `cl-return-from
+         ;; NAME` can exit it (Emacs names the implicit block with this name).
+         ((equal kw "named") (setq loop-name (nth 1 c) c (nthcdr 2 c)))
+         ;; `and' joins another binding clause that steps in parallel; for the
+         ;; common iteration cases this behaves like a second `for'.
+         ((equal kw "and") (setq c (cons 'for (cdr c))))
          ;; for V across SEQ — iterate the elements of a string/vector/list.
          ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "across"))
           (let ((var (nth 1 c)) (tv (make-symbol "tail")))
@@ -1409,19 +2508,35 @@ pub const PRELUDE: &str = r#"
             (setq c (nthcdr 4 c))))
          ;; for V being [the|each] KIND of SOURCE  (elements / hash-keys / hash-values)
          ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "being"))
-          (let ((var (nth 1 c)) (tv (make-symbol "tail")) (r (nthcdr 3 c)))
+          (let ((var (nth 1 c)) (tv (make-symbol "tail")) (ht (make-symbol "ht")) (r (nthcdr 3 c)))
             (when (member (cl-loop--kw (car r)) '("the" "each")) (setq r (cdr r)))
             (let ((kind (cl-loop--kw (car r))))
               (setq r (cdr r))
               (when (member (cl-loop--kw (car r)) '("of" "in")) (setq r (cdr r)))
-              (let ((listform (cond ((member kind '("hash-keys" "hash-key")) (list 'hash-table-keys (car r)))
-                                    ((member kind '("hash-values" "hash-value")) (list 'hash-table-values (car r)))
-                                    (t (list 'append (car r) nil)))))
+              (let* ((source (car r))
+                     (hashp (member kind '("hash-keys" "hash-key" "hash-values" "hash-value")))
+                     (keysp (member kind '("hash-keys" "hash-key")))
+                     (listform (cond (keysp (list 'hash-table-keys ht))
+                                     ((member kind '("hash-values" "hash-value")) (list 'hash-table-values ht))
+                                     (t (list 'append source nil))))
+                     (usevar nil) (usekind nil))
                 (setq r (cdr r))
-                (when (equal (cl-loop--kw (car r)) "using") (setq r (nthcdr 2 r)))
+                ;; using (hash-values V) / (hash-keys V): bind the companion var.
+                (when (equal (cl-loop--kw (car r)) "using")
+                  (let ((u (nth 1 r))) (setq usekind (cl-loop--kw (car u)) usevar (nth 1 u)))
+                  (setq r (nthcdr 2 r)))
+                (when hashp (setq binds (cons (list ht source) binds)))
                 (setq binds (cons (list tv listform) (cons (list var nil) binds)))
+                (when usevar
+                  (setq binds (cons (list usevar (if (equal usekind "index") 0 nil)) binds)))
                 (setq test (if (eq test t) tv (list 'and test tv)))
                 (setq pre (cons (list 'setq var (list 'car tv)) pre))
+                ;; companion: value for a key-iteration (the common form).
+                (when (and usevar keysp (member usekind '("hash-values" "hash-value")))
+                  (setq pre (cons (list 'setq usevar (list 'gethash var ht)) pre)))
+                ;; using (index V): V counts iterations from 0.
+                (when (and usevar (equal usekind "index"))
+                  (setq steps (cons (list 'setq usevar (list '1+ usevar)) steps)))
                 (setq steps (cons (list 'setq tv (list 'cdr tv)) steps))
                 (setq c r)))))
          ;; for V = INIT [then STEP] — bind to INIT, step at end of each iteration
@@ -1463,30 +2578,45 @@ pub const PRELUDE: &str = r#"
          ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "in")
                (consp (nth 1 c)))
           (let* ((pat (nth 1 c)) (tv (make-symbol "tail")) (ev (make-symbol "el"))
-                 (dbs (cl-db--binds pat ev)) (setqs nil))
+                 (dbs (cl-db--binds pat ev)) (setqs nil) (r (nthcdr 4 c)) (stepfn nil))
+            (when (equal (cl-loop--kw (car r)) "by")
+              (setq stepfn (nth 1 r) r (nthcdr 2 r)))
             (setq binds (cons (list tv (nth 3 c)) (cons (list ev nil) binds)))
             (dolist (b dbs) (setq binds (cons (list (car b) nil) binds)))
             (setq test (if (eq test t) tv (list 'and test tv)))
             (setq setqs (cons (list 'setq ev (list 'car tv)) nil))
             (dolist (b dbs) (setq setqs (cons (list 'setq (car b) (car (cdr b))) setqs)))
             (setq pre (cons (cons 'progn (reverse setqs)) pre))
-            (setq steps (cons (list 'setq tv (list 'cdr tv)) steps))
-            (setq c (nthcdr 4 c))))
-         ;; for V in LIST
+            (setq steps (cons (list 'setq tv (if stepfn (list 'funcall stepfn tv) (list 'cdr tv))) steps))
+            (setq c r)))
+         ;; for V in LIST [by STEP-FN]
          ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "in"))
-          (let ((var (nth 1 c)) (tv (make-symbol "tail")))
+          (let ((var (nth 1 c)) (tv (make-symbol "tail")) (r (nthcdr 4 c)) (stepfn nil))
+            (when (equal (cl-loop--kw (car r)) "by")
+              (setq stepfn (nth 1 r) r (nthcdr 2 r)))
             (setq binds (cons (list tv (nth 3 c)) (cons (list var nil) binds)))
             (setq test (if (eq test t) tv (list 'and test tv)))
             (setq pre (cons (list 'setq var (list 'car tv)) pre))
-            (setq steps (cons (list 'setq tv (list 'cdr tv)) steps))
-            (setq c (nthcdr 4 c))))
+            (setq steps (cons (list 'setq tv (if stepfn (list 'funcall stepfn tv) (list 'cdr tv))) steps))
+            (setq c r)))
          ;; for V on LIST
          ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "on"))
-          (let ((var (nth 1 c)))
-            (setq binds (cons (list var (nth 3 c)) binds))
-            (setq test (if (eq test t) var (list 'and test var)))
-            (setq steps (cons (list 'setq var (list 'cdr var)) steps))
-            (setq c (nthcdr 4 c))))
+          (let ((pat (nth 1 c)) (r (nthcdr 4 c)) (stepfn nil))
+            (when (equal (cl-loop--kw (car r)) "by")
+              (setq stepfn (nth 1 r) r (nthcdr 2 r)))
+            (if (consp pat)
+                ;; Destructure the current tail's leading elements each iteration.
+                (let* ((tv (make-symbol "tail")) (dbs (cl-db--binds pat tv)) (setqs nil))
+                  (setq binds (cons (list tv (nth 3 c)) binds))
+                  (dolist (b dbs) (setq binds (cons (list (car b) nil) binds)))
+                  (setq test (if (eq test t) tv (list 'and test tv)))
+                  (dolist (b dbs) (setq setqs (cons (list 'setq (car b) (car (cdr b))) setqs)))
+                  (setq pre (cons (cons 'progn (reverse setqs)) pre))
+                  (setq steps (cons (list 'setq tv (if stepfn (list 'funcall stepfn tv) (list 'cdr tv))) steps)))
+              (setq binds (cons (list pat (nth 3 c)) binds))
+              (setq test (if (eq test t) pat (list 'and test pat)))
+              (setq steps (cons (list 'setq pat (if stepfn (list 'funcall stepfn pat) (list 'cdr pat))) steps)))
+            (setq c r)))
          ;; repeat N
          ((equal kw "repeat")
           (let ((rv (make-symbol "n")))
@@ -1554,6 +2684,12 @@ pub const PRELUDE: &str = r#"
          ((equal kw "return")
           (setq body (cons (list 'throw ''--cl-loop-- (nth 1 c)) body))
           (setq c (nthcdr 2 c)))
+         ((equal kw "initially")
+          (setq c (cdr c))
+          (when (member (cl-loop--kw (car c)) '("do" "doing")) (setq c (cdr c)))
+          (let ((fs nil))
+            (while (and c (not (cl-loop--clause-p (car c)))) (setq fs (cons (car c) fs)) (setq c (cdr c)))
+            (setq initial (append initial (reverse fs)))))
          ((equal kw "finally")
           (setq c (cdr c))
           (if (equal (cl-loop--kw (car c)) "return")
@@ -1568,23 +2704,63 @@ pub const PRELUDE: &str = r#"
                         (acc-kind '--clacc--)
                         (bool-result t)
                         (t nil))))
-      `(let* (,@(reverse binds) (--clacc-- ,init))
-         (catch '--cl-loop--
-           (while ,test ,@(reverse pre) ,@(reverse body) ,@(reverse steps))
-           ,result)))))
+      ;; Wrap in `(cl-block NAME …)` (NAME defaults to nil) so `cl-return`/
+      ;; `cl-return-from NAME` exit the loop.
+      `(cl-block ,loop-name
+         (let* (,@(reverse binds) (--clacc-- ,init))
+           ,@initial
+           (catch '--cl-loop--
+             (while ,test ,@(reverse pre) ,@(reverse body) ,@(reverse steps))
+             ,result))))))
 
 ;; The predicate symbol for a `cl-typecase' type name (integer->integerp, etc.).
+(defmacro cl-deftype (name arglist &rest body)
+  ;; Register a type alias: NAME (with ARGLIST) expands to the type spec BODY
+  ;; returns, consulted by cl-typep.
+  (list 'progn
+        (list 'put (list 'quote name) (list 'quote 'cl-deftype-handler)
+              (cons 'lambda (cons arglist body)))
+        (list 'quote name)))
+(defun cl--type-bound (n lo hi)
+  ;; Range check for (TYPE LO HI); bound `*'/nil/absent means unbounded.
+  (and (or (null lo) (eq lo '*) (>= n lo))
+       (or (null hi) (eq hi '*) (<= n hi))))
 (defun cl-typep (obj type)
-  ;; Simple type names only: (cl-typep 5 'integer) => t.
-  (cond ((eq type t) t)
-        ((eq type nil) nil)
-        (t (funcall (cl-typecase--pred type) obj))))
+  ;; Simple type names plus compound specifiers: (integer LO HI), (or …),
+  ;; (and …), (not T), (member …), (eql V), (satisfies PRED).
+  (cond
+   ((eq type t) t)
+   ((eq type nil) nil)
+   ((consp type)
+    (let ((head (car type)) (args (cdr type)))
+      (cond
+       ((eq head 'or) (let ((r nil)) (dolist (tp args) (when (cl-typep obj tp) (setq r t))) r))
+       ((eq head 'and) (let ((r t)) (dolist (tp args) (unless (cl-typep obj tp) (setq r nil))) r))
+       ((eq head 'not) (not (cl-typep obj (car args))))
+       ((eq head 'member) (and (memql obj args) t))
+       ((eq head 'eql) (eql obj (car args)))
+       ((eq head 'satisfies) (and (funcall (car args) obj) t))
+       ((memq head '(integer fixnum bignum signed-byte unsigned-byte))
+        (and (integerp obj) (cl--type-bound obj (car args) (car (cdr args)))))
+       ((eq head 'float) (and (floatp obj) (cl--type-bound obj (car args) (car (cdr args)))))
+       ((memq head '(number real)) (and (numberp obj) (cl--type-bound obj (car args) (car (cdr args)))))
+       ;; A cl-deftype alias applied to arguments.
+       ((and (symbolp head) (get head 'cl-deftype-handler))
+        (cl-typep obj (apply (get head 'cl-deftype-handler) args)))
+       (t nil))))
+   ;; A cl-deftype alias used bare.
+   ((and (symbolp type) (get type 'cl-deftype-handler))
+    (cl-typep obj (funcall (get type 'cl-deftype-handler))))
+   (t (funcall (cl-typecase--pred type) obj))))
 (defun cl-typecase--pred (type)
   (cond ((eq type 'list) 'listp)
         ((eq type 'null) 'null)
         ((eq type 'atom) 'atom)
         ((eq type 'number) 'numberp)
-        (t (intern (concat (symbol-name type) "p")))))
+        ;; Builtins use TYPEp; cl-defstruct types use the hyphenated TYPE-p.
+        (t (let ((p (intern (concat (symbol-name type) "p")))
+                 (sp (intern (concat (symbol-name type) "-p"))))
+             (if (and (not (fboundp p)) (fboundp sp)) sp p)))))
 
 ;; ---- cl-defgeneric / cl-defmethod: single/multi type-dispatch with CLOS
 ;; method combination — primary plus :before/:after/:around qualifiers and
@@ -1708,11 +2884,16 @@ pub const PRELUDE: &str = r#"
                 (let ((type (car clause)) (body (cdr clause)))
                   (if (memq type '(t otherwise))
                       (cons t body)
-                    (cons (list (cl-typecase--pred type) '--ct-v--) body))))
+                    ;; Route through cl-typep so compound type specs work too.
+                    (cons (list 'cl-typep '--ct-v-- (list 'quote type)) body))))
               clauses))))
 (defmacro cl-the (_type form) form)
-(defmacro cl-assert (form &rest _)
-  (list 'if form nil (list 'signal (list 'quote 'cl-assertion-failed) (list 'list (list 'quote form)))))
+(defmacro cl-assert (form &optional _show-args string &rest args)
+  ;; With a STRING, signal a plain `error' with the formatted message; otherwise
+  ;; `cl-assertion-failed' carrying the failed FORM.
+  (if string
+      (list 'if form nil (cons 'error (cons string args)))
+    (list 'if form nil (list 'signal (list 'quote 'cl-assertion-failed) (list 'list (list 'quote form))))))
 (defmacro cl-check-type (form type &rest _)
   (list 'if (list 'cl-typep form (list 'quote type)) nil
         (list 'signal (list 'quote 'wrong-type-argument) (list 'list (list 'quote type) form))))
@@ -1744,15 +2925,49 @@ pub const PRELUDE: &str = r#"
            ,@body
            (let ,tmps (setq ,@setqargs)))
          ,@(cdr endclause)))))
+;; cl-do*: like cl-do but bindings and step assignments are sequential (let* and
+;; an in-order setq), so each spec sees the updated earlier ones.
+(defmacro cl-do* (specs endclause &rest body)
+  (let ((inits nil) (steps nil))
+    (dolist (s specs)
+      (let ((var (if (consp s) (car s) s))
+            (init (if (consp s) (car (cdr s)) nil))
+            (has-step (and (consp s) (cdr (cdr s)))))
+        (setq inits (cons (list var init) inits))
+        (when has-step
+          (setq steps (cons (car (cdr (cdr s))) (cons var steps))))))
+    (setq inits (nreverse inits) steps (nreverse steps))
+    `(let* ,inits
+       (while (not ,(car endclause))
+         ,@body
+         (setq ,@steps))
+       ,@(cdr endclause))))
+;; cl-progv: dynamically bind the runtime lists SYMBOLS to VALUES around BODY,
+;; restoring (or unbinding) each afterwards.
+(defmacro cl-progv (symbols values &rest body)
+  `(let* ((--pv-syms-- ,symbols)
+          (--pv-saved-- (mapcar (lambda (s) (list s (boundp s) (and (boundp s) (symbol-value s))))
+                                --pv-syms--)))
+     (unwind-protect
+         (progn
+           (let ((ss --pv-syms--) (vv ,values))
+             (while ss (set (car ss) (car vv)) (setq ss (cdr ss) vv (cdr vv))))
+           ,@body)
+       (dolist (e --pv-saved--)
+         (if (nth 1 e) (set (car e) (nth 2 e)) (makunbound (car e)))))))
 ;; Build let* bindings that positionally destructure VALEXPR (a symbol holding a
 ;; list) against a flat ARGLIST, honoring &optional and &rest.
 (defun cl-db--plist-get (plist key default)
   ;; plist-get with a fallback when KEY is absent (for &key defaults).
   (let ((m (plist-member plist key))) (if m (car (cdr m)) default)))
 (defun cl-db--binds (arglist v)
-  ;; Supports &optional / &rest / &key with per-arg defaults `(VAR DEFAULT)` and
-  ;; nested patterns in required position. &key reads the plist tail at position i.
+  ;; Supports &whole, &optional / &rest / &key with per-arg defaults `(VAR DEFAULT)`
+  ;; and nested patterns in required position. &key reads the plist tail at pos i.
   (let ((binds nil) (i 0) (mode 'req))
+    ;; Leading (&whole VAR …): bind VAR to the whole value, then continue.
+    (when (eq (car arglist) '&whole)
+      (setq binds (cons (list (car (cdr arglist)) v) binds))
+      (setq arglist (cddr arglist)))
     (while (consp arglist)
       (let ((a (car arglist)))
         (cond
@@ -1835,8 +3050,23 @@ pub const PRELUDE: &str = r#"
        ((eq head 'cadr) (list 'setcar (list 'cdr (car args)) val))
        ((eq head 'cdar) (list 'setcdr (list 'car (car args)) val))
        ((eq head 'cddr) (list 'setcdr (list 'cdr (car args)) val))
+       ;; Triple combinators: set{car,cdr} of the inner two-step accessor.
+       ((eq head 'caaar) (list 'setcar (list 'caar (car args)) val))
+       ((eq head 'caadr) (list 'setcar (list 'cadr (car args)) val))
+       ((eq head 'cadar) (list 'setcar (list 'cdar (car args)) val))
+       ((eq head 'caddr) (list 'setcar (list 'cddr (car args)) val))
+       ((eq head 'cdaar) (list 'setcdr (list 'caar (car args)) val))
+       ((eq head 'cdadr) (list 'setcdr (list 'cadr (car args)) val))
+       ((eq head 'cddar) (list 'setcdr (list 'cdar (car args)) val))
+       ((eq head 'cdddr) (list 'setcdr (list 'cddr (car args)) val))
        ((eq head 'nth) (list 'setcar (list 'nthcdr (car args) (car (cdr args))) val))
-       ((eq head 'elt)
+       ;; (setf (nthcdr N L) V): N=0 replaces L; else setcdr the (N-1)th cell.
+       ((eq head 'nthcdr)
+        (list 'let (list (list '--setf-nc-- (car args)))
+              (list 'if (list '<= '--setf-nc-- 0)
+                    (setf--expand (car (cdr args)) val)
+                    (list 'setcdr (list 'nthcdr (list '1- '--setf-nc--) (car (cdr args))) val))))
+       ((memq head '(elt seq-elt))
         ;; Bind the sequence + index once: list → setcar, array → aset.
         (list 'let (list (list '--setf-s-- (car args)) (list '--setf-n-- (car (cdr args))))
               (list 'if (list 'listp '--setf-s--)
@@ -1846,16 +3076,39 @@ pub const PRELUDE: &str = r#"
        ((eq head 'gethash) (list 'puthash (car args) val (car (cdr args))))
        ((eq head 'symbol-value) (list 'set (car args) val))
        ((eq head 'symbol-function) (list 'fset (car args) val))
-       ;; (setf (alist-get K AL) V): setcdr an existing pair, else prepend.
+       ;; (setf (get SYM PROP) V) -> (put SYM PROP V).
+       ((eq head 'get) (list 'put (car args) (car (cdr args)) val))
+       ;; cl-first..cl-tenth name list positions; cl-rest is the cdr.
+       ((eq head 'cl-rest) (list 'setcdr (car args) val))
+       ((memq head '(cl-first cl-second cl-third cl-fourth cl-fifth
+                     cl-sixth cl-seventh cl-eighth cl-ninth cl-tenth))
+        (let ((idx (cdr (assq head '((cl-first . 0) (cl-second . 1) (cl-third . 2)
+                                     (cl-fourth . 3) (cl-fifth . 4) (cl-sixth . 5)
+                                     (cl-seventh . 6) (cl-eighth . 7) (cl-ninth . 8)
+                                     (cl-tenth . 9))))))
+          (list 'setcar (list 'nthcdr idx (car args)) val)))
+       ;; (setf (alist-get K AL &optional DEFAULT REMOVE TESTFN) V): setcdr an
+       ;; existing pair (found via TESTFN or eq), else prepend. With REMOVE, a V
+       ;; equal to DEFAULT deletes the entry instead.
        ((eq head 'alist-get)
-        (list 'let (list (list '--ag-p-- (list 'assq (car args) (car (cdr args)))))
-              (list 'if '--ag-p--
-                    (list 'setcdr '--ag-p-- val)
-                    (setf--expand (car (cdr args))
-                                  (list 'cons (list 'cons (car args) val) (car (cdr args)))))))
-       ;; (setf (plist-get P K) V): set an existing value cell, else prepend
-       ;; (K V) to P — matching Emacs's order for a new key.
-       ((eq head 'plist-get)
+        (let* ((key (car args)) (al (nth 1 args)) (default (nth 2 args))
+               (remove (nth 3 args)) (testfn (nth 4 args))
+               (getter (if testfn (list 'assoc key al testfn) (list 'assq key al)))
+               (eq-default (if testfn (list testfn '--ag-v-- default) (list 'eql '--ag-v-- default))))
+          (if remove
+              (list 'let (list (list '--ag-v-- val) (list '--ag-p-- getter))
+                    (list 'if eq-default
+                          (list 'when '--ag-p-- (setf--expand al (list 'delq '--ag-p-- al)))
+                          (list 'if '--ag-p--
+                                (list 'setcdr '--ag-p-- '--ag-v--)
+                                (setf--expand al (list 'cons (list 'cons key '--ag-v--) al)))))
+            (list 'let (list (list '--ag-p-- getter))
+                  (list 'if '--ag-p--
+                        (list 'setcdr '--ag-p-- val)
+                        (setf--expand al (list 'cons (list 'cons key val) al)))))))
+       ;; (setf (plist-get P K) V) / (setf (cl-getf P K) V): set an existing value
+       ;; cell, else prepend (K V) to P — matching Emacs's order for a new key.
+       ((memq head '(plist-get cl-getf))
         (list 'let (list (list '--pg-m-- (list 'plist-member (car args) (car (cdr args)))))
               (list 'if '--pg-m--
                     (list 'setcar (list 'cdr '--pg-m--) val)
@@ -1932,7 +3185,9 @@ pub const PRELUDE: &str = r#"
    ((memq s '(print printing)) "[[:print:]]")
    ((memq s '(word wordchar)) "\\w")
    ((eq s 'not-wordchar) "\\W")
-   ((memq s '(nonl not-newline any anychar anything)) ".")
+   ((memq s '(nonl not-newline any)) ".")
+   ;; anychar/anything match ANY char incl. newline (empty negated class).
+   ((memq s '(anychar anything)) "[^z-a]")
    ((eq s 'unmatchable) "\\`a\\`")
    (t (error "rx: unknown symbol %S" s))))
 (defun rx--atom-p (s)
@@ -1941,6 +3196,8 @@ pub const PRELUDE: &str = r#"
     (cond ((= n 1) t)
           ((and (eq (aref s 0) ?\[) (eq (aref s (1- n)) ?\])) t)
           ((and (= n 2) (eq (aref s 0) ?\\)) t)
+          ;; `\sC` / `\SC` syntax-class matchers are single-char atoms.
+          ((and (= n 3) (eq (aref s 0) ?\\) (memq (aref s 1) '(?s ?S))) t)
           ((and (>= n 4) (eq (aref s 0) ?\\) (eq (aref s 1) ?\()) t)
           (t nil))))
 (defun rx--quant-body (args)
@@ -1980,6 +3237,19 @@ pub const PRELUDE: &str = r#"
         (unless (or (integerp a) (and (stringp a) (= (length a) 1))) (setq ok nil)))
       (setq args (cdr args)))
     ok))
+(defun rx--syntax-code (sym)
+  ;; Map an rx `(syntax CLASS)` name to its `\sC` syntax-class code.
+  (cond ((eq sym 'whitespace) "-")
+        ((eq sym 'word) "w")
+        ((eq sym 'symbol) "_")
+        ((eq sym 'punctuation) ".")
+        ((eq sym 'open-parenthesis) "(")
+        ((eq sym 'close-parenthesis) ")")
+        ((eq sym 'string-quote) "\"")
+        ((eq sym 'comment-start) "<")
+        ((eq sym 'comment-end) ">")
+        ((eq sym 'escape) "\\\\")
+        (t (error "rx: unknown syntax class %S" sym))))
 (defun rx--list (form)
   (let ((head (car form)) (args (cdr form)))
     (cond
@@ -1995,6 +3265,13 @@ pub const PRELUDE: &str = r#"
      ((memq head '(zero-or-more * 0+)) (concat (rx--quant-body args) "*"))
      ((memq head '(one-or-more + 1+)) (concat (rx--quant-body args) "+"))
      ((memq head '(zero-or-one opt optional)) (concat (rx--quant-body args) "?"))
+     ;; `?` reads as the space char (32) and `??` as the `?` char (63); Emacs's
+     ;; rx treats them as the greedy/non-greedy optional operators.
+     ((eql head 32) (concat (rx--quant-body args) "?"))
+     ((eql head 63) (concat (rx--quant-body args) "??"))
+     ((eq head 'syntax)
+      ;; Emacs emits the `\w` shorthand for word syntax, `\sC` for the rest.
+      (if (eq (car args) 'word) "\\w" (concat "\\s" (rx--syntax-code (car args)))))
      ((eq head '=) (concat (rx--quant-body (cdr args)) "\\{" (number-to-string (car args)) "\\}"))
      ((eq head '>=) (concat (rx--quant-body (cdr args)) "\\{" (number-to-string (car args)) ",\\}"))
      ((memq head '(** repeat))
@@ -2006,8 +3283,17 @@ pub const PRELUDE: &str = r#"
      ((eq head 'not) (rx--not (car args)))
      ((memq head '(regexp regex)) (car args))
      ((eq head 'literal) (regexp-quote (car args)))
+     ((eq head 'backref) (concat "\\" (number-to-string (car args))))
+     ;; minimal-match/maximal-match: render the inner form (greediness control
+     ;; isn't modeled separately here).
+     ((memq head '(minimal-match maximal-match)) (rx--form (car args)))
      (t (error "rx: unknown form %S" head)))))
 (defmacro rx (&rest forms) (rx--seq forms))
+(defun rx-to-string (form &optional no-group)
+  "Translate the rx FORM to a regexp string; wrap in a shy group unless NO-GROUP
+or the result is already atomic/grouped."
+  (let ((s (rx--form form)))
+    (if (or no-group (rx--atom-p s)) s (concat "\\(?:" s "\\)"))))
 
 (defun pcase--literal-p (pat)
   (or (numberp pat) (stringp pat) (keywordp pat) (eq pat t) (null pat)))
@@ -2034,6 +3320,11 @@ pub const PRELUDE: &str = r#"
         (let* ((tv (make-symbol "app"))
                (r (pcase--compile (nth 2 pat) tv)))
           (cons (car r) (cons (list tv (pcase--apply (nth 1 pat) val)) (cdr r)))))
+       ;; (let PAT EXPR): match PAT against EXPR's value (EXPR ignores VAL).
+       ((eq head 'let)
+        (let* ((tv (make-symbol "let"))
+               (r (pcase--compile (nth 1 pat) tv)))
+          (cons (car r) (cons (list tv (nth 2 pat)) (cdr r)))))
        ((eq head 'and)
         (let ((tests nil) (binds nil))
           (dolist (p (cdr pat))
@@ -2116,13 +3407,31 @@ pub const PRELUDE: &str = r#"
 (defmacro pcase-let* (bindings &rest body)
   ;; Sequential pcase-let; our `let*' expansion already binds in order.
   (cons 'pcase-let (cons bindings body)))
+(defmacro pcase-setq (&rest args)
+  ;; Pairs of PATTERN VALUE: destructure each VALUE and `setq' the pattern's
+  ;; variables (the existing bindings, not new ones).
+  (let ((forms nil) (i 0))
+    (while args
+      (let* ((pat (car args)) (val (car (cdr args)))
+             (tv (intern (concat "--ps-" (number-to-string i) "--")))
+             (r (pcase--compile pat tv)))
+        (setq args (cdr (cdr args)) i (1+ i))
+        (setq forms
+              (cons (list 'let (list (list tv val))
+                          (cons 'progn
+                                (mapcar (lambda (b) (list 'setq (car b) (car (cdr b))))
+                                        (cdr r))))
+                    forms))))
+    (cons 'progn (reverse forms))))
 (defmacro pcase-dolist (spec &rest body)
   ;; Iterate (cadr SPEC), destructuring each element against (car SPEC).
   (let ((ev (make-symbol "e")))
     (list 'dolist (list ev (car (cdr spec)))
           (cons 'pcase-let (cons (list (list (car spec) ev)) body)))))
 (defmacro seq-let (args seq &rest body)
-  ;; Positionally bind ARGS to the elements of SEQ for BODY; `&rest` binds the tail.
+  ;; Positionally bind ARGS to the elements of SEQ for BODY; `&rest` binds the
+  ;; tail. ARGS may be a list or a vector pattern.
+  (when (vectorp args) (setq args (append args nil)))
   (let ((s (make-symbol "seq")) (binds nil) (i 0) (more t))
     (while (and args more)
       (let ((a (car args)))
@@ -2143,14 +3452,15 @@ pub const PRELUDE: &str = r#"
       (setq rest (cdr rest)))
     `(let ((,s ,seq)) ,@(reverse sets))))
 (defmacro seq-doseq (spec &rest body)
-  ;; (seq-doseq (VAR SEQUENCE) BODY...) — iterate VAR over any sequence's elements.
-  (let ((var (car spec)) (seq (car (cdr spec))))
-    `(let ((--seq-doseq-tail-- (append ,seq nil)) (,var nil))
+  ;; (seq-doseq (VAR SEQUENCE) BODY...) — iterate VAR over any sequence's
+  ;; elements. Returns the sequence (like Emacs, via seq-do).
+  (let ((var (car spec)) (seq (car (cdr spec))) (sv (make-symbol "seq")))
+    `(let* ((,sv ,seq) (--seq-doseq-tail-- (append ,sv nil)) (,var nil))
        (while --seq-doseq-tail--
          (setq ,var (car --seq-doseq-tail--))
          ,@body
          (setq --seq-doseq-tail-- (cdr --seq-doseq-tail--)))
-       nil)))
+       ,sv)))
 (defun macroexp-progn (forms) (if (cdr forms) (cons 'progn forms) (car forms)))
 (defmacro cl-function (f) (list 'function f))
 
@@ -2246,8 +3556,29 @@ pub const PRELUDE: &str = r#"
    ((eq type 'hash-table)
     (let ((h (make-hash-table :test 'equal)))
       (dolist (p pairs) (puthash (car p) (cdr p) h)) h))
+   ;; (hash-table :test TEST …) — the keyword-spec form.
+   ((and (consp type) (eq (car type) 'hash-table))
+    (let ((h (make-hash-table :test (or (plist-get (cdr type) :test) 'eql))))
+      (dolist (p pairs) (puthash (car p) (cdr p) h)) h))
    (t (error "map-into: unsupported type %S" type))))
 (defun map-into (map type) (map--into (map-pairs map) type))
+(defun map-insert (map key value)
+  "Return a new map like MAP with KEY mapped to VALUE (MAP is unchanged)."
+  (cond ((listp map) (cons (cons key value) map))
+        ((hash-table-p map) (let ((h (copy-hash-table map))) (puthash key value h) h))
+        (t (error "map-insert: unsupported map type"))))
+(defun map-put! (map key value &optional testfn)
+  "Set KEY to VALUE in MAP in place; error if an alist must grow."
+  (cond
+   ((hash-table-p map) (puthash key value map) map)
+   ((listp map)
+    (let ((entry (assoc key map (or testfn #'equal))))
+      (if entry (progn (setcdr entry value) map)
+        (error "Cannot modify map in-place: %S" map))))
+   ((arrayp map) (aset map key value) map)
+   (t (error "map-put!: unsupported map type"))))
+(defun map-values-apply (function map) (map-apply (lambda (_k v) (funcall function v)) map))
+(defun map-keys-apply (function map) (map-apply (lambda (k _v) (funcall function k)) map))
 (defun map-merge (type &rest maps)
   (let ((pairs nil))
     (dolist (m maps) (setq pairs (append pairs (map-pairs m))))

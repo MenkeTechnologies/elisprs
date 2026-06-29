@@ -179,6 +179,9 @@ pub struct ElispHost {
     /// A pending `throw`: (tag, value). Set by `throw`, consumed by `catch`.
     /// Distinguishes a non-local `throw` from an ordinary error during unwinding.
     pub(crate) pending_throw: Option<(Value, Value)>,
+    /// Tags of the `catch` frames currently active, so `throw` can detect when no
+    /// matching catch exists and signal `no-catch` (like Emacs) instead of leaking.
+    pub(crate) catch_tags: Vec<Value>,
     /// The structured error object `(ERROR-SYMBOL . DATA)` from the most recent
     /// `signal`/`error`, so `condition-case` can bind the handler variable to the
     /// real list (not a re-parsed string). Cleared when entering a c-c body.
@@ -190,6 +193,17 @@ pub struct ElispHost {
     /// Output-capture stack for `with-output-to-string`: when non-empty,
     /// `princ`/`prin1`/`print`/`terpri` append to the top buffer instead of stdout.
     pub(crate) output_capture: Vec<String>,
+    /// A stack of editing buffers (text + 1-based point). Index 0 is the implicit
+    /// default buffer; `with-temp-buffer` pushes/pops a fresh one. Minimal model:
+    /// text + point only (no markers, narrowing, or save-excursion).
+    pub(crate) buffers: Vec<EditBuffer>,
+}
+
+/// A minimal editing buffer: a char vector and a 1-based point (1..=len+1).
+#[derive(Default)]
+pub struct EditBuffer {
+    pub text: Vec<char>,
+    pub point: usize,
 }
 
 /// Result of the most recent `string-match`, in *character* positions (elisp
@@ -200,6 +214,9 @@ pub struct MatchData {
     /// `spans[0]` is the whole match; `spans[n]` is capture group `n`. A group
     /// that did not participate is `None`.
     pub spans: Vec<Option<(usize, usize)>>,
+    /// True if the last match was a buffer search: spans are 1-based buffer
+    /// positions and `match-string` reads from `subject` accordingly.
+    pub from_buffer: bool,
 }
 
 impl Default for ElispHost {
@@ -219,9 +236,14 @@ impl ElispHost {
             frame_stack: Vec::new(),
             error: None,
             pending_throw: None,
+            catch_tags: Vec::new(),
             pending_error: None,
             match_data: None,
             output_capture: Vec::new(),
+            buffers: vec![EditBuffer {
+                text: Vec::new(),
+                point: 1,
+            }],
         };
         crate::builtins::install(&mut h);
         h.builtin_count = h.arena.len();
@@ -337,6 +359,15 @@ impl ElispHost {
         }
         Ok(())
     }
+    /// Clear a symbol's global value cell (`makunbound`). Lexical bindings are
+    /// left untouched — they shadow the cell and unwind on their own.
+    pub fn unset_value(&mut self, v: &Value) -> Result<(), String> {
+        let id = self.sym_handle(v).ok_or("makunbound: not a symbol")?;
+        if let Obj::Symbol(s) = &mut self.arena[id as usize] {
+            s.value = None;
+        }
+        Ok(())
+    }
     pub fn get_value(&self, v: &Value) -> Result<Value, String> {
         if let Some(id) = self.sym_handle(v) {
             if let Some(val) = self.lex.as_ref().and_then(|s| s.lookup(id)) {
@@ -347,7 +378,7 @@ impl ElispHost {
             Some(Obj::Symbol(s)) => s
                 .value
                 .clone()
-                .ok_or_else(|| format!("Symbol's value as variable is void: {}", s.name)),
+                .ok_or_else(|| format!("void-variable: {}", s.name)),
             _ => match v {
                 Value::Bool(true) => Ok(Value::Bool(true)),
                 Value::Undef => Ok(Value::Undef),
@@ -365,6 +396,12 @@ impl ElispHost {
     }
     fn is_special(&self, id: u32) -> bool {
         matches!(self.arena.get(id as usize), Some(Obj::Symbol(s)) if s.special)
+    }
+    /// True if V is a symbol marked special (defvar/defconst), for `special-variable-p`.
+    pub fn symbol_special(&self, v: &Value) -> bool {
+        self.sym_handle(v)
+            .map(|id| self.is_special(id))
+            .unwrap_or(false)
     }
     pub fn set_function_value(&mut self, sym: &Value, def: Value) -> Result<(), String> {
         let id = self.sym_handle(sym).ok_or("fset: not a symbol")?;
@@ -808,6 +845,24 @@ impl ElispHost {
         }
     }
 
+    /// True if a printer flag dynamic var (e.g. `print-escape-newlines`) is non-nil.
+    fn print_flag(&self, name: &str) -> bool {
+        self.print_flag_or(name, false)
+    }
+
+    /// Like `print_flag` but uses DEFAULT when the variable is unbound (e.g.
+    /// `print-quoted` defaults to t).
+    fn print_flag_or(&self, name: &str, default: bool) -> bool {
+        match self
+            .obarray
+            .get(name)
+            .and_then(|id| self.arena.get(*id as usize))
+        {
+            Some(Obj::Symbol(s)) => s.value.as_ref().map(el_truthy).unwrap_or(default),
+            _ => default,
+        }
+    }
+
     /// Print a sequence's elements honoring `print-length` (truncate with `...`).
     fn print_seq(&self, items: &[Value], readable: bool, depth: usize) -> Vec<String> {
         let limit = self.print_limit("print-length");
@@ -930,15 +985,20 @@ impl ElispHost {
         let nd = depth + 1;
         // Emacs abbreviates the two-element forms `(quote X)`/`(function X)`/`` (` X) ``
         // as `'X`/`#'X`/`` `X ``; longer lists with those heads print in full.
+        // Honored only when `print-quoted` is non-nil (its default).
         if let Some(Obj::Cons(head, tail)) = self.obj(v) {
-            let prefix = match self.obj(head) {
-                Some(Obj::Symbol(s)) => match s.name.as_str() {
-                    "quote" => Some("'"),
-                    "function" => Some("#'"),
-                    "`" => Some("`"),
+            let prefix = if self.print_flag_or("print-quoted", true) {
+                match self.obj(head) {
+                    Some(Obj::Symbol(s)) => match s.name.as_str() {
+                        "quote" => Some("'"),
+                        "function" => Some("#'"),
+                        "`" => Some("`"),
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
+                }
+            } else {
+                None
             };
             if let Some(prefix) = prefix {
                 if let Some(Obj::Cons(arg, rest)) = self.obj(tail) {
@@ -996,6 +1056,11 @@ impl ElispHost {
         }
     }
 
+    /// The current editing buffer (top of the stack; index 0 is the default).
+    pub fn cur_buf(&mut self) -> &mut EditBuffer {
+        self.buffers.last_mut().expect("buffer stack never empty")
+    }
+
     /// `eq`-style identity comparison (used for `catch`/`throw` tags).
     pub fn values_eq(&self, a: &Value, b: &Value) -> bool {
         if !el_truthy(a) && !el_truthy(b) {
@@ -1019,9 +1084,13 @@ impl ElispHost {
         };
         // These conditions carry a list of *values* as DATA in Emacs, not a
         // message string: `(wrong-type-argument PREDICATE VALUE)`,
-        // `(args-out-of-range ARRAY START END)`. The Rust helpers render those
-        // values in readable form, so re-read them into separate elements.
-        if matches!(sym.as_str(), "wrong-type-argument" | "args-out-of-range") {
+        // `(args-out-of-range ARRAY START END)`, `(void-variable SYM)`,
+        // `(void-function SYM)`. The Rust helpers render those values in
+        // readable form, so re-read them into separate elements.
+        if matches!(
+            sym.as_str(),
+            "wrong-type-argument" | "args-out-of-range" | "void-variable" | "void-function"
+        ) {
             if let Some(data) = self.read_all_forms(&msg) {
                 let s = self.intern(&sym);
                 return self.cons(s, data);
@@ -1179,9 +1248,14 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 let mut pred: Option<Value> = None;
                 let mut key: Option<Value> = None;
                 let mut reverse = false;
+                // The classic `(sort SEQ PRED)` form sorts in place; the Emacs-30
+                // keyword form is non-destructive unless `:in-place t`.
+                let mut in_place;
                 if args.len() == 2 && !is_kw(&args[1]) {
                     pred = Some(args[1].clone());
+                    in_place = true;
                 } else {
+                    in_place = false;
                     let mut idx = 1;
                     while idx < args.len() {
                         let kw = with_host(|h| h.sym_name(&args[idx])).unwrap_or_default();
@@ -1195,6 +1269,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                                 }
                             }
                             ":reverse" => reverse = truthy,
+                            ":in-place" => in_place = truthy,
                             _ => {}
                         }
                         idx += 2;
@@ -1213,11 +1288,39 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 if reverse {
                     sorted.reverse();
                 }
+                // In-place forms write the sorted values back into the original
+                // sequence and return it; otherwise build a fresh one.
                 return Ok(with_host(|h| {
+                    if !in_place {
+                        return if was_vec {
+                            h.alloc(Obj::Vector(sorted))
+                        } else {
+                            h.list_from(sorted)
+                        };
+                    }
                     if was_vec {
+                        if let Value::Obj(id) = &args[0] {
+                            if let Some(Obj::Vector(v)) = h.arena.get_mut(*id as usize) {
+                                *v = sorted;
+                                return args[0].clone();
+                            }
+                        }
                         h.alloc(Obj::Vector(sorted))
                     } else {
-                        h.list_from(sorted)
+                        let mut cur = args[0].clone();
+                        for val in sorted {
+                            let next = match h.obj(&cur) {
+                                Some(Obj::Cons(_, cdr)) => cdr.clone(),
+                                _ => break,
+                            };
+                            if let Value::Obj(id) = cur {
+                                if let Some(Obj::Cons(car, _)) = h.arena.get_mut(id as usize) {
+                                    *car = val;
+                                }
+                            }
+                            cur = next;
+                        }
+                        args[0].clone()
                     }
                 }));
             }
@@ -1235,23 +1338,35 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             // `eval` macroexpands, compiles, and runs a form — re-entrant, so it
             // lives here (outside any host borrow), like the other intrinsics.
             "eval" => {
-                let expanded = macroexpand_all(&args[0])?;
+                let form = args.first().ok_or("wrong-number-of-arguments: eval")?;
+                let expanded = macroexpand_all(form)?;
                 let chunk = with_host(|h| crate::compiler::compile_top(h, &expanded))?;
                 return run_chunk(chunk);
             }
             // The macro-expansion functions run macro expanders (re-entrant).
             "macroexpand-1" => {
-                return Ok(macroexpand_1(&args[0])?.unwrap_or_else(|| args[0].clone()));
+                let form = args
+                    .first()
+                    .ok_or("wrong-number-of-arguments: macroexpand-1")?;
+                return Ok(macroexpand_1(form)?.unwrap_or_else(|| form.clone()));
             }
             "macroexpand" => {
                 // Expand the head to a fixpoint; don't recurse into sub-forms.
-                let mut f = args[0].clone();
+                let mut f = args
+                    .first()
+                    .ok_or("wrong-number-of-arguments: macroexpand")?
+                    .clone();
                 while let Some(e) = macroexpand_1(&f)? {
                     f = e;
                 }
                 return Ok(f);
             }
-            "macroexpand-all" => return macroexpand_all(&args[0]),
+            "macroexpand-all" => {
+                return macroexpand_all(
+                    args.first()
+                        .ok_or("wrong-number-of-arguments: macroexpand-all")?,
+                )
+            }
             // `replace-regexp-in-string` with a *function* REP must call that
             // function per match — VM re-entry — so it's handled here rather than
             // in the (host-borrowing) subr, which only does string templates.
@@ -1307,6 +1422,7 @@ fn replace_regexp_with_fn(args: &[Value]) -> Result<Value, String> {
     let mut out = String::with_capacity(subject.len());
     let mut last = 0usize;
     for caps in re.captures_iter(&subject) {
+        let Ok(caps) = caps else { break };
         let m = caps.get(0).unwrap();
         out.push_str(&subject[last..m.start()]);
         // Char-indexed match data so `match-string`/`match-beginning` work in FUNC.
@@ -1325,6 +1441,7 @@ fn replace_regexp_with_fn(args: &[Value]) -> Result<Value, String> {
             h.match_data = Some(MatchData {
                 subject: subject.clone(),
                 spans,
+                from_buffer: false,
             })
         });
         let r = call_function(&repfn, &[matched])?;
@@ -1489,7 +1606,12 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
 fn intrinsic_catch(args: &[Value]) -> Result<Value, String> {
     let tag = args.first().cloned().unwrap_or(Value::Undef);
     let thunk = args.get(1).cloned().unwrap_or(Value::Undef);
-    match call_function(&thunk, &[]) {
+    with_host(|h| h.catch_tags.push(tag.clone()));
+    let result = call_function(&thunk, &[]);
+    with_host(|h| {
+        h.catch_tags.pop();
+    });
+    match result {
         Ok(v) => Ok(v),
         Err(e) => {
             let pend = with_host(|h| h.pending_throw.clone());
@@ -1572,13 +1694,34 @@ fn intrinsic_condition_case(args: &[Value]) -> Result<Value, String> {
             })
             .unwrap_or_else(|| e.split(':').next().unwrap_or("error").trim().to_string());
             let hlist = with_host(|h| h.list_vec(&handlers)).unwrap_or_default();
+            // The signaled symbol's `error-conditions` (itself + parents, via
+            // define-error); a handler matches any condition on this chain.
+            let getfn = with_host(|h| h.intern("get"));
+            let symv = with_host(|h| h.intern(&esym));
+            let propv = with_host(|h| h.intern("error-conditions"));
+            let signal_conditions: Vec<String> = call_function(&getfn, &[symv, propv])
+                .ok()
+                .and_then(|v| with_host(|h| h.list_vec(&v)))
+                .map(|items| with_host(|h| items.iter().filter_map(|x| h.sym_name(x)).collect()))
+                .unwrap_or_default();
             for hp in hlist {
                 let parts = with_host(|h| h.list_vec(&hp)).unwrap_or_default();
                 if parts.len() < 2 {
                     continue;
                 }
-                let cname = with_host(|h| h.sym_name(&parts[0])).unwrap_or_default();
-                if cname == "error" || cname == "t" || cname == esym {
+                // A handler condition is a symbol or a list of symbols; it matches
+                // if any names `error`/`t`, the signaled condition, or a parent of
+                // it (per the signal's error-conditions chain).
+                let conds: Vec<String> = with_host(|h| match h.sym_name(&parts[0]) {
+                    Some(name) => vec![name],
+                    None => h
+                        .list_vec(&parts[0])
+                        .map(|items| items.iter().filter_map(|x| h.sym_name(x)).collect())
+                        .unwrap_or_default(),
+                });
+                if conds.iter().any(|c| {
+                    c == "error" || c == "t" || *c == esym || signal_conditions.contains(c)
+                }) {
                     let depth = with_host(|h| {
                         let d = h.specdepth();
                         if matches!(h.obj(&var), Some(Obj::Symbol(_))) {

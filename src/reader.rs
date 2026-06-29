@@ -109,6 +109,19 @@ impl Reader {
                 let f = self.read_form(h)?;
                 Ok(quoted(h, "function", f))
             }
+            // #s(hash-table …) / #s(RECORD …) literal.
+            '#' if self.peek_at(1) == Some('s') && self.peek_at(2) == Some('(') => {
+                self.pos += 2;
+                self.read_record(h)
+            }
+            // #("string" …intervals) — read the string, dropping text properties.
+            '#' if self.peek_at(1) == Some('(') => {
+                self.pos += 1;
+                let lst = self.read_list(h)?;
+                Ok(h.list_vec(&lst)
+                    .and_then(|v| v.into_iter().next())
+                    .unwrap_or(Value::Undef))
+            }
             '#' if matches!(
                 self.peek_at(1),
                 Some('x' | 'X' | 'o' | 'O' | 'b' | 'B' | '0'..='9')
@@ -184,8 +197,36 @@ impl Reader {
                 Some('\\') => {
                     self.pos += 1;
                     let e = self.peek().ok_or("unterminated string")?;
-                    self.pos += 1;
-                    s.push(unescape(e));
+                    let dash = self.peek_at(1) == Some('-');
+                    let scalar = match e {
+                        // Control: `\^X` and `\C-X` fold like char literals. The
+                        // target is read as a plain char (or nested escape), not
+                        // re-interpreted as an escape letter (so `\^a` is C-a, not
+                        // control of the bell `\a`).
+                        '^' => {
+                            self.pos += 1;
+                            apply_control(self.read_control_target()?)
+                        }
+                        'C' if dash => {
+                            self.pos += 2;
+                            apply_control(self.read_control_target()?)
+                        }
+                        // `\s` (not `\s-`) is the space character.
+                        's' if !dash => {
+                            self.pos += 1;
+                            32
+                        }
+                        // A literal newline after `\` is elided (line continuation).
+                        '\n' => {
+                            self.pos += 1;
+                            continue;
+                        }
+                        _ => self.read_escape_scalar()?,
+                    };
+                    match char::from_u32(scalar as u32) {
+                        Some(c) => s.push(c),
+                        None => return Err(format!("invalid character code {scalar} in string")),
+                    }
                 }
                 Some(c) => {
                     self.pos += 1;
@@ -241,11 +282,108 @@ impl Reader {
                 self.pos += 2;
                 Ok(self.read_char_spec()? | C_ALT)
             }
-            _ => {
+            // `?\s` not followed by `-` is the space character.
+            's' => {
                 self.pos += 1;
-                Ok(unescape(e) as i64)
+                Ok(32)
+            }
+            // `\xHH…` / `\uHHHH` / `\U00HHHHHH` / octal `\OOO` / named escapes.
+            _ => self.read_escape_scalar(),
+        }
+    }
+
+    /// Read a numeric/named escape, `self.pos` pointing at the char right after
+    /// the backslash: hex `xHH…`, unicode `uHHHH` / `U00HHHHHH`, octal `OOO`
+    /// (1–3 digits), or a single-letter escape via `unescape`.
+    fn read_escape_scalar(&mut self) -> Result<i64, String> {
+        let e = self.peek().ok_or("unterminated escape")?;
+        match e {
+            'x' => {
+                self.pos += 1;
+                let mut n: i64 = 0;
+                let mut any = false;
+                while let Some(d) = self.peek().and_then(|c| c.to_digit(16)) {
+                    n = n * 16 + d as i64;
+                    self.pos += 1;
+                    any = true;
+                }
+                if !any {
+                    return Err("missing hex digits after \\x".to_string());
+                }
+                Ok(n)
+            }
+            'u' => {
+                self.pos += 1;
+                self.read_fixed_hex(4)
+            }
+            'U' => {
+                self.pos += 1;
+                self.read_fixed_hex(8)
+            }
+            // \N{U+HHHH} codepoint escape (the named-char form needs a name table).
+            'N' if self.peek_at(1) == Some('{') => {
+                self.pos += 2;
+                let start = self.pos;
+                while self.peek().is_some() && self.peek() != Some('}') {
+                    self.pos += 1;
+                }
+                let name: String = self.chars[start..self.pos].iter().collect();
+                if self.peek() == Some('}') {
+                    self.pos += 1;
+                }
+                match name.trim().strip_prefix("U+") {
+                    Some(hex) => i64::from_str_radix(hex.trim(), 16)
+                        .map_err(|_| format!("invalid \\N{{{name}}}")),
+                    None => Err(format!("unsupported character name: {name}")),
+                }
+            }
+            '0'..='7' => {
+                let mut n: i64 = 0;
+                let mut count = 0;
+                while count < 3 {
+                    match self.peek().and_then(|c| c.to_digit(8)) {
+                        Some(d) => {
+                            n = n * 8 + d as i64;
+                            self.pos += 1;
+                            count += 1;
+                        }
+                        None => break,
+                    }
+                }
+                Ok(n)
+            }
+            other => {
+                self.pos += 1;
+                Ok(unescape(other) as i64)
             }
         }
+    }
+
+    /// Read the target of a control prefix (`\^`/`\C-`): a plain character, or a
+    /// nested `\…` escape if the next char is a backslash.
+    fn read_control_target(&mut self) -> Result<i64, String> {
+        let nc = self.peek().ok_or("unterminated escape")?;
+        if nc == '\\' {
+            self.pos += 1;
+            self.read_escape_scalar()
+        } else {
+            self.pos += 1;
+            Ok(nc as i64)
+        }
+    }
+
+    /// Read exactly `n` hex digits (for `\u` / `\U`), erroring if any is missing.
+    fn read_fixed_hex(&mut self, n: usize) -> Result<i64, String> {
+        let mut val: i64 = 0;
+        for _ in 0..n {
+            let d = self
+                .peek()
+                .and_then(|c| c.to_digit(16))
+                .ok_or("missing hex digits in unicode escape")?;
+            val = val * 16 + d as i64;
+            self.pos += 1;
+        }
+        Ok(val)
     }
 
     /// Read a radix-prefixed integer: `#x1f` / `#b101` / `#o17` (and uppercase),
@@ -304,6 +442,51 @@ impl Reader {
         let n = i64::from_str_radix(&tok, base)
             .map_err(|_| format!("invalid digits for base {base}: {tok}"))?;
         Ok(Value::Int(sign * n))
+    }
+
+    /// Read a `#s(…)` literal: a hash-table (`#s(hash-table test … data (k v …))`)
+    /// or a record (`#s(NAME slot…)`, stored as a `cl-struct-NAME`-tagged vector).
+    /// `self.pos` is at the `(`.
+    fn read_record(&mut self, h: &mut ElispHost) -> Result<Value, String> {
+        let lst = self.read_list(h)?;
+        let items = h.list_vec(&lst).ok_or("malformed #s(...) literal")?;
+        if items.is_empty() {
+            return Err("empty #s(...) literal".to_string());
+        }
+        if h.sym_name(&items[0]).as_deref() == Some("hash-table") {
+            let mut test = 1u8; // eql
+            let mut data: Vec<Value> = Vec::new();
+            let mut i = 1;
+            while i + 1 < items.len() {
+                match h.sym_name(&items[i]).as_deref() {
+                    Some("test") => {
+                        test = match h.sym_name(&items[i + 1]).as_deref() {
+                            Some("eq") => 0,
+                            Some("equal") => 2,
+                            _ => 1,
+                        };
+                    }
+                    Some("data") => data = h.list_vec(&items[i + 1]).unwrap_or_default(),
+                    _ => {}
+                }
+                i += 2;
+            }
+            let mut entries = Vec::new();
+            let mut j = 0;
+            while j + 1 < data.len() {
+                entries.push((data[j].clone(), data[j + 1].clone()));
+                j += 2;
+            }
+            Ok(h.alloc(Obj::HashTable { test, entries }))
+        } else {
+            let name = h
+                .sym_name(&items[0])
+                .ok_or("#s record type must be a symbol")?;
+            let tag = h.intern(&format!("cl-struct-{name}"));
+            let mut v = vec![tag];
+            v.extend_from_slice(&items[1..]);
+            Ok(h.alloc(Obj::Vector(v)))
+        }
     }
 
     fn read_atom(&mut self, h: &mut ElispHost) -> Result<Value, String> {
@@ -490,7 +673,12 @@ fn unescape(e: char) -> char {
         't' => '\t',
         'r' => '\r',
         '0' => '\0',
-        'e' => '\u{1b}',
+        'e' => '\u{1b}', // escape
+        'a' => '\u{7}',  // bell
+        'b' => '\u{8}',  // backspace
+        'v' => '\u{b}',  // vertical tab
+        'f' => '\u{c}',  // formfeed
+        'd' => '\u{7f}', // delete
         other => other,
     }
 }
@@ -504,6 +692,13 @@ fn classify(h: &mut ElispHost, tok: &str) -> Value {
     if !tok.starts_with(':') {
         if let Ok(i) = tok.parse::<i64>() {
             return Value::Int(i);
+        }
+        // A trailing decimal point with no fractional digits is an integer in
+        // elisp: `1.` => 1, `-3.` => -3 (but `1.5`/`1.e3` are floats).
+        if let Some(intpart) = tok.strip_suffix('.') {
+            if let Ok(i) = intpart.parse::<i64>() {
+                return Value::Int(i);
+            }
         }
         if looks_numeric(tok) {
             if let Ok(f) = tok.parse::<f64>() {

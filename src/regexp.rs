@@ -12,8 +12,8 @@
 //! `\>`, `\_<`, `\_>`), word/symbol/whitespace escapes (`\w \W \b \B \s- \sw`),
 //! and character alternatives `[...]` (passed through, since both dialects share
 //! `[a-z]`, `[^...]`, and POSIX `[:class:]`). Backreferences in the *pattern*
-//! (`\1`..`\9`) are unsupported — the `regex` crate has no backtracking — and
-//! produce an explicit error rather than a silent mismatch.
+//! (`\1`..`\9`) pass through to fancy-regex's backtracking engine, which spells
+//! them the same way.
 
 /// Translate an Emacs regexp string into the `regex` crate's syntax.
 pub fn translate(pat: &str) -> Result<String, String> {
@@ -47,17 +47,33 @@ fn translate_escape(
     match e {
         // Grouping / alternation / bounds: drop the backslash.
         '(' => {
-            // Preserve a shy group `\(?:` as the crate's `(?:`.
+            // `\(?…` is either a shy group `\(?:` or an explicitly-numbered group
+            // `\(?N:RE\)`. fancy-regex has no explicit-numbering syntax, but it
+            // numbers capture groups positionally — so an explicit group becomes a
+            // plain capture `(`, which gives the right match-data index whenever the
+            // explicit numbers are sequential (the common case, e.g. font-lock's
+            // `\(?1:…\)\(?2:…\)`). Non-sequential numbering isn't preserved.
             if it.peek() == Some(&'?') {
-                out.push('(');
-                out.push('?');
-                it.next();
-                // Copy the modifier run up to and including ':' (e.g. `?:`).
-                while let Some(&n) = it.peek() {
-                    out.push(n);
-                    it.next();
-                    if n == ':' {
-                        break;
+                it.next(); // consume '?'
+                if matches!(it.peek(), Some(d) if d.is_ascii_digit()) {
+                    // `\(?N:` — drop the digits and the ':' , emit a plain capture.
+                    while matches!(it.peek(), Some(d) if d.is_ascii_digit()) {
+                        it.next();
+                    }
+                    if it.peek() == Some(&':') {
+                        it.next();
+                    }
+                    out.push('(');
+                } else {
+                    // Shy group `\(?:` (or any other `?`-modifier run up to ':').
+                    out.push('(');
+                    out.push('?');
+                    while let Some(&n) = it.peek() {
+                        out.push(n);
+                        it.next();
+                        if n == ':' {
+                            break;
+                        }
                     }
                 }
             } else {
@@ -99,11 +115,11 @@ fn translate_escape(
                 Some(_) | None => out.push_str(if neg { r"\S" } else { r"\s" }),
             }
         }
-        // Backreferences are unrepresentable in a non-backtracking engine.
+        // Backreferences `\1`..`\9` — fancy-regex's backtracking engine handles
+        // these; both dialects spell them the same way.
         '1'..='9' => {
-            return Err(format!(
-                "backreference \\{e} in regexp is unsupported (no backtracking)"
-            ));
+            out.push('\\');
+            out.push(e);
         }
         // Anything else: keep the escape (covers `\.`, `\*`, `\\`, `\+`, …).
         other => {
@@ -129,6 +145,12 @@ fn copy_class(it: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
         it.next();
     }
     while let Some(c) = it.next() {
+        if c == '\\' {
+            // In an elisp char class a backslash is an ordinary character (no
+            // escapes), so escape it for the `regex` crate: `[\"]` matches `\`/`"`.
+            out.push_str("\\\\");
+            continue;
+        }
         out.push(c);
         if c == '[' && it.peek() == Some(&':') {
             // POSIX class `[:alpha:]` — copy through its closing `:]`.
@@ -157,6 +179,11 @@ mod tests {
         assert_eq!(t(r"\(ab\|cd\)+"), "(ab|cd)+");
         assert_eq!(t(r"a(b)c"), r"a\(b\)c");
         assert_eq!(t(r"\(?:foo\)"), "(?:foo)");
+        // Explicitly-numbered groups `\(?N:…\)` become plain captures (fancy-regex
+        // numbers positionally, which is correct for sequential explicit numbers).
+        assert_eq!(t(r"\(?1:foo\)"), "(foo)");
+        assert_eq!(t(r"\(?1:a\)-\(?2:b\)"), "(a)-(b)");
+        assert_eq!(t(r"\(?:x\)\(?1:y\)"), "(?:x)(y)");
     }
 
     #[test]
@@ -180,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn backreference_rejected() {
-        assert!(translate(r"\(a\)\1").is_err());
+    fn backreference_passes_through() {
+        assert_eq!(t(r"\(a\)\1"), r"(a)\1");
     }
 }

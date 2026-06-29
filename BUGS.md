@@ -78,8 +78,10 @@ matches Emacs (shortest form, exponential for extreme magnitudes); added the pca
 **Notable still-missing:** `string-fill` (word-wrapping); the `cl-loop` clauses
 above.
 
-**Still divergent (harder):** pattern backreferences in regexps (the backing
-engine doesn't backtrack).
+**Still divergent (harder):** ~~pattern backreferences in regexps (the backing
+engine doesn't backtrack)~~ — ✅ FIXED: swapped the matching engine to
+`fancy-regex`, whose backtracking handles `\1`..`\9` while keeping the linear
+`regex` fast path for backref-free patterns.
 
 ---
 

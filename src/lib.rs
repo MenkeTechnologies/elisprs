@@ -26,9 +26,27 @@ pub fn eval_str(src: &str) -> Result<Value, String> {
     eval_forms(src)
 }
 
+/// Splice literal top-level `(progn …)` forms into their subforms (recursively),
+/// so an earlier subform's `defmacro`/`defun` is in effect before a later subform
+/// is compiled — matching Emacs's top-level handling.
+fn splice_top_forms(h: &mut host::ElispHost, forms: Vec<Value>) -> Vec<Value> {
+    let mut out = Vec::new();
+    for f in forms {
+        let progn = match h.list_vec(&f) {
+            Some(v) if !v.is_empty() && h.sym_name(&v[0]).as_deref() == Some("progn") => Some(v),
+            _ => None,
+        };
+        match progn {
+            Some(v) => out.extend(splice_top_forms(h, v[1..].to_vec())),
+            None => out.push(f),
+        }
+    }
+    out
+}
+
 /// Evaluate a sequence of top-level forms (macro-expand → lower → run).
 fn eval_forms(src: &str) -> Result<Value, String> {
-    let forms = host::with_host(|h| reader::read_all(h, src))?;
+    let forms = host::with_host(|h| reader::read_all(h, src).map(|fs| splice_top_forms(h, fs)))?;
     let mut last = Value::Undef;
     for form in &forms {
         // Macro-expand before lowering (a prior form's `defmacro` is in effect).
@@ -65,6 +83,18 @@ fn load_prelude() {
 /// Render a value (prin1 style when `readable`).
 pub fn print(v: &Value, readable: bool) -> String {
     host::with_host(|h| h.print(v, readable))
+}
+
+/// Render an internal error string as Emacs's `error-message-string` would: a
+/// condition like `void-variable: foo` becomes "Symbol's value as variable is
+/// void: foo". Falls back to the raw string if formatting fails.
+pub fn format_error(e: &str) -> String {
+    let obj = host::with_host(|h| h.make_error_object(e));
+    let func = host::with_host(|h| h.intern("error-message-string"));
+    match host::call_function(&func, &[obj]) {
+        Ok(Value::Str(s)) => s.to_string(),
+        _ => e.to_string(),
+    }
 }
 
 /// Run a `.el` file, using the rkyv bytecode cache at `~/.elisprs/scripts.rkyv`.
@@ -112,7 +142,7 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
     let prelude_end = host::with_host(|h| h.arena_len());
     let baseline = host::with_host(|h| h.snapshot_values(builtin_count, prelude_end));
 
-    let forms = host::with_host(|h| reader::read_all(h, &src))?;
+    let forms = host::with_host(|h| reader::read_all(h, &src).map(|fs| splice_top_forms(h, fs)))?;
     let mut chunks = Vec::with_capacity(forms.len());
     let mut last = Value::Undef;
     for form in &forms {

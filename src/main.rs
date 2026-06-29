@@ -48,7 +48,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("error: {e}");
+                eprintln!("error: {}", elisprs::format_error(&e));
                 ExitCode::FAILURE
             }
         };
@@ -58,7 +58,7 @@ fn main() -> ExitCode {
         return match elisprs::eval_file(file) {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("error: {e}");
+                eprintln!("error: {}", elisprs::format_error(&e));
                 ExitCode::FAILURE
             }
         };
@@ -135,7 +135,7 @@ fn repl() -> ExitCode {
         }
         match elisprs::eval_str(&src) {
             Ok(v) => println!("{}", elisprs::print(&v, true)),
-            Err(e) => eprintln!("error: {e}"),
+            Err(e) => eprintln!("error: {}", elisprs::format_error(&e)),
         }
     }
 }

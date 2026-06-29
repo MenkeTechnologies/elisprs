@@ -312,7 +312,9 @@ fn reverse_fn(h: &mut ElispHost, a: &[Value]) -> R {
         items.reverse();
         return Ok(h.alloc(Obj::Vector(items)));
     }
-    let mut v = h.list_vec(&a[0]).ok_or("wrong-type-argument: sequencep")?;
+    let mut v = h
+        .list_vec(&a[0])
+        .ok_or_else(|| format!("wrong-type-argument: sequencep {}", h.print(&a[0], true)))?;
     v.reverse();
     Ok(h.list_from(v))
 }
@@ -357,7 +359,10 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
                 h.list_vec(&a[0]).map(|v| v.len()).unwrap_or(0) as i64
             )),
         },
-        _ => Err("wrong-type-argument: sequencep".to_string()),
+        _ => Err(format!(
+            "wrong-type-argument: sequencep {}",
+            h.print(&a[0], true)
+        )),
     }
 }
 fn nth_fn(h: &mut ElispHost, a: &[Value]) -> R {
@@ -442,28 +447,40 @@ fn make_vector(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.alloc(Obj::Vector(vec![a[1].clone(); n])))
 }
 fn aref(h: &mut ElispHost, a: &[Value]) -> R {
-    let i = as_num(&a[1])?.0.max(0) as usize;
+    let idx = as_num(&a[1])?.0;
+    let oor = |h: &ElispHost| format!("args-out-of-range: {} {idx}", h.print(&a[0], true));
+    if idx < 0 {
+        return Err(oor(h));
+    }
+    let i = idx as usize;
     match h.obj(&a[0]) {
-        Some(Obj::Vector(items)) => items.get(i).cloned().ok_or("args-out-of-range".to_string()),
+        Some(Obj::Vector(items)) => items.get(i).cloned().ok_or_else(|| oor(h)),
         _ => match &a[0] {
             Value::Str(s) => s
                 .chars()
                 .nth(i)
                 .map(|c| Value::Int(c as i64))
-                .ok_or("args-out-of-range".to_string()),
-            _ => Err("wrong-type-argument: arrayp".to_string()),
+                .ok_or_else(|| oor(h)),
+            _ => Err(format!(
+                "wrong-type-argument: arrayp {}",
+                h.print(&a[0], true)
+            )),
         },
     }
 }
 fn aset(h: &mut ElispHost, a: &[Value]) -> R {
-    let i = as_num(&a[1])?.0.max(0) as usize;
+    let idx = as_num(&a[1])?.0;
+    if idx < 0 {
+        return Err(format!("args-out-of-range: {} {idx}", h.print(&a[0], true)));
+    }
+    let i = idx as usize;
     if let Value::Obj(id) = &a[0] {
         if let Some(Obj::Vector(items)) = h.arena.get_mut(*id as usize) {
             if i < items.len() {
                 items[i] = a[2].clone();
                 return Ok(a[2].clone());
             }
-            return Err("args-out-of-range".to_string());
+            return Err(format!("args-out-of-range: {} {idx}", h.print(&a[0], true)));
         }
     }
     Err("wrong-type-argument: arrayp".to_string())
@@ -479,14 +496,21 @@ fn fillarray(h: &mut ElispHost, a: &[Value]) -> R {
             return Ok(a[0].clone());
         }
     }
-    Err("wrong-type-argument: arrayp".to_string())
+    Err(format!(
+        "wrong-type-argument: arrayp {}",
+        h.print(&a[0], true)
+    ))
 }
 
 // ── symbols / cells ──
 fn symbol_name(h: &mut ElispHost, a: &[Value]) -> R {
-    h.sym_name(&a[0])
-        .map(Value::str)
-        .ok_or("wrong-type-argument: symbolp".to_string())
+    match h.sym_name(&a[0]) {
+        Some(s) => Ok(Value::str(s)),
+        None => Err(format!(
+            "wrong-type-argument: symbolp {}",
+            h.print(&a[0], true)
+        )),
+    }
 }
 fn intern_fn(h: &mut ElispHost, a: &[Value]) -> R {
     match &a[0] {
@@ -506,6 +530,11 @@ fn set_fn(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn symbol_value(h: &mut ElispHost, a: &[Value]) -> R {
     h.get_value(&a[0])
+}
+/// `(makunbound SYMBOL)` — clear SYMBOL's value cell, returning SYMBOL.
+fn makunbound(h: &mut ElispHost, a: &[Value]) -> R {
+    h.unset_value(&a[0])?;
+    Ok(a[0].clone())
 }
 /// `(fset SYMBOL DEFINITION)` — set SYMBOL's function cell, returning DEFINITION.
 fn fset(h: &mut ElispHost, a: &[Value]) -> R {
@@ -570,8 +599,20 @@ fn prin1_to_string(h: &mut ElispHost, a: &[Value]) -> R {
 // `throw` records the (tag, value) and aborts via the error channel; `catch`
 // (an intrinsic in host::call_function) intercepts it.
 fn throw_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    h.pending_throw = Some((a[0].clone(), a.get(1).cloned().unwrap_or(Value::Undef)));
-    Err("--throw--".to_string())
+    let tag = a[0].clone();
+    let val = a.get(1).cloned().unwrap_or(Value::Undef);
+    let tags = h.catch_tags.clone();
+    if tags.iter().any(|t| h.values_eq(t, &tag)) {
+        h.pending_throw = Some((tag, val));
+        Err("--throw--".to_string())
+    } else {
+        // No matching catch on the stack: signal (no-catch TAG VALUE).
+        let sym = h.intern("no-catch");
+        let data = h.list_from(vec![tag, val]);
+        let display = h.print(&data, true);
+        h.pending_error = Some(h.cons(sym, data));
+        Err(format!("no-catch: {display}"))
+    }
 }
 fn error_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // Error object: (error "MESSAGE"). Keep it for condition-case.
@@ -609,8 +650,12 @@ fn concat_fn(h: &mut ElispHost, a: &[Value]) -> R {
             Value::Str(s) => out.push_str(s),
             Value::Undef => {}
             _ => {
-                // concat over a list of chars
-                if let Some(items) = h.list_vec(v) {
+                // concat over a list OR vector of character codes.
+                let items = h.list_vec(v).or_else(|| match h.obj(v) {
+                    Some(Obj::Vector(items)) => Some(items.clone()),
+                    _ => None,
+                });
+                if let Some(items) = items {
                     for it in items {
                         if let Value::Int(c) = it {
                             if let Some(ch) = char::from_u32(c as u32) {
@@ -641,7 +686,17 @@ struct FmtSpec {
 /// Format an integer in `radix` (8/16) the way Emacs's `%o`/`%x`/`%X` do: a
 /// leading `-` and the magnitude's digits (not two's complement), with an
 /// optional `0`/`0x`/`0X` prefix when the `#` flag is set.
-fn format_radix(n: i64, radix: u32, upper: bool, alt: bool) -> String {
+/// Zero-pad a magnitude digit string to at least `prec` digits (integer-precision
+/// semantics). `Some(0)` with value "0" yields an empty string, like C/Emacs.
+fn pad_digits(mag: &str, prec: Option<usize>) -> String {
+    match prec {
+        None => mag.to_string(),
+        Some(0) if mag == "0" => String::new(),
+        Some(p) if mag.len() < p => format!("{}{mag}", "0".repeat(p - mag.len())),
+        Some(_) => mag.to_string(),
+    }
+}
+fn format_radix(n: i64, radix: u32, upper: bool, alt: bool, prec: Option<usize>) -> String {
     let (sign, mag) = if n < 0 {
         ("-", n.unsigned_abs())
     } else {
@@ -652,6 +707,7 @@ fn format_radix(n: i64, radix: u32, upper: bool, alt: bool) -> String {
         (16, false) => format!("{mag:x}"),
         _ => format!("{mag:o}"),
     };
+    let body = pad_digits(&body, prec);
     let prefix = if alt && mag != 0 {
         match (radix, upper) {
             (16, true) => "0X",
@@ -871,10 +927,14 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             }
             'S' => h.print(arg, true),
             // The `+`/space sign flags apply to the signed conversions (d/e/f/g).
-            'd' => apply_sign(as_num(arg)?.0.to_string(), &spec),
-            'o' => format_radix(as_num(arg)?.0, 8, false, spec.alt),
-            'x' => format_radix(as_num(arg)?.0, 16, false, spec.alt),
-            'X' => format_radix(as_num(arg)?.0, 16, true, spec.alt),
+            'd' => {
+                let n = as_num(arg)?.0;
+                let mag = pad_digits(&n.unsigned_abs().to_string(), spec.prec);
+                apply_sign(if n < 0 { format!("-{mag}") } else { mag }, &spec)
+            }
+            'o' => format_radix(as_num(arg)?.0, 8, false, spec.alt, spec.prec),
+            'x' => format_radix(as_num(arg)?.0, 16, false, spec.alt, spec.prec),
+            'X' => format_radix(as_num(arg)?.0, 16, true, spec.alt, spec.prec),
             'c' => char::from_u32(as_num(arg)?.0 as u32)
                 .map(String::from)
                 .unwrap_or_default(),
@@ -1073,7 +1133,10 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
         } else {
             // SEPARATORS is a regexp in Emacs, not a literal string.
             let re = compile_cf(&sep, false)?;
-            re.split(&s).map(|w| w.to_string()).collect()
+            re.split(&s)
+                .filter_map(|w| w.ok())
+                .map(|w| w.to_string())
+                .collect()
         }
     };
     if omit_nulls {
@@ -1183,17 +1246,16 @@ pub(crate) fn char_of_byte(s: &str, byte_idx: usize) -> usize {
     s[..byte_idx].chars().count()
 }
 
-/// Compile an elisp regexp to a `regex::Regex` (optionally case-insensitively,
+/// Compile an elisp regexp to a `fancy_regex::Regex` (optionally case-insensitively,
 /// for `case-fold-search`), surfacing translation and compilation failures as
 /// elisp-style `invalid-regexp` errors.
-pub(crate) fn compile_cf(pat: &str, case_insensitive: bool) -> Result<regex::Regex, String> {
+pub(crate) fn compile_cf(pat: &str, case_insensitive: bool) -> Result<fancy_regex::Regex, String> {
     let translated = crate::regexp::translate(pat)?;
-    let pat = if case_insensitive {
-        format!("(?i){translated}")
-    } else {
-        translated
-    };
-    regex::Regex::new(&pat).map_err(|e| format!("invalid-regexp: {e}"))
+    // Elisp `^`/`$` always match line boundaries, so compile in multiline mode;
+    // `\``/`\'` (translated to \A/\z) keep matching the absolute start/end.
+    let flags = if case_insensitive { "(?mi)" } else { "(?m)" };
+    let pat = format!("{flags}{translated}");
+    fancy_regex::Regex::new(&pat).map_err(|e| format!("invalid-regexp: {e}"))
 }
 /// Read the dynamic `case-fold-search` (default t) — string matching folds case
 /// unless it is bound to nil.
@@ -1210,12 +1272,12 @@ pub(crate) fn case_fold_search(h: &ElispHost) -> bool {
 /// Run `re` against `subject` starting at char index `start`, returning the
 /// capture spans in *char* positions (group 0 = whole match).
 fn run_match(
-    re: &regex::Regex,
+    re: &fancy_regex::Regex,
     subject: &str,
     start: usize,
 ) -> Option<Vec<Option<(usize, usize)>>> {
     let start_byte = byte_of_char(subject, start);
-    let caps = re.captures_at(subject, start_byte)?;
+    let caps = re.captures_from_pos(subject, start_byte).ok().flatten()?;
     let spans = (0..caps.len())
         .map(|i| {
             caps.get(i).map(|m| {
@@ -1243,7 +1305,11 @@ fn string_match(h: &mut ElispHost, a: &[Value]) -> R {
     match run_match(&re, &subject, start) {
         Some(spans) => {
             let begin = spans[0].map(|(b, _)| b as i64).unwrap_or(0);
-            h.match_data = Some(MatchData { subject, spans });
+            h.match_data = Some(MatchData {
+                subject,
+                spans,
+                from_buffer: false,
+            });
             Ok(Value::Int(begin))
         }
         None => Ok(Value::Undef),
@@ -1287,11 +1353,24 @@ fn match_string(h: &mut ElispHost, a: &[Value]) -> R {
     let Some(md) = h.match_data.as_ref() else {
         return Ok(Value::Undef);
     };
+    let span = md.spans.get(n).copied().flatten();
+    // Buffer matches store 1-based buffer positions; read the current buffer
+    // text by char (unless an explicit STRING argument is given).
+    if md.from_buffer && !matches!(a.get(1), Some(Value::Str(_))) {
+        return Ok(match span {
+            Some((b, e)) => {
+                let t = &h.cur_buf().text;
+                let (lo, hi) = ((b - 1).min(t.len()), (e - 1).min(t.len()));
+                Value::str(t[lo..hi].iter().collect::<String>())
+            }
+            None => Value::Undef,
+        });
+    }
     let subject = match a.get(1) {
         Some(Value::Str(s)) => s.to_string(),
         _ => md.subject.clone(),
     };
-    match md.spans.get(n).copied().flatten() {
+    match span {
         Some((b, e)) => {
             let bb = byte_of_char(&subject, b);
             let eb = byte_of_char(&subject, e);
@@ -1348,7 +1427,11 @@ fn set_match_data(h: &mut ElispHost, a: &[Value]) -> R {
             _ => spans.push(None),
         }
     }
-    h.match_data = Some(MatchData { subject, spans });
+    h.match_data = Some(MatchData {
+        subject,
+        spans,
+        from_buffer: false,
+    });
     Ok(Value::Undef)
 }
 
@@ -1369,7 +1452,7 @@ fn regexp_quote(_h: &mut ElispHost, a: &[Value]) -> R {
 
 /// Expand a `replace-regexp-in-string` template against one match: `\&` is the
 /// whole match, `\1`..`\9` are capture groups, `\\` is a literal backslash.
-fn expand_replacement(rep: &str, caps: &regex::Captures, subject: &str) -> String {
+fn expand_replacement(rep: &str, caps: &fancy_regex::Captures, subject: &str) -> String {
     let mut out = String::with_capacity(rep.len());
     let mut it = rep.chars().peekable();
     while let Some(c) = it.next() {
@@ -1400,6 +1483,43 @@ fn expand_replacement(rep: &str, caps: &regex::Captures, subject: &str) -> Strin
     out
 }
 
+/// Adapt REP's case to MATCHED's (Emacs FIXEDCASE-nil behavior): an all-uppercase
+/// match upcases REP; a capitalized match (first letter upper, some lowercase)
+/// upcases the first letter of each word in REP; otherwise REP is unchanged.
+fn adapt_replacement_case(matched: &str, rep: String) -> String {
+    let (mut upper, mut lower, mut first_upper) = (0u32, 0u32, None);
+    for c in matched.chars() {
+        if c.is_alphabetic() {
+            if c.is_uppercase() {
+                upper += 1;
+            } else {
+                lower += 1;
+            }
+            if first_upper.is_none() {
+                first_upper = Some(c.is_uppercase());
+            }
+        }
+    }
+    if upper > 0 && lower == 0 {
+        rep.to_uppercase()
+    } else if first_upper == Some(true) {
+        // Upcase the first letter of each word (run of alphanumerics), keep the rest.
+        let mut out = String::with_capacity(rep.len());
+        let mut prev_word = false;
+        for c in rep.chars() {
+            if c.is_alphabetic() && !prev_word {
+                out.extend(c.to_uppercase());
+            } else {
+                out.push(c);
+            }
+            prev_word = c.is_alphanumeric();
+        }
+        out
+    } else {
+        rep
+    }
+}
+
 /// `(replace-regexp-in-string REGEXP REP STRING &optional FIXEDCASE LITERAL)` —
 /// replace every match of REGEXP in STRING with REP. REP is a template (`\&`,
 /// `\N` backrefs) unless LITERAL is non-nil. Function-valued REP is not yet
@@ -1408,6 +1528,11 @@ fn replace_regexp_in_string(h: &mut ElispHost, a: &[Value]) -> R {
     let pat = as_string(&a[0])?;
     let rep = as_string(&a[1])?;
     let subject = as_string(&a[2])?;
+    // FIXEDCASE (4th arg) nil → adapt the replacement's case to the match's.
+    let fixedcase = !matches!(
+        a.get(3),
+        Some(Value::Undef) | Some(Value::Bool(false)) | None
+    );
     let literal = !matches!(
         a.get(4),
         Some(Value::Undef) | Some(Value::Bool(false)) | None
@@ -1416,13 +1541,19 @@ fn replace_regexp_in_string(h: &mut ElispHost, a: &[Value]) -> R {
     let mut out = String::with_capacity(subject.len());
     let mut last = 0usize;
     for caps in re.captures_iter(&subject) {
+        let Ok(caps) = caps else { break };
         let m = caps.get(0).unwrap();
         out.push_str(&subject[last..m.start()]);
-        if literal {
-            out.push_str(&rep);
+        let piece = if literal {
+            rep.clone()
         } else {
-            out.push_str(&expand_replacement(&rep, &caps, &subject));
-        }
+            expand_replacement(&rep, &caps, &subject)
+        };
+        out.push_str(&if fixedcase {
+            piece
+        } else {
+            adapt_replacement_case(m.as_str(), piece)
+        });
         last = m.end();
         // Avoid an infinite loop on a zero-width match.
         if m.start() == m.end() {
@@ -1628,7 +1759,9 @@ fn string_to_number(_h: &mut ElispHost, a: &[Value]) -> R {
     let raw = as_string(&a[0])?;
     let s = raw.trim_start();
     if let Some(bv) = a.get(1) {
-        if !is_nil(bv) {
+        // Base 10 (and nil) use the float-capable default parser below; only a
+        // non-decimal base forces integer-only parsing.
+        if !is_nil(bv) && as_int(bv)? != 10 {
             let base = as_int(bv)?.clamp(2, 16) as u32;
             let mut chars = s.chars().peekable();
             let mut sign = 1i64;
@@ -1696,6 +1829,90 @@ fn string_to_number(_h: &mut ElispHost, a: &[Value]) -> R {
     } else {
         Value::Int(tok.parse().unwrap_or(0))
     })
+}
+
+// ── sxhash ──
+// Hash values are NOT bit-compatible with GNU Emacs (impl-specific), but they are
+// self-consistent: `equal`/`eq`/`eql` objects hash equally, within bounded depth.
+fn hash_mix(acc: u64, x: u64) -> u64 {
+    (acc ^ x)
+        .wrapping_mul(0x100000001b3)
+        .wrapping_add(0x9e3779b97f4a7c15)
+}
+fn hash_bytes(s: &str) -> u64 {
+    let mut acc = 0xcbf29ce484222325u64;
+    for b in s.bytes() {
+        acc = hash_mix(acc, b as u64);
+    }
+    acc
+}
+/// Structural hash (for `sxhash-equal`), depth-bounded like Emacs.
+fn sxhash_equal(h: &ElispHost, v: &Value, depth: u32) -> u64 {
+    match v {
+        Value::Int(n) => *n as u64,
+        Value::Float(f) => f.to_bits(),
+        Value::Str(s) => hash_bytes(s),
+        Value::Bool(false) | Value::Undef => 0,
+        Value::Bool(true) => 1,
+        Value::Obj(_) => match h.obj(v) {
+            Some(Obj::Symbol(s)) => hash_mix(0x5111, hash_bytes(&s.name)),
+            Some(Obj::Cons(car, cdr)) => {
+                if depth >= 5 {
+                    0x3
+                } else {
+                    let (car, cdr) = (car.clone(), cdr.clone());
+                    hash_mix(
+                        hash_mix(0xc0, sxhash_equal(h, &car, depth + 1)),
+                        sxhash_equal(h, &cdr, depth + 1),
+                    )
+                }
+            }
+            Some(Obj::Vector(items)) => {
+                if depth >= 5 {
+                    0x4
+                } else {
+                    let items = items.clone();
+                    let mut acc = 0x7e;
+                    for it in &items {
+                        acc = hash_mix(acc, sxhash_equal(h, it, depth + 1));
+                    }
+                    acc
+                }
+            }
+            _ => 0x6,
+        },
+        _ => 0x8,
+    }
+}
+/// Identity-ish hash (for `sxhash-eq`): heap objects by arena id, numbers by value.
+fn sxhash_eq(v: &Value) -> u64 {
+    match v {
+        Value::Int(n) => *n as u64,
+        Value::Float(f) => f.to_bits(),
+        Value::Bool(false) | Value::Undef => 0,
+        Value::Bool(true) => 1,
+        Value::Str(s) => hash_bytes(s),
+        Value::Obj(id) => hash_mix(0xab, *id as u64),
+        _ => 0x8,
+    }
+}
+/// Mask a raw hash to a non-negative fixnum, as Emacs's sxhash returns.
+fn sxhash_fixnum(x: u64) -> Value {
+    Value::Int((x & 0x1FFF_FFFF_FFFF_FFFF) as i64)
+}
+fn sxhash_equal_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(sxhash_fixnum(sxhash_equal(h, &a[0], 0)))
+}
+fn sxhash_eq_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(sxhash_fixnum(sxhash_eq(&a[0])))
+}
+fn sxhash_eql_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    // eql: numbers by value, everything else by identity.
+    let x = match &a[0] {
+        Value::Int(_) | Value::Float(_) => sxhash_equal(h, &a[0], 0),
+        other => sxhash_eq(other),
+    };
+    Ok(sxhash_fixnum(x))
 }
 
 /// `(type-of OBJECT)` — the symbol naming OBJECT's primitive type.
@@ -1888,6 +2105,362 @@ fn logcount_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     };
     Ok(Value::Int(bits as i64))
 }
+// ── secure-hash / sha1 / md5 (self-contained, no crates) ──
+fn sha1_bytes(msg: &[u8]) -> Vec<u8> {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let ml = (msg.len() as u64).wrapping_mul(8);
+    let mut data = msg.to_vec();
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&ml.to_be_bytes());
+    for chunk in data.chunks(64) {
+        let mut w = [0u32; 80];
+        for (i, wi) in w.iter_mut().enumerate().take(16) {
+            *wi = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let tmp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = tmp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    h.iter().flat_map(|x| x.to_be_bytes()).collect()
+}
+fn sha256_bytes(msg: &[u8]) -> Vec<u8> {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let ml = (msg.len() as u64).wrapping_mul(8);
+    let mut data = msg.to_vec();
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&ml.to_be_bytes());
+    for chunk in data.chunks(64) {
+        let mut w = [0u32; 64];
+        for (i, wi) in w.iter_mut().enumerate().take(16) {
+            *wi = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut v = h;
+        for i in 0..64 {
+            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+            let ch = (v[4] & v[5]) ^ ((!v[4]) & v[6]);
+            let t1 = v[7]
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let t2 = s0.wrapping_add(maj);
+            v = [
+                t1.wrapping_add(t2),
+                v[0],
+                v[1],
+                v[2],
+                v[3].wrapping_add(t1),
+                v[4],
+                v[5],
+                v[6],
+            ];
+        }
+        for (hi, vi) in h.iter_mut().zip(v.iter()) {
+            *hi = hi.wrapping_add(*vi);
+        }
+    }
+    h.iter().flat_map(|x| x.to_be_bytes()).collect()
+}
+fn md5_bytes(msg: &[u8]) -> Vec<u8> {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
+    ];
+    let (mut a0, mut b0, mut c0, mut d0) =
+        (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
+    let ml = (msg.len() as u64).wrapping_mul(8);
+    let mut data = msg.to_vec();
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&ml.to_le_bytes());
+    for chunk in data.chunks(64) {
+        let mut m = [0u32; 16];
+        for (i, mi) in m.iter_mut().enumerate() {
+            *mi = u32::from_le_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (f, g) = match i {
+                0..=15 => ((b & c) | ((!b) & d), i),
+                16..=31 => ((d & b) | ((!d) & c), (5 * i + 1) % 16),
+                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | (!d)), (7 * i) % 16),
+            };
+            let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    [a0, b0, c0, d0]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect()
+}
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+/// The string argument's bytes between optional char START/END.
+fn hash_input(a: &[Value], obj_idx: usize) -> Result<Vec<u8>, String> {
+    let s = as_string(&a[obj_idx])?;
+    let chars: Vec<char> = s.chars().collect();
+    let start = match a.get(obj_idx + 1) {
+        Some(v) if !is_nil(v) => as_int(v)?.max(0) as usize,
+        _ => 0,
+    };
+    let end = match a.get(obj_idx + 2) {
+        Some(v) if !is_nil(v) => (as_int(v)?.max(0) as usize).min(chars.len()),
+        _ => chars.len(),
+    };
+    let sub: String = chars[start.min(end)..end].iter().collect();
+    Ok(sub.into_bytes())
+}
+fn sha1_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::str(to_hex(&sha1_bytes(&hash_input(a, 0)?))))
+}
+fn md5_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::str(to_hex(&md5_bytes(&hash_input(a, 0)?))))
+}
+/// `(secure-hash ALGORITHM OBJECT &optional START END BINARY)`.
+fn secure_hash(h: &mut ElispHost, a: &[Value]) -> R {
+    // ALGORITHM is a symbol (md5/sha1/sha256/…); accept a string too.
+    let algo = h
+        .sym_name(&a[0])
+        .or_else(|| as_string(&a[0]).ok())
+        .unwrap_or_default();
+    let bytes = hash_input(a, 1)?;
+    let digest = match algo.as_str() {
+        "md5" => md5_bytes(&bytes),
+        "sha1" => sha1_bytes(&bytes),
+        "sha256" => sha256_bytes(&bytes),
+        other => return Err(format!("error: unsupported secure-hash algorithm {other}")),
+    };
+    // BINARY (4th optional, index 4): return the raw bytes as a string.
+    if a.get(4).is_some_and(|v| !is_nil(v)) {
+        Ok(Value::str(
+            digest.iter().map(|&b| b as char).collect::<String>(),
+        ))
+    } else {
+        Ok(Value::str(to_hex(&digest)))
+    }
+}
+// ── base64 / url encoding ──
+const B64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+fn b64_encode(input: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        out.push(alphabet[((n >> 18) & 63) as usize] as char);
+        out.push(alphabet[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(alphabet[((n >> 6) & 63) as usize] as char);
+        } else if pad {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(alphabet[(n & 63) as usize] as char);
+        } else if pad {
+            out.push('=');
+        }
+    }
+    out
+}
+/// Insert a newline every 76 output characters (Emacs base64 default wrapping).
+fn b64_wrap(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + s.len() / 76);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && i % 76 == 0 {
+            out.push('\n');
+        }
+        out.push(c);
+    }
+    out
+}
+fn b64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let val = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    };
+    let (mut bits, mut nbits, mut out) = (0u32, 0u32, Vec::new());
+    for c in input.bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = val(c).ok_or("error: invalid base64 data")?;
+        bits = (bits << 6) | v;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((bits >> nbits) as u8);
+        }
+    }
+    Ok(out)
+}
+/// Render decoded bytes as a string with each byte a char 0–255 (unibyte-ish).
+fn bytes_to_str(bytes: &[u8]) -> Value {
+    Value::str(bytes.iter().map(|&b| b as char).collect::<String>())
+}
+fn base64_encode_string(_h: &mut ElispHost, a: &[Value]) -> R {
+    let raw = b64_encode(as_string(&a[0])?.as_bytes(), B64_STD, true);
+    let no_break = a.get(1).is_some_and(|v| !is_nil(v));
+    Ok(Value::str(if no_break { raw } else { b64_wrap(&raw) }))
+}
+fn base64_decode_string(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(bytes_to_str(&b64_decode(&as_string(&a[0])?)?))
+}
+fn base64url_encode_string(_h: &mut ElispHost, a: &[Value]) -> R {
+    let no_pad = a.get(1).is_some_and(|v| !is_nil(v));
+    Ok(Value::str(b64_encode(
+        as_string(&a[0])?.as_bytes(),
+        B64_URL,
+        !no_pad,
+    )))
+}
+fn base64url_decode_string(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(bytes_to_str(&b64_decode(&as_string(&a[0])?)?))
+}
+/// `(url-hexify-string STRING)` — percent-encode all but `[A-Za-z0-9-._~]`.
+fn url_hexify_string(_h: &mut ElispHost, a: &[Value]) -> R {
+    let mut out = String::new();
+    for b in as_string(&a[0])?.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    Ok(Value::str(out))
+}
+/// `(url-unhex-string STRING)` — decode `%XX` escapes.
+fn url_unhex_string(_h: &mut ElispHost, a: &[Value]) -> R {
+    let s = as_string(&a[0])?;
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    Ok(Value::str(String::from_utf8(out).unwrap_or_else(|e| {
+        e.into_bytes().iter().map(|&b| b as char).collect()
+    })))
+}
 /// `(string-to-vector STRING)` — a vector of STRING's character codes.
 fn string_to_vector(h: &mut ElispHost, a: &[Value]) -> R {
     let s = as_string(&a[0])?;
@@ -1975,6 +2548,53 @@ fn now_secs() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+// ── random ──
+thread_local! {
+    static RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Seed the PRNG from the system clock (xorshift never starts from 0).
+fn rng_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e3779b97f4a7c15);
+    nanos | 1
+}
+fn rng_next() -> u64 {
+    RNG_STATE.with(|s| {
+        let mut x = s.get();
+        if x == 0 {
+            x = rng_seed();
+        }
+        // xorshift64
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        x
+    })
+}
+/// `(random &optional LIMIT)`. With a positive integer LIMIT, return an integer in
+/// [0, LIMIT); with t, reseed and return a random integer; otherwise a random
+/// fixnum (may be negative).
+fn random_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    match a.first() {
+        Some(Value::Bool(true)) => {
+            RNG_STATE.with(|s| s.set(rng_seed()));
+            Ok(Value::Int((rng_next() >> 1) as i64))
+        }
+        Some(v) if !is_nil(v) => {
+            let n = as_int(v)?;
+            if n <= 0 {
+                return Err("args-out-of-range: random limit must be positive".to_string());
+            }
+            Ok(Value::Int((rng_next() % n as u64) as i64))
+        }
+        _ => Ok(Value::Int((rng_next() >> 1) as i64)),
+    }
 }
 
 /// Convert an elisp TIME value to epoch seconds (float). Accepts nil (= now), an
@@ -2269,6 +2889,943 @@ fn encode_time(h: &mut ElispHost, a: &[Value]) -> R {
     ]))
 }
 
+// ── environment / working directory ──
+fn getenv_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let name = as_string(&a[0])?;
+    Ok(std::env::var(&name).map(Value::str).unwrap_or(Value::Undef))
+}
+fn setenv_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+    let name = as_string(&a[0])?;
+    match a.get(1) {
+        Some(v) if !is_nil(v) => {
+            let val = as_string(v)?;
+            std::env::set_var(&name, &val);
+            Ok(Value::str(val))
+        }
+        _ => {
+            std::env::remove_var(&name);
+            Ok(Value::Undef)
+        }
+    }
+}
+fn special_variable_p(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(h.symbol_special(&a[0])))
+}
+fn func_arity(h: &mut ElispHost, a: &[Value]) -> R {
+    let (min, max) = {
+        match h.resolve_function(&a[0])? {
+            Resolved::Subr { min, max, .. } => (min as i64, max.map(|m| m as i64)),
+            Resolved::Closure { params, .. } => {
+                let mn = params.required.len() as i64;
+                if params.rest.is_some() {
+                    (mn, None)
+                } else {
+                    (mn, Some(mn + params.optional.len() as i64))
+                }
+            }
+        }
+    };
+    let maxv = match max {
+        Some(m) => Value::Int(m),
+        None => h.intern("many"),
+    };
+    Ok(h.cons(Value::Int(min), maxv))
+}
+fn current_directory(_h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::str(
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "/".to_string()),
+    ))
+}
+
+// ── filesystem (read-only queries) ──
+/// Expand a leading `~/` against $HOME; relative paths resolve against the
+/// process cwd (= `default-directory`), as elisp expects.
+fn fs_expand(s: &str) -> std::path::PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(s)
+}
+fn fs_access(p: &std::path::Path, mode: libc::c_int) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    match std::ffi::CString::new(p.as_os_str().as_bytes()) {
+        Ok(c) => unsafe { libc::access(c.as_ptr(), mode) == 0 },
+        Err(_) => false,
+    }
+}
+fn file_exists_p(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(fs_expand(&as_string(&a[0])?).exists()))
+}
+fn file_directory_p(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(fs_expand(&as_string(&a[0])?).is_dir()))
+}
+fn file_regular_p(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(fs_expand(&as_string(&a[0])?).is_file()))
+}
+fn file_readable_p(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(fs_access(
+        &fs_expand(&as_string(&a[0])?),
+        libc::R_OK,
+    )))
+}
+fn file_writable_p(_h: &mut ElispHost, a: &[Value]) -> R {
+    let p = fs_expand(&as_string(&a[0])?);
+    // For a non-existent file, writability is the parent directory's.
+    let target = if p.exists() {
+        p.clone()
+    } else {
+        p.parent().map(|x| x.to_path_buf()).unwrap_or(p)
+    };
+    Ok(nil_or(fs_access(&target, libc::W_OK)))
+}
+fn file_symlink_p(_h: &mut ElispHost, a: &[Value]) -> R {
+    match std::fs::read_link(fs_expand(&as_string(&a[0])?)) {
+        Ok(t) => Ok(Value::str(t.to_string_lossy().into_owned())),
+        Err(_) => Ok(Value::Undef),
+    }
+}
+fn directory_files_raw(h: &mut ElispHost, a: &[Value]) -> R {
+    let raw = as_string(&a[0])?;
+    let match_re = match a.get(1) {
+        Some(v) if !is_nil(v) => Some(compile_cf(&as_string(v)?, false)?),
+        _ => None,
+    };
+    let nosort = a.get(2).is_some_and(|v| !is_nil(v));
+    let rd = std::fs::read_dir(fs_expand(&raw))
+        .map_err(|_| format!("file-missing: Opening directory: No such file: {raw}"))?;
+    let mut names: Vec<String> = vec![".".into(), "..".into()];
+    for e in rd.flatten() {
+        names.push(e.file_name().to_string_lossy().into_owned());
+    }
+    if let Some(re) = match_re {
+        names.retain(|n| re.is_match(n).unwrap_or(false));
+    }
+    if !nosort {
+        names.sort();
+    }
+    Ok(h.list_from(names.into_iter().map(Value::str).collect()))
+}
+
+// ── buffers (minimal model: char text + 1-based point) ──
+fn buffer_push(h: &mut ElispHost, _a: &[Value]) -> R {
+    h.buffers.push(crate::host::EditBuffer {
+        text: Vec::new(),
+        point: 1,
+    });
+    Ok(Value::Undef)
+}
+fn buffer_pop(h: &mut ElispHost, _a: &[Value]) -> R {
+    if h.buffers.len() > 1 {
+        h.buffers.pop();
+    }
+    Ok(Value::Undef)
+}
+fn insert_chars(v: &Value) -> Result<Vec<char>, String> {
+    match v {
+        Value::Str(s) => Ok(s.chars().collect()),
+        Value::Int(n) => Ok(vec![char::from_u32(*n as u32).unwrap_or('\u{fffd}')]),
+        _ => Err("wrong-type-argument: char-or-string-p".to_string()),
+    }
+}
+fn insert_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let mut chunks = Vec::new();
+    for v in a {
+        chunks.extend(insert_chars(v)?);
+    }
+    let buf = h.cur_buf();
+    let at = (buf.point - 1).min(buf.text.len());
+    let n = chunks.len();
+    buf.text.splice(at..at, chunks);
+    buf.point = at + n + 1;
+    Ok(Value::Undef)
+}
+fn buffer_string(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::str(h.cur_buf().text.iter().collect::<String>()))
+}
+fn buffer_size(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::Int(h.cur_buf().text.len() as i64))
+}
+fn point_fn(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::Int(h.cur_buf().point as i64))
+}
+fn point_min(_h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::Int(1))
+}
+fn point_max(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::Int(h.cur_buf().text.len() as i64 + 1))
+}
+fn goto_char(h: &mut ElispHost, a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    let max = buf.text.len() as i64 + 1;
+    let p = as_int(&a[0])?.clamp(1, max);
+    buf.point = p as usize;
+    Ok(Value::Int(p))
+}
+fn erase_buffer(h: &mut ElispHost, _a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    buf.text.clear();
+    buf.point = 1;
+    Ok(Value::Undef)
+}
+fn char_after(h: &mut ElispHost, a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    let pos = match a.first() {
+        Some(v) if !is_nil(v) => as_int(v)? as usize,
+        _ => buf.point,
+    };
+    Ok(if pos >= 1 && pos <= buf.text.len() {
+        Value::Int(buf.text[pos - 1] as i64)
+    } else {
+        Value::Undef
+    })
+}
+fn buffer_substring(h: &mut ElispHost, a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    let len = buf.text.len() as i64;
+    let s = as_int(&a[0])?.clamp(1, len + 1);
+    let e = as_int(&a[1])?.clamp(1, len + 1);
+    let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+    Ok(Value::str(
+        buf.text[(lo - 1) as usize..(hi - 1) as usize]
+            .iter()
+            .collect::<String>(),
+    ))
+}
+fn delete_region(h: &mut ElispHost, a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    let len = buf.text.len() as i64;
+    let s = as_int(&a[0])?.clamp(1, len + 1);
+    let e = as_int(&a[1])?.clamp(1, len + 1);
+    let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+    buf.text.drain((lo - 1) as usize..(hi - 1) as usize);
+    if buf.point >= hi as usize {
+        buf.point -= (hi - lo) as usize;
+    } else if buf.point > lo as usize {
+        buf.point = lo as usize;
+    }
+    Ok(Value::Undef)
+}
+fn insert_file_contents(h: &mut ElispHost, a: &[Value]) -> R {
+    let raw = as_string(&a[0])?;
+    let content = std::fs::read_to_string(fs_expand(&raw))
+        .map_err(|_| format!("file-missing: Opening input file: No such file: {raw}"))?;
+    let chars: Vec<char> = content.chars().collect();
+    let n = chars.len() as i64;
+    let buf = h.cur_buf();
+    let start = buf.point;
+    let at = (buf.point - 1).min(buf.text.len());
+    buf.text.splice(at..at, chars);
+    buf.point = start; // leaves point at the beginning of the inserted text
+    Ok(h.list_from(vec![Value::str(raw), Value::Int(n)]))
+}
+
+// ── buffer motion ──
+fn forward_char(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = match a.first() {
+        Some(v) if !is_nil(v) => as_int(v)?,
+        _ => 1,
+    };
+    let buf = h.cur_buf();
+    let max = buf.text.len() as i64 + 1;
+    buf.point = (buf.point as i64 + n).clamp(1, max) as usize;
+    Ok(Value::Undef)
+}
+fn backward_char(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = match a.first() {
+        Some(v) if !is_nil(v) => as_int(v)?,
+        _ => 1,
+    };
+    let buf = h.cur_buf();
+    let max = buf.text.len() as i64 + 1;
+    buf.point = (buf.point as i64 - n).clamp(1, max) as usize;
+    Ok(Value::Undef)
+}
+/// 1-based position of the beginning of POINT's line.
+fn bol_of(t: &[char], point: usize) -> usize {
+    let mut p = point;
+    while p > 1 && t[p - 2] != '\n' {
+        p -= 1;
+    }
+    p
+}
+/// 1-based position of the end of POINT's line (before the newline / at eob).
+fn eol_of(t: &[char], point: usize) -> usize {
+    let mut p = point;
+    while p <= t.len() && t[p - 1] != '\n' {
+        p += 1;
+    }
+    p
+}
+fn beginning_of_line(h: &mut ElispHost, _a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    buf.point = bol_of(&buf.text, buf.point);
+    Ok(Value::Undef)
+}
+fn end_of_line(h: &mut ElispHost, _a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    buf.point = eol_of(&buf.text, buf.point);
+    Ok(Value::Undef)
+}
+/// 1-based start of the line N-1 lines forward (N<1 = backward) from POINT's line.
+fn bol_after_lines(t: &[char], point: usize, n: i64) -> usize {
+    let mut p = bol_of(t, point);
+    let mut k = n;
+    while k > 0 {
+        let e = eol_of(t, p);
+        if e <= t.len() {
+            p = e + 1;
+        } else {
+            p = e;
+            break;
+        }
+        k -= 1;
+    }
+    while k < 0 && p > 1 {
+        p = bol_of(t, p - 1);
+        k += 1;
+    }
+    p
+}
+fn line_beginning_position(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = match a.first() {
+        Some(v) if !is_nil(v) => as_int(v)?,
+        _ => 1,
+    };
+    let buf = h.cur_buf();
+    Ok(Value::Int(
+        bol_after_lines(&buf.text, buf.point, n - 1) as i64
+    ))
+}
+fn line_end_position(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = match a.first() {
+        Some(v) if !is_nil(v) => as_int(v)?,
+        _ => 1,
+    };
+    let buf = h.cur_buf();
+    let bol = bol_after_lines(&buf.text, buf.point, n - 1);
+    Ok(Value::Int(eol_of(&buf.text, bol) as i64))
+}
+fn bolp(h: &mut ElispHost, _a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    Ok(nil_or(buf.point == 1 || buf.text[buf.point - 2] == '\n'))
+}
+fn eolp(h: &mut ElispHost, _a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    Ok(nil_or(
+        buf.point > buf.text.len() || buf.text[buf.point - 1] == '\n',
+    ))
+}
+fn bobp(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(nil_or(h.cur_buf().point == 1))
+}
+fn eobp(h: &mut ElispHost, _a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    Ok(nil_or(buf.point == buf.text.len() + 1))
+}
+fn forward_line(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = match a.first() {
+        Some(v) if !is_nil(v) => as_int(v)?,
+        _ => 1,
+    };
+    let buf = h.cur_buf();
+    let len = buf.text.len();
+    let mut p = buf.point;
+    let mut short = 0i64;
+    if n >= 0 {
+        let mut moved = 0;
+        while moved < n {
+            let mut q = p;
+            while q <= len && buf.text[q - 1] != '\n' {
+                q += 1;
+            }
+            if q > len {
+                // No newline before eob: land at eob; the partial line counts as
+                // one not-fully-moved line unless we were already at bol/eob.
+                short = n - moved - if p <= len { 1 } else { 0 };
+                p = len + 1;
+                break;
+            }
+            p = q + 1;
+            moved += 1;
+        }
+    } else {
+        p = bol_of(&buf.text, p);
+        let mut moved = 0;
+        while moved < -n {
+            if p == 1 {
+                short = -n - moved;
+                break;
+            }
+            p = bol_of(&buf.text, p - 1);
+            moved += 1;
+        }
+    }
+    buf.point = p;
+    Ok(Value::Int(short))
+}
+
+// ── buffer search (sets buffer-position match data) ──
+fn set_buf_match(h: &mut ElispHost, spans0: &[Option<(usize, usize)>], text: String) {
+    let spans = spans0
+        .iter()
+        .map(|o| o.map(|(b, e)| (b + 1, e + 1)))
+        .collect();
+    h.match_data = Some(MatchData {
+        subject: text,
+        spans,
+        from_buffer: true,
+    });
+}
+fn search_forward(h: &mut ElispHost, a: &[Value]) -> R {
+    let needle: Vec<char> = as_string(&a[0])?.chars().collect();
+    let len = h.cur_buf().text.len();
+    let bound = match a.get(1) {
+        Some(v) if !is_nil(v) => (as_int(v)?.max(0) as usize).min(len + 1),
+        _ => len + 1,
+    };
+    let noerror = a.get(2).is_some_and(|v| !is_nil(v));
+    let start = h.cur_buf().point - 1;
+    let nlen = needle.len();
+    let found = {
+        let hay = &h.cur_buf().text;
+        let mut res = None;
+        let mut i = start;
+        // match must end at or before bound-1 (0-based) => i+nlen <= bound-1
+        while i + nlen <= (bound - 1).max(start) || (nlen == 0 && i == start) {
+            if i + nlen <= len && hay[i..i + nlen] == needle[..] {
+                res = Some(i);
+                break;
+            }
+            if nlen == 0 {
+                res = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        res
+    };
+    match found {
+        Some(i) => {
+            let end = i + nlen;
+            let text: String = h.cur_buf().text.iter().collect();
+            h.cur_buf().point = end + 1;
+            set_buf_match(h, &[Some((i, end))], text);
+            Ok(Value::Int((end + 1) as i64))
+        }
+        None if noerror => Ok(Value::Undef),
+        None => Err(format!("search-failed: {}", as_string(&a[0])?)),
+    }
+}
+fn re_search_forward(h: &mut ElispHost, a: &[Value]) -> R {
+    let pat = as_string(&a[0])?;
+    let re = compile_cf(&pat, case_fold_search(h))?;
+    let bound = match a.get(1) {
+        Some(v) if !is_nil(v) => Some(as_int(v)?.max(0) as usize),
+        _ => None,
+    };
+    let noerror = a.get(2).is_some_and(|v| !is_nil(v));
+    let text: String = h.cur_buf().text.iter().collect();
+    let start_char = h.cur_buf().point - 1;
+    let m = run_match(&re, &text, start_char).filter(|spans| {
+        spans[0]
+            .map(|(_, e)| bound.is_none_or(|b| e < b))
+            .unwrap_or(false)
+    });
+    match m {
+        Some(spans0) => {
+            let endc = spans0[0].unwrap().1;
+            h.cur_buf().point = endc + 1;
+            set_buf_match(h, &spans0, text);
+            Ok(Value::Int((endc + 1) as i64))
+        }
+        None if noerror => Ok(Value::Undef),
+        None => Err(format!("search-failed: {pat}")),
+    }
+}
+fn looking_at(h: &mut ElispHost, a: &[Value]) -> R {
+    let re = compile_cf(&as_string(&a[0])?, case_fold_search(h))?;
+    let text: String = h.cur_buf().text.iter().collect();
+    let start_char = h.cur_buf().point - 1;
+    match run_match(&re, &text, start_char) {
+        Some(spans0) if spans0[0].map(|(b, _)| b == start_char).unwrap_or(false) => {
+            set_buf_match(h, &spans0, text);
+            Ok(Value::Bool(true))
+        }
+        _ => Ok(Value::Undef),
+    }
+}
+fn looking_at_p(h: &mut ElispHost, a: &[Value]) -> R {
+    let saved = h.match_data.take();
+    let r = looking_at(h, a);
+    h.match_data = saved;
+    r
+}
+/// Expand NEWTEXT's `\&` (whole match), `\N` (group N), and `\\` escapes using
+/// GT, an accessor returning the text of group N.
+fn expand_repl(newtext: &str, gt: &dyn Fn(usize) -> String) -> String {
+    let chars: Vec<char> = newtext.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            let c = chars[i + 1];
+            if c == '&' {
+                out.push_str(&gt(0));
+            } else if c.is_ascii_digit() {
+                out.push_str(&gt(c as usize - '0' as usize));
+            } else {
+                out.push(c);
+            }
+            i += 2;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+/// `(replace-match NEWTEXT &optional FIXEDCASE LITERAL STRING SUBEXP)`. With a
+/// STRING argument, returns a new string with the last `string-match` of STRING
+/// replaced; otherwise edits the current buffer and leaves point after the
+/// replacement. Expands `\&`/`\N`/`\\` unless LITERAL, adapts case unless
+/// FIXEDCASE.
+fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
+    let newtext = as_string(&a[0])?;
+    let fixedcase = !matches!(
+        a.get(1),
+        Some(Value::Undef) | Some(Value::Bool(false)) | None
+    );
+    let literal = !matches!(
+        a.get(2),
+        Some(Value::Undef) | Some(Value::Bool(false)) | None
+    );
+    let subexp = match a.get(4) {
+        Some(v) if !is_nil(v) => as_int(v)?.max(0) as usize,
+        _ => 0,
+    };
+    let spans = {
+        let md = h
+            .match_data
+            .as_ref()
+            .ok_or("args-out-of-range: no match data".to_string())?;
+        md.spans.clone()
+    };
+    // STRING mode: spans are 0-based char indices into STRING; return a new string.
+    if let Some(Value::Str(s)) = a.get(3) {
+        let subject: Vec<char> = s.chars().collect();
+        let (b, e) = spans
+            .get(subexp)
+            .copied()
+            .flatten()
+            .ok_or("args-out-of-range: no such subexpression".to_string())?;
+        let gt = |n: usize| -> String {
+            spans
+                .get(n)
+                .copied()
+                .flatten()
+                .map(|(gb, ge)| subject[gb..ge].iter().collect::<String>())
+                .unwrap_or_default()
+        };
+        let matched = gt(subexp);
+        let rep = if literal {
+            newtext
+        } else {
+            expand_repl(&newtext, &gt)
+        };
+        let rep = if fixedcase {
+            rep
+        } else {
+            adapt_replacement_case(&matched, rep)
+        };
+        let mut out: String = subject[..b].iter().collect();
+        out.push_str(&rep);
+        out.extend(&subject[e..]);
+        return Ok(Value::str(out));
+    }
+    let text: Vec<char> = h.cur_buf().text.clone();
+    let (b, e) = spans
+        .get(subexp)
+        .copied()
+        .flatten()
+        .ok_or("args-out-of-range: no such subexpression".to_string())?;
+    let gt = |n: usize| -> String {
+        spans
+            .get(n)
+            .copied()
+            .flatten()
+            .map(|(gb, ge)| text[(gb - 1)..(ge - 1)].iter().collect::<String>())
+            .unwrap_or_default()
+    };
+    let matched = gt(subexp);
+    let rep = if literal {
+        newtext
+    } else {
+        expand_repl(&newtext, &gt)
+    };
+    let rep = if fixedcase {
+        rep
+    } else {
+        adapt_replacement_case(&matched, rep)
+    };
+    let rep_chars: Vec<char> = rep.chars().collect();
+    let rlen = rep_chars.len();
+    let buf = h.cur_buf();
+    buf.text.splice((b - 1)..(e - 1), rep_chars);
+    buf.point = b + rlen;
+    Ok(Value::Undef)
+}
+
+// ── filesystem writes / mutations ──
+fn write_region(h: &mut ElispHost, a: &[Value]) -> R {
+    let append = a.get(3).is_some_and(|v| !is_nil(v));
+    // START may be a string (write it directly) or a buffer position.
+    let content: String = match &a[0] {
+        Value::Str(s) => s.to_string(),
+        _ => {
+            let buf = h.cur_buf();
+            let len = buf.text.len() as i64;
+            let s = as_int(&a[0])?.clamp(1, len + 1);
+            let e = match a.get(1) {
+                Some(v) if !is_nil(v) => as_int(v)?.clamp(1, len + 1),
+                _ => len + 1,
+            };
+            let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+            buf.text[(lo - 1) as usize..(hi - 1) as usize]
+                .iter()
+                .collect()
+        }
+    };
+    let filename = as_string(&a[2])?;
+    let path = fs_expand(&filename);
+    let res = if append {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(content.as_bytes()))
+    } else {
+        std::fs::write(&path, content.as_bytes())
+    };
+    res.map_err(|_| format!("file-error: Opening output file: {filename}"))?;
+    Ok(Value::Undef)
+}
+fn delete_file(_h: &mut ElispHost, a: &[Value]) -> R {
+    let f = as_string(&a[0])?;
+    std::fs::remove_file(fs_expand(&f)).map_err(|_| format!("file-error: Removing file: {f}"))?;
+    Ok(Value::Undef)
+}
+fn make_directory(_h: &mut ElispHost, a: &[Value]) -> R {
+    let f = as_string(&a[0])?;
+    let parents = a.get(1).is_some_and(|v| !is_nil(v));
+    let p = fs_expand(&f);
+    let r = if parents {
+        std::fs::create_dir_all(&p)
+    } else {
+        std::fs::create_dir(&p)
+    };
+    r.map_err(|_| format!("file-error: Creating directory: {f}"))?;
+    Ok(Value::Undef)
+}
+fn rename_file(_h: &mut ElispHost, a: &[Value]) -> R {
+    let (o, n) = (as_string(&a[0])?, as_string(&a[1])?);
+    std::fs::rename(fs_expand(&o), fs_expand(&n))
+        .map_err(|_| format!("file-error: Renaming: {o}"))?;
+    Ok(Value::Undef)
+}
+fn copy_file(_h: &mut ElispHost, a: &[Value]) -> R {
+    let (o, n) = (as_string(&a[0])?, as_string(&a[1])?);
+    std::fs::copy(fs_expand(&o), fs_expand(&n)).map_err(|_| format!("file-error: Copying: {o}"))?;
+    Ok(Value::Undef)
+}
+
+// ── subprocesses ──
+fn shell_command_to_string(_h: &mut ElispHost, a: &[Value]) -> R {
+    let cmd = as_string(&a[0])?;
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .output()
+    {
+        Ok(o) => Ok(Value::str(String::from_utf8_lossy(&o.stdout).into_owned())),
+        Err(_) => Ok(Value::str(String::new())),
+    }
+}
+fn call_process(h: &mut ElispHost, a: &[Value]) -> R {
+    let program = as_string(&a[0])?;
+    // a[1] INFILE and a[3] DISPLAY are ignored; a[2] DESTINATION; a[4..] ARGS.
+    let args: Vec<String> = a
+        .get(4..)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|v| as_string(v).ok())
+        .collect();
+    let insert = matches!(a.get(2), Some(v) if !is_nil(v));
+    let out = std::process::Command::new(&program)
+        .args(&args)
+        .output()
+        .map_err(|_| format!("file-error: Searching for program: {program}"))?;
+    if insert {
+        let chars: Vec<char> = String::from_utf8_lossy(&out.stdout).chars().collect();
+        let buf = h.cur_buf();
+        let at = (buf.point - 1).min(buf.text.len());
+        let n = chars.len();
+        buf.text.splice(at..at, chars);
+        buf.point = at + n + 1;
+    }
+    Ok(Value::Int(out.status.code().unwrap_or(-1) as i64))
+}
+fn process_lines(h: &mut ElispHost, a: &[Value]) -> R {
+    let program = as_string(&a[0])?;
+    let args: Vec<String> = a
+        .get(1..)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|v| as_string(v).ok())
+        .collect();
+    let out = std::process::Command::new(&program)
+        .args(&args)
+        .output()
+        .map_err(|_| format!("file-error: Searching for program: {program}"))?;
+    if !out.status.success() {
+        return Err(format!("error: {program} exited with non-zero status"));
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut lines: Vec<&str> = s.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    Ok(h.list_from(lines.into_iter().map(Value::str).collect()))
+}
+
+// ── more buffer editing/motion ──
+fn char_before(h: &mut ElispHost, a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    let pos = match a.first() {
+        Some(v) if !is_nil(v) => as_int(v)? as usize,
+        _ => buf.point,
+    };
+    Ok(if pos >= 2 && pos - 1 <= buf.text.len() {
+        Value::Int(buf.text[pos - 2] as i64)
+    } else {
+        Value::Undef
+    })
+}
+fn delete_char(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_int(&a[0])?;
+    let buf = h.cur_buf();
+    let len = buf.text.len();
+    if n >= 0 {
+        let end = (buf.point - 1 + n as usize).min(len);
+        buf.text.drain((buf.point - 1)..end);
+    } else {
+        let cnt = (-n) as usize;
+        let start = (buf.point - 1).saturating_sub(cnt);
+        buf.text.drain(start..(buf.point - 1));
+        buf.point = start + 1;
+    }
+    Ok(Value::Undef)
+}
+fn insert_char(h: &mut ElispHost, a: &[Value]) -> R {
+    let c = char::from_u32(as_int(&a[0])? as u32).unwrap_or('\u{fffd}');
+    let count = match a.get(1) {
+        Some(v) if !is_nil(v) => as_int(v)?.max(0) as usize,
+        _ => 1,
+    };
+    let buf = h.cur_buf();
+    let at = buf.point - 1;
+    buf.text.splice(at..at, vec![c; count]);
+    buf.point = at + count + 1;
+    Ok(Value::Undef)
+}
+fn count_lines(h: &mut ElispHost, a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    let len = buf.text.len() as i64;
+    let s = as_int(&a[0])?.clamp(1, len + 1);
+    let e = as_int(&a[1])?.clamp(1, len + 1);
+    let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+    let region = &buf.text[(lo - 1) as usize..(hi - 1) as usize];
+    let nl = region.iter().filter(|&&c| c == '\n').count();
+    // Count the final partial line (region non-empty and not ending in newline).
+    let extra = if !region.is_empty() && region[region.len() - 1] != '\n' {
+        1
+    } else {
+        0
+    };
+    Ok(Value::Int((nl + extra) as i64))
+}
+fn line_number_at_pos(h: &mut ElispHost, a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    let pos = match a.first() {
+        Some(v) if !is_nil(v) => as_int(v)? as usize,
+        _ => buf.point,
+    };
+    let upto = (pos.saturating_sub(1)).min(buf.text.len());
+    let n = buf.text[..upto].iter().filter(|&&c| c == '\n').count();
+    Ok(Value::Int(n as i64 + 1))
+}
+fn current_column(h: &mut ElispHost, _a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    // Expand tabs to the next multiple of tab-width (8) like Emacs.
+    let bol = bol_of(&buf.text, buf.point);
+    let mut col = 0usize;
+    for i in bol..buf.point {
+        if buf.text[i - 1] == '\t' {
+            col = (col / 8 + 1) * 8;
+        } else {
+            col += 1;
+        }
+    }
+    Ok(Value::Int(col as i64))
+}
+fn search_backward(h: &mut ElispHost, a: &[Value]) -> R {
+    let needle: Vec<char> = as_string(&a[0])?.chars().collect();
+    let bound = match a.get(1) {
+        Some(v) if !is_nil(v) => (as_int(v)?.max(1) as usize) - 1,
+        _ => 0,
+    };
+    let noerror = a.get(2).is_some_and(|v| !is_nil(v));
+    let point = h.cur_buf().point;
+    let nlen = needle.len();
+    let found = {
+        let hay = &h.cur_buf().text;
+        let mut res = None;
+        if nlen == 0 {
+            res = Some(point - 1);
+        } else if point > nlen {
+            let mut i = point - 1 - nlen; // max start so match ends at point-1
+            loop {
+                if hay[i..i + nlen] == needle[..] {
+                    res = Some(i);
+                    break;
+                }
+                if i <= bound {
+                    break;
+                }
+                i -= 1;
+            }
+        }
+        res
+    };
+    match found {
+        Some(i) => {
+            let text: String = h.cur_buf().text.iter().collect();
+            h.cur_buf().point = i + 1;
+            set_buf_match(h, &[Some((i, i + nlen))], text);
+            Ok(Value::Int((i + 1) as i64))
+        }
+        None if noerror => Ok(Value::Undef),
+        None => Err(format!("search-failed: {}", as_string(&a[0])?)),
+    }
+}
+fn re_search_backward(h: &mut ElispHost, a: &[Value]) -> R {
+    let pat = as_string(&a[0])?;
+    let re = compile_cf(&pat, case_fold_search(h))?;
+    let noerror = a.get(2).is_some_and(|v| !is_nil(v));
+    let text: String = h.cur_buf().text.iter().collect();
+    let point_char = h.cur_buf().point - 1;
+    // Last non-overlapping match that ends at or before point.
+    let mut best: Option<Vec<Option<(usize, usize)>>> = None;
+    let mut from = 0;
+    while let Some(spans) = run_match(&re, &text, from) {
+        let (b, e) = spans[0].unwrap();
+        if e > point_char {
+            break;
+        }
+        best = Some(spans.clone());
+        from = if e > b { e } else { e + 1 };
+    }
+    match best {
+        Some(spans0) => {
+            let bc = spans0[0].unwrap().0;
+            h.cur_buf().point = bc + 1;
+            set_buf_match(h, &spans0, text);
+            Ok(Value::Int((bc + 1) as i64))
+        }
+        None if noerror => Ok(Value::Undef),
+        None => Err(format!("search-failed: {pat}")),
+    }
+}
+fn parse_char_set(spec: &str) -> (bool, Vec<(char, char)>) {
+    let chars: Vec<char> = spec.chars().collect();
+    let mut i = 0;
+    let neg = chars.first() == Some(&'^');
+    if neg {
+        i = 1;
+    }
+    let mut ranges = Vec::new();
+    while i < chars.len() {
+        if i + 2 < chars.len() && chars[i + 1] == '-' {
+            ranges.push((chars[i], chars[i + 2]));
+            i += 3;
+        } else {
+            ranges.push((chars[i], chars[i]));
+            i += 1;
+        }
+    }
+    (neg, ranges)
+}
+fn in_char_set(c: char, ranges: &[(char, char)], neg: bool) -> bool {
+    let m = ranges.iter().any(|&(a, b)| c >= a && c <= b);
+    m != neg
+}
+fn skip_chars_forward(h: &mut ElispHost, a: &[Value]) -> R {
+    let (neg, ranges) = parse_char_set(&as_string(&a[0])?);
+    let buf = h.cur_buf();
+    let start = buf.point;
+    while buf.point <= buf.text.len() && in_char_set(buf.text[buf.point - 1], &ranges, neg) {
+        buf.point += 1;
+    }
+    Ok(Value::Int((buf.point - start) as i64))
+}
+fn skip_chars_backward(h: &mut ElispHost, a: &[Value]) -> R {
+    let (neg, ranges) = parse_char_set(&as_string(&a[0])?);
+    let buf = h.cur_buf();
+    let start = buf.point;
+    while buf.point > 1 && in_char_set(buf.text[buf.point - 2], &ranges, neg) {
+        buf.point -= 1;
+    }
+    Ok(Value::Int(buf.point as i64 - start as i64))
+}
+fn forward_word(h: &mut ElispHost, a: &[Value]) -> R {
+    // Word = run of alphanumerics (no syntax tables).
+    let n = match a.first() {
+        Some(v) if !is_nil(v) => as_int(v)?,
+        _ => 1,
+    };
+    let buf = h.cur_buf();
+    let len = buf.text.len();
+    for _ in 0..n {
+        while buf.point <= len && !buf.text[buf.point - 1].is_alphanumeric() {
+            buf.point += 1;
+        }
+        while buf.point <= len && buf.text[buf.point - 1].is_alphanumeric() {
+            buf.point += 1;
+        }
+    }
+    Ok(Value::Bool(true))
+}
+fn backward_word(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = match a.first() {
+        Some(v) if !is_nil(v) => as_int(v)?,
+        _ => 1,
+    };
+    let buf = h.cur_buf();
+    for _ in 0..n {
+        while buf.point > 1 && !buf.text[buf.point - 2].is_alphanumeric() {
+            buf.point -= 1;
+        }
+        while buf.point > 1 && buf.text[buf.point - 2].is_alphanumeric() {
+            buf.point -= 1;
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
 /// Install the primitive subr set.
 pub fn install(h: &mut ElispHost) {
     let mut s = |n: &str, min: usize, max: Option<usize>, f: crate::host::SubrFn| {
@@ -2328,6 +3885,26 @@ pub fn install(h: &mut ElispHost) {
     s("set", 2, Some(2), set_fn);
     s("symbol-value", 1, Some(1), symbol_value);
     s("boundp", 1, Some(1), boundp);
+    s("makunbound", 1, Some(1), makunbound);
+    s("sha1", 1, Some(4), sha1_fn);
+    s("md5", 1, Some(5), md5_fn);
+    s("secure-hash", 2, Some(5), secure_hash);
+    s("base64-encode-string", 1, Some(2), base64_encode_string);
+    s("base64-decode-string", 1, Some(3), base64_decode_string);
+    s(
+        "base64url-encode-string",
+        1,
+        Some(2),
+        base64url_encode_string,
+    );
+    s(
+        "base64url-decode-string",
+        1,
+        Some(2),
+        base64url_decode_string,
+    );
+    s("url-hexify-string", 1, Some(2), url_hexify_string);
+    s("url-unhex-string", 1, Some(2), url_unhex_string);
     s("fset", 2, Some(2), fset);
     s("fboundp", 1, Some(1), fboundp);
     s("indirect-function", 1, Some(2), indirect_function);
@@ -2354,6 +3931,90 @@ pub fn install(h: &mut ElispHost) {
     s("hash-table-values", 1, Some(1), hash_table_values);
     s("copy-hash-table", 1, Some(1), copy_hash_table);
     // time
+    s("getenv", 1, Some(2), getenv_fn);
+    s("setenv", 1, Some(3), setenv_fn);
+    s("special-variable-p", 1, Some(1), special_variable_p);
+    s("func-arity", 1, Some(1), func_arity);
+    s("subr-arity", 1, Some(1), func_arity);
+    s("--current-directory--", 0, Some(0), current_directory);
+    s("file-exists-p", 1, Some(1), file_exists_p);
+    s("file-directory-p", 1, Some(1), file_directory_p);
+    s("file-regular-p", 1, Some(1), file_regular_p);
+    s("file-readable-p", 1, Some(1), file_readable_p);
+    s("file-writable-p", 1, Some(1), file_writable_p);
+    s("file-symlink-p", 1, Some(1), file_symlink_p);
+    s("--directory-files--", 1, Some(3), directory_files_raw);
+    // buffers (minimal)
+    s("--buffer-push--", 0, Some(0), buffer_push);
+    s("--buffer-pop--", 0, Some(0), buffer_pop);
+    s("insert", 0, None, insert_fn);
+    s("buffer-string", 0, Some(0), buffer_string);
+    s("buffer-size", 0, Some(1), buffer_size);
+    s("point", 0, Some(0), point_fn);
+    s("point-min", 0, Some(0), point_min);
+    s("point-max", 0, Some(0), point_max);
+    s("goto-char", 1, Some(1), goto_char);
+    s("erase-buffer", 0, Some(0), erase_buffer);
+    s("char-after", 0, Some(1), char_after);
+    s("buffer-substring", 2, Some(2), buffer_substring);
+    s(
+        "buffer-substring-no-properties",
+        2,
+        Some(2),
+        buffer_substring,
+    );
+    s("delete-region", 2, Some(2), delete_region);
+    s("insert-file-contents", 1, None, insert_file_contents);
+    s("forward-char", 0, Some(1), forward_char);
+    s("backward-char", 0, Some(1), backward_char);
+    s("beginning-of-line", 0, Some(1), beginning_of_line);
+    s("end-of-line", 0, Some(1), end_of_line);
+    s(
+        "line-beginning-position",
+        0,
+        Some(1),
+        line_beginning_position,
+    );
+    s("line-end-position", 0, Some(1), line_end_position);
+    s("pos-bol", 0, Some(1), line_beginning_position);
+    s("pos-eol", 0, Some(1), line_end_position);
+    s("bolp", 0, Some(0), bolp);
+    s("eolp", 0, Some(0), eolp);
+    s("bobp", 0, Some(0), bobp);
+    s("eobp", 0, Some(0), eobp);
+    s("forward-line", 0, Some(1), forward_line);
+    s("search-forward", 1, Some(4), search_forward);
+    s("re-search-forward", 1, Some(4), re_search_forward);
+    s("looking-at", 1, Some(2), looking_at);
+    s("looking-at-p", 1, Some(1), looking_at_p);
+    s("replace-match", 1, Some(5), replace_match);
+    // filesystem writes / mutations
+    s("write-region", 3, Some(7), write_region);
+    s("delete-file", 1, Some(2), delete_file);
+    s("make-directory", 1, Some(2), make_directory);
+    s("rename-file", 2, Some(3), rename_file);
+    s("copy-file", 2, Some(6), copy_file);
+    s(
+        "shell-command-to-string",
+        1,
+        Some(1),
+        shell_command_to_string,
+    );
+    s("call-process", 1, None, call_process);
+    s("process-lines", 1, None, process_lines);
+    s("char-before", 0, Some(1), char_before);
+    s("delete-char", 1, Some(2), delete_char);
+    s("insert-char", 1, Some(3), insert_char);
+    s("count-lines", 2, Some(2), count_lines);
+    s("line-number-at-pos", 0, Some(2), line_number_at_pos);
+    s("current-column", 0, Some(0), current_column);
+    s("search-backward", 1, Some(4), search_backward);
+    s("re-search-backward", 1, Some(4), re_search_backward);
+    s("skip-chars-forward", 1, Some(2), skip_chars_forward);
+    s("skip-chars-backward", 1, Some(2), skip_chars_backward);
+    s("forward-word", 0, Some(1), forward_word);
+    s("backward-word", 0, Some(1), backward_word);
+    s("random", 0, Some(1), random_fn);
     s("float-time", 0, Some(1), float_time);
     s("current-time", 0, Some(0), current_time);
     s("format-time-string", 1, Some(3), format_time_string);
@@ -2433,6 +4094,10 @@ pub fn install(h: &mut ElispHost) {
     s("upcase", 1, Some(1), upcase_fn);
     s("type-of", 1, Some(1), type_of);
     s("recordp", 1, Some(1), recordp);
+    s("sxhash-equal", 1, Some(1), sxhash_equal_fn);
+    s("sxhash", 1, Some(1), sxhash_equal_fn);
+    s("sxhash-eq", 1, Some(1), sxhash_eq_fn);
+    s("sxhash-eql", 1, Some(1), sxhash_eql_fn);
     s("cl-struct-p", 1, Some(1), recordp);
     s("functionp", 1, Some(1), functionp);
     s("char-or-string-p", 1, Some(1), char_or_string_p);

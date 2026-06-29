@@ -51,6 +51,8 @@ rkyv = { version = "0.7", features = ["validation", "archive_le", "size_32"] }
 bincode = "1"
 libc = "0.2"
 # Emacs-Lisp regexps (string-match / replace-regexp-in-string / match-string).
-# elisp regexp syntax is translated to the `regex` crate's dialect in
-# src/regexp.rs; the matching engine itself is reused rather than hand-rolled.
-regex = "1"
+# elisp regexp syntax is translated to the `regex`-dialect in src/regexp.rs;
+# `fancy-regex` is the matching engine — it adds a backtracking fallback for
+# backreferences (\1..\9) while keeping the linear `regex` crate fast path for
+# patterns that don't need it.
+fancy-regex = "0.14"
