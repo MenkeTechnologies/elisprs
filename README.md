@@ -10,7 +10,7 @@
 [![CI](https://github.com/MenkeTechnologies/elisprs/actions/workflows/ci.yml/badge.svg)](https://github.com/MenkeTechnologies/elisprs/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-online-blue.svg)](https://menketechnologies.github.io/elisprs/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-![status](https://img.shields.io/badge/status-milestone%201%20%C2%B7%20early-9b5de5.svg)
+![status](https://img.shields.io/badge/status-active-9b5de5.svg)
 
 ### `[EMACS LISP // RUN .EL OUTSIDE EMACS // LISP-2 + DYNAMIC SCOPE // RUST CORE]`
 
@@ -80,9 +80,10 @@ The build produces the `elisp` binary:
 elisp FILE.el            # evaluate a file
 elisp -e "(+ 1 2)"       # evaluate an expression, print its value
 elisp                    # REPL (balanced-paren continuation, Ctrl-D to exit)
-elisp --lsp              # language server over stdio        (stub — see roadmap)
-elisp --dap              # debug adapter over stdio          (stub — see roadmap)
-elisp --aot FILE -o a.o  # lower to a fusevm chunk (native object pending)
+elisp --lsp              # language server over stdio        (completion/hover/diagnostics/signature help)
+elisp --dap              # debug adapter over stdio          (breakpoints/stepping/variables)
+elisp --aot FILE -o a.o  # AOT-compile to a native object via fusevm::aot
+elisp --aot-exe FILE -o a.out  # AOT-compile to a standalone native executable
 elisp --version
 ```
 
@@ -140,11 +141,9 @@ elisp --version
 - **Generalized `setf`** over the common places: `car`, `cdr`, `nth`, `elt`, `aref`, `gethash`, `symbol-value`, plus plain variables and multiple place/value pairs.
 - **`format` field specs.** `%[-][0][width][.prec]` with `s S d o x X c e f g`, e.g. `(format "%05d" 42)` → `00042`.
 
-**Known limitations** — surfaced loudly rather than silently misread:
+**Scope.** Both **lexical** (`lexical-binding: t`) and **dynamic** binding are honored — lexical closures capture their defining environment, while `defvar` / special variables bind dynamically.
 
-- **Dynamic scope only.** `lexical-binding` is not honored yet (the lexical-binding frontend is in progress).
-
-This is a useful elisp core, **not** the ~1000-subr GNU Emacs surface, and it is not buffer-aware — editor integration (buffers, point, markers) is a separate track.
+**Not in scope** — surfaced loudly rather than silently misread: this is a useful elisp core, **not** the ~1000-subr GNU Emacs surface, and it is not buffer-aware — editor integration (buffers, point, markers) is a separate track.
 
 ---
 
@@ -163,15 +162,15 @@ elisp cells (cons / symbol / vector / closure / macro / subr) live in the `Elisp
 | `src/compiler.rs` | Lowers elisp forms to a `fusevm::Chunk`; lambda bodies become sub-chunks |
 | `src/builtins.rs` | The subr standard library (reached host-side from the `CALL` extension op) |
 | `src/prelude.rs` | The `[DERIVED]` elisp prelude — breadth written in elisp on top of the primitives |
-| `src/aot.rs` | `--aot` driver: lowers a `.el` file to a `fusevm::Chunk` (native object via `fusevm::aot` pending) |
-| `src/lsp.rs` / `src/dap.rs` | `--lsp` / `--dap` servers (stubs) |
+| `src/aot.rs` | `--aot` / `--aot-exe` driver: lowers a `.el` file to a `fusevm::Chunk`, emits a native object via `fusevm::aot::compile_object`, and links a standalone executable |
+| `src/lsp.rs` / `src/dap.rs` | `--lsp` (completion/hover/diagnostics/signature help) and `--dap` (breakpoints/stepping/variables) servers |
 | `src/main.rs` | The `elisp` CLI + REPL |
 
 ---
 
 ## [0x05] STATUS // COMPONENT GRID
 
-The grid reflects the current state of the tree, not aspiration — planned items are labelled.
+The grid reflects the current state of the tree.
 
 | Component | State |
 |---|---|
@@ -185,10 +184,10 @@ The grid reflects the current state of the tree, not aspiration — planned item
 | Dotted pairs, backquote/unquote, `setcar`/`setcdr` | Working |
 | `elisp` CLI — file / `-e` / REPL | Working |
 | ERT test surface (`ert-deftest`/`should`/`should-error`) | Working (prelude) |
-| `--lsp` / `--dap` servers | Stub (planned) |
+| `--lsp` / `--dap` servers | Working |
 | elisp → `fusevm::Chunk` lowering + execution (`compiler.rs` / `host.rs`) | Working |
-| `--aot` → native object via `fusevm::aot::compile_object` | Planned (lowering works; native emit pending) |
-| `lexical-binding` | In progress |
+| `--aot` / `--aot-exe` → native object + standalone executable via `fusevm::aot::compile_object` | Working |
+| `lexical-binding` (lexical + dynamic) | Working |
 
 ---
 
@@ -200,13 +199,14 @@ The grid reflects the current state of the tree, not aspiration — planned item
 2. ✅ An elisp `Op::Extended(id, arg)` range dispatches quote / funcall / special-var bind / cons navigation through a handler registered with `vm.set_extension_handler(...)`.
 3. ✅ Every top-level form lowers in `compiler.rs`; lambda bodies become sub-chunks.
 4. ✅ The subr library is reachable host-side from the `CALL` extension op.
+5. ✅ **JIT / AOT tiers.** `fusevm` is built with `jit-disk-cache` + `aot`, so elisp chunks pick up the three-tier Cranelift JIT, and `--aot` / `--aot-exe` emit a native object and a standalone executable through `fusevm::aot::compile_object`.
+6. ✅ **Lexical + dynamic binding.** Lexical closures capture their defining environment; `defvar` / special variables bind dynamically.
+7. ✅ **Tooling.** `--lsp` (completion/hover/diagnostics/signature help over the obarray, mirroring `awkrs --lsp`) and `--dap` (breakpoints/stepping off `eval` + the dynamic specstack) both ship.
 
 **Next:**
 
-- **JIT / AOT tiers.** Build `fusevm` with the `jit` feature so elisp chunks pick up the three-tier Cranelift JIT, and wire `--aot` native-object emission through `fusevm::aot::compile_object` (today `--aot` lowers to a chunk; native emission needs fusevm's `aot` feature). Both come essentially for free, the way they do for the sibling frontends.
 - **Coverage.** Broaden special-form / macro / backquote lowering toward full milestone-2 elisp.
-
-**Tooling.** `--lsp` (completion/hover/definition/diagnostics over the obarray, mirroring `awkrs --lsp`), `--dap` (breakpoints/stepping off `eval` + the dynamic specstack, reusing `zemacs-dap` transport), and editor plugins (`vscode-elisp` / `vim-elisp` / `emacs-elisp`).
+- **Editor plugins.** `vscode-elisp` / `vim-elisp` / `emacs-elisp` over the `--lsp` server.
 
 ---
 
