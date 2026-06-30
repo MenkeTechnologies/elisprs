@@ -102,6 +102,13 @@ fn div(_h: &mut ElispHost, a: &[Value]) -> R {
         }
         f /= vf;
     }
+    // A float division that yields NaN (e.g. (/ 0.0 0.0)) gets a hardware-dependent
+    // sign bit: x86-64 produces a sign-negative NaN, ARM a positive one. Emacs prints
+    // such a result as "0.0e+NaN" (positive), so canonicalize the sign here to keep
+    // output platform-independent. A later negation still flips it to "-0.0e+NaN".
+    if isf && f.is_nan() {
+        f = f.abs();
+    }
     Ok(num_result(i, f, isf))
 }
 fn modulo(_h: &mut ElispHost, a: &[Value]) -> R {
