@@ -4283,10 +4283,7 @@ mod tests {
         // Empty string with default separators -> nil.
         assert_eq!(eval("(string-split \"\")"), "nil");
         // Explicit separator regexp, omit-nulls default off keeps empty fields.
-        assert_eq!(
-            eval("(string-split \"a,,b\" \",\")"),
-            "(\"a\" \"\" \"b\")"
-        );
+        assert_eq!(eval("(string-split \"a,,b\" \",\")"), "(\"a\" \"\" \"b\")");
         // Empty separator splits into single characters.
         assert_eq!(eval("(string-split \"abc\" \"\")"), "(\"a\" \"b\" \"c\")");
     }
@@ -4301,10 +4298,7 @@ mod tests {
         // No match -> nil.
         assert_eq!(eval("(member-ignore-case \"z\" '(\"a\" \"b\"))"), "nil");
         // Non-string elements are skipped, never match.
-        assert_eq!(
-            eval("(member-ignore-case \"b\" '(1 2 \"B\"))"),
-            "(\"B\")"
-        );
+        assert_eq!(eval("(member-ignore-case \"b\" '(1 2 \"B\"))"), "(\"B\")");
         // Empty list -> nil.
         assert_eq!(eval("(member-ignore-case \"a\" nil)"), "nil");
     }
