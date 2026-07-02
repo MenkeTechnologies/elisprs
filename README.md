@@ -100,13 +100,14 @@ elisp --version
 | Group | Functions |
 |---|---|
 | Arithmetic | `+ - * / % mod 1+ 1- abs max min = /= < > <= >=` |
-| Lists | `car cdr cons list append nth nthcdr reverse length member memq assoc assq` |
+| Lists | `car cdr cons list append nth nthcdr reverse length member memq assoc assq member-ignore-case` |
+| c*r combinators | `caar cadr cdar cddr caadr cadar cdaar cdadr cddar` (+ `cl-caar cl-cadr cl-cdar cl-cddr`) |
 | Mutation | `setcar setcdr aset` |
 | Vectors | `vector make-vector aref vectorp` |
 | Hash tables | `make-hash-table gethash puthash remhash clrhash maphash hash-table-count hash-table-keys hash-table-values hash-table-p` |
 | Predicates | `eq eql equal null not numberp integerp floatp stringp symbolp consp listp atom functionp` |
 | Symbols/cells | `set symbol-value symbol-function fset boundp fboundp symbol-name intern make-symbol` |
-| Strings | `concat string= string-equal string< upcase downcase number-to-string string-to-number` |
+| Strings | `concat string= string-equal string< upcase downcase number-to-string string-to-number string-split` |
 | IO/format | `format message princ prin1 prin1-to-string print terpri` |
 | Functional | `funcall apply mapcar mapc sort identity` |
 | Regexp | `string-match string-match-p match-beginning match-end match-string match-data set-match-data replace-regexp-in-string regexp-quote` (+ `save-match-data`) |

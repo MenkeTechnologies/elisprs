@@ -403,6 +403,55 @@ fn nth_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 
+// ── c[ad]+r combinators ──
+// Each composes `car`/`cdr`, inheriting their exact edge semantics: car/cdr of
+// nil yield nil (so short lists return nil), while car/cdr of a non-nil non-cons
+// signals `wrong-type-argument listp`. Read the letters right-to-left as the
+// order of operations (e.g. `caadr` = (car (car (cdr X)))).
+fn caadr(h: &mut ElispHost, a: &[Value]) -> R {
+    let v = cdr(h, a)?;
+    let v = car(h, &[v])?;
+    car(h, &[v])
+}
+fn cadar(h: &mut ElispHost, a: &[Value]) -> R {
+    let v = car(h, a)?;
+    let v = cdr(h, &[v])?;
+    car(h, &[v])
+}
+fn cdaar(h: &mut ElispHost, a: &[Value]) -> R {
+    let v = car(h, a)?;
+    let v = car(h, &[v])?;
+    cdr(h, &[v])
+}
+fn cdadr(h: &mut ElispHost, a: &[Value]) -> R {
+    let v = cdr(h, a)?;
+    let v = car(h, &[v])?;
+    cdr(h, &[v])
+}
+fn cddar(h: &mut ElispHost, a: &[Value]) -> R {
+    let v = car(h, a)?;
+    let v = cdr(h, &[v])?;
+    cdr(h, &[v])
+}
+// cl-lib 2-level aliases (cl-caar/cl-cadr/cl-cdar/cl-cddr), identical to the
+// non-prefixed forms.
+fn cl_caar(h: &mut ElispHost, a: &[Value]) -> R {
+    let v = car(h, a)?;
+    car(h, &[v])
+}
+fn cl_cadr(h: &mut ElispHost, a: &[Value]) -> R {
+    let v = cdr(h, a)?;
+    car(h, &[v])
+}
+fn cl_cdar(h: &mut ElispHost, a: &[Value]) -> R {
+    let v = car(h, a)?;
+    cdr(h, &[v])
+}
+fn cl_cddr(h: &mut ElispHost, a: &[Value]) -> R {
+    let v = cdr(h, a)?;
+    cdr(h, &[v])
+}
+
 // ── predicates ──
 fn null_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(is_nil(&a[0])))
@@ -2548,6 +2597,44 @@ fn compare_strings(_h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 
+/// `(member-ignore-case ELT LIST)` — like `member`, but the comparison is
+/// case-insensitive and ELT is compared only against the *string* elements of
+/// LIST (non-strings are skipped, never match). Returns the tail of LIST that
+/// begins with the first matching element, else nil. Mirrors GNU Emacs subr.el:
+/// each candidate is tested via `(compare-strings ELT 0 nil CAND 0 nil t)` which
+/// signals `wrong-type-argument stringp` if ELT is not a string and a string
+/// candidate is reached; an all-non-string / empty LIST returns nil silently.
+fn member_ignore_case(h: &mut ElispHost, a: &[Value]) -> R {
+    let elt = a[0].clone();
+    let mut cur = a[1].clone();
+    loop {
+        // Pull car/cdr out into owned values so the immutable arena borrow ends
+        // before the mutable `compare_strings` call below.
+        let (car, cdr) = match h.obj(&cur) {
+            Some(Obj::Cons(car, cdr)) => (car.clone(), cdr.clone()),
+            _ => return Ok(Value::Undef),
+        };
+        if let Value::Str(_) = &car {
+            let cmp = compare_strings(
+                h,
+                &[
+                    elt.clone(),
+                    Value::Int(0),
+                    Value::Undef,
+                    car,
+                    Value::Int(0),
+                    Value::Undef,
+                    Value::Bool(true),
+                ],
+            )?;
+            if matches!(cmp, Value::Bool(true)) {
+                return Ok(cur);
+            }
+        }
+        cur = cdr;
+    }
+}
+
 // ── time ──
 fn now_secs() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3879,6 +3966,16 @@ pub fn install(h: &mut ElispHost) {
     s("reverse", 1, Some(1), reverse_fn);
     s("length", 1, Some(1), length_fn);
     s("nth", 2, Some(2), nth_fn);
+    // c[ad]+r combinators (3-level completers + cl-lib 2-level aliases)
+    s("caadr", 1, Some(1), caadr);
+    s("cadar", 1, Some(1), cadar);
+    s("cdaar", 1, Some(1), cdaar);
+    s("cdadr", 1, Some(1), cdadr);
+    s("cddar", 1, Some(1), cddar);
+    s("cl-caar", 1, Some(1), cl_caar);
+    s("cl-cadr", 1, Some(1), cl_cadr);
+    s("cl-cdar", 1, Some(1), cl_cdar);
+    s("cl-cddr", 1, Some(1), cl_cddr);
     // vectors
     s("vector", 0, None, vector_fn);
     s("make-vector", 2, Some(2), make_vector);
@@ -4124,4 +4221,91 @@ pub fn install(h: &mut ElispHost) {
     s("read", 1, Some(1), read_fn);
     s("read-from-string", 1, Some(3), read_from_string);
     s("compare-strings", 6, Some(7), compare_strings);
+    // Emacs 28 alias for split-string with identical semantics (direct forwarder).
+    s("string-split", 1, Some(4), split_string);
+    s("member-ignore-case", 2, Some(2), member_ignore_case);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{eval_str, print, reset_host};
+
+    fn eval(src: &str) -> String {
+        reset_host();
+        let v = eval_str(src).expect("eval failed");
+        print(&v, true)
+    }
+
+    fn eval_err(src: &str) -> String {
+        reset_host();
+        eval_str(src).unwrap_err()
+    }
+
+    #[test]
+    fn cadr_family_composition() {
+        // caadr = (car (car (cdr X)))
+        assert_eq!(eval("(caadr '(1 (2 3) 4))"), "2");
+        // cadar = (car (cdr (car X)))
+        assert_eq!(eval("(cadar '((1 2 3) 4))"), "2");
+        // cdaar = (cdr (car (car X)))
+        assert_eq!(eval("(cdaar '(((1 2) 3) 4))"), "(2)");
+        // cdadr = (cdr (car (cdr X)))
+        assert_eq!(eval("(cdadr '(1 (2 3) 4))"), "(3)");
+        // cddar = (cdr (cdr (car X)))
+        assert_eq!(eval("(cddar '((1 2 3) 4))"), "(3)");
+    }
+
+    #[test]
+    fn cadr_family_nil_edges() {
+        // Intermediate nil propagates to nil (no error) on short lists.
+        assert_eq!(eval("(caadr '(1))"), "nil");
+        assert_eq!(eval("(cadar '(nil))"), "nil");
+        assert_eq!(eval("(cddar '((1)))"), "nil");
+        // A non-nil non-cons intermediate signals wrong-type-argument listp.
+        assert!(eval_err("(caadr '(1 2 3))").contains("listp"));
+    }
+
+    #[test]
+    fn cl_two_level_aliases() {
+        assert_eq!(eval("(cl-caar '((1 2) 3))"), "1");
+        assert_eq!(eval("(cl-cadr '(1 2 3))"), "2");
+        assert_eq!(eval("(cl-cdar '((1 2) 3))"), "(2)");
+        assert_eq!(eval("(cl-cddr '(1 2 3 4))"), "(3 4)");
+        // Short/nil lists yield nil.
+        assert_eq!(eval("(cl-cadr '(1))"), "nil");
+        assert_eq!(eval("(cl-cddr '(1))"), "nil");
+    }
+
+    #[test]
+    fn string_split_forwards_to_split_string() {
+        // Default separators: whitespace, omit-nulls implicitly on.
+        assert_eq!(eval("(string-split \"  a  b c \")"), "(\"a\" \"b\" \"c\")");
+        // Empty string with default separators -> nil.
+        assert_eq!(eval("(string-split \"\")"), "nil");
+        // Explicit separator regexp, omit-nulls default off keeps empty fields.
+        assert_eq!(
+            eval("(string-split \"a,,b\" \",\")"),
+            "(\"a\" \"\" \"b\")"
+        );
+        // Empty separator splits into single characters.
+        assert_eq!(eval("(string-split \"abc\" \"\")"), "(\"a\" \"b\" \"c\")");
+    }
+
+    #[test]
+    fn member_ignore_case_semantics() {
+        // Returns the tail beginning at the first case-insensitive string match.
+        assert_eq!(
+            eval("(member-ignore-case \"b\" '(\"A\" \"B\" \"C\"))"),
+            "(\"B\" \"C\")"
+        );
+        // No match -> nil.
+        assert_eq!(eval("(member-ignore-case \"z\" '(\"a\" \"b\"))"), "nil");
+        // Non-string elements are skipped, never match.
+        assert_eq!(
+            eval("(member-ignore-case \"b\" '(1 2 \"B\"))"),
+            "(\"B\")"
+        );
+        // Empty list -> nil.
+        assert_eq!(eval("(member-ignore-case \"a\" nil)"), "nil");
+    }
 }
