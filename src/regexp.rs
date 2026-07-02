@@ -11,7 +11,7 @@
 //! (incl. shy `\(?:`), alternation, bounded repeats, anchors (`\``, `\'`, `\<`,
 //! `\>`, `\_<`, `\_>`), word/symbol/whitespace escapes (`\w \W \b \B \s- \sw`),
 //! and character alternatives `[...]` (passed through, since both dialects share
-//! `[a-z]`, `[^...]`, and POSIX `[:class:]`). Backreferences in the *pattern*
+//! `[a-z]`, `[^...]`, and POSIX `[:class:\]`). Backreferences in the *pattern*
 //! (`\1`..`\9`) pass through to fancy-regex's backtracking engine, which spells
 //! them the same way.
 
