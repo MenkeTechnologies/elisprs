@@ -2524,13 +2524,86 @@ fn string_to_vector(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.alloc(Obj::Vector(items)))
 }
 /// `(logb X)` — the binary exponent of |X|: floor(log2(|X|)).
+///
+/// Faithful to Emacs 30 `Flogb` (floatfns.c): a finite nonzero argument yields
+/// the integer `frexp` exponent minus one; every other case (zero, ±infinity,
+/// NaN) falls through to C `logb`, which returns a *float* — `-inf` for zero,
+/// `+inf` for either infinity, and NaN for NaN.
 fn logb_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let f = as_num(&a[0])?.1.abs();
-    if f == 0.0 {
-        // Emacs returns most-negative-fixnum (62-bit) for (logb 0).
-        return Ok(Value::Int(-2305843009213693952));
+    let f = as_num(&a[0])?.1;
+    if f.is_finite() && f != 0.0 {
+        return Ok(Value::Int(f.abs().log2().floor() as i64));
     }
-    Ok(Value::Int(f.log2().floor() as i64))
+    let val = if f.is_nan() {
+        f64::NAN
+    } else if f == 0.0 {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    };
+    Ok(Value::Float(val))
+}
+/// `(max-char &optional UNICODE)` — the largest character code. With non-nil
+/// UNICODE the max Unicode scalar (`#x10FFFF`); otherwise the max Emacs char
+/// code (`#x3FFFFF`), which spans the raw-byte / eight-bit range too.
+fn max_char(_h: &mut ElispHost, a: &[Value]) -> R {
+    let unicode = a.first().map(|v| !is_nil(v)).unwrap_or(false);
+    Ok(Value::Int(if unicode { 0x10_FFFF } else { 0x3F_FFFF }))
+}
+/// `(byteorder)` — `?l` (108) on a little-endian host, `?B` (66) on big-endian.
+fn byteorder(_h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::Int(if cfg!(target_endian = "little") {
+        108
+    } else {
+        66
+    }))
+}
+/// `(bare-symbol-p OBJECT)` — non-nil if OBJECT is a symbol without position.
+/// elisprs has no symbol-with-position type, so every symbol is bare — this is
+/// exactly `symbolp` (nil and t count as symbols).
+fn bare_symbol_p(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(
+        matches!(a[0], Value::Bool(true) | Value::Undef)
+            || matches!(h.obj(&a[0]), Some(Obj::Symbol(_))),
+    ))
+}
+/// `(car-less-than-car A B)` — `(< (car A) (car B))`, the standard comparator
+/// for sorting alists (Emacs `car-less-than-car`).
+fn car_less_than_car(h: &mut ElispHost, a: &[Value]) -> R {
+    let car_of = |h: &ElispHost, v: &Value| -> Result<Value, String> {
+        match h.obj(v) {
+            Some(Obj::Cons(x, _)) => Ok(x.clone()),
+            _ if is_nil(v) => Ok(Value::Undef),
+            _ => Err(format!("wrong-type-argument: listp {}", h.print(v, true))),
+        }
+    };
+    let a0 = car_of(h, &a[0])?;
+    let b0 = car_of(h, &a[1])?;
+    Ok(nil_or(as_num(&a0)?.1 < as_num(&b0)?.1))
+}
+/// `(subr-name SUBR)` — the name of a primitive SUBR as a string. Signals
+/// `wrong-type-argument` when SUBR is not a subr (e.g. a plain symbol).
+fn subr_name(h: &mut ElispHost, a: &[Value]) -> R {
+    match h.obj(&a[0]) {
+        Some(Obj::Subr { name, .. }) => Ok(Value::str(name.clone())),
+        _ => Err(format!(
+            "wrong-type-argument: subrp {}",
+            h.print(&a[0], true)
+        )),
+    }
+}
+/// `(default-boundp SYMBOL)` — non-nil if SYMBOL has a default value. This model
+/// has no buffer-local bindings, so the default value is the toplevel value and
+/// this coincides with `boundp`.
+fn default_boundp(h: &mut ElispHost, a: &[Value]) -> R {
+    let bound = is_nil(&a[0]) || matches!(a[0], Value::Bool(true)) || h.get_value(&a[0]).is_ok();
+    Ok(nil_or(bound))
+}
+/// `(default-toplevel-value SYMBOL)` — SYMBOL's default (toplevel) value. Without
+/// buffer-local bindings this is `symbol-value`; signals `void-variable` when
+/// SYMBOL is unbound.
+fn default_toplevel_value(h: &mut ElispHost, a: &[Value]) -> R {
+    h.get_value(&a[0])
 }
 /// `(read STRING)` — read the first Lisp form from STRING.
 fn read_fn(h: &mut ElispHost, a: &[Value]) -> R {
@@ -3961,6 +4034,7 @@ pub fn install(h: &mut ElispHost) {
     s("cdr", 1, Some(1), cdr);
     s("setcar", 2, Some(2), setcar);
     s("setcdr", 2, Some(2), setcdr);
+    s("car-less-than-car", 2, Some(2), car_less_than_car);
     s("list", 0, None, list_fn);
     s("append", 0, None, append_fn);
     s("reverse", 1, Some(1), reverse_fn);
@@ -3989,6 +4063,9 @@ pub fn install(h: &mut ElispHost) {
     s("set", 2, Some(2), set_fn);
     s("symbol-value", 1, Some(1), symbol_value);
     s("boundp", 1, Some(1), boundp);
+    s("default-boundp", 1, Some(1), default_boundp);
+    s("default-toplevel-value", 1, Some(1), default_toplevel_value);
+    s("bare-symbol-p", 1, Some(1), bare_symbol_p);
     s("makunbound", 1, Some(1), makunbound);
     s("sha1", 1, Some(4), sha1_fn);
     s("md5", 1, Some(5), md5_fn);
@@ -4040,6 +4117,7 @@ pub fn install(h: &mut ElispHost) {
     s("special-variable-p", 1, Some(1), special_variable_p);
     s("func-arity", 1, Some(1), func_arity);
     s("subr-arity", 1, Some(1), func_arity);
+    s("subr-name", 1, Some(1), subr_name);
     s("--current-directory--", 0, Some(0), current_directory);
     s("file-exists-p", 1, Some(1), file_exists_p);
     s("file-directory-p", 1, Some(1), file_directory_p);
@@ -4218,6 +4296,8 @@ pub fn install(h: &mut ElispHost) {
     s("char-uppercase-p", 1, Some(1), char_uppercase_p);
     s("string-distance", 2, Some(3), string_distance);
     s("logb", 1, Some(1), logb_fn);
+    s("max-char", 0, Some(1), max_char);
+    s("byteorder", 0, Some(0), byteorder);
     s("read", 1, Some(1), read_fn);
     s("read-from-string", 1, Some(3), read_from_string);
     s("compare-strings", 6, Some(7), compare_strings);

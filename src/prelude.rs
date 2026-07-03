@@ -320,27 +320,46 @@ pub const PRELUDE: &str = r#"
   (let ((test (cl--getkey keys :test 'eql)) (key (cl--getkey keys :key 'identity)))
     (if (seq-some (lambda (x) (funcall test (funcall key item) (funcall key x))) list)
         list (cons item list))))
+;; Faithful ports of Emacs `cl-union'/`cl-intersection'/`cl-set-difference'
+;; (cl-seq.el). They honor :test (default `eql') and :key, and reproduce the
+;; length-swap + memq/numberp fast path that determines element order. Without
+;; keys, non-numeric elements are compared with `memq' (eq), exactly like Emacs.
 (defun cl-union (l1 l2 &rest keys)
-  (let ((test (cl--getkey keys :test 'eql)) (r (append l1 nil)) (b l2))
-    (while b
-      (let ((x (car b)))
-        (unless (seq-some (lambda (y) (funcall test x y)) r) (setq r (cons x r))))
-      (setq b (cdr b)))
-    r))
+  (cond ((null l1) l2)
+        ((null l2) l1)
+        ((and (not keys) (equal l1 l2)) l1)
+        (t
+         (unless (>= (length l1) (length l2))
+           (let ((tmp l1)) (setq l1 l2 l2 tmp)))
+         (while l2
+           (if (or keys (numberp (car l2)))
+               (setq l1 (apply 'cl-adjoin (car l2) l1 keys))
+             (or (memq (car l2) l1) (setq l1 (cons (car l2) l1))))
+           (setq l2 (cdr l2)))
+         l1)))
 (defun cl-intersection (l1 l2 &rest keys)
-  (let ((test (cl--getkey keys :test 'eql)) (r nil) (a l1))
-    (while a
-      (let ((x (car a)))
-        (when (seq-some (lambda (y) (funcall test x y)) l2) (setq r (cons x r))))
-      (setq a (cdr a)))
-    r))
+  (and l1 l2
+       (if (equal l1 l2) l1
+         (let ((key (cl--getkey keys :key 'identity)) (res nil))
+           (unless (>= (length l1) (length l2))
+             (let ((tmp l1)) (setq l1 l2 l2 tmp)))
+           (while l2
+             (when (if (or keys (numberp (car l2)))
+                       (apply 'cl-member (funcall key (car l2)) l1 keys)
+                     (memq (car l2) l1))
+               (setq res (cons (car l2) res)))
+             (setq l2 (cdr l2)))
+           res))))
 (defun cl-set-difference (l1 l2 &rest keys)
-  (let ((test (cl--getkey keys :test 'eql)) (r nil) (a l1))
-    (while a
-      (let ((x (car a)))
-        (unless (seq-some (lambda (y) (funcall test x y)) l2) (setq r (cons x r))))
-      (setq a (cdr a)))
-    (nreverse r)))
+  (if (or (null l1) (null l2)) l1
+    (let ((key (cl--getkey keys :key 'identity)) (res nil))
+      (while l1
+        (unless (if (or keys (numberp (car l1)))
+                    (apply 'cl-member (funcall key (car l1)) l2 keys)
+                  (memq (car l1) l2))
+          (setq res (cons (car l1) res)))
+        (setq l1 (cdr l1)))
+      (nreverse res))))
 (defun cl-subsetp (l1 l2 &rest keys)
   ;; t when every element of L1 appears in L2 (under :test, with :key applied to
   ;; elements of both lists).
@@ -1031,11 +1050,23 @@ TYPE nil maps for side effects only and returns nil."
       (setq lst (cdr lst)))
     r))
 (defun cl-remove-duplicates (seq &rest keys)
-  ;; Default keeps the LAST occurrence of each `equal' element; with :from-end
-  ;; non-nil, keeps the FIRST.
-  (if (plist-get keys :from-end)
-      (cl--like (delete-dups (append seq nil)) seq)
-    (cl--like (reverse (delete-dups (reverse (append seq nil)))) seq)))
+  ;; Return a copy of SEQ with duplicates removed. Elements are compared with
+  ;; :test (default `eql') applied to the value returned by :key (default
+  ;; `identity'). Default keeps the LAST occurrence of each element; with
+  ;; :from-end non-nil, keeps the FIRST. Keeping the LAST occurrence in order is
+  ;; the same as keeping the FIRST occurrence of the reversed list.
+  (let* ((test (cl--getkey keys :test 'eql))
+         (key (cl--getkey keys :key 'identity))
+         (from-end (cl--getkey keys :from-end nil))
+         (items (if from-end (append seq nil) (reverse (append seq nil))))
+         (seen nil) (res nil))
+    (dolist (x items)
+      (let ((k (funcall key x)) (dup nil) (s seen))
+        (while (and s (not dup))
+          (when (funcall test k (car s)) (setq dup t))
+          (setq s (cdr s)))
+        (unless dup (setq seen (cons k seen) res (cons x res)))))
+    (cl--like (if from-end (nreverse res) res) seq)))
 (defun cl-pairlis (the-keys the-values &optional alist)
   (let ((ks (reverse the-keys)) (vs (reverse the-values)) (res alist))
     (while ks
@@ -1670,13 +1701,18 @@ TYPE nil maps for side effects only and returns nil."
      ((null data) (symbol-name sym))
      (t (concat (symbol-name sym) ": " (mapconcat render data ", "))))))
 (defun seq-group-by (fn seq)
-  (let ((result nil))
-    (dolist (x (append seq nil))
-      (let* ((key (funcall fn x)) (cell (assoc key result)))
-        (if cell (setcdr cell (cons x (cdr cell)))
-          (setq result (cons (cons key (list x)) result)))))
-    ;; Reverse so groups appear in first-encounter order, items in order.
-    (nreverse (mapcar (lambda (c) (cons (car c) (reverse (cdr c)))) result))))
+  ;; Faithful port of Emacs `seq-group-by' (seq.el): fold over the REVERSED
+  ;; sequence, prepending newly-seen keys and pushing each element onto its
+  ;; group's cdr. This yields groups in reverse first-encounter order with
+  ;; items in forward order.
+  (seq-reduce
+   (lambda (acc elt)
+     (let* ((key (funcall fn elt)) (cell (assoc key acc)))
+       (if cell (setcdr cell (cons elt (cdr cell)))
+         (setq acc (cons (list key elt) acc)))
+       acc))
+   (reverse (append seq nil))
+   nil))
 
 (defun plist-put (plist prop val &optional predicate)
   ;; Mutate PLIST in place: overwrite an existing PROP, or append (PROP VAL) to

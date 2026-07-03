@@ -108,6 +108,71 @@ fn cl_family() {
 }
 
 #[test]
+fn cl_set_ops_test_and_key() {
+    // Default comparison is `eql', not `equal': distinct string objects stay.
+    assert_eq!(
+        eval("(cl-remove-duplicates (list \"a\" \"a\" \"b\"))"),
+        "(\"a\" \"a\" \"b\")"
+    );
+    assert_eq!(
+        eval("(cl-remove-duplicates (list \"a\" \"a\" \"b\") :test #'equal)"),
+        "(\"a\" \"b\")"
+    );
+    // Default keeps last occurrence; :from-end keeps first.
+    assert_eq!(eval("(cl-remove-duplicates '(1 2 1 3 2))"), "(1 3 2)");
+    assert_eq!(
+        eval("(cl-remove-duplicates '(1 2 1 3 2) :from-end t)"),
+        "(1 2 3)"
+    );
+    // :key selects the comparison value.
+    assert_eq!(
+        eval("(cl-remove-duplicates '((1 . a) (1 . b) (2 . c)) :key #'car)"),
+        "((1 . b) (2 . c))"
+    );
+    assert_eq!(
+        eval("(cl-remove-duplicates '((1 . a) (1 . b) (2 . c)) :key #'car :from-end t)"),
+        "((1 . a) (2 . c))"
+    );
+    // Union order: non-dup items of shorter list prepended onto longer.
+    assert_eq!(eval("(cl-union '(1 2 3) '(3 4 5))"), "(5 4 1 2 3)");
+    assert_eq!(
+        eval("(cl-union '(\"a\") '(\"a\" \"b\"))"),
+        "(\"a\" \"a\" \"b\")"
+    );
+    assert_eq!(
+        eval("(cl-union '((1 . a)) '((1 . b) (2 . c)) :key #'car)"),
+        "((1 . b) (2 . c))"
+    );
+    assert_eq!(eval("(cl-union nil '(1 2))"), "(1 2)");
+    // Intersection returns matches from the shorter list in push order.
+    assert_eq!(eval("(cl-intersection '(1 2 3) '(2 3 4))"), "(3 2)");
+    assert_eq!(
+        eval("(cl-intersection '((1 . a) (3 . x)) '((1 . b) (2 . c)) :key #'car)"),
+        "((1 . b))"
+    );
+    // Set-difference keeps LIST1 items absent from LIST2, original order.
+    assert_eq!(eval("(cl-set-difference '(1 2 3 4) '(2 4))"), "(1 3)");
+    assert_eq!(
+        eval("(cl-set-difference '((1 . a) (3 . x)) '((1 . b)) :key #'car)"),
+        "((3 . x))"
+    );
+}
+
+#[test]
+fn seq_group_by_ordering() {
+    // Reverse first-encounter key order, forward item order (Emacs fold order).
+    assert_eq!(
+        eval("(seq-group-by (lambda (x) (= 0 (mod x 2))) '(1 2 3 4 5))"),
+        "((t 2 4) (nil 1 3 5))"
+    );
+    assert_eq!(
+        eval("(seq-group-by #'car '((a . 1) (b . 2) (a . 3)))"),
+        "((b (b . 2)) (a (a . 1) (a . 3)))"
+    );
+    assert_eq!(eval("(seq-group-by #'identity '())"), "nil");
+}
+
+#[test]
 fn place_mutating_macros() {
     assert_eq!(eval("(let ((x 5)) (incf x) x)"), "6");
     assert_eq!(eval("(let ((x 5)) (decf x) x)"), "4");

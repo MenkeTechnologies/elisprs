@@ -205,6 +205,89 @@ fn error_and_signal_are_catchable() {
 }
 
 #[test]
+fn logb_special_cases_are_floats() {
+    // Finite nonzero magnitudes yield the integer binary exponent (frexp e - 1).
+    assert_eq!(eval("(logb 1024)"), "10");
+    assert_eq!(eval("(logb -8.0)"), "3");
+    assert_eq!(eval("(logb 0.5)"), "-1");
+    // Zero, ±infinity and NaN fall through to C `logb`, which returns a *float*:
+    // -inf for zero (int or float), +inf for either infinity, NaN for NaN.
+    assert_eq!(eval("(logb 0.0)"), "-1.0e+INF");
+    assert_eq!(eval("(logb 0)"), "-1.0e+INF");
+    assert_eq!(eval("(logb (/ 1.0 0.0))"), "1.0e+INF");
+    assert_eq!(eval("(logb (/ -1.0 0.0))"), "1.0e+INF");
+    assert_eq!(eval("(logb (/ 0.0 0.0))"), "0.0e+NaN");
+}
+
+#[test]
+fn max_char_and_byteorder() {
+    // Default is the max Emacs char code (#x3FFFFF); UNICODE arg caps at #x10FFFF.
+    assert_eq!(eval("(max-char)"), "4194303");
+    assert_eq!(eval("(max-char t)"), "1114111");
+    // Test host is little-endian aarch64/x86_64 → ?l.
+    assert_eq!(eval("(byteorder)"), "108");
+}
+
+#[test]
+fn bare_symbol_p_matches_symbolp() {
+    // No symbol-with-position type here, so bare-symbol-p == symbolp: nil and t
+    // are symbols, non-symbols are not.
+    assert_eq!(
+        eval("(list (bare-symbol-p 'foo) (bare-symbol-p nil) (bare-symbol-p t))"),
+        "(t t t)"
+    );
+    assert_eq!(
+        eval("(list (bare-symbol-p 5) (bare-symbol-p \"s\") (bare-symbol-p '(a)))"),
+        "(nil nil nil)"
+    );
+}
+
+#[test]
+fn car_less_than_car_comparator() {
+    assert_eq!(eval("(car-less-than-car '(1 . x) '(2 . y))"), "t");
+    assert_eq!(eval("(car-less-than-car '(3 . x) '(2 . y))"), "nil");
+    // Equal cars are not strictly less.
+    assert_eq!(eval("(car-less-than-car '(2 a) '(2 b))"), "nil");
+    // Mixed int/float cars compare numerically.
+    assert_eq!(eval("(car-less-than-car '(2.5 a) '(3 b))"), "t");
+    // Sorting an alist by its keys uses this as the predicate.
+    assert_eq!(
+        eval("(sort (list '(3 . c) '(1 . a) '(2 . b)) #'car-less-than-car)"),
+        "((1 . a) (2 . b) (3 . c))"
+    );
+}
+
+#[test]
+fn subr_name_of_primitive() {
+    assert_eq!(eval("(subr-name (symbol-function 'car))"), "\"car\"");
+    assert_eq!(
+        eval("(subr-name (symbol-function 'max-char))"),
+        "\"max-char\""
+    );
+    // A plain symbol is not a subr.
+    assert_eq!(
+        eval("(condition-case e (subr-name 'car) (error (car e)))"),
+        "wrong-type-argument"
+    );
+}
+
+#[test]
+fn default_boundp_and_toplevel_value() {
+    // No buffer-local bindings: default-boundp tracks boundp, default-toplevel-value
+    // tracks symbol-value.
+    assert_eq!(
+        eval("(progn (setq zz-dv 41) (list (default-boundp 'zz-dv) (default-toplevel-value 'zz-dv)))"),
+        "(t 41)"
+    );
+    assert_eq!(eval("(default-boundp 'no-such-var-zzz)"), "nil");
+    // Unbound symbol signals void-variable.
+    assert_eq!(
+        eval("(condition-case e (default-toplevel-value 'no-such-var-zzz) (error (car e)))"),
+        "void-variable"
+    );
+}
+
+#[test]
 fn identity_and_ignore() {
     assert_eq!(eval("(identity 42)"), "42");
     assert_eq!(eval("(ignore 1 2 3)"), "nil");
