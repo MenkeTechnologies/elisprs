@@ -295,7 +295,12 @@ fn append_fn(h: &mut ElispHost, a: &[Value]) -> R {
                 Value::Str(s) => out.extend(s.chars().map(|c| Value::Int(c as i64))),
                 _ => match h.list_vec(v) {
                     Some(items) => out.extend(items),
-                    None => return Err("wrong-type-argument: sequencep".to_string()),
+                    None => {
+                        return Err(format!(
+                            "wrong-type-argument: sequencep {}",
+                            h.print(v, true)
+                        ))
+                    }
                 },
             },
         }
@@ -499,8 +504,11 @@ fn vector_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.alloc(Obj::Vector(a.to_vec())))
 }
 fn make_vector(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_num(&a[0])?.0.max(0) as usize;
-    Ok(h.alloc(Obj::Vector(vec![a[1].clone(); n])))
+    let n = as_num(&a[0])?.0;
+    if n < 0 {
+        return Err(format!("wrong-type-argument: wholenump {n}"));
+    }
+    Ok(h.alloc(Obj::Vector(vec![a[1].clone(); n as usize])))
 }
 fn aref(h: &mut ElispHost, a: &[Value]) -> R {
     let idx = as_num(&a[1])?.0;
@@ -1055,10 +1063,15 @@ fn number_to_string(h: &mut ElispHost, a: &[Value]) -> R {
 
 // ── hash tables ──
 fn hash_eq(h: &ElispHost, test: u8, a: &Value, b: &Value) -> bool {
-    if test == 2 {
-        el_equal(h, a, b)
-    } else {
-        el_eq(h, a, b)
+    match test {
+        // `equal` test: deep structural equality.
+        2 => el_equal(h, a, b),
+        // `eql` test (the make-hash-table default): like `eq` but equal floats
+        // (and, in real Emacs, equal bignums) compare the same, so a float key
+        // put with `puthash` is found again by `gethash`.
+        1 => el_eql(h, a, b),
+        // `eq` test: identity.
+        _ => el_eq(h, a, b),
     }
 }
 fn make_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
@@ -1291,9 +1304,12 @@ fn string_to_char(_h: &mut ElispHost, a: &[Value]) -> R {
     ))
 }
 fn make_string(_h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_int(&a[0])?.max(0) as usize;
+    let n = as_int(&a[0])?;
+    if n < 0 {
+        return Err(format!("wrong-type-argument: wholenump {n}"));
+    }
     let c = char::from_u32(as_int(&a[1])? as u32).unwrap_or(' ');
-    Ok(Value::str(c.to_string().repeat(n)))
+    Ok(Value::str(c.to_string().repeat(n as usize)))
 }
 fn string_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     let mut s = String::new();
@@ -2191,7 +2207,12 @@ fn vconcat_fn(h: &mut ElispHost, a: &[Value]) -> R {
                 Value::Str(s) => out.extend(s.chars().map(|c| Value::Int(c as i64))),
                 _ => match h.list_vec(v) {
                     Some(items) => out.extend(items),
-                    None => return Err("wrong-type-argument: sequencep".to_string()),
+                    None => {
+                        return Err(format!(
+                            "wrong-type-argument: sequencep {}",
+                            h.print(v, true)
+                        ))
+                    }
                 },
             },
         }
@@ -3129,6 +3150,21 @@ fn fmt_time_string(fmt: &str, tm: &libc::tm, secs: f64) -> String {
                 '0',
             )),
             's' => out.push_str(&(secs.floor() as i64).to_string()),
+            // Subsecond field: nanoseconds as a fixed 9-digit number. A field
+            // width ≤ 9 keeps that many leading digits (%3N = milliseconds,
+            // %6N = microseconds); a width > 9 right-pads with zeros.
+            'N' => {
+                let frac = secs - secs.floor();
+                let nanos = (frac * 1.0e9).round().clamp(0.0, 999_999_999.0) as i64;
+                let full = format!("{nanos:09}");
+                let w = user_w.unwrap_or(9);
+                if w <= 9 {
+                    out.push_str(&full[..w]);
+                } else {
+                    out.push_str(&full);
+                    out.push_str(&"0".repeat(w - 9));
+                }
+            }
             'p' => out.push_str(if tm.tm_hour < 12 { "AM" } else { "PM" }),
             'P' => out.push_str(if tm.tm_hour < 12 { "am" } else { "pm" }),
             'a' => out.push_str(WD_ABBR[(tm.tm_wday as usize) % 7]),

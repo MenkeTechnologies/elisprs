@@ -352,3 +352,63 @@ fn assoc_default_test_and_default() {
         "2"
     );
 }
+
+#[test]
+fn assoc_testfn_arg_order() {
+    // `assoc' with a TESTFN calls (funcall TEST (car ELEMENT) KEY): element-car
+    // first, key second — matching real Emacs. All values from emacs 30.2.
+    assert_eq!(
+        eval("(assoc 3 '((1 . a) (2 . b)) (lambda (elem key) (< elem key)))"),
+        "(1 . a)"
+    );
+    assert_eq!(
+        eval("(assoc 3 '((4 . a) (2 . b)) (lambda (elem key) (< elem key)))"),
+        "(2 . b)"
+    );
+}
+
+#[test]
+fn cl_seq_test_not() {
+    // :test-not selects an element when (funcall TEST-NOT item elt) is nil.
+    assert_eq!(eval("(cl-member 2 '(1 2 3) :test-not #'eql)"), "(1 2 3)");
+    assert_eq!(
+        eval("(cl-assoc 2 '((1 . a) (2 . b) (3 . c)) :test-not #'eql)"),
+        "(1 . a)"
+    );
+    assert_eq!(
+        eval("(cl-rassoc 2 '((a . 1) (b . 2)) :test-not #'eql)"),
+        "(a . 1)"
+    );
+    assert_eq!(eval("(cl-find 2 '(1 2 3) :test-not #'eql)"), "1");
+    assert_eq!(eval("(cl-remove 2 '(1 2 3 2) :test-not #'eql)"), "(2 2)");
+    assert_eq!(eval("(cl-count 5 '(5 1 5 2 5) :test-not #'eql)"), "2");
+    assert_eq!(eval("(cl-position 2 '(1 2 3) :test-not #'eql)"), "0");
+}
+
+#[test]
+fn cl_seq_start_end() {
+    // :start/:end confine the active window on remove/substitute/find/find-if.
+    assert_eq!(
+        eval("(cl-remove 2 '(2 1 2 3 2) :start 1 :end 4)"),
+        "(2 1 3 2)"
+    );
+    assert_eq!(
+        eval("(cl-remove 5 '(5 1 5 2 5) :test-not #'eql :start 1 :end 4)"),
+        "(5 5 5)"
+    );
+    assert_eq!(
+        eval("(cl-substitute 9 2 '(2 1 2 3 2) :start 1 :end 4)"),
+        "(2 1 9 3 2)"
+    );
+    assert_eq!(eval("(cl-find 2 '(2 1 2 3) :start 1 :end 2)"), "nil");
+    assert_eq!(eval("(cl-find-if #'cl-evenp '(1 2 3 4) :start 2)"), "4");
+    assert_eq!(
+        eval("(cl-remove-if #'cl-evenp '(2 1 2 3 2) :start 1 :end 4)"),
+        "(2 1 3 2)"
+    );
+    // :start/:end + :count + :from-end (last COUNT match within the window).
+    assert_eq!(
+        eval("(cl-substitute 9 5 '(5 5 5 5 5) :start 1 :end 4 :count 1 :from-end t)"),
+        "(5 5 5 9 5)"
+    );
+}

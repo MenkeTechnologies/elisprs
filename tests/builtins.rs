@@ -480,3 +480,78 @@ fn format_argument_step_errors() {
     assert_eq!(eval("(format \"%d\" 42)"), "\"42\"");
     assert_eq!(eval("(format \"%2$s %1$s\" \"a\" \"b\")"), "\"b a\"");
 }
+
+#[test]
+fn hash_table_eql_matches_float_keys() {
+    // The default hash test is `eql`, which matches equal floats — a float key
+    // stored with puthash must be found again by gethash (was `eq`, missed it).
+    assert_eq!(
+        eval("(let ((h (make-hash-table))) (puthash 1.5 'v h) (gethash 1.5 h))"),
+        "v"
+    );
+    assert_eq!(
+        eval("(let ((h (make-hash-table :test 'eql))) (puthash 1.5 'v h) (gethash 1.5 h))"),
+        "v"
+    );
+    // Re-putting an eql-equal float key overwrites in place (count stays 1).
+    assert_eq!(
+        eval("(let ((h (make-hash-table))) (puthash 2.0 'a h) (puthash 2.0 'b h) (list (gethash 2.0 h) (hash-table-count h)))"),
+        "(b 1)"
+    );
+    // Under the `eq` test two distinct float objects are not identical, so the
+    // key is not found.
+    assert_eq!(
+        eval("(let ((h (make-hash-table :test 'eq))) (puthash 1.5 'v h) (gethash 1.5 h))"),
+        "nil"
+    );
+}
+
+#[test]
+fn format_time_string_subsecond_field() {
+    // %N is nanoseconds as a fixed 9-digit number; a width <= 9 keeps that many
+    // leading digits (%3N milliseconds, %6N microseconds), width > 9 right-pads.
+    assert_eq!(eval("(format-time-string \"%N\" 0 t)"), "\"000000000\"");
+    assert_eq!(eval("(format-time-string \"%N\" 1.5 t)"), "\"500000000\"");
+    assert_eq!(eval("(format-time-string \"%3N\" 1.5 t)"), "\"500\"");
+    assert_eq!(eval("(format-time-string \"%6N\" 1.25 t)"), "\"250000\"");
+    assert_eq!(
+        eval("(format-time-string \"%9N\" 1.123456789 t)"),
+        "\"123456789\""
+    );
+    assert_eq!(
+        eval("(format-time-string \"%12N\" 1.5 t)"),
+        "\"500000000000\""
+    );
+    assert_eq!(eval("(format-time-string \"%3N\" 0 t)"), "\"000\"");
+}
+
+#[test]
+fn make_vector_and_make_string_reject_negative_length() {
+    // Emacs signals (wrong-type-argument wholenump N) rather than silently
+    // clamping a negative length to an empty sequence.
+    assert_eq!(
+        eval("(condition-case e (make-vector -1 0) (error e))"),
+        "(wrong-type-argument wholenump -1)"
+    );
+    assert_eq!(
+        eval("(condition-case e (make-string -3 65) (error e))"),
+        "(wrong-type-argument wholenump -3)"
+    );
+    // Non-negative lengths still build normally.
+    assert_eq!(eval("(make-vector 3 0)"), "[0 0 0]");
+    assert_eq!(eval("(make-string 3 65)"), "\"AAA\"");
+}
+
+#[test]
+fn vconcat_and_append_report_bad_sequence_value() {
+    // The sequencep error DATA must carry the offending value, so a
+    // condition-case handler can inspect it (was dropped before).
+    assert_eq!(
+        eval("(condition-case e (vconcat 5) (error e))"),
+        "(wrong-type-argument sequencep 5)"
+    );
+    assert_eq!(
+        eval("(condition-case e (append 5 nil) (error e))"),
+        "(wrong-type-argument sequencep 5)"
+    );
+}
