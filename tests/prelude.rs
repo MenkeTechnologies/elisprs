@@ -224,6 +224,59 @@ fn setf_generalized_places() {
 }
 
 #[test]
+fn map_plist_shaped_lists() {
+    // A list whose car is an atom is a plist map (KEY VALUE KEY VALUE...),
+    // matching Emacs map.el's `map--plist-p'. Values captured from emacs 30.2.
+    assert_eq!(eval("(map-elt '(1 2 3) 1)"), "2");
+    assert_eq!(eval("(map-elt '(:a 1 :b 2) :b)"), "2");
+    assert_eq!(eval("(map-elt '(:a 1 :b 2) :z 'nf)"), "nf");
+    assert_eq!(eval("(map-keys '(:a 1 :b 2))"), "(:a :b)");
+    assert_eq!(eval("(map-values '(:a 1 :b 2))"), "(1 2)");
+    assert_eq!(eval("(map-pairs '(:a 1 :b 2))"), "((:a . 1) (:b . 2))");
+    // Length counts key/value pairs, not cells.
+    assert_eq!(eval("(map-length '(:a 1 :b 2))"), "2");
+    // map-contains-key returns the plist tail (truthy), not `t'.
+    assert_eq!(eval("(map-contains-key '(:a 1 :b 2) :b)"), "(:b 2)");
+    assert_eq!(eval("(map-contains-key '(:a 1 :b 2) :z)"), "nil");
+    assert_eq!(eval("(map-delete '(:a 1 :b 2 :c 3) :b)"), "(:a 1 :c 3)");
+    assert_eq!(eval("(map-insert '(:a 1) :b 2)"), "(:b 2 :a 1)");
+    assert_eq!(
+        eval("(map-nested-elt '(:a (:b (:c 42))) '(:a :b :c))"),
+        "42"
+    );
+    // setf on an existing plist key mutates in place; a new key appends.
+    assert_eq!(
+        eval("(let ((m (list :a 1 :b 2))) (setf (map-elt m :b) 99) m)"),
+        "(:a 1 :b 99)"
+    );
+    assert_eq!(
+        eval("(let ((m (list :a 1 :b 2))) (setf (map-elt m :c) 3) m)"),
+        "(:a 1 :b 2 :c 3)"
+    );
+    // Alist-shaped lists (car is a cons) keep alist semantics.
+    assert_eq!(eval("(map-elt '((a . 1) (b . 2)) 'b)"), "2");
+    assert_eq!(eval("(map-length '((a . 1) (b . 2)))"), "2");
+    assert_eq!(eval("(map-contains-key '((a . 1)) 'a)"), "t");
+}
+
+#[test]
+fn string_truncate_left_prepends_ellipsis() {
+    // Keeps the rightmost chars; "..." always prepended when truncating, so the
+    // result can exceed LENGTH when LENGTH <= 3. Values from emacs 30.2.
+    assert_eq!(
+        eval("(string-truncate-left \"hello world\" 5)"),
+        "\"...ld\""
+    );
+    assert_eq!(
+        eval("(string-truncate-left \"hello world\" 8)"),
+        "\"...world\""
+    );
+    assert_eq!(eval("(string-truncate-left \"hello\" 10)"), "\"hello\"");
+    assert_eq!(eval("(string-truncate-left \"abcdef\" 3)"), "\"...f\"");
+    assert_eq!(eval("(string-truncate-left \"ab\" 0)"), "\"...b\"");
+}
+
+#[test]
 fn mapconcat_over_function_quote() {
     assert_eq!(
         eval("(mapconcat #'number-to-string '(1 2 3) \"+\")"),

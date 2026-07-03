@@ -780,6 +780,15 @@ pub const PRELUDE: &str = r#"
 (defun string-clean-whitespace (s)
   ;; Collapse internal whitespace runs to a single space and trim the ends.
   (string-trim (replace-regexp-in-string "[ \t\n\r]+" " " s)))
+(defun string-truncate-left (string length)
+  ;; If STRING is longer than LENGTH, keep the rightmost characters and prepend
+  ;; "..." (so the result may exceed the original when LENGTH is <= 3).
+  (let ((strlen (length string)))
+    (if (<= strlen length)
+        string
+      (setq length (max 0 (- length 3)))
+      (concat "..." (substring string (min (1- strlen)
+                                           (max 0 (- strlen length))))))))
 (defun string-remove-prefix (prefix s)
   (if (string-prefix-p prefix s) (substring s (length prefix) (length s)) s))
 (defun string-remove-suffix (suffix s)
@@ -3503,15 +3512,22 @@ or the result is already atomic/grouped."
 (defun hash-table-empty-p (h) (= 0 (hash-table-count h)))
 
 ;;; ---- map.el (subset) ----
-;; A generic key/value interface over alists, hash-tables and arrays. Lists are
-;; treated strictly as alists, and (like Emacs map.el) the default test for list
-;; lookups is `equal` (not `eq`).
+;; A generic key/value interface over alists, hash-tables and arrays. A list
+;; whose first element is an atom is treated as a plist (KEY VALUE KEY VALUE...),
+;; exactly like Emacs map.el; otherwise it is an alist. Alist lookups default to
+;; `equal`, plist lookups default to `eq` (plist-member's default).
+(defun map--plist-p (list)
+  "Return non-nil if LIST is the start of a nonempty plist map."
+  (and (consp list) (atom (car list))))
 (defun map-elt (map key &optional default testfn)
   (cond
    ((hash-table-p map) (gethash key map default))
    ((listp map)
-    (let ((entry (assoc key map (or testfn #'equal))))
-      (if entry (cdr entry) default)))
+    (if (map--plist-p map)
+        (let ((res (plist-member map key testfn)))
+          (if res (cadr res) default))
+      (let ((entry (assoc key map (or testfn #'equal))))
+        (if entry (cdr entry) default))))
    ((arrayp map)
     (if (and (integerp key) (>= key 0) (< key (length map)))
         (aref map key)
@@ -3522,7 +3538,10 @@ or the result is already atomic/grouped."
    ((hash-table-p map)
     (let ((sentinel (list 'map--miss)))
       (not (eq sentinel (gethash key map sentinel)))))
-   ((listp map) (and (assoc key map (or testfn #'equal)) t))
+   ((listp map)
+    (if (map--plist-p map)
+        (plist-member map key testfn)
+      (and (assoc key map (or testfn #'equal)) t)))
    ((arrayp map) (and (integerp key) (>= key 0) (< key (length map))))
    (t nil)))
 (defun map-keys (map) (map-apply (lambda (k _v) k) map))
@@ -3531,7 +3550,7 @@ or the result is already atomic/grouped."
 (defun map-length (map)
   (cond
    ((hash-table-p map) (hash-table-count map))
-   ((listp map) (length map))
+   ((listp map) (if (map--plist-p map) (/ (length map) 2) (length map)))
    ((arrayp map) (length map))
    (t 0)))
 (defun map-empty-p (map) (= 0 (map-length map)))
@@ -3539,7 +3558,11 @@ or the result is already atomic/grouped."
   (cond
    ((hash-table-p map) (maphash function map) nil)
    ((listp map)
-    (dolist (pair map) (funcall function (car pair) (cdr pair)))
+    (if (map--plist-p map)
+        (while map
+          (funcall function (car map) (cadr map))
+          (setq map (cddr map)))
+      (dolist (pair map) (funcall function (car pair) (cdr pair))))
     nil)
    ((arrayp map)
     (dotimes (i (length map)) (funcall function i (aref map i)))
@@ -3571,18 +3594,26 @@ or the result is already atomic/grouped."
   (cond
    ((hash-table-p map) (remhash key map) map)
    ((listp map)
-    (let ((res nil))
-      (dolist (pair map) (unless (equal (car pair) key) (setq res (cons pair res))))
-      (nreverse res)))
+    (if (map--plist-p map)
+        (let ((res nil))
+          (while map
+            (unless (eq (car map) key) (setq res (cons (cadr map) (cons (car map) res))))
+            (setq map (cddr map)))
+          (nreverse res))
+      (let ((res nil))
+        (dolist (pair map) (unless (equal (car pair) key) (setq res (cons pair res))))
+        (nreverse res))))
    (t map)))
 ;; Internal: return MAP updated so KEY maps to VALUE (used by setf map-elt).
 (defun map--put (map key value)
   (cond
    ((hash-table-p map) (puthash key value map) map)
    ((listp map)
-    (let ((entry (assoc key map #'equal)))
-      (if entry (progn (setcdr entry value) map)
-        (cons (cons key value) map))))
+    (if (map--plist-p map)
+        (plist-put map key value)
+      (let ((entry (assoc key map #'equal)))
+        (if entry (progn (setcdr entry value) map)
+          (cons (cons key value) map)))))
    ((arrayp map) (aset map key value) map)
    (t (error "map--put: unsupported map type"))))
 (defun map--into (pairs type)
@@ -3600,7 +3631,8 @@ or the result is already atomic/grouped."
 (defun map-into (map type) (map--into (map-pairs map) type))
 (defun map-insert (map key value)
   "Return a new map like MAP with KEY mapped to VALUE (MAP is unchanged)."
-  (cond ((listp map) (cons (cons key value) map))
+  (cond ((listp map)
+         (if (map--plist-p map) (cons key (cons value map)) (cons (cons key value) map)))
         ((hash-table-p map) (let ((h (copy-hash-table map))) (puthash key value h) h))
         (t (error "map-insert: unsupported map type"))))
 (defun map-put! (map key value &optional testfn)
@@ -3608,9 +3640,11 @@ or the result is already atomic/grouped."
   (cond
    ((hash-table-p map) (puthash key value map) map)
    ((listp map)
-    (let ((entry (assoc key map (or testfn #'equal))))
-      (if entry (progn (setcdr entry value) map)
-        (error "Cannot modify map in-place: %S" map))))
+    (if (map--plist-p map)
+        (progn (plist-put map key value) value)
+      (let ((entry (assoc key map (or testfn #'equal))))
+        (if entry (progn (setcdr entry value) map)
+          (error "Cannot modify map in-place: %S" map)))))
    ((arrayp map) (aset map key value) map)
    (t (error "map-put!: unsupported map type"))))
 (defun map-values-apply (function map) (map-apply (lambda (_k v) (funcall function v)) map))

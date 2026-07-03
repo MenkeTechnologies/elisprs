@@ -2558,6 +2558,151 @@ fn byteorder(_h: &mut ElispHost, _a: &[Value]) -> R {
         66
     }))
 }
+// ── character modifiers / descriptions (faithful C ports) ──
+// Modifier bit values from src/lisp.h; base-character mask is CHARACTERBITS=22.
+const CHAR_ALT: i64 = 0x0400000;
+const CHAR_SUPER: i64 = 0x0800000;
+const CHAR_HYPER: i64 = 0x1000000;
+const CHAR_SHIFT: i64 = 0x2000000;
+const CHAR_CTL: i64 = 0x4000000;
+const CHAR_META: i64 = 0x8000000;
+const CHAR_MODIFIER_MASK: i64 =
+    CHAR_ALT | CHAR_SUPER | CHAR_HYPER | CHAR_SHIFT | CHAR_CTL | CHAR_META;
+const MAX_CHAR: i64 = 0x3F_FFFF;
+const MAX_5_BYTE_CHAR: i64 = 0x3F_FF7F;
+
+/// `ASCII_CHAR_P(c)` (src/character.h): `0 <= c && c < 0x80`.
+fn ascii_char_p(c: i64) -> bool {
+    (0..0x80).contains(&c)
+}
+/// `CHECK_CHARACTER`: a character is a fixnum in `0..=MAX_CHAR` (`0x3FFFFF`).
+fn check_character(v: &Value) -> Result<i64, String> {
+    let c = as_int(v)?;
+    if (0..=MAX_CHAR).contains(&c) {
+        Ok(c)
+    } else {
+        Err(format!("wrong-type-argument: characterp {c}"))
+    }
+}
+
+/// `(char-resolve-modifiers CHAR)` — port of `char_resolve_modifier_mask`
+/// (src/character.c). Fold the Shift and Control modifier bits of an ASCII base
+/// character into the code; Meta and other modifiers are left in place. CHAR is
+/// any integer (`CHECK_FIXNUM`), not just a valid character.
+fn char_resolve_modifiers(_h: &mut ElispHost, a: &[Value]) -> R {
+    let mut c = as_int(&a[0])?;
+    // A non-ASCII base character can't reflect modifier bits into the code.
+    if !ascii_char_p(c & !CHAR_MODIFIER_MASK) {
+        return Ok(Value::Int(c));
+    }
+    if c & CHAR_SHIFT != 0 {
+        let base = c & 0o377;
+        // Shift is valid only with [A-Za-z]; on control chars / SPC it's dropped.
+        if (b'A' as i64..=b'Z' as i64).contains(&base) {
+            c &= !CHAR_SHIFT;
+        } else if (b'a' as i64..=b'z' as i64).contains(&base) {
+            c = (c & !CHAR_SHIFT) - (b'a' as i64 - b'A' as i64);
+        } else if (c & !CHAR_MODIFIER_MASK) <= 0x20 {
+            c &= !CHAR_SHIFT;
+        }
+    }
+    if c & CHAR_CTL != 0 {
+        let base = c & 0o377;
+        // Allow `\C- ` and `\C-?`; otherwise make ASCII control chars from
+        // letters (both cases) and the non-letters within 0100..0137.
+        if base == b' ' as i64 {
+            c &= !0o177 & !CHAR_CTL;
+        } else if base == b'?' as i64 {
+            c = 0o177 | (c & !0o177 & !CHAR_CTL);
+        } else if (0o101..=0o132).contains(&(c & 0o137)) {
+            c &= 0o37 | (!0o177 & !CHAR_CTL);
+        } else if (0o100..=0o137).contains(&(c & 0o177)) {
+            c &= 0o37 | (!0o177 & !CHAR_CTL);
+        }
+    }
+    Ok(Value::Int(c))
+}
+
+/// `(text-char-description CHARACTER)` — port of `Ftext_char_description`
+/// (src/keymap.c) + `push_text_char_description`. ASCII control chars become
+/// `^X`, DEL becomes `^?`, everything else renders as itself. Modifier bits
+/// (Meta etc.) fail the `characterp` check. Characters outside Unicode
+/// (eight-bit / raw internal codes) can't be held in a UTF-8 string here, so
+/// they yield the empty string.
+fn text_char_description(_h: &mut ElispHost, a: &[Value]) -> R {
+    let c = check_character(&a[0])?;
+    if ascii_char_p(c) {
+        let s = if c < 0o40 {
+            format!("^{}", (c as u8 + 64) as char)
+        } else if c == 0o177 {
+            "^?".to_string()
+        } else {
+            (c as u8 as char).to_string()
+        };
+        Ok(Value::str(s))
+    } else {
+        Ok(Value::str(
+            char::from_u32(c as u32)
+                .map(|c| c.to_string())
+                .unwrap_or_default(),
+        ))
+    }
+}
+
+/// `(unibyte-char-to-multibyte BYTE)` — port of `Funibyte_char_to_multibyte`
+/// (src/charset.c). ASCII bytes map to themselves; bytes `0x80..=0xFF` become
+/// the eight-bit character `0x3FFF00 + byte`. BYTE above 255 is not unibyte.
+fn unibyte_char_to_multibyte(_h: &mut ElispHost, a: &[Value]) -> R {
+    let c = check_character(&a[0])?;
+    if c >= 256 {
+        return Err(format!("error: Not a unibyte character: {c}"));
+    }
+    Ok(Value::Int(if c < 0x80 { c } else { c + 0x3F_FF00 }))
+}
+
+/// `(multibyte-char-to-unibyte CHAR)` — port of `Fmultibyte_char_to_unibyte`
+/// (src/charset.c). Characters below 256 map to themselves, eight-bit chars
+/// (above `MAX_5_BYTE_CHAR`) map to their raw byte, all others map to -1.
+fn multibyte_char_to_unibyte(_h: &mut ElispHost, a: &[Value]) -> R {
+    let c = check_character(&a[0])?;
+    let byte = if c < 256 {
+        c
+    } else if c > MAX_5_BYTE_CHAR {
+        c - 0x3F_FF00
+    } else {
+        -1
+    };
+    Ok(Value::Int(byte))
+}
+
+/// `(emacs-pid)` — the process id of the running interpreter.
+fn emacs_pid(_h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::Int(std::process::id() as i64))
+}
+
+/// `(load-average &optional USE-FLOATS)` — port of `Fload_average` (src/fns.c).
+/// The 1/5/15-minute system load averages: each `load` (a float) when
+/// USE-FLOATS is non-nil, else `trunc(100 * load)` as an integer.
+fn load_average(h: &mut ElispHost, a: &[Value]) -> R {
+    let use_floats = a.first().map(|v| !is_nil(v)).unwrap_or(false);
+    let mut loads = [0f64; 3];
+    let n = unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) };
+    if n < 0 {
+        return Err("error: load-average not implemented for this operating system".to_string());
+    }
+    let items = loads[..n as usize]
+        .iter()
+        .map(|&l| {
+            if use_floats {
+                Value::Float(l)
+            } else {
+                Value::Int((100.0 * l) as i64)
+            }
+        })
+        .collect();
+    Ok(h.list_from(items))
+}
+
 /// `(bare-symbol-p OBJECT)` — non-nil if OBJECT is a symbol without position.
 /// elisprs has no symbol-with-position type, so every symbol is bare — this is
 /// exactly `symbolp` (nil and t count as symbols).
@@ -4298,6 +4443,22 @@ pub fn install(h: &mut ElispHost) {
     s("logb", 1, Some(1), logb_fn);
     s("max-char", 0, Some(1), max_char);
     s("byteorder", 0, Some(0), byteorder);
+    s("char-resolve-modifiers", 1, Some(1), char_resolve_modifiers);
+    s("text-char-description", 1, Some(1), text_char_description);
+    s(
+        "unibyte-char-to-multibyte",
+        1,
+        Some(1),
+        unibyte_char_to_multibyte,
+    );
+    s(
+        "multibyte-char-to-unibyte",
+        1,
+        Some(1),
+        multibyte_char_to_unibyte,
+    );
+    s("emacs-pid", 0, Some(0), emacs_pid);
+    s("load-average", 0, Some(1), load_average);
     s("read", 1, Some(1), read_fn);
     s("read-from-string", 1, Some(3), read_from_string);
     s("compare-strings", 6, Some(7), compare_strings);

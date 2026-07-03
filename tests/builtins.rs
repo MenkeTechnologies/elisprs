@@ -288,6 +288,85 @@ fn default_boundp_and_toplevel_value() {
 }
 
 #[test]
+fn char_resolve_modifiers_folds_shift_and_ctl() {
+    // Reader already resolves \C-a to 1; an explicit CHAR_CTL (2^26) bit folds
+    // the same way. Meta (2^27) is left in place, not folded into the code.
+    assert_eq!(eval("(char-resolve-modifiers ?\\C-a)"), "1");
+    assert_eq!(eval("(char-resolve-modifiers (+ (expt 2 26) ?a))"), "1");
+    assert_eq!(eval("(char-resolve-modifiers ?\\M-a)"), "134217825");
+    assert_eq!(eval("(char-resolve-modifiers ?\\C-\\M-a)"), "134217729");
+    // Shift on a lowercase letter uppercases it and drops the bit.
+    assert_eq!(eval("(char-resolve-modifiers ?\\S-a)"), "65");
+    // Plain ASCII and \C-@ pass through / resolve to 0; a non-ASCII base char
+    // (only modifier bits stripped is still >= 0x80) is returned unchanged.
+    assert_eq!(eval("(char-resolve-modifiers ?a)"), "97");
+    assert_eq!(eval("(char-resolve-modifiers ?\\C-@)"), "0");
+    assert_eq!(eval("(char-resolve-modifiers 4194303)"), "4194303");
+}
+
+#[test]
+fn text_char_description_caret_forms() {
+    // ASCII control chars render as ^X (byte + 64), DEL as ^?, SPC/printables
+    // as themselves.
+    assert_eq!(eval("(text-char-description 0)"), "\"^@\"");
+    assert_eq!(eval("(text-char-description ?\\C-a)"), "\"^A\"");
+    assert_eq!(eval("(text-char-description 27)"), "\"^[\"");
+    assert_eq!(eval("(text-char-description 31)"), "\"^_\"");
+    assert_eq!(eval("(text-char-description 127)"), "\"^?\"");
+    assert_eq!(eval("(text-char-description 32)"), "\" \"");
+    assert_eq!(eval("(text-char-description ?a)"), "\"a\"");
+    // Non-ASCII chars come back as themselves (round-trip via string-to-char).
+    assert_eq!(eval("(string-to-char (text-char-description 955))"), "955");
+    // A char with modifier bits is not a valid character -> characterp error.
+    assert_eq!(
+        eval("(condition-case e (text-char-description ?\\M-a) (error (car e)))"),
+        "wrong-type-argument"
+    );
+    assert_eq!(
+        eval("(condition-case e (text-char-description -1) (error e))"),
+        "(wrong-type-argument characterp -1)"
+    );
+}
+
+#[test]
+fn unibyte_multibyte_char_roundtrip() {
+    // ASCII bytes are identity; high bytes 0x80..0xFF become eight-bit chars
+    // 0x3FFF00 + byte, and back.
+    assert_eq!(eval("(unibyte-char-to-multibyte 65)"), "65");
+    assert_eq!(eval("(unibyte-char-to-multibyte 128)"), "4194176");
+    assert_eq!(eval("(unibyte-char-to-multibyte 200)"), "4194248");
+    assert_eq!(eval("(unibyte-char-to-multibyte 255)"), "4194303");
+    assert_eq!(eval("(multibyte-char-to-unibyte 4194248)"), "200");
+    assert_eq!(eval("(multibyte-char-to-unibyte 4194303)"), "255");
+    // Chars below 256 map to themselves; ordinary multibyte chars have no
+    // unibyte form and yield -1.
+    assert_eq!(eval("(multibyte-char-to-unibyte 200)"), "200");
+    assert_eq!(eval("(multibyte-char-to-unibyte 955)"), "-1");
+    assert_eq!(eval("(multibyte-char-to-unibyte 300)"), "-1");
+    // A byte above 255 is not a unibyte character (plain `error`); a negative
+    // arg fails the characterp check first.
+    assert_eq!(
+        eval("(condition-case e (unibyte-char-to-multibyte 256) (error (error-message-string e)))"),
+        "\"Not a unibyte character: 256\""
+    );
+    assert_eq!(
+        eval("(condition-case e (unibyte-char-to-multibyte -1) (error (car e)))"),
+        "wrong-type-argument"
+    );
+}
+
+#[test]
+fn emacs_pid_and_load_average_shape() {
+    // emacs-pid is a positive integer; load-average returns the three system
+    // load figures as integers by default, floats with a non-nil arg.
+    assert_eq!(eval("(integerp (emacs-pid))"), "t");
+    assert_eq!(eval("(> (emacs-pid) 0)"), "t");
+    assert_eq!(eval("(length (load-average))"), "3");
+    assert_eq!(eval("(integerp (car (load-average)))"), "t");
+    assert_eq!(eval("(floatp (car (load-average t)))"), "t");
+}
+
+#[test]
 fn identity_and_ignore() {
     assert_eq!(eval("(identity 42)"), "42");
     assert_eq!(eval("(ignore 1 2 3)"), "nil");
