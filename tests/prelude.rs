@@ -283,3 +283,72 @@ fn mapconcat_over_function_quote() {
         "\"1+2+3\""
     );
 }
+
+#[test]
+fn cl_from_end_count_removes_last_matches() {
+    // :from-end with :count deletes/substitutes the LAST COUNT matches, keeping
+    // original order. Every expected value captured from emacs 30.2 + cl-lib.
+    assert_eq!(
+        eval("(cl-remove 2 (list 1 2 3 2 1) :count 1 :from-end t)"),
+        "(1 2 3 1)"
+    );
+    assert_eq!(
+        eval("(cl-remove-if #'cl-evenp (list 1 2 3 4 5 6) :count 2 :from-end t)"),
+        "(1 2 3 5)"
+    );
+    assert_eq!(
+        eval("(cl-remove-if-not #'cl-evenp (list 1 2 3 4 5 6) :count 2 :from-end t)"),
+        "(1 2 4 6)"
+    );
+    assert_eq!(
+        eval("(cl-substitute 9 2 (list 1 2 3 2 1) :count 1 :from-end t)"),
+        "(1 2 3 9 1)"
+    );
+    assert_eq!(
+        eval("(cl-substitute-if 9 #'cl-evenp (list 1 2 3 4 5 6) :count 2 :from-end t)"),
+        "(1 2 3 9 5 9)"
+    );
+    // cl-remove-if now honors :key too (previously errored on non-numbers).
+    assert_eq!(
+        eval("(cl-remove-if #'cl-evenp (list '(1) '(2) '(3) '(4)) :key #'car)"),
+        "((1) (3))"
+    );
+    // Forward (no :from-end) removal still removes the FIRST COUNT matches.
+    assert_eq!(eval("(cl-remove 2 (list 1 2 3 2 1) :count 1)"), "(1 3 2 1)");
+}
+
+#[test]
+fn cl_mismatch_search_from_end() {
+    // :from-end reports the trailing mismatch / rightmost subsequence match.
+    assert_eq!(
+        eval("(cl-mismatch (list 1 2 3 4) (list 1 2) :from-end t)"),
+        "3"
+    );
+    assert_eq!(eval("(cl-mismatch (list 1 2 3) (list 1 2 3))"), "nil");
+    assert_eq!(
+        eval("(cl-mismatch (list '(1) '(2) '(9)) (list '(1) '(2) '(3)) :key #'car)"),
+        "2"
+    );
+    assert_eq!(
+        eval("(cl-search (list 2 3) (list 1 2 3 2 3) :from-end t)"),
+        "3"
+    );
+    assert_eq!(eval("(cl-search (list 2 3) (list 1 2 3 2 3))"), "1");
+    assert_eq!(eval("(cl-search (list) (list 1 2 3) :from-end t)"), "3");
+}
+
+#[test]
+fn assoc_default_test_and_default() {
+    // assoc-default takes optional TEST and DEFAULT; TEST is called (ELEM KEY).
+    assert_eq!(eval("(assoc-default 2 (list '(1 . a) '(2 . b)) #'=)"), "b");
+    assert_eq!(
+        eval("(assoc-default \"x\" (list '(\"a\" . 1)) nil 'def)"),
+        "nil"
+    );
+    // Non-cons element that matches returns DEFAULT, not the element.
+    assert_eq!(eval("(assoc-default 5 (list 3 5 7) #'= 'hit)"), "hit");
+    assert_eq!(
+        eval("(assoc-default \"b\" (list '(\"a\" . 1) '(\"b\" . 2)))"),
+        "2"
+    );
+}

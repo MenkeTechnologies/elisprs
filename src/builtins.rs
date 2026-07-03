@@ -970,37 +970,51 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             prec,
             conv,
         };
+        // Emacs error messages for the argument step. The curly apostrophe in
+        // BAD_TYPE matches `emacs -Q` (default text-quoting-style).
+        const NOT_ENOUGH: &str = "Not enough arguments for format string";
+        const BAD_TYPE: &str = "Format specifier doesn\u{2019}t match argument type";
         // A field number selects an explicit (1-based) argument; otherwise take
         // the next one in sequence.
-        let arg = a.get(field.unwrap_or(ai)).unwrap_or(&Value::Undef);
+        let idx = field.unwrap_or(ai);
+        // The numeric/char conversions need a number-valued argument; a missing
+        // one is "Not enough arguments", a non-number is a type mismatch.
+        let numf = |idx: usize| -> Result<(i64, f64, bool), String> {
+            let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
+            as_num(arg).map_err(|_| BAD_TYPE.to_string())
+        };
         let body = match conv {
             's' => {
+                let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
                 let s = h.print(arg, false);
                 match spec.prec {
                     Some(p) => s.chars().take(p).collect(),
                     None => s,
                 }
             }
-            'S' => h.print(arg, true),
+            'S' => {
+                let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
+                h.print(arg, true)
+            }
             // The `+`/space sign flags apply to the signed conversions (d/e/f/g).
             'd' => {
-                let n = as_num(arg)?.0;
+                let n = numf(idx)?.0;
                 let mag = pad_digits(&n.unsigned_abs().to_string(), spec.prec);
                 apply_sign(if n < 0 { format!("-{mag}") } else { mag }, &spec)
             }
-            'o' => format_radix(as_num(arg)?.0, 8, false, spec.alt, spec.prec),
-            'x' => format_radix(as_num(arg)?.0, 16, false, spec.alt, spec.prec),
-            'X' => format_radix(as_num(arg)?.0, 16, true, spec.alt, spec.prec),
-            'c' => char::from_u32(as_num(arg)?.0 as u32)
+            'o' => format_radix(numf(idx)?.0, 8, false, spec.alt, spec.prec),
+            'x' => format_radix(numf(idx)?.0, 16, false, spec.alt, spec.prec),
+            'X' => format_radix(numf(idx)?.0, 16, true, spec.alt, spec.prec),
+            'c' => char::from_u32(numf(idx)?.0 as u32)
                 .map(String::from)
                 .unwrap_or_default(),
-            'e' => apply_sign(format_e(as_num(arg)?.1, spec.prec.unwrap_or(6)), &spec),
+            'e' => apply_sign(format_e(numf(idx)?.1, spec.prec.unwrap_or(6)), &spec),
             'f' => apply_sign(
-                format!("{:.*}", spec.prec.unwrap_or(6), as_num(arg)?.1),
+                format!("{:.*}", spec.prec.unwrap_or(6), numf(idx)?.1),
                 &spec,
             ),
             'g' => apply_sign(
-                format_g(as_num(arg)?.1, spec.prec.unwrap_or(6), spec.alt),
+                format_g(numf(idx)?.1, spec.prec.unwrap_or(6), spec.alt),
                 &spec,
             ),
             other => {
@@ -1142,9 +1156,27 @@ fn copy_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
 
 // ── strings ──
 fn substring(h: &mut ElispHost, a: &[Value]) -> R {
-    let s = as_string(&a[0])?;
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len() as i64;
+    // Emacs `substring` works on both strings and vectors (arrays).
+    enum Seq {
+        Str(Vec<char>),
+        Vec(Vec<Value>),
+    }
+    let seq = match &a[0] {
+        Value::Str(s) => Seq::Str(s.chars().collect()),
+        _ => match h.obj(&a[0]) {
+            Some(Obj::Vector(items)) => Seq::Vec(items.clone()),
+            _ => {
+                return Err(format!(
+                    "wrong-type-argument: arrayp {}",
+                    h.print(&a[0], true)
+                ));
+            }
+        },
+    };
+    let len = match &seq {
+        Seq::Str(c) => c.len() as i64,
+        Seq::Vec(v) => v.len() as i64,
+    };
     // Negative indices count from the end; Emacs then bounds-checks rather than
     // clamping, signalling args-out-of-range for anything outside [0, len].
     let adj = |i: i64| -> i64 {
@@ -1163,16 +1195,27 @@ fn substring(h: &mut ElispHost, a: &[Value]) -> R {
         _ => len,
     };
     if start < 0 || end > len || start > end {
+        // Emacs reports the *original* FROM/TO arguments (nil for an omitted
+        // TO), not the negative-resolved or defaulted values.
+        let from = a
+            .get(1)
+            .map(|v| h.print(v, true))
+            .unwrap_or_else(|| "nil".to_string());
+        let to = a
+            .get(2)
+            .map(|v| h.print(v, true))
+            .unwrap_or_else(|| "nil".to_string());
         return Err(format!(
-            "args-out-of-range: {} {start} {end}",
+            "args-out-of-range: {} {from} {to}",
             h.print(&a[0], true)
         ));
     }
-    Ok(Value::str(
-        chars[start as usize..end as usize]
-            .iter()
-            .collect::<String>(),
-    ))
+    match seq {
+        Seq::Str(c) => Ok(Value::str(
+            c[start as usize..end as usize].iter().collect::<String>(),
+        )),
+        Seq::Vec(v) => Ok(h.alloc(Obj::Vector(v[start as usize..end as usize].to_vec()))),
+    }
 }
 fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
     let s = as_string(&a[0])?;
@@ -1817,31 +1860,39 @@ fn string_to_number(_h: &mut ElispHost, a: &[Value]) -> R {
     if let Some(bv) = a.get(1) {
         // Base 10 (and nil) use the float-capable default parser below; only a
         // non-decimal base forces integer-only parsing.
-        if !is_nil(bv) && as_int(bv)? != 10 {
-            let base = as_int(bv)?.clamp(2, 16) as u32;
-            let mut chars = s.chars().peekable();
-            let mut sign = 1i64;
-            match chars.peek() {
-                Some('+') => {
-                    chars.next();
-                }
-                Some('-') => {
-                    sign = -1;
-                    chars.next();
-                }
-                _ => {}
+        if !is_nil(bv) {
+            let base_i = as_int(bv)?;
+            // Emacs restricts BASE to 2..16 and signals args-out-of-range
+            // otherwise (checked before the base==10 fast path).
+            if !(2..=16).contains(&base_i) {
+                return Err(format!("args-out-of-range: {base_i}"));
             }
-            let (mut n, mut seen) = (0i64, false);
-            for c in chars {
-                match c.to_digit(base) {
-                    Some(d) => {
-                        n = n.wrapping_mul(base as i64) + d as i64;
-                        seen = true;
+            if base_i != 10 {
+                let base = base_i as u32;
+                let mut chars = s.chars().peekable();
+                let mut sign = 1i64;
+                match chars.peek() {
+                    Some('+') => {
+                        chars.next();
                     }
-                    None => break,
+                    Some('-') => {
+                        sign = -1;
+                        chars.next();
+                    }
+                    _ => {}
                 }
+                let (mut n, mut seen) = (0i64, false);
+                for c in chars {
+                    match c.to_digit(base) {
+                        Some(d) => {
+                            n = n.wrapping_mul(base as i64) + d as i64;
+                            seen = true;
+                        }
+                        None => break,
+                    }
+                }
+                return Ok(Value::Int(if seen { sign * n } else { 0 }));
             }
-            return Ok(Value::Int(if seen { sign * n } else { 0 }));
         }
     }
     let b: Vec<char> = s.chars().collect();
@@ -1855,12 +1906,17 @@ fn string_to_number(_h: &mut ElispHost, a: &[Value]) -> R {
         i += 1;
         has_digit = true;
     }
+    // A bare trailing dot (no fractional digit, no exponent) keeps the number an
+    // integer in Emacs: `(string-to-number "1.")` => 1, not 1.0. Only a digit
+    // after the dot — or an exponent below — makes it a float.
+    let mut dot_pos = None;
     if i < n && b[i] == '.' {
-        is_float = true;
+        dot_pos = Some(i);
         i += 1;
         while i < n && b[i].is_ascii_digit() {
             i += 1;
             has_digit = true;
+            is_float = true;
         }
     }
     if has_digit && i < n && (b[i] == 'e' || b[i] == 'E') {
@@ -1879,12 +1935,16 @@ fn string_to_number(_h: &mut ElispHost, a: &[Value]) -> R {
     if !has_digit {
         return Ok(Value::Int(0));
     }
-    let tok: String = b[start..i].iter().collect();
-    Ok(if is_float {
-        Value::Float(tok.parse().unwrap_or(0.0))
+    if is_float {
+        let tok: String = b[start..i].iter().collect();
+        Ok(Value::Float(tok.parse().unwrap_or(0.0)))
     } else {
-        Value::Int(tok.parse().unwrap_or(0))
-    })
+        // Integer parse must exclude a trailing dot ("1." => 1), so stop at the
+        // dot position when one was consumed without becoming a float.
+        let end = dot_pos.unwrap_or(i);
+        let tok: String = b[start..end].iter().collect();
+        Ok(Value::Int(tok.parse().unwrap_or(0)))
+    }
 }
 
 // ── sxhash ──

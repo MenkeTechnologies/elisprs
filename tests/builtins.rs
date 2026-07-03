@@ -372,3 +372,111 @@ fn identity_and_ignore() {
     assert_eq!(eval("(ignore 1 2 3)"), "nil");
     assert_eq!(eval("(always)"), "t");
 }
+
+#[test]
+fn string_to_number_trailing_dot_is_integer() {
+    // A bare trailing dot keeps the value an integer, matching Emacs:
+    // `(string-to-number "1.")` => 1 (integer), not 1.0.
+    assert_eq!(eval("(string-to-number \"1.\")"), "1");
+    assert_eq!(eval("(string-to-number \"12.\")"), "12");
+    assert_eq!(eval("(string-to-number \"-3.\")"), "-3");
+    assert_eq!(eval("(string-to-number \"1..\")"), "1");
+    // But a digit after the dot, or an exponent, still makes it a float.
+    assert_eq!(eval("(string-to-number \"1.5\")"), "1.5");
+    assert_eq!(eval("(string-to-number \".5\")"), "0.5");
+    assert_eq!(eval("(string-to-number \"1.e3\")"), "1000.0");
+    assert_eq!(eval("(string-to-number \"1e3\")"), "1000.0");
+    // Type is really integer, not a float that prints without ".0".
+    assert_eq!(eval("(integerp (string-to-number \"1.\"))"), "t");
+    assert_eq!(eval("(floatp (string-to-number \"1.5\"))"), "t");
+}
+
+#[test]
+fn string_to_number_base_out_of_range_errors() {
+    // Emacs restricts BASE to 2..16 and signals args-out-of-range with the base
+    // as its sole datum; a valid base still parses.
+    assert_eq!(eval("(string-to-number \"ff\" 16)"), "255");
+    assert_eq!(eval("(string-to-number \"101\" 2)"), "5");
+    assert_eq!(
+        eval("(condition-case e (string-to-number \"z\" 36) (args-out-of-range (cdr e)))"),
+        "(36)"
+    );
+    assert_eq!(
+        eval("(condition-case e (string-to-number \"10\" 20) (args-out-of-range (cdr e)))"),
+        "(20)"
+    );
+    assert_eq!(
+        eval("(condition-case e (string-to-number \"10\" 1) (args-out-of-range (cdr e)))"),
+        "(1)"
+    );
+}
+
+#[test]
+fn substring_error_data_reports_raw_args() {
+    // Out-of-range substring reports the *original* FROM/TO arguments (nil for
+    // an omitted TO, raw negatives), not the resolved/defaulted values.
+    assert_eq!(
+        eval("(condition-case e (substring \"abc\" 5) (args-out-of-range (cdr e)))"),
+        "(\"abc\" 5 nil)"
+    );
+    assert_eq!(
+        eval("(condition-case e (substring \"abc\" -5) (args-out-of-range (cdr e)))"),
+        "(\"abc\" -5 nil)"
+    );
+    assert_eq!(
+        eval("(condition-case e (substring \"abc\" -5 -1) (args-out-of-range (cdr e)))"),
+        "(\"abc\" -5 -1)"
+    );
+    // A non-array first argument fails the `arrayp` type check.
+    assert_eq!(
+        eval("(condition-case e (substring 5 0) (wrong-type-argument (cdr e)))"),
+        "(arrayp 5)"
+    );
+}
+
+#[test]
+fn substring_on_vectors() {
+    // Emacs `substring` slices vectors too, returning a fresh vector.
+    assert_eq!(eval("(substring [1 2 3 4] 1 3)"), "[2 3]");
+    assert_eq!(eval("(substring [1 2 3] -2)"), "[2 3]");
+    assert_eq!(eval("(substring [1 2 3])"), "[1 2 3]");
+    assert_eq!(
+        eval("(condition-case e (substring [1 2 3] 5) (args-out-of-range (cdr e)))"),
+        "([1 2 3] 5 nil)"
+    );
+}
+
+#[test]
+fn format_argument_step_errors() {
+    // A missing argument for a consuming directive is a plain `error` with the
+    // Emacs message, not a wrong-type signal.
+    for form in [
+        "(format \"%d\")",
+        "(format \"%s\")",
+        "(format \"%S\")",
+        "(format \"%x\")",
+        "(format \"%d %%\")",
+    ] {
+        assert_eq!(
+            eval(&format!(
+                "(condition-case e {form} (error (list (car e) (cadr e))))"
+            )),
+            "(error \"Not enough arguments for format string\")",
+            "form: {form}"
+        );
+    }
+    // A non-numeric argument to a numeric/char directive is the type-mismatch
+    // error (curly apostrophe matches `emacs -Q`).
+    let bad_type = "(error \"Format specifier doesn\u{2019}t match argument type\")";
+    assert_eq!(
+        eval("(condition-case e (format \"%d\" \"x\") (error (list (car e) (cadr e))))"),
+        bad_type
+    );
+    assert_eq!(
+        eval("(condition-case e (format \"%c\" \"x\") (error (list (car e) (cadr e))))"),
+        bad_type
+    );
+    // Well-formed calls still work.
+    assert_eq!(eval("(format \"%d\" 42)"), "\"42\"");
+    assert_eq!(eval("(format \"%2$s %1$s\" \"a\" \"b\")"), "\"b a\"");
+}
