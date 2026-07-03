@@ -555,3 +555,85 @@ fn vconcat_and_append_report_bad_sequence_value() {
         "(wrong-type-argument sequencep 5)"
     );
 }
+
+#[test]
+fn regexp_quote_does_not_escape_close_bracket() {
+    // Emacs's regexp-quote escapes `*.\?+[^$` but NOT `]` (search.c
+    // Fregexp_quote). Previously `]` was over-escaped.
+    assert_eq!(eval(r#"(regexp-quote "a]b")"#), r#""a]b""#);
+    assert_eq!(eval(r#"(regexp-quote "a[b]c")"#), r#""a\\[b]c""#);
+    assert_eq!(
+        eval(r#"(regexp-quote ".*+?[]^$")"#),
+        r#""\\.\\*\\+\\?\\[]\\^\\$""#
+    );
+}
+
+#[test]
+fn string_distance_bytewise_counts_utf8_bytes() {
+    // With BYTECOMPARE non-nil Emacs measures the edit distance over UTF-8
+    // bytes, so the 2-byte é vs the 1-byte e costs 2, not 1.
+    assert_eq!(eval(r#"(string-distance "café" "cafe")"#), "1");
+    assert_eq!(eval(r#"(string-distance "café" "cafe" t)"#), "2");
+    // Bytewise distance from empty counts the byte length (é = 2 bytes).
+    assert_eq!(eval(r#"(string-distance "" "é" t)"#), "2");
+    assert_eq!(eval(r#"(string-distance "" "é")"#), "1");
+}
+
+#[test]
+fn upcase_char_uses_simple_single_char_mapping() {
+    // upcase on a *character* folds to one char. ß has a distinct single-char
+    // uppercase ẞ (U+1E9E); Rust's full mapping would give "SS" -> 'S'.
+    assert_eq!(eval("(upcase ?ß)"), "7838");
+    assert_eq!(eval("(char-to-string (upcase ?ß))"), "\"ẞ\"");
+    // Greek iota-subscript titlecase forms map to their single titlecase char.
+    assert_eq!(eval("(upcase 8064)"), "8072");
+    assert_eq!(eval("(upcase 8115)"), "8124");
+    assert_eq!(eval("(upcase 8179)"), "8188");
+    // A multi-char full mapping with no single simple mapping stays unchanged
+    // (the ﬁ ligature), rather than collapsing to its first char 'F'.
+    assert_eq!(eval("(upcase 64257)"), "64257");
+    // downcase of İ (U+0130) full-maps to two chars -> Emacs leaves it as-is.
+    assert_eq!(eval("(downcase 304)"), "304");
+    // Whole-string upcase still uses the full mapping.
+    assert_eq!(eval(r#"(upcase "ß")"#), "\"SS\"");
+}
+
+#[test]
+fn mod_float_preserves_signed_zero() {
+    // Emacs `mod` on floats is fmod + sign-fix; an exact-multiple negative
+    // dividend keeps -0.0 (was flushed to 0.0 by the floor-based formula).
+    assert_eq!(eval("(mod -0.0 5)"), "-0.0");
+    assert_eq!(eval("(mod -7.5 2.5)"), "-0.0");
+    // Ordinary cases unchanged, sign follows the divisor.
+    assert_eq!(eval("(mod 5.5 2)"), "1.5");
+    assert_eq!(eval("(mod -5.5 2)"), "0.5");
+    assert_eq!(eval("(mod 5.5 -2)"), "-0.5");
+}
+
+#[test]
+fn ldexp_preserves_subnormals() {
+    // scalbn semantics: subnormal results survive instead of underflowing to 0
+    // (a naive x*2^n overflows 2^n to inf, then to 0).
+    assert_eq!(eval("(ldexp 1.0 -1074)"), "5e-324");
+    assert_eq!(eval("(ldexp 3.0 -1074)"), "1.5e-323");
+    assert_eq!(eval("(ldexp -2.0 -1074)"), "-1e-323");
+    // Below the subnormal floor it does round to zero.
+    assert_eq!(eval("(ldexp 1.0 -1075)"), "0.0");
+    // Overflow and ordinary scaling still behave.
+    assert_eq!(eval("(ldexp 1.0 1024)"), "1.0e+INF");
+    assert_eq!(eval("(ldexp 1.5 3)"), "12.0");
+}
+
+#[test]
+fn frexp_is_exact_for_extreme_magnitudes() {
+    // Bit-level decomposition: significand in [0.5,1) is exact for huge and
+    // subnormal inputs (the log2/divide formula gave 0.0 and inf respectively).
+    assert_eq!(eval("(frexp 1e308)"), "(0.5562684646268004 . 1024)");
+    assert_eq!(eval("(frexp 5e-324)"), "(0.5 . -1073)");
+    assert_eq!(eval("(frexp 8.0)"), "(0.5 . 4)");
+    assert_eq!(eval("(frexp 1.0)"), "(0.5 . 1)");
+    // Zero, signed zero, and non-finite pass through with exponent 0.
+    assert_eq!(eval("(frexp 0.0)"), "(0.0 . 0)");
+    assert_eq!(eval("(frexp -0.0)"), "(-0.0 . 0)");
+    assert_eq!(eval("(frexp 1.0e+INF)"), "(1.0e+INF . 0)");
+}

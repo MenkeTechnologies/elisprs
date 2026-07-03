@@ -128,7 +128,14 @@ fn mod_fn(_h: &mut ElispHost, a: &[Value]) -> R {
         if yf == 0.0 {
             return Err("arith-error: division by zero".to_string());
         }
-        return Ok(Value::Float(xf - yf * (xf / yf).floor()));
+        // Faithful port of Emacs `Fmod` (data.c): fmod, then fix the sign so the
+        // result matches the divisor. `%` on f64 is fmod (the remainder keeps the
+        // dividend's sign, so `(mod -0.0 5)` stays `-0.0`, as Emacs returns).
+        let mut r = xf % yf;
+        if if yf < 0.0 { r > 0.0 } else { r < 0.0 } {
+            r += yf;
+        }
+        return Ok(Value::Float(r));
     }
     if yi == 0 {
         return Err("arith-error: division by zero".to_string());
@@ -332,21 +339,52 @@ fn reverse_fn(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// `(downcase OBJ)` / `(upcase OBJ)` — case-fold a string, or a single character
 /// (an integer), returning the same kind. Unicode-aware via Rust's case mapping.
+/// Single-character (simple) case mapping, matching Emacs's `upcase`/`downcase`
+/// on a *character*. Rust's `char::to_uppercase`/`to_lowercase` are the Unicode
+/// *full* mappings, which can expand to several chars (ß→"SS", ﬁ→"FI"); Emacs's
+/// char case folds to exactly one char. For the multi-expansion chars Emacs
+/// returns the char unchanged, except this enumerated set where the simple /
+/// titlecase mapping is a distinct single char (German sharp s and the Greek
+/// iota-subscript forms). Verified against emacs 30.2 `upcase` over 0..#x110000.
+fn simple_case(cp: i64, upper: bool) -> i64 {
+    if upper {
+        match cp {
+            223 => return 7838,                                       // ß → ẞ
+            8064..=8071 | 8080..=8087 | 8096..=8103 => return cp + 8, // ᾀ.. → ᾈ..
+            8115 | 8131 | 8179 => return cp + 9,                      // ῃ ῳ ᾳ → titlecase
+            _ => {}
+        }
+    }
+    let Some(ch) = u32::try_from(cp).ok().and_then(char::from_u32) else {
+        return cp;
+    };
+    let mut mapped: [char; 3] = ['\0'; 3];
+    let mut n = 0;
+    if upper {
+        for m in ch.to_uppercase() {
+            if n < 3 {
+                mapped[n] = m;
+            }
+            n += 1;
+        }
+    } else {
+        for m in ch.to_lowercase() {
+            if n < 3 {
+                mapped[n] = m;
+            }
+            n += 1;
+        }
+    }
+    // A multi-char full mapping has no single-char simple mapping → unchanged.
+    if n == 1 {
+        mapped[0] as i64
+    } else {
+        cp
+    }
+}
 fn case_fold(a: &[Value], upper: bool) -> R {
     match &a[0] {
-        Value::Int(c) => {
-            let mapped = char::from_u32(*c as u32)
-                .map(|ch| {
-                    if upper {
-                        ch.to_uppercase().next()
-                    } else {
-                        ch.to_lowercase().next()
-                    }
-                    .unwrap_or(ch) as i64
-                })
-                .unwrap_or(*c);
-            Ok(Value::Int(mapped))
-        }
+        Value::Int(c) => Ok(Value::Int(simple_case(*c, upper))),
         Value::Str(s) => Ok(Value::str(if upper {
             s.to_uppercase()
         } else {
@@ -1556,8 +1594,9 @@ fn regexp_quote(_h: &mut ElispHost, a: &[Value]) -> R {
     let s = as_string(&a[0])?;
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        // The set Emacs's own `regexp-quote` escapes.
-        if matches!(c, '.' | '*' | '+' | '?' | '[' | ']' | '^' | '$' | '\\') {
+        // The set Emacs's own `regexp-quote` escapes (search.c Fregexp_quote:
+        // `*.\?+[^$`). Notably `]` is NOT escaped.
+        if matches!(c, '.' | '*' | '+' | '?' | '[' | '^' | '$' | '\\') {
             out.push('\\');
         }
         out.push(c);
@@ -1832,24 +1871,76 @@ fn atan_fn(_h: &mut ElispHost, a: &[Value]) -> R {
         None => y.atan(),
     }))
 }
+/// `ldexp(x, n)` = `x * 2^n`, computed like C's `scalbn` (musl) so subnormal
+/// results are preserved instead of flushing to 0. A naive `x * 2f64.powi(n)`
+/// overflows `2^n` to infinity for very negative `n` and returns 0.0, whereas
+/// Emacs (via C `ldexp`) yields the smallest subnormal (e.g. `(ldexp 1.0 -1074)`
+/// => 5e-324). The staged scaling keeps every intermediate in range.
+fn scalbn(x: f64, mut n: i64) -> f64 {
+    let two_1023 = 2f64.powi(1023);
+    let two_m1022 = f64::MIN_POSITIVE; // 2^-1022
+    let two_53 = (1u64 << 53) as f64; // 2^53
+    let mut y = x;
+    if n > 1023 {
+        y *= two_1023;
+        n -= 1023;
+        if n > 1023 {
+            y *= two_1023;
+            n -= 1023;
+            if n > 1023 {
+                n = 1023;
+            }
+        }
+    } else if n < -1022 {
+        // Keep the final n < -53 to avoid double rounding in the subnormal range.
+        y *= two_m1022 * two_53;
+        n += 1022 - 53;
+        if n < -1022 {
+            y *= two_m1022 * two_53;
+            n += 1022 - 53;
+            if n < -1022 {
+                n = -1022;
+            }
+        }
+    }
+    y * f64::from_bits(((0x3ff + n) as u64) << 52)
+}
 fn ldexp_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     let m = as_num(&a[0])?.1;
-    let e = as_num(&a[1])?.0 as i32;
-    Ok(Value::Float(m * 2f64.powi(e)))
+    let e = as_num(&a[1])?.0;
+    Ok(Value::Float(scalbn(m, e)))
 }
 fn copysign_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Float(as_num(&a[0])?.1.copysign(as_num(&a[1])?.1)))
 }
-fn frexp_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    // Decompose V into (SIGNIFICAND . EXPONENT) with the significand in [0.5,1).
-    let v = as_num(&a[0])?.1;
-    let (m, e) = if v == 0.0 || !v.is_finite() {
-        (v, 0)
+/// Decompose V into (SIGNIFICAND . EXPONENT) with the significand in [0.5,1).
+/// Bit-level port of C `frexp` (musl): exact for all values including subnormals
+/// and huge magnitudes. The old `log2`-based formula divided by `2^e`, which
+/// overflowed/underflowed to give `(0.0 . 1024)` for 1e308 and `(inf . -1073)`
+/// for the smallest subnormal instead of Emacs's `(0.5562… . 1024)` / `(0.5 . -1073)`.
+fn frexp_parts(x: f64) -> (f64, i64) {
+    let bits = x.to_bits();
+    let ee = (bits >> 52) & 0x7ff;
+    if ee == 0 {
+        // Subnormal or zero.
+        if x == 0.0 {
+            (x, 0) // preserves -0.0
+        } else {
+            // Normalize by scaling up 2^64, then correct the exponent.
+            let (m, e) = frexp_parts(x * 2f64.powi(64));
+            (m, e - 64)
+        }
+    } else if ee == 0x7ff {
+        (x, 0) // inf or NaN
     } else {
-        let e = v.abs().log2().floor() as i32 + 1;
-        (v / 2f64.powi(e), e)
-    };
-    Ok(h.cons(Value::Float(m), Value::Int(e as i64)))
+        let e = ee as i64 - 0x3fe;
+        let m = f64::from_bits((bits & 0x800f_ffff_ffff_ffff) | 0x3fe0_0000_0000_0000);
+        (m, e)
+    }
+}
+fn frexp_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let (m, e) = frexp_parts(as_num(&a[0])?.1);
+    Ok(h.cons(Value::Float(m), Value::Int(e)))
 }
 fn isnan_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(a[0], Value::Float(f) if f.is_nan())))
@@ -2177,9 +2268,23 @@ fn char_uppercase_p(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(c.is_some_and(|c| c.is_uppercase())))
 }
 /// `(string-distance S1 S2 &optional BYTECOMPARE)` — Levenshtein edit distance.
+/// With BYTECOMPARE non-nil, Emacs measures over UTF-8 bytes, not characters
+/// (editfns.c Fstring_distance).
 fn string_distance(_h: &mut ElispHost, a: &[Value]) -> R {
-    let s1: Vec<char> = as_string(&a[0])?.chars().collect();
-    let s2: Vec<char> = as_string(&a[1])?.chars().collect();
+    let a0 = as_string(&a[0])?;
+    let a1 = as_string(&a[1])?;
+    let bytewise = a.len() > 2 && !is_nil(&a[2]);
+    let (s1, s2): (Vec<u32>, Vec<u32>) = if bytewise {
+        (
+            a0.bytes().map(|b| b as u32).collect(),
+            a1.bytes().map(|b| b as u32).collect(),
+        )
+    } else {
+        (
+            a0.chars().map(|c| c as u32).collect(),
+            a1.chars().map(|c| c as u32).collect(),
+        )
+    };
     let m = s2.len();
     let mut prev: Vec<usize> = (0..=m).collect();
     let mut cur = vec![0usize; m + 1];

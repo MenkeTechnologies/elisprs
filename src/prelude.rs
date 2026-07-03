@@ -56,10 +56,12 @@ pub const PRELUDE: &str = r#"
     (nthcdr (max 0 (- (length l) n)) l)))
 (defun make-list (n x) (let ((r nil)) (while (> n 0) (setq r (cons x r)) (setq n (1- n))) r))
 (defun number-sequence (from &optional to inc)
-  ;; With only FROM, the sequence is (FROM); INC defaults to 1.
-  (if (null to)
+  ;; With only FROM, or FROM=TO, the sequence is (FROM); INC defaults to 1.
+  (if (or (null to) (= from to))
       (list from)
     (setq inc (or inc 1))
+    ;; A zero increment would loop forever; Emacs signals instead.
+    (when (= inc 0) (error "The increment can not be zero"))
     (let ((r nil))
       (if (< inc 0)
           (while (>= from to) (setq r (cons from r)) (setq from (+ from inc)))
@@ -97,8 +99,8 @@ pub const PRELUDE: &str = r#"
   (let ((k (if (symbolp key) (symbol-name key) key)) (r nil))
     (while (and alist (not r))
       (let* ((el (car alist))
-             (s (if (consp el) (car el) el))
-             (s (if (symbolp s) (symbol-name s) s)))
+             (raw (if (consp el) (car el) el))
+             (s (if (symbolp raw) (symbol-name raw) raw)))
         (if (if case-fold (string-equal-ignore-case k s) (string= k s))
             (setq r el)
           (setq alist (cdr alist)))))
@@ -321,10 +323,33 @@ pub const PRELUDE: &str = r#"
       (if has-init (seq-reduce f l init)
         (if (null l) (funcall f) (seq-reduce f (cdr l) (car l)))))))
 (defun cl-endp (x) (null x))
-(defun cl-subst (new old tree &rest _keys)
-  (cond ((eql tree old) new)
-        ((consp tree) (cons (cl-subst new old (car tree)) (cl-subst new old (cdr tree))))
-        (t tree)))
+(defun cl-subst (new old tree &rest keys)
+  ;; With no keywords, substitute OLD (matched by `eql') throughout TREE. When
+  ;; :test/:test-not/:key are given, defer to `cl-sublis' exactly like Emacs, so
+  ;; the predicate is applied to every node — conses included.
+  (if keys
+      (apply 'cl-sublis (list (cons old new)) tree keys)
+    (cond ((eql tree old) new)
+          ((consp tree) (cons (cl-subst new old (car tree)) (cl-subst new old (cdr tree))))
+          (t tree))))
+(defun cl-sublis (alist tree &rest keys)
+  ;; Substitute per ALIST of (OLD . NEW) throughout TREE, honoring :test,
+  ;; :test-not and :key against each node (including cons cells).
+  (let ((test (cl--getkey keys :test nil))
+        (test-not (cl--getkey keys :test-not nil))
+        (key (cl--getkey keys :key 'identity)))
+    (cl--sublis-rec alist tree test test-not key)))
+(defun cl--sublis-rec (alist tree test test-not key)
+  (let ((keyed (funcall key tree)) (p alist) (hit nil))
+    (while (and p (not hit))
+      (if (cl--seq-match test test-not (car (car p)) keyed)
+          (setq hit p)
+        (setq p (cdr p))))
+    (if hit (cdr (car hit))
+      (if (consp tree)
+          (cons (cl--sublis-rec alist (car tree) test test-not key)
+                (cl--sublis-rec alist (cdr tree) test test-not key))
+        tree))))
 ;; NOTE: `push'/`dolist' are defined later in this file, so these helpers use
 ;; explicit `while'/`setq'/`cons' loops to stay valid at load time.
 (defun cl-maplist (fn list)
@@ -537,7 +562,7 @@ pub const PRELUDE: &str = r#"
 
 ;;; ---- predicates ----
 (defun booleanp (x) (if (or (eq x t) (eq x nil)) t nil))
-(defun characterp (x) (and (integerp x) (>= x 0)))
+(defun characterp (x) (and (integerp x) (>= x 0) (<= x #x3FFFFF)))
 (defun sequencep (x) (or (listp x) (vectorp x) (stringp x)))
 (defun arrayp (x) (or (vectorp x) (stringp x)))
 (defun string-or-null-p (x) (or (null x) (stringp x)))
@@ -1110,10 +1135,19 @@ TYPE nil maps for side effects only and returns nil."
         (unless dup (setq seen (cons k seen) res (cons x res)))))
     (cl--like (if from-end (nreverse res) res) seq)))
 (defun cl-pairlis (the-keys the-values &optional alist)
-  (let ((ks (reverse the-keys)) (vs (reverse the-values)) (res alist))
-    (while ks
-      (setq res (cons (cons (car ks) (car vs)) res) ks (cdr ks) vs (cdr vs)))
-    res))
+  ;; Pair KEYS with VALUES (stopping at the shorter list), prepended to ALIST.
+  (nconc (cl-mapcar 'cons the-keys the-values) alist))
+(defun cl-remprop (symbol propname)
+  ;; Remove the first PROPNAME/value pair from SYMBOL's plist; return t if one
+  ;; was removed, else nil. Rebuilds the plist rather than splicing in place.
+  (let ((plist (symbol-plist symbol)) (out nil) (found nil))
+    (while plist
+      (if (and (not found) (eq (car plist) propname))
+          (setq found t)
+        (setq out (append out (list (car plist) (car (cdr plist))))))
+      (setq plist (cdr (cdr plist))))
+    (when found (setplist symbol out))
+    found))
 (defun lax-plist-get (plist prop)
   (let ((res nil) (found nil))
     (while (and plist (not found))

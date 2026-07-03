@@ -412,3 +412,65 @@ fn cl_seq_start_end() {
         "(5 5 5 9 5)"
     );
 }
+
+// Correctness-audit fixes, each differential-tested against Emacs 30.2.
+#[test]
+fn characterp_upper_bound() {
+    // Bounded at #x3FFFFF (MAX_CHAR): one below is a character, one above is not.
+    assert_eq!(eval("(characterp #x3FFFFF)"), "t");
+    assert_eq!(eval("(characterp (1+ #x3FFFFF))"), "nil");
+    assert_eq!(eval("(characterp -1)"), "nil");
+}
+
+#[test]
+fn number_sequence_zero_increment() {
+    // A zero increment errors instead of looping forever; FROM=TO short-circuits.
+    assert_eq!(
+        eval("(condition-case nil (number-sequence 1 10 0) (error 'caught))"),
+        "caught"
+    );
+    assert_eq!(eval("(number-sequence 5 5 0)"), "(5)");
+    assert_eq!(eval("(number-sequence 1 7 3)"), "(1 4 7)");
+}
+
+#[test]
+fn assoc_string_symbol_case_fold() {
+    // Symbol elements coerce to their names even under case folding.
+    assert_eq!(eval("(assoc-string \"FOO\" '(foo bar) t)"), "foo");
+    assert_eq!(eval("(assoc-string \"a\" '(\"A\" \"b\") t)"), "\"A\"");
+}
+
+#[test]
+fn cl_subst_and_sublis_keyword_test() {
+    // cl-subst honors :test, matching whole subtrees like cl-sublis.
+    assert_eq!(
+        eval("(cl-subst 0 \"x\" '(\"x\" \"y\" \"x\") :test #'equal)"),
+        "(0 \"y\" 0)"
+    );
+    assert_eq!(
+        eval("(cl-subst 'X '(a) '((a) b (a)) :test #'equal)"),
+        "(X b X)"
+    );
+    // Default (no keyword) path still uses eql throughout the tree.
+    assert_eq!(eval("(cl-subst 'x 'a '(a b (a c) a))"), "(x b (x c) x)");
+    assert_eq!(
+        eval("(cl-sublis '((a . x) (b . y)) '(a b (a . b)))"),
+        "(x y (x . y))"
+    );
+}
+
+#[test]
+fn cl_pairlis_and_remprop() {
+    // cl-pairlis stops at the shorter list and prepends to ALIST.
+    assert_eq!(eval("(cl-pairlis '(a b c) '(1 2))"), "((a . 1) (b . 2))");
+    assert_eq!(
+        eval("(cl-pairlis '(a b) '(1 2) '((c . 3)))"),
+        "((a . 1) (b . 2) (c . 3))"
+    );
+    // cl-remprop drops one property and reports whether one was present.
+    assert_eq!(
+        eval("(progn (put 'pa 'a 1) (put 'pa 'b 2) (list (cl-remprop 'pa 'a) (symbol-plist 'pa)))"),
+        "(t (b 2))"
+    );
+    assert_eq!(eval("(cl-remprop 'pa-none 'nope)"), "nil");
+}
