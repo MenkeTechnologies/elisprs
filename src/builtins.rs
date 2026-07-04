@@ -1111,7 +1111,8 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
                 h.print(arg, true)
             }
             // The `+`/space sign flags apply to the signed conversions (d/e/f/g).
-            'd' => {
+            // `%i` is an accepted alias for `%d` (as in C printf).
+            'd' | 'i' => {
                 let n = numf(idx)?.0;
                 let mag = pad_digits(&n.unsigned_abs().to_string(), spec.prec);
                 apply_sign(if n < 0 { format!("-{mag}") } else { mag }, &spec)
@@ -1132,10 +1133,14 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
                 &spec,
             ),
             other => {
-                // Unknown directive: emit verbatim, consume no argument.
-                out.push('%');
-                out.push(other);
-                continue;
+                // Unknown conversion. Emacs still validates argument
+                // availability first — `(format "%b")` is "Not enough
+                // arguments", but `(format "%b" 1)` is "Invalid format
+                // operation %b" — so check the arg before signalling.
+                if a.get(idx).is_none() {
+                    return Err(NOT_ENOUGH.to_string());
+                }
+                return Err(format!("Invalid format operation %{other}"));
             }
         };
         if field.is_none() {
@@ -1526,7 +1531,18 @@ fn string_match(h: &mut ElispHost, a: &[Value]) -> R {
     let subject = as_string(&a[1])?;
     let start = match a.get(2) {
         Some(Value::Undef) | Some(Value::Bool(false)) | None => 0,
-        Some(v) => as_int(v)?.max(0) as usize,
+        Some(v) => {
+            // Emacs: a negative START counts from the end (`len + START`); any
+            // START outside `[0, len]` after that adjustment is args-out-of-range,
+            // whose DATA is `(STRING RAW-START)`.
+            let raw = as_int(v)?;
+            let len = subject.chars().count() as i64;
+            let pos = if raw < 0 { len + raw } else { raw };
+            if pos < 0 || pos > len {
+                return Err(format!("args-out-of-range: {} {raw}", h.print(&a[1], true)));
+            }
+            pos as usize
+        }
     };
     let re = compile_cf(&pat, case_fold_search(h))?;
     match run_match(&re, &subject, start) {
@@ -1904,6 +1920,30 @@ fn ash_fn(h: &mut ElispHost, a: &[Value]) -> R {
             }
         } else {
             n >> sh
+        }
+    }))
+}
+
+/// `(lsh VALUE COUNT)` — *logical* shift, unlike `ash`'s arithmetic shift.
+/// Left shift matches `ash`. For a right shift (negative COUNT) Emacs treats the
+/// fixnum as an *unsigned* value of the fixnum bit width, so vacated high bits
+/// fill with zeros rather than the sign bit: `(lsh -1 -1)` => 2305843009213693951
+/// (`(2^62-1) >> 1`), not -1. Fixnums are 62-bit here (`most-positive-fixnum`
+/// = 2^61-1), so mask to 62 bits before the unsigned shift.
+fn lsh_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    const FIXNUM_MASK: u64 = (1u64 << 62) - 1;
+    let n = as_integer(h, &a[0])?;
+    let c = as_integer(h, &a[1])?;
+    Ok(Value::Int(if c >= 0 {
+        n.wrapping_shl(c as u32)
+    } else {
+        let sh = (-c) as u32;
+        // Masked value is < 2^62, so any shift ≥ 62 yields 0 (and this also
+        // avoids an out-of-range `>>` on the u64).
+        if sh >= 62 {
+            0
+        } else {
+            (((n as u64) & FIXNUM_MASK) >> sh) as i64
         }
     }))
 }
@@ -3041,11 +3081,41 @@ fn read_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// STRING (from char index START), returning `(OBJECT . END-INDEX)`.
 fn read_from_string(h: &mut ElispHost, a: &[Value]) -> R {
     let s = as_string(&a[0])?;
-    let start = match a.get(1) {
-        Some(Value::Int(n)) => (*n).max(0) as usize,
-        _ => 0,
+    let size = s.chars().count() as i64;
+    // START/END follow Emacs `validate_subarray`: a negative index counts from
+    // the end (`i + len`), nil defaults to 0 / len, and the checked range is
+    // `0 <= from <= to <= len`; a violation is args-out-of-range whose DATA is
+    // `(STRING RAW-START RAW-END)` built from the *original* (unadjusted) args.
+    let adj = |v: Option<&Value>, default: i64| -> i64 {
+        match v {
+            Some(Value::Int(n)) => {
+                if *n < 0 {
+                    n + size
+                } else {
+                    *n
+                }
+            }
+            _ => default,
+        }
     };
-    let (form, end) = crate::reader::read_one(h, &s, start)?;
+    let from = adj(a.get(1), 0);
+    let to = adj(a.get(2), size);
+    if !(0 <= from && from <= to && to <= size) {
+        let disp = |v: Option<&Value>| match v {
+            None | Some(Value::Undef) | Some(Value::Bool(false)) => "nil".to_string(),
+            Some(v) => h.print(v, true),
+        };
+        return Err(format!(
+            "args-out-of-range: {} {} {}",
+            h.print(&a[0], true),
+            disp(a.get(1)),
+            disp(a.get(2))
+        ));
+    }
+    // Limit the reader to the first `to` characters. Char indices in the prefix
+    // are identical to the original, so the returned END position stays valid.
+    let limited: String = s.chars().take(to as usize).collect();
+    let (form, end) = crate::reader::read_one(h, &limited, from as usize)?;
     Ok(h.cons(form, Value::Int(end as i64)))
 }
 /// `(compare-strings S1 START1 END1 S2 START2 END2 &optional IGNORE-CASE)` —
@@ -4689,7 +4759,7 @@ pub fn install(h: &mut ElispHost) {
     s("logxor", 0, None, logxor_fn);
     s("lognot", 1, Some(1), lognot_fn);
     s("ash", 2, Some(2), ash_fn);
-    s("lsh", 2, Some(2), ash_fn);
+    s("lsh", 2, Some(2), lsh_fn);
     // parity: float math / parsing / introspection
     s("expt", 2, Some(2), expt_fn);
     s("sqrt", 1, Some(1), sqrt_fn);

@@ -797,3 +797,102 @@ fn nth_requires_an_integer_index() {
         "(integerp \"a\")"
     );
 }
+
+#[test]
+fn lsh_is_a_logical_shift_not_arithmetic() {
+    // `lsh` differs from `ash` only on a right shift: it treats the fixnum as an
+    // unsigned value of the fixnum bit width (62 bits here), so vacated high bits
+    // fill with zeros rather than the sign bit (oracle: emacs 30.2).
+    assert_eq!(eval("(lsh -1 -1)"), "2305843009213693951");
+    assert_eq!(eval("(lsh -2 -1)"), "2305843009213693951");
+    assert_eq!(eval("(lsh -8 -2)"), "1152921504606846974");
+    assert_eq!(eval("(lsh most-negative-fixnum -1)"), "1152921504606846976");
+    assert_eq!(eval("(lsh -1 -61)"), "1");
+    assert_eq!(eval("(lsh -1 -100)"), "0");
+    // Non-negative values and left shifts behave exactly like `ash`.
+    assert_eq!(eval("(lsh 6 -1)"), "3");
+    assert_eq!(eval("(lsh 1 4)"), "16");
+    assert_eq!(eval("(lsh -1 1)"), "-2");
+    // `ash`, by contrast, keeps the sign on a right shift.
+    assert_eq!(eval("(ash -1 -1)"), "-1");
+    assert_eq!(eval("(ash -8 -2)"), "-2");
+}
+
+#[test]
+fn format_accepts_percent_i_as_decimal_alias() {
+    // `%i` is an accepted alias for `%d` (as in C printf), honouring the same
+    // width/precision/sign flags (oracle: emacs 30.2).
+    assert_eq!(eval("(format \"%i\" 42)"), "\"42\"");
+    assert_eq!(eval("(format \"%i\" -4)"), "\"-4\"");
+    assert_eq!(eval("(format \"%i\" 3.9)"), "\"3\"");
+    assert_eq!(eval("(format \"%+i\" 5)"), "\"+5\"");
+    assert_eq!(eval("(format \"%.3i\" 7)"), "\"007\"");
+    assert_eq!(eval("(format \"%5i\" 3)"), "\"    3\"");
+    assert_eq!(eval("(format \"%i %d\" 10 20)"), "\"10 20\"");
+}
+
+#[test]
+fn format_signals_on_invalid_conversion() {
+    // An unknown conversion is a plain `error` "Invalid format operation %X" —
+    // but Emacs validates argument availability first, so a missing argument is
+    // still "Not enough arguments" (oracle: emacs 30.2).
+    assert_eq!(
+        eval("(condition-case e (format \"%b\" 1) (error (cadr e)))"),
+        "\"Invalid format operation %b\""
+    );
+    assert_eq!(
+        eval("(condition-case e (format \"%5z\" 1) (error (cadr e)))"),
+        "\"Invalid format operation %z\""
+    );
+    assert_eq!(
+        eval("(condition-case e (format \"%b\") (error (cadr e)))"),
+        "\"Not enough arguments for format string\""
+    );
+}
+
+#[test]
+fn string_match_start_counts_from_end_and_checks_bounds() {
+    // A negative START counts from the end (`len + START`); START in `[0, len]`
+    // is valid (len itself only matches empty), and anything outside that range
+    // is args-out-of-range with DATA `(STRING RAW-START)` (oracle: emacs 30.2).
+    assert_eq!(eval("(string-match \"c\" \"abc\" -1)"), "2");
+    assert_eq!(eval("(string-match \"b\" \"abc\" -3)"), "1");
+    assert_eq!(eval("(string-match \"a\" \"abc\" 3)"), "nil");
+    assert_eq!(eval("(string-match \"\" \"abc\" 3)"), "3");
+    assert_eq!(
+        eval("(condition-case e (string-match \"a\" \"abc\" 4) (args-out-of-range (cdr e)))"),
+        "(\"abc\" 4)"
+    );
+    assert_eq!(
+        eval("(condition-case e (string-match \"a\" \"abc\" -100) (args-out-of-range (cdr e)))"),
+        "(\"abc\" -100)"
+    );
+}
+
+#[test]
+fn read_from_string_honours_start_and_end() {
+    // END limits how much of STRING is read; START/END count from the end when
+    // negative, default to 0/len, and args-out-of-range reports the raw args
+    // (nil for an omitted END) (oracle: emacs 30.2).
+    assert_eq!(eval("(read-from-string \"hello\" 0 3)"), "(hel . 3)");
+    assert_eq!(eval("(read-from-string \"12345\" 1 3)"), "(23 . 3)");
+    assert_eq!(eval("(read-from-string \"hello\" -1)"), "(o . 5)");
+    assert_eq!(eval("(read-from-string \"hello\" 0 5)"), "(hello . 5)");
+    // START == len (or an empty END window) is end-of-file, not a match.
+    assert_eq!(
+        eval("(condition-case e (read-from-string \"hello\" 5) (end-of-file 'eof))"),
+        "eof"
+    );
+    assert_eq!(
+        eval("(condition-case e (read-from-string \"hello\" 0 10) (args-out-of-range (cdr e)))"),
+        "(\"hello\" 0 10)"
+    );
+    assert_eq!(
+        eval("(condition-case e (read-from-string \"hello\" 6) (args-out-of-range (cdr e)))"),
+        "(\"hello\" 6 nil)"
+    );
+    assert_eq!(
+        eval("(condition-case e (read-from-string \"hello\" 3 2) (args-out-of-range (cdr e)))"),
+        "(\"hello\" 3 2)"
+    );
+}

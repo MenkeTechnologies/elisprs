@@ -518,3 +518,79 @@ fn cl_some_every_multiple_sequences() {
     // cl-some yields the first non-nil predicate VALUE, not merely t
     assert_eq!(eval("(cl-some 'identity [nil nil 3])"), "3");
 }
+
+#[test]
+fn safe_length_matches_emacs_brent() {
+    // Proper and dotted lists count cons cells; nil is 0.
+    assert_eq!(eval("(safe-length '(1 2 3))"), "3");
+    assert_eq!(eval("(safe-length nil)"), "0");
+    assert_eq!(eval("(safe-length '(1 2 . 3))"), "2");
+    // Circular lists terminate and return Emacs 30.2's Brent tortoise/hare
+    // count (>= distinct cells): a 1-, 2-, 3-cycle => 1, 4, 5; a 100-cycle => 226.
+    assert_eq!(
+        eval("(let ((l (list 1))) (setcdr l l) (safe-length l))"),
+        "1"
+    );
+    assert_eq!(
+        eval("(let ((l (list 1 2))) (setcdr (cdr l) l) (safe-length l))"),
+        "4"
+    );
+    assert_eq!(
+        eval("(let ((l (list 1 2 3))) (setcdr (cddr l) l) (safe-length l))"),
+        "5"
+    );
+    assert_eq!(
+        eval("(let ((l (make-list 100 0))) (setcdr (nthcdr 99 l) l) (safe-length l))"),
+        "226"
+    );
+}
+
+#[test]
+fn float_index_and_destructuring_arity_signal() {
+    // A float index is rejected: nthcdr/elt-on-list signal integerp, elt on an
+    // array or string signals fixnump (aref's contract) -- matching Emacs 30.2.
+    assert_eq!(eval("(nthcdr 2 '(a b c))"), "(c)");
+    assert_eq!(
+        eval("(condition-case e (nthcdr 1.5 '(a b c)) (error (cdr e)))"),
+        "(integerp 1.5)"
+    );
+    assert_eq!(
+        eval("(condition-case e (nthcdr 2.0 '(a b c)) (error (cdr e)))"),
+        "(integerp 2.0)"
+    );
+    assert_eq!(
+        eval("(condition-case e (elt '(a b) 1.5) (error (cdr e)))"),
+        "(integerp 1.5)"
+    );
+    assert_eq!(
+        eval("(condition-case e (elt [1 2 3] 1.5) (error (cdr e)))"),
+        "(fixnump 1.5)"
+    );
+    assert_eq!(
+        eval("(condition-case e (elt \"abc\" 1.5) (error (cdr e)))"),
+        "(fixnump 1.5)"
+    );
+    // cl-destructuring-bind enforces arity like Emacs; the signal data is
+    // (ARGLIST COUNT), with a nested mismatch reported against the outer arglist.
+    assert_eq!(
+        eval("(cl-destructuring-bind (a &rest r) '(1 2 3) (list a r))"),
+        "(1 (2 3))"
+    );
+    assert_eq!(
+        eval("(condition-case e (cl-destructuring-bind (a b) '(1 2 3) t) (error (cdr e)))"),
+        "((a b) 3)"
+    );
+    assert_eq!(
+        eval("(condition-case e (cl-destructuring-bind (a &optional b) '() t) (error (cdr e)))"),
+        "((a &optional b) 0)"
+    );
+    assert_eq!(
+        eval("(condition-case e (cl-destructuring-bind (a (b c)) '(1 (2 3 4)) t) (error (cdr e)))"),
+        "((a (b c)) 3)"
+    );
+    // cl-loop destructuring stays lenient (no arity error).
+    assert_eq!(
+        eval("(cl-loop for (a b) in '((1 2) (3 4 5)) collect a)"),
+        "(1 3)"
+    );
+}

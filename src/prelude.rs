@@ -46,7 +46,11 @@ pub const PRELUDE: &str = r#"
 (defun wholenump (x) (natnump x))
 
 ;;; ---- list construction / access ----
-(defun nthcdr (n l) (while (and (> n 0) l) (setq l (cdr l)) (setq n (1- n))) l)
+(defun nthcdr (n l)
+  ;; Emacs signals on a non-integer index (a float is rejected even when it
+  ;; is integer-valued): (nthcdr 1.5 '(a b c)) => wrong-type-argument integerp.
+  (unless (integerp n) (signal 'wrong-type-argument (list 'integerp n)))
+  (while (and (> n 0) l) (setq l (cdr l)) (setq n (1- n))) l)
 (defun last (l &optional n)
   ;; The last N cons cells of L (default 1): (last '(1 2 3) 2) => (2 3).
   ;; Guard on consp so an improper tail stops the walk instead of erroring:
@@ -68,20 +72,31 @@ pub const PRELUDE: &str = r#"
         (while (<= from to) (setq r (cons from r)) (setq from (+ from inc))))
       (reverse r))))
 (defun elt (seq n)
+  ;; List path defers to `nth' (signals integerp on a float index); the array
+  ;; path signals fixnump like Emacs: (elt [1 2 3] 1.5) => wrong-type-argument
+  ;; fixnump, matching aref's own contract rather than nth's integerp.
   (cond ((listp seq) (nth n seq))
-        ((arrayp seq) (aref seq n))
+        ((arrayp seq)
+         (unless (integerp n) (signal 'wrong-type-argument (list 'fixnump n)))
+         (aref seq n))
         (t (signal 'wrong-type-argument (list 'sequencep seq)))))
 (defun safe-length (l)
-  ;; Count cons cells without erroring or looping forever (Floyd cycle detection,
-  ;; so a circular list terminates): (safe-length '(1 2 . 3)) => 2.
-  (let ((slow l) (fast l) (n 0))
-    (catch 'safe-length--done
-      (while t
-        (unless (consp fast) (throw 'safe-length--done n))
-        (setq fast (cdr fast) n (1+ n))
-        (unless (consp fast) (throw 'safe-length--done n))
-        (setq fast (cdr fast) n (1+ n) slow (cdr slow))
-        (when (eq fast slow) (throw 'safe-length--done n))))))
+  ;; Length of a possibly circular or dotted list, never erroring or looping
+  ;; forever.  Faithful to Emacs 30.2's FOR_EACH_TAIL_SAFE (Brent's teleporting
+  ;; tortoise/hare, lisp.h): the tortoise jumps to the current tail after
+  ;; 2, 4, 8, ... steps and a cycle is reported when the tail meets it, so a
+  ;; circular list returns an integer >= the number of distinct cells -- a
+  ;; 3-cycle => 5, exactly as Emacs.  (safe-length '(1 2 . 3)) => 2.
+  (let ((tail l) (tortoise l) (interval 2) (q 2) (len 0) (done nil))
+    (while (and (consp tail) (not done))
+      (setq len (1+ len) tail (cdr tail))
+      (if (not (consp tail))
+          (setq done t)
+        (setq q (1- q))
+        (if (> q 0)
+            (when (eq tail tortoise) (setq done t))
+          (setq interval (* interval 2) q interval tortoise tail))))
+    len))
 (defun length= (seq n) (= (length seq) n))
 (defun length< (seq n) (< (length seq) n))
 (defun length> (seq n) (> (length seq) n))
@@ -3160,14 +3175,48 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (defun cl-db--plist-get (plist key default)
   ;; plist-get with a fallback when KEY is absent (for &key defaults).
   (let ((m (plist-member plist key))) (if m (car (cdr m)) default)))
-(defun cl-db--binds (arglist v)
+(defun cl-db--arity (arglist)
+  ;; (MIN . MAX) element counts a destructuring ARGLIST accepts; MAX is nil for
+  ;; no upper bound (&rest / &body / &key or a dotted tail allow extra elements).
+  ;; &aux vars consume nothing, so they neither raise MIN nor lift the bound.
+  (let ((min 0) (max 0) (mode 'req) (unbounded nil))
+    (when (eq (car arglist) '&whole) (setq arglist (cddr arglist)))
+    (while (consp arglist)
+      (let ((a (car arglist)))
+        (cond
+         ((eq a '&optional) (setq mode 'opt))
+         ((memq a '(&rest &body &key)) (setq mode 'done unbounded t))
+         ((eq a '&aux) (setq mode 'done))
+         ((eq mode 'done) nil)
+         ((eq mode 'opt) (setq max (1+ max)))
+         (t (setq min (1+ min) max (1+ max)))))
+      (setq arglist (cdr arglist)))
+    (when (and arglist (symbolp arglist)) (setq unbounded t))
+    (cons min (if unbounded nil max))))
+(defun cl-db--check (val min max arglist)
+  ;; Signal `wrong-number-of-arguments' when VAL's length is outside [MIN,MAX]
+  ;; (MAX nil = unbounded), reporting ARGLIST like Emacs' cl-destructuring-bind.
+  (let ((n (length val)))
+    (when (or (< n min) (and max (> n max)))
+      (signal 'wrong-number-of-arguments (list arglist n))))
+  nil)
+(defun cl-db--binds (arglist v &optional check)
   ;; Supports &whole, &optional / &rest / &key with per-arg defaults `(VAR DEFAULT)`
   ;; and nested patterns in required position. &key reads the plist tail at pos i.
+  ;; When CHECK (the top-level arglist to report) is non-nil, an arity guard is
+  ;; emitted so cl-destructuring-bind errors on length mismatch; cl-loop passes
+  ;; no CHECK and stays lenient, matching Emacs in both cases.
   (let ((binds nil) (i 0) (mode 'req))
     ;; Leading (&whole VAR …): bind VAR to the whole value, then continue.
     (when (eq (car arglist) '&whole)
       (setq binds (cons (list (car (cdr arglist)) v) binds))
       (setq arglist (cddr arglist)))
+    (when check
+      (let ((ar (cl-db--arity arglist)))
+        (setq binds (cons (list (make-symbol "--cl-db-chk--")
+                                (list 'cl-db--check v (car ar) (cdr ar)
+                                      (list 'quote check)))
+                          binds))))
     (while (consp arglist)
       (let ((a (car arglist)))
         (cond
@@ -3195,7 +3244,7 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
           ;; Nested pattern: bind a temp to the element, then destructure it.
           (let ((tv (make-symbol "db")))
             (setq binds (cons (list tv (list 'nth i v)) binds))
-            (dolist (rb (cl-db--binds a tv)) (setq binds (cons rb binds))))
+            (dolist (rb (cl-db--binds a tv check)) (setq binds (cons rb binds))))
           (setq i (1+ i)))
          (t (setq binds (cons (list a (list 'nth i v)) binds)) (setq i (1+ i)))))
       (setq arglist (cdr arglist)))
@@ -3205,7 +3254,7 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
     (reverse binds)))
 (defmacro cl-destructuring-bind (arglist expr &rest body)
   `(let ((--cl-db-v-- ,expr))
-     (let* ,(cl-db--binds arglist '--cl-db-v--) ,@body)))
+     (let* ,(cl-db--binds arglist '--cl-db-v-- arglist) ,@body)))
 ;; cl-defun/cl-defmacro: defun/defmacro accepting a full cl-lambda-list
 ;; (&optional/&key/&rest/&aux with per-arg defaults), via cl-destructuring-bind.
 (defmacro cl-defun (name arglist &rest body)

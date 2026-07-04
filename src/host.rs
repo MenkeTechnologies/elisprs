@@ -1084,6 +1084,23 @@ impl ElispHost {
     /// Build the `(error-symbol "message")` object a `condition-case` handler
     /// binds its variable to, from a rendered "symbol: message" error string.
     pub fn make_error_object(&mut self, e: &str) -> Value {
+        // Conditions Emacs signals with an empty DATA list: the condition object
+        // is just `(SYMBOL)` with no message datum (`arith-error`, `end-of-file`,
+        // `beginning-of-buffer`, `end-of-buffer`). Their human-readable text lives
+        // in the symbol's `error-message`, not in the data, so drop it here. The
+        // generic `error`/`user-error` symbols keep the message as data.
+        const NIL_DATA_ERRORS: &[&str] = &[
+            "arith-error",
+            "end-of-file",
+            "beginning-of-buffer",
+            "end-of-buffer",
+        ];
+        let trimmed = e.trim();
+        let sym_candidate = trimmed.split_once(':').map_or(trimmed, |(s, _)| s.trim());
+        if NIL_DATA_ERRORS.contains(&sym_candidate) {
+            let s = self.intern(sym_candidate);
+            return self.list_from(vec![s]);
+        }
         let (sym, msg) = match e.split_once(':') {
             Some((s, m)) => (s.trim().to_string(), m.trim().to_string()),
             None => ("error".to_string(), e.to_string()),

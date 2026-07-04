@@ -562,6 +562,59 @@ fn condition_case_multi_condition_handlers() {
 }
 
 #[test]
+fn condition_case_error_object_data() {
+    // The bound object is `(SYMBOL . DATA)`. Conditions Emacs signals with an
+    // empty DATA list bind to just `(SYMBOL)` — the message is NOT a datum.
+    // Oracle: `emacs -Q --batch` 30.2 → all of these `(arith-error)` / `(end-of-file)`.
+    assert_eq!(
+        eval("(condition-case e (/ 1 0) (error e))"),
+        "(arith-error)"
+    );
+    assert_eq!(
+        eval("(condition-case e (% 7 0) (error e))"),
+        "(arith-error)"
+    );
+    assert_eq!(
+        eval("(condition-case e (mod 7 0) (error e))"),
+        "(arith-error)"
+    );
+    assert_eq!(
+        eval("(condition-case e (read \"\") (error e))"),
+        "(end-of-file)"
+    );
+    assert_eq!(
+        eval("(condition-case e (signal 'arith-error nil) (error e))"),
+        "(arith-error)"
+    );
+    // Generic `error`/`user-error` keep the message string AS the data.
+    assert_eq!(
+        eval("(condition-case e (error \"boom\") (error e))"),
+        "(error \"boom\")"
+    );
+    assert_eq!(
+        eval("(condition-case e (user-error \"u\") (error e))"),
+        "(user-error \"u\")"
+    );
+    // Value-carrying conditions keep their structured DATA list unchanged.
+    assert_eq!(
+        eval("(condition-case e (car 5) (error e))"),
+        "(wrong-type-argument listp 5)"
+    );
+    assert_eq!(
+        eval("(condition-case e (aref [1 2] 5) (error e))"),
+        "(args-out-of-range [1 2] 5)"
+    );
+    assert_eq!(
+        eval("(condition-case e (symbol-value 'zzz-none) (error e))"),
+        "(void-variable zzz-none)"
+    );
+    assert_eq!(
+        eval("(condition-case e (zzz-none) (error e))"),
+        "(void-function zzz-none)"
+    );
+}
+
+#[test]
 fn emacs_parity_error_data_elements() {
     // wrong-type-argument DATA is (PREDICATE VALUE) as separate elements (R2-B).
     assert_eq!(
