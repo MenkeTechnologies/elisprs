@@ -72,29 +72,28 @@ pub struct Params {
     pub rest: Option<u32>,
 }
 
-/// A lexical scope frame: symbol→value bindings plus a parent link. Closures
-/// capture the scope active at their definition (indefinite extent). Mutation
-/// (via interior `RefCell`) lets `setq` update a lexical slot in place.
+/// One lexical binding: a `symbol → value` cell plus a link to the rest of the
+/// environment. The environment is a persistent singly-linked list — each
+/// binding conses a fresh node onto the front (matching Emacs's lexical
+/// environment alist). A closure captures the current head (`Rc` clone); later
+/// bindings cons *new* heads, so they are invisible to an already-captured
+/// closure. `setq` mutates the found cell in place (via `RefCell`), so a
+/// binding shared by a closure and its enclosing body updates for both.
 pub struct Scope {
-    vars: RefCell<Vec<(u32, Value)>>,
+    sym: u32,
+    val: RefCell<Value>,
     parent: Lex,
 }
 pub type Lex = Option<Rc<Scope>>;
 
 impl Scope {
-    fn child(parent: Lex) -> Rc<Scope> {
-        Rc::new(Scope {
-            vars: RefCell::new(Vec::new()),
-            parent,
-        })
-    }
     fn lookup(self: &Rc<Scope>, sym: u32) -> Option<Value> {
         let mut cur = Some(self.clone());
         while let Some(s) = cur {
-            for (k, v) in s.vars.borrow().iter() {
-                if *k == sym {
-                    return Some(v.clone());
-                }
+            // Head is the newest binding: the first match down the chain
+            // shadows older same-name bindings (Emacs lexical `let*`).
+            if s.sym == sym {
+                return Some(s.val.borrow().clone());
             }
             cur = s.parent.clone();
         }
@@ -103,11 +102,11 @@ impl Scope {
     fn set(self: &Rc<Scope>, sym: u32, val: &Value) -> bool {
         let mut cur = Some(self.clone());
         while let Some(s) = cur {
-            for (k, v) in s.vars.borrow_mut().iter_mut() {
-                if *k == sym {
-                    *v = val.clone();
-                    return true;
-                }
+            // Newest binding wins (see `lookup`): `setq` updates the most
+            // recently established cell for the symbol.
+            if s.sym == sym {
+                *s.val.borrow_mut() = val.clone();
+                return true;
             }
             cur = s.parent.clone();
         }
@@ -468,17 +467,21 @@ impl ElispHost {
         }
     }
     // ── lexical scope management ──
-    /// Push a new lexical scope as a child of the current one.
+    /// Open a lexical scope: record an unwind boundary (the current lexical
+    /// head + specstack depth). No binding node is created yet — each
+    /// `bind_here` conses one; `close_scope` restores the saved head, dropping
+    /// every node bound within this scope.
     pub fn open_scope(&mut self) {
         self.frame_stack
             .push((self.lex.clone(), self.specstack.len()));
-        self.lex = Some(Scope::child(self.lex.clone()));
     }
-    /// Push a new lexical scope as a child of `env` (a closure's captured env).
+    /// Open a scope whose bindings extend `env` (a closure's captured env):
+    /// record the unwind boundary, then make `env` the active lexical head so
+    /// subsequent `bind_here` calls cons the params onto it.
     pub fn open_scope_in(&mut self, env: Lex) {
         self.frame_stack
             .push((self.lex.clone(), self.specstack.len()));
-        self.lex = Some(Scope::child(env));
+        self.lex = env;
     }
     /// Pop the innermost scope: restore the prior lexical env and unwind any
     /// dynamic (special-var) bindings made within it.
@@ -505,12 +508,15 @@ impl ElispHost {
     pub fn bind_here(&mut self, id: u32, val: Value) {
         if self.is_special(id) {
             let _ = self.specbind(&Value::Obj(id), val);
-        } else if let Some(scope) = &self.lex {
-            scope.vars.borrow_mut().push((id, val));
         } else {
-            if let Obj::Symbol(s) = &mut self.arena[id as usize] {
-                s.value = Some(val);
-            }
+            // Cons a fresh single-binding node onto the lexical chain. A later
+            // same-name rebind conses another node in front (shadows it);
+            // closures that captured the earlier head never see it.
+            self.lex = Some(Rc::new(Scope {
+                sym: id,
+                val: RefCell::new(val),
+                parent: self.lex.take(),
+            }));
         }
     }
     /// Bind a symbol value into the current scope (lexical/dynamic per special).
