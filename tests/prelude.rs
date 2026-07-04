@@ -594,3 +594,32 @@ fn float_index_and_destructuring_arity_signal() {
         "(1 3)"
     );
 }
+
+#[test]
+fn cl_loop_and_combiner() {
+    // `and' joins the next accumulation clause into the same iteration step
+    // (emacs 30.2: (1 10 2 20 3 30)); previously errored `unsupported clause`.
+    assert_eq!(
+        eval("(cl-loop for i from 1 to 3 collect i and collect (* i 10))"),
+        "(1 10 2 20 3 30)"
+    );
+    assert_eq!(
+        eval(
+            "(cl-loop for i from 1 to 3 collect i into a and collect (* i 10) into b \
+             finally return (list a b))"
+        ),
+        "((1 2 3) (10 20 30))"
+    );
+}
+
+#[test]
+fn max_min_nan_propagation() {
+    // Emacs `max`/`min` propagate NaN from any argument, not just the leading one.
+    assert_eq!(eval("(max 1.0 (/ 0.0 0.0))"), "0.0e+NaN");
+    assert_eq!(eval("(max (/ 0.0 0.0) 1)"), "0.0e+NaN");
+    assert_eq!(eval("(min 1 (/ 0.0 0.0))"), "0.0e+NaN");
+    // Non-NaN cases keep emacs' "return the extremum as-is" typing (no contagion).
+    assert_eq!(eval("(max 1 2.0 3)"), "3");
+    assert_eq!(eval("(max 1 2 3.0)"), "3.0");
+    assert_eq!(eval("(min 1 2.0 3)"), "1");
+}

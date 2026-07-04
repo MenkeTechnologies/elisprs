@@ -1091,6 +1091,7 @@ impl ElispHost {
         // generic `error`/`user-error` symbols keep the message as data.
         const NIL_DATA_ERRORS: &[&str] = &[
             "arith-error",
+            "overflow-error",
             "end-of-file",
             "beginning-of-buffer",
             "end-of-buffer",
@@ -1722,11 +1723,23 @@ fn intrinsic_condition_case(args: &[Value]) -> Result<Value, String> {
             let getfn = with_host(|h| h.intern("get"));
             let symv = with_host(|h| h.intern(&esym));
             let propv = with_host(|h| h.intern("error-conditions"));
-            let signal_conditions: Vec<String> = call_function(&getfn, &[symv, propv])
+            let mut signal_conditions: Vec<String> = call_function(&getfn, &[symv, propv])
                 .ok()
                 .and_then(|v| with_host(|h| h.list_vec(&v)))
                 .map(|items| with_host(|h| items.iter().filter_map(|x| h.sym_name(x)).collect()))
                 .unwrap_or_default();
+            // `overflow-error`/`range-error` are signalled by float-rounding subrs
+            // but their `define-error` chain lives in the elisp prelude, which may
+            // not register them; supply Emacs's fixed parent chain so an
+            // `arith-error`/`range-error` handler still catches an overflow.
+            if signal_conditions.is_empty() {
+                let chain: &[&str] = match esym.as_str() {
+                    "overflow-error" => &["overflow-error", "range-error", "arith-error", "error"],
+                    "range-error" => &["range-error", "arith-error", "error"],
+                    _ => &[],
+                };
+                signal_conditions = chain.iter().map(|s| s.to_string()).collect();
+            }
             for hp in hlist {
                 let parts = with_host(|h| h.list_vec(&hp)).unwrap_or_default();
                 if parts.len() < 2 {

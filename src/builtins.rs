@@ -1074,7 +1074,7 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             out.push('%');
             break;
         };
-        let spec = FmtSpec {
+        let mut spec = FmtSpec {
             left,
             zero,
             plus,
@@ -1123,15 +1123,29 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             'c' => char::from_u32(numf(idx)?.0 as u32)
                 .map(String::from)
                 .unwrap_or_default(),
-            'e' => apply_sign(format_e(numf(idx)?.1, spec.prec.unwrap_or(6)), &spec),
-            'f' => apply_sign(
-                format!("{:.*}", spec.prec.unwrap_or(6), numf(idx)?.1),
-                &spec,
-            ),
-            'g' => apply_sign(
-                format_g(numf(idx)?.1, spec.prec.unwrap_or(6), spec.alt),
-                &spec,
-            ),
+            'e' | 'f' | 'g' => {
+                let v = numf(idx)?.1;
+                if v.is_finite() {
+                    let raw = match conv {
+                        'e' => format_e(v, spec.prec.unwrap_or(6)),
+                        'f' => format!("{:.*}", spec.prec.unwrap_or(6), v),
+                        _ => format_g(v, spec.prec.unwrap_or(6), spec.alt),
+                    };
+                    apply_sign(raw, &spec)
+                } else {
+                    // inf/nan: Emacs renders "inf"/"-inf"/"nan", ignoring precision
+                    // and the `0` flag (space-padded to width). `+`/space signs
+                    // apply to infinities but never to NaN.
+                    spec.zero = false;
+                    if v.is_nan() {
+                        "nan".to_string()
+                    } else if v < 0.0 {
+                        "-inf".to_string()
+                    } else {
+                        apply_sign("inf".to_string(), &spec)
+                    }
+                }
+            }
             other => {
                 // Unknown conversion. Emacs still validates argument
                 // availability first — `(format "%b")` is "Not enough
@@ -1837,9 +1851,26 @@ fn quotient(a: &[Value], rm: Rm) -> R {
             if df == 0.0 {
                 return Err("arith-error: division by zero".to_string());
             }
-            Ok(Value::Int(apply_rm(xf / df, rm) as i64))
+            let q = xf / df;
+            if !q.is_finite() {
+                // Emacs signals `overflow-error` when a float rounding op has no
+                // finite integer result (infinite or NaN quotient), rather than
+                // saturating. (truncate 1.0e+INF 2.0) => (overflow-error).
+                return Err("overflow-error".to_string());
+            }
+            Ok(Value::Int(apply_rm(q, rm) as i64))
         }
-        _ => Ok(Value::Int(if xisf { apply_rm(xf, rm) as i64 } else { xi })),
+        _ => {
+            if xisf {
+                if !xf.is_finite() {
+                    // (truncate 1.0e+INF), (round (/ 0.0 0.0)) => (overflow-error).
+                    return Err("overflow-error".to_string());
+                }
+                Ok(Value::Int(apply_rm(xf, rm) as i64))
+            } else {
+                Ok(Value::Int(xi))
+            }
+        }
     }
 }
 fn apply_rm(f: f64, rm: Rm) -> f64 {
@@ -1971,7 +2002,13 @@ fn exp_fn(_h: &mut ElispHost, a: &[Value]) -> R {
 fn log_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     let x = as_num(&a[0])?.1;
     Ok(Value::Float(match a.get(1) {
-        Some(b) => x.log(as_num(b)?.1),
+        // Emacs uses `log10`/`log2` for base 10/2 (exact for powers of the base:
+        // (log 1000 10) => 3.0), falling back to ln(x)/ln(base) otherwise.
+        Some(b) => match as_num(b)?.1 {
+            base if base == 10.0 => x.log10(),
+            base if base == 2.0 => x.log2(),
+            base => x.ln() / base.ln(),
+        },
         None => x.ln(),
     }))
 }

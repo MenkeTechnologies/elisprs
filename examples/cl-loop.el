@@ -45,4 +45,22 @@
   (should (equal (cl-loop for x in (list 1 2 3) collect x into ys finally return (cons 'done ys))
                  (list 'done 1 2 3))))
 
+(ert-deftest cl-loop-and-combiner ()
+  ;; `and' joins the next accumulation clause into the same iteration step.
+  (should (equal (cl-loop for i from 1 to 3 collect i and collect (* i 10))
+                 (list 1 10 2 20 3 30)))
+  (should (equal (cl-loop for i from 1 to 3 collect i into a and collect (* i 10) into b
+                          finally return (list a b))
+                 (list (list 1 2 3) (list 10 20 30))))
+  (should (equal (cl-loop for i from 1 to 3 sum i into s and count t into n
+                          finally return (list s n))
+                 (list 6 3)))
+  ;; `and'-joined accumulators inside a conditional share the branch condition.
+  (should (equal (cl-loop for i from 1 to 3 when (cl-oddp i) collect i and collect (* i 10))
+                 (list 1 10 3 30)))
+  (should (equal (cl-loop for i from 1 to 4
+                          if (cl-evenp i) collect i and collect (* i 10)
+                          else collect (- i) and collect 0)
+                 (list -1 0 2 20 -3 0 4 40))))
+
 (ert-run-tests-batch-and-exit)

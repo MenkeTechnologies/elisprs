@@ -896,3 +896,84 @@ fn read_from_string_honours_start_and_end() {
         "(\"hello\" 3 2)"
     );
 }
+
+#[test]
+fn float_rounding_of_infinity_signals_overflow_error() {
+    // truncate/round/floor/ceiling of a non-finite float have no integer result;
+    // Emacs signals `overflow-error` (empty data) rather than saturating an int.
+    // The condition object is `(overflow-error)` (oracle: emacs 30.2).
+    assert_eq!(
+        eval("(condition-case e (truncate 1.0e+INF) (error e))"),
+        "(overflow-error)"
+    );
+    assert_eq!(
+        eval("(condition-case e (round (/ 0.0 0.0)) (error e))"),
+        "(overflow-error)"
+    );
+    // The `overflow-error` condition inherits arith-error/range-error, so those
+    // parent handlers catch it too (error-conditions chain, oracle: emacs 30.2).
+    assert_eq!(
+        eval("(condition-case e (floor 1.0e+INF) (arith-error 'ar))"),
+        "ar"
+    );
+    assert_eq!(
+        eval("(condition-case e (ceiling -1.0e+INF) (range-error 'rg))"),
+        "rg"
+    );
+    // The 2-arg DIVISOR form signals it when the quotient is non-finite; a zero
+    // divisor still wins as arith-error.
+    assert_eq!(
+        eval("(condition-case e (floor 1.0e+INF 2.0) (overflow-error 'oe))"),
+        "oe"
+    );
+    assert_eq!(
+        eval("(condition-case e (truncate 1.0e+INF 0.0) (arith-error 'z))"),
+        "z"
+    );
+    // Finite floats are unchanged; the float-returning f* forms stay float.
+    assert_eq!(
+        eval("(list (truncate 5.9) (round 2.5) (floor 3.7))"),
+        "(5 2 3)"
+    );
+    assert_eq!(eval("(ffloor 1.0e+INF)"), "1.0e+INF");
+    assert_eq!(eval("(ftruncate -1.0e+INF)"), "-1.0e+INF");
+}
+
+#[test]
+fn format_of_non_finite_floats() {
+    // %e/%f/%g of inf/nan render "inf"/"-inf"/"nan" (Emacs used to be a panic in
+    // elisprs). Precision is ignored, the `0` flag falls back to space padding,
+    // and +/space signs apply to infinities but not NaN (oracle: emacs 30.2).
+    assert_eq!(
+        eval(
+            "(list (format \"%g\" 1.0e+INF) (format \"%g\" -1.0e+INF) (format \"%g\" (/ 0.0 0.0)))"
+        ),
+        "(\"inf\" \"-inf\" \"nan\")"
+    );
+    assert_eq!(
+        eval(
+            "(list (format \"%e\" 1.0e+INF) (format \"%f\" -1.0e+INF) (format \"%.2f\" 1.0e+INF))"
+        ),
+        "(\"inf\" \"-inf\" \"inf\")"
+    );
+    assert_eq!(
+        eval(
+            "(list (format \"%10g\" 1.0e+INF) (format \"%+g\" 1.0e+INF) (format \"% g\" 1.0e+INF))"
+        ),
+        "(\"       inf\" \"+inf\" \" inf\")"
+    );
+    assert_eq!(eval("(format \"%010g\" 1.0e+INF)"), "\"       inf\"");
+    assert_eq!(eval("(format \"%+g\" (/ 0.0 0.0))"), "\"nan\"");
+}
+
+#[test]
+fn log_uses_exact_base_10_and_2() {
+    // Emacs computes `(log X 10)`/`(log X 2)` via log10/log2, exact for powers of
+    // the base; a naive ln(x)/ln(base) yields 2.9999999999999996 (oracle: 30.2).
+    assert_eq!(
+        eval("(list (log 1000 10) (log 1024 2) (log 100 10))"),
+        "(3.0 10.0 2.0)"
+    );
+    // Other bases fall back to the ratio form and match Emacs bit-for-bit.
+    assert_eq!(eval("(log 8 3)"), "1.892789260714372");
+}

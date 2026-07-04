@@ -30,8 +30,22 @@ pub const PRELUDE: &str = r#"
 (defconst float-e 2.718281828459045)
 (defconst pi 3.141592653589793)
 ;; `abs` is a primitive subr (keeps int/float type; (abs -0.0) => 0.0).
-(defun max (x &rest xs) (while xs (if (> (car xs) x) (setq x (car xs))) (setq xs (cdr xs))) x)
-(defun min (x &rest xs) (while xs (if (< (car xs) x) (setq x (car xs))) (setq xs (cdr xs))) x)
+;; NaN propagates: any NaN arg makes the result NaN (a NaN never wins `>`/`<`,
+;; so once it lands in the accumulator no later value can displace it).
+(defun max (x &rest xs)
+  (while xs
+    (let ((y (car xs)))
+      (if (> y x) (setq x y))
+      (if (and (floatp y) (isnan y)) (setq x y)))
+    (setq xs (cdr xs)))
+  x)
+(defun min (x &rest xs)
+  (while xs
+    (let ((y (car xs)))
+      (if (< y x) (setq x y))
+      (if (and (floatp y) (isnan y)) (setq x y)))
+    (setq xs (cdr xs)))
+  x)
 ;; `mod` is a primitive subr (handles float operands + divisor-sign semantics).
 (defun /= (a b) (not (= a b)))
 (defun plusp (x) (> x 0))
@@ -2676,6 +2690,13 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
             "counting" "maximize" "maximizing" "minimize" "minimizing" "do"
             "doing" "finally" "return" "when" "unless" "if" "else" "end"
             "always" "never" "thereis" "and" "into")))
+;; True when X names a clause `cl-loop--accum' can parse (accumulators + do/return).
+(defun cl-loop--accum-kw-p (x)
+  (member (cl-loop--kw x)
+          '("collect" "collecting" "append" "appending" "nconc" "nconcing"
+            "sum" "summing" "count" "counting" "maximize" "maximizing"
+            "minimize" "minimizing" "vconcat" "vconcating" "concat" "concating"
+            "do" "doing" "return")))
 ;; Parse ONE accumulation or `do' clause at C. Return (FORM REST KIND VAR INIT):
 ;; FORM targets VAR (or `--clacc--' when VAR is nil), KIND is the accumulator
 ;; kind (nil for `do'), INIT its initial value.
@@ -2723,9 +2744,18 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
          ;; named NAME — wrap the loop in `(cl-block NAME …)` so `cl-return-from
          ;; NAME` can exit it (Emacs names the implicit block with this name).
          ((equal kw "named") (setq loop-name (nth 1 c) c (nthcdr 2 c)))
-         ;; `and' joins another binding clause that steps in parallel; for the
-         ;; common iteration cases this behaves like a second `for'.
-         ((equal kw "and") (setq c (cons 'for (cdr c))))
+         ;; `and' joins the next clause into the SAME iteration step. When it
+         ;; joins an accumulation / conditional / do clause, drop `and' and let
+         ;; that clause parse normally (its body already runs each pass). When it
+         ;; joins a binding clause the leading `for' is omitted, so re-insert it.
+         ((equal kw "and")
+          (if (member (cl-loop--kw (nth 1 c))
+                      '("collect" "collecting" "append" "appending" "nconc" "nconcing"
+                        "sum" "summing" "count" "counting" "maximize" "maximizing"
+                        "minimize" "minimizing" "vconcat" "vconcating" "concat" "concating"
+                        "do" "doing" "when" "unless" "if" "return"))
+              (setq c (cdr c))
+            (setq c (cons 'for (cdr c)))))
          ;; for V across SEQ — iterate the elements of a string/vector/list.
          ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "across"))
           (let ((var (nth 1 c)) (tv (make-symbol "tail")))
@@ -2870,20 +2900,36 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
                   (setq binds (cons (list wv nil) binds) r (cdr r)))
                 (if (equal (cl-loop--kw (car r)) "and") (setq r (cdr r)) (setq more nil))))
             (setq c r)))
-         ;; when/unless/if COND <accum> [else <accum>] [end]
+         ;; when/unless/if COND <accum> [and <accum>...] [else <accum> [and ...]] [end]
+         ;; `and'-joined accumulators all share the branch condition (emacs 30.2:
+         ;; `when C collect X and collect Y' gates BOTH collects on C).
          ((member kw '("when" "unless" "if"))
           (let* ((cnd (nth 1 c)) (r (nthcdr 2 c)) (neg (equal kw "unless"))
-                 (a (cl-loop--accum r)) (cform (nth 0 a)) (aform nil))
+                 (a (cl-loop--accum r)) (cforms (list (nth 0 a))) (aforms nil))
             (setq r (nth 1 a))
             (if (nth 3 a) (setq binds (cons (list (nth 3 a) (nth 4 a)) binds))
               (when (nth 2 a) (setq acc-kind (nth 2 a))))
+            (while (and (equal (cl-loop--kw (car r)) "and") (cl-loop--accum-kw-p (nth 1 r)))
+              (let ((a2 (cl-loop--accum (cdr r))))
+                (setq cforms (cons (nth 0 a2) cforms) r (nth 1 a2))
+                (if (nth 3 a2) (setq binds (cons (list (nth 3 a2) (nth 4 a2)) binds))
+                  (when (nth 2 a2) (setq acc-kind (nth 2 a2))))))
             (when (equal (cl-loop--kw (car r)) "else")
               (let ((b (cl-loop--accum (cdr r))))
-                (setq aform (nth 0 b) r (nth 1 b))
+                (setq aforms (list (nth 0 b)) r (nth 1 b))
                 (if (nth 3 b) (setq binds (cons (list (nth 3 b) (nth 4 b)) binds))
-                  (when (nth 2 b) (setq acc-kind (nth 2 b))))))
+                  (when (nth 2 b) (setq acc-kind (nth 2 b))))
+                (while (and (equal (cl-loop--kw (car r)) "and") (cl-loop--accum-kw-p (nth 1 r)))
+                  (let ((b2 (cl-loop--accum (cdr r))))
+                    (setq aforms (cons (nth 0 b2) aforms) r (nth 1 b2))
+                    (if (nth 3 b2) (setq binds (cons (list (nth 3 b2) (nth 4 b2)) binds))
+                      (when (nth 2 b2) (setq acc-kind (nth 2 b2))))))))
             (when (equal (cl-loop--kw (car r)) "end") (setq r (cdr r)))
-            (setq body (cons (if neg (list 'if cnd aform cform) (list 'if cnd cform aform)) body))
+            (let ((cform (if (cdr cforms) (cons 'progn (reverse cforms)) (car cforms)))
+                  (aform (cond ((null aforms) nil)
+                               ((cdr aforms) (cons 'progn (reverse aforms)))
+                               (t (car aforms)))))
+              (setq body (cons (if neg (list 'if cnd aform cform) (list 'if cnd cform aform)) body)))
             (setq c r)))
          ;; boolean termination clauses
          ((equal kw "always")
