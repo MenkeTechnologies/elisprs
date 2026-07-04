@@ -1726,7 +1726,20 @@ Port of cl-fill from cl-seq.el (mutates SEQ in place, returns SEQ)."
 (defun cl-replace (seq1 seq2 &rest keys)
   "Replace the elements of SEQ1 with those of SEQ2, destructively; returns SEQ1.
 Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
-  (let ((start1 (cl--getkey keys :start1 0)) (end1 (cl--getkey keys :end1 nil))
+  (if (stringp seq1)
+      ;; Immutable-string model: return a fresh modified string. The return value
+      ;; is faithful to emacs cl-replace; in-place string aliasing is unsupported.
+      (let* ((start1 (cl--getkey keys :start1 0)) (end1 (cl--getkey keys :end1 nil))
+             (start2 (cl--getkey keys :start2 0)) (end2 (cl--getkey keys :end2 nil))
+             (l1 (append seq1 nil)) (l2 (append seq2 nil))
+             (e1 (min (or end1 (length l1)) (length l1)))
+             (e2 (min (or end2 (length l2)) (length l2)))
+             (p1 (nthcdr start1 l1)) (p2 (nthcdr start2 l2)))
+        (while (and p1 p2 (< start1 e1) (< start2 e2))
+          (setcar p1 (car p2))
+          (setq p1 (cdr p1) p2 (cdr p2) start1 (1+ start1) start2 (1+ start2)))
+        (apply #'string l1))
+    (let ((start1 (cl--getkey keys :start1 0)) (end1 (cl--getkey keys :end1 nil))
         (start2 (cl--getkey keys :start2 0)) (end2 (cl--getkey keys :end2 nil)))
     (if (and (eq seq1 seq2) (<= start2 start1))
         (or (= start1 start2)
@@ -1762,7 +1775,7 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
           (while (< start1 end1)
             (aset seq1 start1 (aref seq2 start2))
             (setq start2 (1+ start2) start1 (1+ start1))))))
-    seq1))
+    seq1)))
 (defun cl-mapcan (fn &rest seqs) (apply 'nconc (apply 'cl-mapcar fn seqs)))
 (defun cl-acons (key val alist) (cons (cons key val) alist))
 (defun cl-list* (&rest args)
