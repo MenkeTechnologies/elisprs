@@ -159,15 +159,19 @@ fn mod_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     let (xi, xf, xisf) = as_num(&a[0])?;
     let (yi, yf, yisf) = as_num(&a[1])?;
     if xisf || yisf {
-        if yf == 0.0 {
-            return Err("arith-error: division by zero".to_string());
-        }
         // Faithful port of Emacs `Fmod` (data.c): fmod, then fix the sign so the
         // result matches the divisor. `%` on f64 is fmod (the remainder keeps the
-        // dividend's sign, so `(mod -0.0 5)` stays `-0.0`, as Emacs returns).
+        // dividend's sign, so `(mod -0.0 5)` stays `-0.0`, as Emacs returns). A
+        // zero float divisor yields NaN — Emacs does NOT signal arith-error for
+        // float mod-by-zero (only integer mod-by-zero, handled below).
         let mut r = xf % yf;
         if if yf < 0.0 { r > 0.0 } else { r < 0.0 } {
             r += yf;
+        }
+        // Canonicalize the hardware-dependent NaN sign to positive, matching
+        // Emacs's "0.0e+NaN" printer (mirrors the `div` handling above).
+        if r.is_nan() {
+            r = r.abs();
         }
         return Ok(Value::Float(r));
     }
@@ -2383,31 +2387,42 @@ fn subrp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::Subr { .. }))))
 }
 // Forms elisprs lowers as compiler intrinsics but which Emacs classifies as
-// *macros* (`lambda`/`when`/… are macros there, not special forms).
-const INTRINSIC_MACROS: &[&str] = &["lambda", "when", "unless", "defun", "defmacro"];
-// The genuine special forms, matching Emacs's `special-form-p`.
-const SPECIAL_FORMS: &[&str] = &[
-    "quote",
-    "function",
-    "progn",
-    "prog1",
-    "prog2",
-    "if",
-    "cond",
-    "and",
-    "or",
-    "while",
-    "setq",
-    "let",
-    "let*",
-    "defvar",
-    "defconst",
-    "catch",
-    "unwind-protect",
-    "condition-case",
-    "save-current-buffer",
-    "save-excursion",
-    "save-restriction",
+// *macros* (`lambda`/`when`/… are macros there, not special forms). Each carries
+// the minimum arity of its Emacs `subr.el` lambda-list (max is always `many`),
+// used by `func-arity`.
+const INTRINSIC_MACROS: &[(&str, i64)] = &[
+    ("lambda", 0),
+    ("when", 1),
+    ("unless", 1),
+    ("defun", 2),
+    ("defmacro", 2),
+];
+// The genuine special forms, matching Emacs's `special-form-p`. Each carries the
+// C-level minimum arity Emacs's `func-arity` reports (max is always `unevalled`).
+// `prog2` is a macro in Emacs, not a special form; `interactive`/`inline` are.
+const SPECIAL_FORMS: &[(&str, i64)] = &[
+    ("and", 0),
+    ("catch", 1),
+    ("cond", 0),
+    ("condition-case", 2),
+    ("defconst", 2),
+    ("defvar", 1),
+    ("function", 1),
+    ("if", 2),
+    ("inline", 0),
+    ("interactive", 0),
+    ("let", 1),
+    ("let*", 1),
+    ("or", 0),
+    ("prog1", 1),
+    ("progn", 0),
+    ("quote", 1),
+    ("save-current-buffer", 0),
+    ("save-excursion", 0),
+    ("save-restriction", 0),
+    ("setq", 0),
+    ("unwind-protect", 1),
+    ("while", 1),
 ];
 /// `(macrop OBJECT)` — non-nil if OBJECT is (or names) a macro.
 fn macrop(h: &mut ElispHost, a: &[Value]) -> R {
@@ -2420,7 +2435,7 @@ fn macrop(h: &mut ElispHost, a: &[Value]) -> R {
     // The intrinsic forms have no closure to resolve, but are macros in Emacs.
     let ok = h
         .sym_name(&a[0])
-        .is_some_and(|n| INTRINSIC_MACROS.contains(&n.as_str()));
+        .is_some_and(|n| INTRINSIC_MACROS.iter().any(|(m, _)| *m == n.as_str()));
     Ok(nil_or(ok))
 }
 /// `(special-form-p OBJECT)` — non-nil if OBJECT names a special form (per
@@ -2428,7 +2443,7 @@ fn macrop(h: &mut ElispHost, a: &[Value]) -> R {
 fn special_form_p(h: &mut ElispHost, a: &[Value]) -> R {
     let ok = h
         .sym_name(&a[0])
-        .map(|n| SPECIAL_FORMS.contains(&n.as_str()))
+        .map(|n| SPECIAL_FORMS.iter().any(|(sf, _)| *sf == n.as_str()))
         .unwrap_or(false);
     Ok(nil_or(ok))
 }
@@ -3624,6 +3639,21 @@ fn special_variable_p(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(h.symbol_special(&a[0])))
 }
 fn func_arity(h: &mut ElispHost, a: &[Value]) -> R {
+    // Special forms and the intrinsic macros have no resolvable function cell,
+    // so `resolve_function` would signal `void-function`. Emacs instead reports
+    // their C-level arity: special forms as `(MIN . unevalled)`, macros as
+    // `(MIN . many)`.
+    if let Some(name) = h.sym_name(&a[0]) {
+        let name = name.as_str().to_owned();
+        if let Some((_, min)) = SPECIAL_FORMS.iter().find(|(sf, _)| *sf == name) {
+            let unevalled = h.intern("unevalled");
+            return Ok(h.cons(Value::Int(*min), unevalled));
+        }
+        if let Some((_, min)) = INTRINSIC_MACROS.iter().find(|(m, _)| *m == name) {
+            let many = h.intern("many");
+            return Ok(h.cons(Value::Int(*min), many));
+        }
+    }
     let (min, max) = {
         match h.resolve_function(&a[0])? {
             Resolved::Subr { min, max, .. } => (min as i64, max.map(|m| m as i64)),

@@ -977,3 +977,58 @@ fn log_uses_exact_base_10_and_2() {
     // Other bases fall back to the ratio form and match Emacs bit-for-bit.
     assert_eq!(eval("(log 8 3)"), "1.892789260714372");
 }
+
+#[test]
+fn mod_float_by_zero_is_nan_not_error() {
+    // Emacs `Fmod` uses fmod for any float operand; a zero float divisor yields
+    // NaN, not an arith-error (oracle emacs 30.2 → all "0.0e+NaN"). Only integer
+    // mod-by-zero signals. The NaN sign is canonicalized positive to match the
+    // Emacs printer regardless of hardware.
+    assert_eq!(eval("(mod 5.0 0)"), "0.0e+NaN");
+    assert_eq!(eval("(mod 5 0.0)"), "0.0e+NaN");
+    assert_eq!(eval("(mod 5.0 0.0)"), "0.0e+NaN");
+    assert_eq!(eval("(mod -5.0 0.0)"), "0.0e+NaN");
+    assert_eq!(eval("(mod 0.0 0.0)"), "0.0e+NaN");
+    // Integer mod-by-zero still signals arith-error.
+    assert_eq!(
+        eval("(condition-case e (mod 5 0) (error e))"),
+        "(arith-error)"
+    );
+}
+
+#[test]
+fn special_form_p_matches_emacs_classification() {
+    // `prog2` is a macro in Emacs, not a special form (oracle: nil).
+    assert_eq!(eval("(special-form-p 'prog2)"), "nil");
+    // `interactive` and `inline` are special forms (oracle: t); were missing.
+    assert_eq!(eval("(special-form-p 'interactive)"), "t");
+    assert_eq!(eval("(special-form-p 'inline)"), "t");
+    // Genuine special forms and non-special forms are unchanged.
+    assert_eq!(eval("(special-form-p 'if)"), "t");
+    assert_eq!(eval("(special-form-p 'progn)"), "t");
+    assert_eq!(eval("(special-form-p 'car)"), "nil");
+    // `prog2` is still a macro.
+    assert_eq!(eval("(macrop 'prog2)"), "t");
+}
+
+#[test]
+fn func_arity_of_special_forms_and_macros() {
+    // Special forms report `(MIN . unevalled)` (oracle emacs 30.2), not a
+    // void-function error.
+    assert_eq!(eval("(func-arity 'if)"), "(2 . unevalled)");
+    assert_eq!(eval("(func-arity 'progn)"), "(0 . unevalled)");
+    assert_eq!(eval("(func-arity 'setq)"), "(0 . unevalled)");
+    assert_eq!(eval("(func-arity 'condition-case)"), "(2 . unevalled)");
+    assert_eq!(eval("(func-arity 'interactive)"), "(0 . unevalled)");
+    assert_eq!(eval("(func-arity 'inline)"), "(0 . unevalled)");
+    // Intrinsic macros report `(MIN . many)` from their subr.el lambda-lists.
+    assert_eq!(eval("(func-arity 'when)"), "(1 . many)");
+    assert_eq!(eval("(func-arity 'unless)"), "(1 . many)");
+    assert_eq!(eval("(func-arity 'lambda)"), "(0 . many)");
+    assert_eq!(eval("(func-arity 'defun)"), "(2 . many)");
+    assert_eq!(eval("(func-arity 'defmacro)"), "(2 . many)");
+    // Regular subrs and closures are unaffected.
+    assert_eq!(eval("(func-arity 'car)"), "(1 . 1)");
+    assert_eq!(eval("(func-arity 'format)"), "(1 . many)");
+    assert_eq!(eval("(func-arity (lambda (a &optional b) 1))"), "(1 . 2)");
+}

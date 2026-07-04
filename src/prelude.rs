@@ -1460,10 +1460,29 @@ TYPE nil maps for side effects only and returns nil."
    ((and (symbolp (car form)) (assq (car form) alist))
     (cons 'funcall (cons (cdr (assq (car form) alist)) (cl-flet--walk (cdr form) alist))))
    (t (cons (cl-flet--walk (car form) alist) (cl-flet--walk (cdr form) alist)))))
+(defun cl-flet--cl-argp (arglist)
+  ;; Non-nil when ARGLIST uses cl-lambda-list features a plain `lambda' can't
+  ;; take: per-arg defaults (cons elements) or &key/&aux/&whole/&allow-other-keys.
+  (let ((cl nil))
+    (while (consp arglist)
+      (when (or (consp (car arglist))
+                (memq (car arglist) '(&key &aux &whole &allow-other-keys)))
+        (setq cl t))
+      (setq arglist (cdr arglist)))
+    cl))
+(defun cl-flet--lambda (spec)
+  ;; SPEC is (ARGLIST . BODY). Build the local-function lambda, routing through
+  ;; `cl-destructuring-bind' when ARGLIST needs full cl-lambda-list handling
+  ;; (matching Emacs cl-flet/cl-labels, which accept cl-lambda-lists).
+  (if (cl-flet--cl-argp (car spec))
+      (list 'lambda '(&rest --cl-flet-args--)
+            (cons 'cl-destructuring-bind
+                  (cons (car spec) (cons '--cl-flet-args-- (cdr spec)))))
+    (cons 'lambda spec)))
 (defmacro cl-flet (bindings &rest body)
   (let* ((gs (mapcar (lambda (b) (make-symbol (symbol-name (car b)))) bindings))
          (alist (cl-mapcar (lambda (b g) (cons (car b) g)) bindings gs)))
-    `(let ,(cl-mapcar (lambda (b g) (list g (cons 'lambda (cdr b)))) bindings gs)
+    `(let ,(cl-mapcar (lambda (b g) (list g (cl-flet--lambda (cdr b)))) bindings gs)
        ,@(cl-flet--walk body alist))))
 (defmacro cl-flet* (bindings &rest body)
   ;; Sequential cl-flet: each local function sees the earlier ones.
@@ -1474,7 +1493,7 @@ TYPE nil maps for side effects only and returns nil."
   (let* ((gs (mapcar (lambda (b) (make-symbol (symbol-name (car b)))) bindings))
          (alist (cl-mapcar (lambda (b g) (cons (car b) g)) bindings gs)))
     `(let ,(mapcar (lambda (g) (list g nil)) gs)
-       ,@(cl-mapcar (lambda (b g) (list 'setq g (cl-flet--walk (cons 'lambda (cdr b)) alist))) bindings gs)
+       ,@(cl-mapcar (lambda (b g) (list 'setq g (cl-flet--lambda (cl-flet--walk (cdr b) alist)))) bindings gs)
        ,@(cl-flet--walk body alist))))
 ;; cl-macrolet: local macros. Expand calls to them throughout BODY at expansion
 ;; time (re-walking each expansion), then leave the rest for the normal pass.
@@ -3265,7 +3284,8 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
   ;; When CHECK (the top-level arglist to report) is non-nil, an arity guard is
   ;; emitted so cl-destructuring-bind errors on length mismatch; cl-loop passes
   ;; no CHECK and stays lenient, matching Emacs in both cases.
-  (let ((binds nil) (i 0) (mode 'req))
+  (let ((binds nil) (i 0) (mode 'req)
+        (haskey nil) (allow nil) (keystart 0) (keywords nil))
     ;; Leading (&whole VAR …): bind VAR to the whole value, then continue.
     (when (eq (car arglist) '&whole)
       (setq binds (cons (list (car (cdr arglist)) v) binds))
@@ -3281,7 +3301,8 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
         (cond
          ((eq a '&optional) (setq mode 'opt))
          ((eq a '&rest) (setq mode 'rest))
-         ((eq a '&key) (setq mode 'key))
+         ((eq a '&key) (setq mode 'key haskey t keystart i))
+         ((eq a '&allow-other-keys) (setq allow t))
          ((eq a '&aux) (setq mode 'aux))
          ((eq mode 'rest) (setq binds (cons (list a (list 'nthcdr i v)) binds)))
          ((eq mode 'aux)
@@ -3291,6 +3312,7 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
           (let* ((var (if (consp a) (car a) a))
                  (def (and (consp a) (car (cdr a))))
                  (kw (intern (concat ":" (symbol-name var)))))
+            (setq keywords (cons kw keywords))
             (setq binds (cons (list var (list 'cl-db--plist-get (list 'nthcdr i v)
                                               (list 'quote kw) def))
                               binds))))
@@ -3307,6 +3329,29 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
           (setq i (1+ i)))
          (t (setq binds (cons (list a (list 'nth i v)) binds)) (setq i (1+ i)))))
       (setq arglist (cdr arglist)))
+    ;; &key keyword validation (only under CHECK, i.e. cl-destructuring-bind).
+    ;; Faithful to cl-macs.el: reject any keyword not among the &key names unless
+    ;; the lambda-list has &allow-other-keys or the plist carries :allow-other-keys t.
+    (when (and check haskey (not allow))
+      (let ((ks (make-symbol "--cl-keys--"))
+            (tail (list 'nthcdr keystart v))
+            (allowed (reverse keywords)))
+        (setq binds
+              (cons
+               (list (make-symbol "--cl-db-keychk--")
+                     (list 'let (list (list ks tail))
+                           (list 'while ks
+                                 (list 'cond
+                                       (list (list 'memq (list 'car ks)
+                                                   (list 'quote (append allowed '(:allow-other-keys))))
+                                             (list 'if (list 'cdr ks) nil
+                                                   (list 'error "Missing argument for %s" (list 'car ks)))
+                                             (list 'setq ks (list 'cddr ks)))
+                                       (list (list 'car (list 'cdr (list 'memq '':allow-other-keys tail)))
+                                             (list 'setq ks nil))
+                                       (list t (list 'error "Keyword argument %s not one of %s"
+                                                     (list 'car ks) (list 'quote allowed)))))))
+               binds))))
     ;; A dotted tail — e.g. (K . V) — binds the trailing symbol to the rest.
     (when (and arglist (symbolp arglist))
       (setq binds (cons (list arglist (list 'nthcdr i v)) binds)))

@@ -75,6 +75,41 @@ fn save_match_data_restores_outer_match() {
 }
 
 #[test]
+fn shy_and_explicit_group_numbering() {
+    // A shy group `\(?:…\)` does not capture: group 1 is the following real group.
+    // (emacs 30.2: (match-string 1) => "b".)
+    assert_eq!(
+        eval("(progn (string-match \"\\\\(?:a\\\\(b\\\\)\\\\)\" \"ab\") (match-string 1 \"ab\"))"),
+        "\"b\""
+    );
+    // Sequentially-numbered explicit groups `\(?1:…\)\(?2:…\)` match positionally,
+    // which is the common font-lock case. (emacs 30.2: ("a" "b").)
+    assert_eq!(
+        eval("(progn (string-match \"\\\\(?1:a\\\\)\\\\(?2:b\\\\)\" \"ab\") (list (match-string 1 \"ab\") (match-string 2 \"ab\")))"),
+        "(\"a\" \"b\")"
+    );
+}
+
+#[test]
+fn word_and_symbol_boundaries_and_case_fold() {
+    // `\<` / `\>` word boundaries and `\_<` / `\_>` symbol boundaries.
+    assert_eq!(eval("(string-match \"\\\\<word\\\\>\" \"a word b\")"), "2");
+    assert_eq!(eval("(string-match \"\\\\_<foo\\\\_>\" \"x foo y\")"), "2");
+    // case-fold-search: default folds case; nil is case-sensitive.
+    assert_eq!(
+        eval("(let ((case-fold-search t)) (string-match \"abc\" \"XABCY\"))"),
+        "1"
+    );
+    assert_eq!(
+        eval("(let ((case-fold-search nil)) (string-match \"abc\" \"XABCY\"))"),
+        "nil"
+    );
+    // `\`` / `\'` buffer-string anchors and bounded `\{n,m\}` repetition.
+    assert_eq!(eval("(string-match \"\\\\`abc\\\\'\" \"abc\")"), "0");
+    assert_eq!(eval("(string-match \"a\\\\{2,3\\\\}\" \"baaac\")"), "1");
+}
+
+#[test]
 fn regexp_quote_escapes_specials() {
     assert_eq!(eval("(regexp-quote \"a.b*c\")"), "\"a\\\\.b\\\\*c\"");
 }

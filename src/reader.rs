@@ -56,6 +56,20 @@ impl Reader {
     fn peek_at(&self, n: usize) -> Option<char> {
         self.chars.get(self.pos + n).copied()
     }
+    /// With the current char a `.`, is it the dotted-pair separator rather than
+    /// the start of a symbol/number? Emacs (`lread.c` `read1`) treats `.` as the
+    /// separator only when the following char is end-of-input, whitespace, or one
+    /// of `"';([#?` `` ` `` `,` — notably NOT `)`/`]`, so `(a .)` and `(.)` read
+    /// the `.` as the symbol `\.`, while `.5`/`...`/`a.b` stay atoms.
+    fn dot_is_separator(&self) -> bool {
+        match self.peek_at(1) {
+            None => true,
+            Some(c) => {
+                c.is_whitespace()
+                    || matches!(c, '"' | '\'' | ';' | '(' | '[' | '#' | '?' | '`' | ',')
+            }
+        }
+    }
     fn skip_ws(&mut self) {
         loop {
             match self.peek() {
@@ -79,6 +93,10 @@ impl Reader {
         match c {
             '(' => self.read_list(h),
             ')' => Err("unexpected )".to_string()),
+            // A separator `.` reaching `read_form` is misplaced: the valid dotted
+            // position is handled inside `read_list`. Top-level `(read ".")`, a
+            // vector element `[a . b]`, or a quoted `'.` all signal invalid syntax.
+            '.' if self.dot_is_separator() => Err("invalid-read-syntax: .".to_string()),
             '[' => self.read_vector(h),
             ']' => Err("unexpected ]".to_string()),
             '`' => {
@@ -144,13 +162,22 @@ impl Reader {
                     self.pos += 1;
                     break;
                 }
-                Some('.') if self.peek_at(1).map(is_delim).unwrap_or(true) => {
-                    // dotted tail: (a b . c)
-                    self.pos += 1;
+                Some('.') if self.dot_is_separator() => {
+                    // dotted tail: (a b . c). A separator `.` with no preceding car
+                    // (`(. a)`) is invalid read syntax; so is a missing cdr (`(a . )`)
+                    // or a second `.`/extra form before the close (`(a . b . c)`).
+                    if items.is_empty() {
+                        return Err("invalid-read-syntax: .".to_string());
+                    }
+                    self.pos += 1; // consume '.'
+                    self.skip_ws();
+                    if self.peek() == Some(')') {
+                        return Err("invalid-read-syntax: )".to_string());
+                    }
                     let tail = self.read_form(h)?;
                     self.skip_ws();
                     if self.peek() != Some(')') {
-                        return Err("malformed dotted list".to_string());
+                        return Err("invalid-read-syntax: expected )".to_string());
                     }
                     self.pos += 1;
                     let mut acc = tail;

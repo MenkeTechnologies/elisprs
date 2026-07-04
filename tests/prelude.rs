@@ -623,3 +623,68 @@ fn max_min_nan_propagation() {
     assert_eq!(eval("(max 1 2 3.0)"), "3.0");
     assert_eq!(eval("(min 1 2.0 3)"), "1");
 }
+
+#[test]
+fn cl_key_unknown_keyword_validation() {
+    // emacs 30.2: cl-destructuring-bind rejects a keyword outside the &key set
+    // with `(error "Keyword argument :y not one of (:x)")'. elisprs previously
+    // ignored the stray keyword and returned (1 2).
+    assert_eq!(
+        eval(
+            "(condition-case e (cl-destructuring-bind (a &key x) '(1 :x 2 :y 3) \
+             (list a x)) (error (car (cdr e))))"
+        ),
+        "\"Keyword argument :y not one of (:x)\""
+    );
+    // A known keyword with no value signals "Missing argument".
+    assert_eq!(
+        eval(
+            "(condition-case e (cl-destructuring-bind (a &key x) '(1 :x) (list a x)) \
+             (error (car (cdr e))))"
+        ),
+        "\"Missing argument for :x\""
+    );
+    // &allow-other-keys in the lambda-list suppresses the check.
+    assert_eq!(
+        eval("(cl-destructuring-bind (a &key x &allow-other-keys) '(1 :x 2 :y 3) (list a x))"),
+        "(1 2)"
+    );
+    // :allow-other-keys t in the plist suppresses the check.
+    assert_eq!(
+        eval("(cl-destructuring-bind (a &key x) '(1 :x 2 :y 3 :allow-other-keys t) (list a x))"),
+        "(1 2)"
+    );
+    // Valid keyword usage and defaults unaffected.
+    assert_eq!(
+        eval("(cl-destructuring-bind (a &key (x 9)) '(1) (list a x))"),
+        "(1 9)"
+    );
+}
+
+#[test]
+fn cl_flet_accepts_cl_lambda_lists() {
+    // emacs 30.2: cl-flet/cl-labels local functions accept full cl-lambda-lists.
+    // elisprs previously built a plain `lambda' and errored on `(y 10)'.
+    assert_eq!(
+        eval("(cl-flet ((f (x &optional (y 10)) (list x y))) (f 1))"),
+        "(1 10)"
+    );
+    assert_eq!(
+        eval("(cl-flet ((f (x &optional (y 10)) (list x y))) (f 1 2))"),
+        "(1 2)"
+    );
+    assert_eq!(
+        eval("(cl-flet ((f (&key x (y 5)) (list x y))) (f :x 1))"),
+        "(1 5)"
+    );
+    // cl-labels recursion with an &optional accumulator default.
+    assert_eq!(
+        eval(
+            "(cl-labels ((sd (n &optional (acc 0)) (if (= n 0) acc (sd (1- n) (+ acc n))))) \
+             (sd 4))"
+        ),
+        "10"
+    );
+    // Plain-arglist cl-flet still works and stays non-recursive (no self-ref).
+    assert_eq!(eval("(cl-flet ((f (a b) (- a b))) (f 10 3))"), "7");
+}

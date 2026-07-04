@@ -29,6 +29,45 @@ fn dotted_pair_syntax() {
 }
 
 #[test]
+fn dot_reader_syntax_matches_emacs() {
+    // A lone separator `.` is invalid read syntax wherever it cannot form a
+    // dotted pair — top level, a vector element, or a list with no preceding car.
+    // (emacs 30.2: all signal `(invalid-read-syntax ".")`.)
+    assert_eq!(
+        eval("(condition-case e (read \".\") (error e))"),
+        "(invalid-read-syntax \".\")"
+    );
+    assert_eq!(
+        eval("(condition-case e (read \"(. a)\") (error e))"),
+        "(invalid-read-syntax \".\")"
+    );
+    assert_eq!(
+        eval("(condition-case e (read \"[a . b]\") (error e))"),
+        "(invalid-read-syntax \".\")"
+    );
+    // A missing cdr (`(a . )`) or a second dot / extra form before the close.
+    assert_eq!(
+        eval("(condition-case e (read \"(a . )\") (error e))"),
+        "(invalid-read-syntax \")\")"
+    );
+    assert_eq!(
+        eval("(condition-case e (read \"(a . b . c)\") (error e))"),
+        "(invalid-read-syntax \"expected )\")"
+    );
+    // A `.` immediately before `)` is the symbol `\\.`, not a separator (emacs
+    // `(a .)` => `(a \\.)`, `(.)` => `(\\.)`).
+    assert_eq!(eval("(read \"(a .)\")"), "(a \\.)");
+    assert_eq!(eval("(read \"(.)\")"), "(\\.)");
+    // Valid dotted pairs are unaffected.
+    assert_eq!(eval("(read \"(1 . 2)\")"), "(1 . 2)");
+    assert_eq!(eval("(read \"(1 2 . 3)\")"), "(1 2 . 3)");
+    // `.5` is a float, `...` is a symbol, `a.b` a symbol — never a bare dot.
+    assert_eq!(eval("(read \".5\")"), "0.5");
+    assert_eq!(eval("(symbol-name (read \"...\"))"), "\"...\"");
+    assert_eq!(eval("(read \"(a.b c)\")"), "(a.b c)");
+}
+
+#[test]
 fn quote_and_function_quote() {
     assert_eq!(eval("(quote nil)"), "nil");
     assert_eq!(eval("()"), "nil");
