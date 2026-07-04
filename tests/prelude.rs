@@ -474,3 +474,47 @@ fn cl_pairlis_and_remprop() {
     );
     assert_eq!(eval("(cl-remprop 'pa-none 'nope)"), "nil");
 }
+
+#[test]
+fn cl_fill_replace_mutate_in_place() {
+    // cl-fill/cl-replace modify the ORIGINAL sequence (per cl-seq.el), not a copy.
+    assert_eq!(
+        eval("(let ((l (list 1 2 3 4 5))) (cl-fill l 'x :start 1 :end 3) l)"),
+        "(1 x x 4 5)"
+    );
+    assert_eq!(
+        eval("(let ((v (vector 0 1 2 3 4))) (cl-fill v 9 :start 1 :end 3) v)"),
+        "[0 9 9 3 4]"
+    );
+    assert_eq!(
+        eval("(let ((l (list 1 2 3 4 5))) (cl-replace l '(a b) :start1 1) l)"),
+        "(1 a b 4 5)"
+    );
+    assert_eq!(
+        eval("(let ((v (vector 0 0 0 0))) (cl-replace v [7 8] :start1 2) v)"),
+        "[0 0 7 8]"
+    );
+    // (setf (cl-subseq ...)) routes through cl-replace and mutates in place.
+    assert_eq!(
+        eval("(let ((l (list 1 2 3 4 5))) (setf (cl-subseq l 1 3) '(20 30)) l)"),
+        "(1 20 30 4 5)"
+    );
+    assert_eq!(
+        eval("(let ((v (vector 1 2 3 4))) (setf (cl-subseq v 1 3) [20 30]) v)"),
+        "[1 20 30 4]"
+    );
+}
+
+#[test]
+fn cl_some_every_multiple_sequences() {
+    // Extra sequences => PRED applied in parallel, stopping at the shortest.
+    assert_eq!(eval("(cl-some '= '(1 2 3) '(3 2 1))"), "t");
+    assert_eq!(eval("(cl-some '> '(1 2 3) '(5 5 5))"), "nil");
+    assert_eq!(eval("(cl-every '< '(1 2 3) '(2 3 4))"), "t");
+    // shorter second sequence bounds the walk, so the last pair is never tested
+    assert_eq!(eval("(cl-every '< '(1 2 3) '(2 3))"), "t");
+    assert_eq!(eval("(cl-notany '= '(1 2) '(3 4))"), "t");
+    assert_eq!(eval("(cl-notevery '= '(1 2) '(1 3))"), "t");
+    // cl-some yields the first non-nil predicate VALUE, not merely t
+    assert_eq!(eval("(cl-some 'identity [nil nil 3])"), "3");
+}

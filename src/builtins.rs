@@ -39,6 +39,40 @@ fn as_string(v: &Value) -> Result<String, String> {
         _ => Err(format!("wrong-type-argument: stringp {}", v.as_str_cow())),
     }
 }
+/// Strict integer accessor signalling `integer-or-marker-p` on non-integers —
+/// Emacs's bitwise (`logand`/`logior`/`logxor`) and `%` argument checks reject
+/// floats rather than truncating them.
+fn as_int_om(h: &ElispHost, v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Int(n) => Ok(*n),
+        _ => Err(format!(
+            "wrong-type-argument: integer-or-marker-p {}",
+            h.print(v, true)
+        )),
+    }
+}
+/// Strict integer accessor signalling `integerp` (for `ash`/`lsh`/`lognot`/`logcount`).
+fn as_integer(h: &ElispHost, v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Int(n) => Ok(*n),
+        _ => Err(format!(
+            "wrong-type-argument: integerp {}",
+            h.print(v, true)
+        )),
+    }
+}
+/// Character-code accessor: a valid character is an integer in [0, #x3FFFFF];
+/// anything else signals `wrong-type-argument characterp VALUE` (a negative code
+/// or one past the upper bound, as `char-to-string`/`make-string` do).
+fn as_char(h: &ElispHost, v: &Value) -> Result<u32, String> {
+    match v {
+        Value::Int(n) if (0..=0x3F_FFFF).contains(n) => Ok(*n as u32),
+        _ => Err(format!(
+            "wrong-type-argument: characterp {}",
+            h.print(v, true)
+        )),
+    }
+}
 fn num_result(i: i64, f: f64, isf: bool) -> Value {
     if isf {
         Value::Float(f)
@@ -111,9 +145,9 @@ fn div(_h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(num_result(i, f, isf))
 }
-fn modulo(_h: &mut ElispHost, a: &[Value]) -> R {
-    let x = as_num(&a[0])?.0;
-    let y = as_num(&a[1])?.0;
+fn modulo(h: &mut ElispHost, a: &[Value]) -> R {
+    let x = as_int_om(h, &a[0])?;
+    let y = as_int_om(h, &a[1])?;
     if y == 0 {
         return Err("arith-error: division by zero".to_string());
     }
@@ -405,9 +439,42 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
         Value::Undef => Ok(Value::Int(0)),
         Value::Obj(_) => match h.obj(&a[0]) {
             Some(Obj::Vector(items)) => Ok(Value::Int(items.len() as i64)),
-            _ => Ok(Value::Int(
-                h.list_vec(&a[0]).map(|v| v.len()).unwrap_or(0) as i64
-            )),
+            Some(Obj::Cons(..)) => {
+                // Walk the cons spine, Floyd-detecting cycles. A non-nil, non-cons
+                // tail is an improper list -> `wrong-type-argument listp TAIL`
+                // (e.g. `(length '(1 2 . 3))` signals with 3); a circular list
+                // signals `circular-list`.
+                let mut fast = a[0].clone();
+                let mut slow = a[0].clone();
+                let mut n: i64 = 0;
+                loop {
+                    for _ in 0..2 {
+                        match h.obj(&fast) {
+                            Some(Obj::Cons(_, d)) => {
+                                fast = d.clone();
+                                n += 1;
+                            }
+                            _ if is_nil(&fast) => return Ok(Value::Int(n)),
+                            _ => {
+                                return Err(format!(
+                                    "wrong-type-argument: listp {}",
+                                    h.print(&fast, true)
+                                ))
+                            }
+                        }
+                    }
+                    if let Some(Obj::Cons(_, d)) = h.obj(&slow) {
+                        slow = d.clone();
+                    }
+                    if h.values_eq(&slow, &fast) {
+                        // Faithful error symbol; the exact DATA payload (the list
+                        // itself) needs cycle-aware printing (host.rs), so we omit
+                        // it here rather than infinite-loop trying to render it.
+                        return Err("circular-list: circular list".to_string());
+                    }
+                }
+            }
+            _ => Ok(Value::Int(0)),
         },
         _ => Err(format!(
             "wrong-type-argument: sequencep {}",
@@ -418,8 +485,9 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
 fn nth_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // `(nth n list)` = `(car (nthcdr n list))`: walk the cons spine n times, then
     // take the car. Improper lists are fine (`(nth 0 '(a . 1))` => a); only when
-    // we actually need the car/cdr of a non-list does Emacs signal listp.
-    let n = as_num(&a[0])?.0;
+    // we actually need the car/cdr of a non-list does Emacs signal listp. N must
+    // be an integer — a float or other type signals `integerp`.
+    let n = as_integer(h, &a[0])?;
     let mut cur = a[1].clone();
     let mut i = 0;
     while i < n {
@@ -1324,12 +1392,10 @@ fn string_join(h: &mut ElispHost, a: &[Value]) -> R {
     let strs: Result<Vec<String>, String> = items.iter().map(as_string).collect();
     Ok(Value::str(strs?.join(&sep)))
 }
-fn char_to_string(_h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_int(&a[0])?;
+fn char_to_string(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_char(h, &a[0])?;
     Ok(Value::str(
-        char::from_u32(n as u32)
-            .map(|c| c.to_string())
-            .unwrap_or_default(),
+        char::from_u32(n).map(|c| c.to_string()).unwrap_or_default(),
     ))
 }
 fn string_to_char(_h: &mut ElispHost, a: &[Value]) -> R {
@@ -1341,12 +1407,12 @@ fn string_to_char(_h: &mut ElispHost, a: &[Value]) -> R {
             .unwrap_or(0),
     ))
 }
-fn make_string(_h: &mut ElispHost, a: &[Value]) -> R {
+fn make_string(h: &mut ElispHost, a: &[Value]) -> R {
     let n = as_int(&a[0])?;
     if n < 0 {
         return Err(format!("wrong-type-argument: wholenump {n}"));
     }
-    let c = char::from_u32(as_int(&a[1])? as u32).unwrap_or(' ');
+    let c = char::from_u32(as_char(h, &a[1])?).unwrap_or(' ');
     Ok(Value::str(c.to_string().repeat(n as usize)))
 }
 fn string_fn(_h: &mut ElispHost, a: &[Value]) -> R {
@@ -1369,9 +1435,17 @@ fn string_search(_h: &mut ElispHost, a: &[Value]) -> R {
     let needle = as_string(&a[0])?;
     let hay = as_string(&a[1])?;
     // Optional START is a char index; search only the tail from there, then map
-    // the byte offset back to an absolute char index.
+    // the byte offset back to an absolute char index. Emacs bounds-checks START
+    // against [0, len], signalling args-out-of-range with the raw START value.
+    let hay_len = hay.chars().count() as i64;
     let start_char = match a.get(2) {
-        Some(Value::Int(n)) => (*n).max(0) as usize,
+        Some(v) if !is_nil(v) => {
+            let n = as_int(v)?;
+            if n < 0 || n > hay_len {
+                return Err(format!("args-out-of-range: {n}"));
+            }
+            n as usize
+        }
         _ => 0,
     };
     let start_byte = hay
@@ -1788,37 +1862,49 @@ fn float_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     let (_i, f, _isf) = as_num(&a[0])?;
     Ok(Value::Float(f))
 }
-fn logand_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+fn logand_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let mut r: i64 = -1;
     for v in a {
-        r &= as_int(v)?;
+        r &= as_int_om(h, v)?;
     }
     Ok(Value::Int(r))
 }
-fn logior_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+fn logior_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let mut r: i64 = 0;
     for v in a {
-        r |= as_int(v)?;
+        r |= as_int_om(h, v)?;
     }
     Ok(Value::Int(r))
 }
-fn logxor_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+fn logxor_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let mut r: i64 = 0;
     for v in a {
-        r ^= as_int(v)?;
+        r ^= as_int_om(h, v)?;
     }
     Ok(Value::Int(r))
 }
-fn lognot_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Int(!as_int(&a[0])?))
+fn lognot_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Int(!as_integer(h, &a[0])?))
 }
-fn ash_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_int(&a[0])?;
-    let c = as_int(&a[1])?;
+fn ash_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_integer(h, &a[0])?;
+    let c = as_integer(h, &a[1])?;
     Ok(Value::Int(if c >= 0 {
         n.wrapping_shl(c as u32)
     } else {
-        n >> (-c) as u32
+        // Arithmetic right shift; a shift ≥ 64 fills with the sign bit, so a
+        // positive value collapses to 0 and a negative one to -1 (Rust's `>>`
+        // would panic on an out-of-range count).
+        let sh = (-c) as u32;
+        if sh >= 64 {
+            if n < 0 {
+                -1
+            } else {
+                0
+            }
+        } else {
+            n >> sh
+        }
     }))
 }
 
@@ -2182,7 +2268,13 @@ fn functionp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(ok))
 }
 fn char_or_string_p(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(matches!(a[0], Value::Int(_) | Value::Str(_))))
+    // A "character" is an integer in [0, #x3FFFFF]; strings always qualify.
+    let ok = match &a[0] {
+        Value::Int(n) => (0..=0x3F_FFFF).contains(n),
+        Value::Str(_) => true,
+        _ => false,
+    };
+    Ok(nil_or(ok))
 }
 fn char_equal(h: &mut ElispHost, a: &[Value]) -> R {
     let (c1, c2) = (as_int(&a[0])?, as_int(&a[1])?);
@@ -2338,8 +2430,8 @@ fn abs_fn(_h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// `(logcount N)` — count of set bits for N≥0, or of clear bits for N<0 (i.e.
 /// bits differing from the sign bit), matching Emacs.
-fn logcount_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_int(&a[0])?;
+fn logcount_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_integer(h, &a[0])?;
     let bits = if n >= 0 {
         n.count_ones()
     } else {

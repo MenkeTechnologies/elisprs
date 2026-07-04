@@ -637,3 +637,163 @@ fn frexp_is_exact_for_extreme_magnitudes() {
     assert_eq!(eval("(frexp -0.0)"), "(-0.0 . 0)");
     assert_eq!(eval("(frexp 1.0e+INF)"), "(1.0e+INF . 0)");
 }
+
+#[test]
+fn char_or_string_p_bounds_the_character_range() {
+    // A "character" is an integer in [0, #x3FFFFF]; strings always qualify, and
+    // anything past the upper bound or below zero does not (oracle: emacs 30.2).
+    assert_eq!(eval("(char-or-string-p 4194303)"), "t");
+    assert_eq!(eval("(char-or-string-p 4194304)"), "nil");
+    assert_eq!(eval("(char-or-string-p -1)"), "nil");
+    assert_eq!(eval("(char-or-string-p 0)"), "t");
+    assert_eq!(eval("(char-or-string-p \"x\")"), "t");
+    assert_eq!(eval("(char-or-string-p 'sym)"), "nil");
+    assert_eq!(eval("(char-or-string-p 1.0)"), "nil");
+}
+
+#[test]
+fn string_search_bounds_check_start() {
+    // START in [0, len] is honoured (len itself allowed); outside signals
+    // args-out-of-range with the raw START value (oracle: emacs 30.2).
+    assert_eq!(eval("(string-search \"lo\" \"hello\" 3)"), "3");
+    assert_eq!(eval("(string-search \"i\" \"hi\" 1)"), "1");
+    assert_eq!(eval("(string-search \"\" \"hi\" 2)"), "2");
+    // START is a char index; the returned index is a char index too.
+    assert_eq!(eval("(string-search \"o\" \"héllo\" 2)"), "4");
+    assert_eq!(
+        eval("(condition-case e (string-search \"x\" \"hi\" 10) (args-out-of-range (cdr e)))"),
+        "(10)"
+    );
+    assert_eq!(
+        eval("(condition-case e (string-search \"x\" \"hi\" -1) (args-out-of-range (cdr e)))"),
+        "(-1)"
+    );
+}
+
+#[test]
+fn length_rejects_improper_lists_and_terminates_on_cycles() {
+    // A proper list / vector / string counts normally; a dotted (improper) tail
+    // signals `wrong-type-argument listp TAIL` with the offending tail value.
+    assert_eq!(eval("(length '(1 2 3))"), "3");
+    assert_eq!(eval("(length nil)"), "0");
+    assert_eq!(eval("(length [1 2 3])"), "3");
+    assert_eq!(eval("(length \"héllo\")"), "5");
+    assert_eq!(
+        eval("(condition-case e (length (cons 1 2)) (wrong-type-argument (cdr e)))"),
+        "(listp 2)"
+    );
+    assert_eq!(
+        eval("(condition-case e (length '(1 2 . 3)) (wrong-type-argument (cdr e)))"),
+        "(listp 3)"
+    );
+    // A circular list terminates with `circular-list` (Floyd detection) rather
+    // than looping forever.
+    assert_eq!(
+        eval("(condition-case e (let ((l (list 1 2 3))) (setcdr (cddr l) l) (length l)) (circular-list 'caught))"),
+        "caught"
+    );
+}
+
+#[test]
+fn bitwise_and_modulo_reject_floats() {
+    // Valid integer arguments still compute; floats/other are rejected with the
+    // predicate Emacs uses: `integer-or-marker-p` for `%`/logand/logior/logxor,
+    // `integerp` for ash/lsh/lognot/logcount (oracle: emacs 30.2).
+    assert_eq!(eval("(% 7 3)"), "1");
+    assert_eq!(eval("(logand 3 5)"), "1");
+    assert_eq!(eval("(logcount 7)"), "3");
+    assert_eq!(
+        eval("(condition-case e (% 7.0 2) (wrong-type-argument (cdr e)))"),
+        "(integer-or-marker-p 7.0)"
+    );
+    assert_eq!(
+        eval("(condition-case e (% 7 2.0) (wrong-type-argument (cdr e)))"),
+        "(integer-or-marker-p 2.0)"
+    );
+    assert_eq!(
+        eval("(condition-case e (logand 3.0 2) (wrong-type-argument (cdr e)))"),
+        "(integer-or-marker-p 3.0)"
+    );
+    assert_eq!(
+        eval("(condition-case e (logior 3.0) (wrong-type-argument (cdr e)))"),
+        "(integer-or-marker-p 3.0)"
+    );
+    assert_eq!(
+        eval("(condition-case e (logxor 3.0) (wrong-type-argument (cdr e)))"),
+        "(integer-or-marker-p 3.0)"
+    );
+    // A non-number reports the value readably (a string stays quoted).
+    assert_eq!(
+        eval("(condition-case e (logand \"x\" 2) (wrong-type-argument (cdr e)))"),
+        "(integer-or-marker-p \"x\")"
+    );
+    assert_eq!(
+        eval("(condition-case e (ash 1.0 2) (wrong-type-argument (cdr e)))"),
+        "(integerp 1.0)"
+    );
+    assert_eq!(
+        eval("(condition-case e (lognot 3.0) (wrong-type-argument (cdr e)))"),
+        "(integerp 3.0)"
+    );
+    assert_eq!(
+        eval("(condition-case e (logcount 3.0) (wrong-type-argument (cdr e)))"),
+        "(integerp 3.0)"
+    );
+}
+
+#[test]
+fn ash_large_shift_fills_with_sign_bit() {
+    // A right shift ≥ 64 collapses to the sign bit — 0 for a non-negative value,
+    // -1 for a negative one — instead of panicking on the out-of-range count.
+    assert_eq!(eval("(ash 1 -100)"), "0");
+    assert_eq!(eval("(ash 8 -100)"), "0");
+    assert_eq!(eval("(ash -1 -100)"), "-1");
+    assert_eq!(eval("(ash -8 -100)"), "-1");
+    assert_eq!(eval("(ash 1 -64)"), "0");
+    assert_eq!(eval("(ash -1 -64)"), "-1");
+    // Ordinary in-range shifts are unaffected.
+    assert_eq!(eval("(ash 8 -2)"), "2");
+    assert_eq!(eval("(ash 1 4)"), "16");
+}
+
+#[test]
+fn char_to_string_and_make_string_check_characterp() {
+    // Valid characters (including astral ones) convert; out-of-range codes signal
+    // `wrong-type-argument characterp CODE` (oracle: emacs 30.2).
+    assert_eq!(eval("(char-to-string ?a)"), "\"a\"");
+    assert_eq!(eval("(char-to-string 128512)"), "\"😀\"");
+    assert_eq!(eval("(make-string 3 ?x)"), "\"xxx\"");
+    assert_eq!(eval("(make-string 3 128512)"), "\"😀😀😀\"");
+    assert_eq!(
+        eval("(condition-case e (char-to-string 4194304) (wrong-type-argument (cdr e)))"),
+        "(characterp 4194304)"
+    );
+    assert_eq!(
+        eval("(condition-case e (char-to-string -1) (wrong-type-argument (cdr e)))"),
+        "(characterp -1)"
+    );
+    assert_eq!(
+        eval("(condition-case e (make-string 3 -1) (wrong-type-argument (cdr e)))"),
+        "(characterp -1)"
+    );
+    assert_eq!(
+        eval("(condition-case e (make-string 3 4194304) (wrong-type-argument (cdr e)))"),
+        "(characterp 4194304)"
+    );
+}
+
+#[test]
+fn nth_requires_an_integer_index() {
+    // Improper lists are fine for an in-range index, but N itself must be an
+    // integer — a float or other type signals `integerp` (oracle: emacs 30.2).
+    assert_eq!(eval("(nth 1 '(a b c))"), "b");
+    assert_eq!(eval("(nth 0 '(a . 1))"), "a");
+    assert_eq!(
+        eval("(condition-case e (nth 1.5 '(a b c)) (wrong-type-argument (cdr e)))"),
+        "(integerp 1.5)"
+    );
+    assert_eq!(
+        eval("(condition-case e (nth \"a\" '(a b)) (wrong-type-argument (cdr e)))"),
+        "(integerp \"a\")"
+    );
+}
