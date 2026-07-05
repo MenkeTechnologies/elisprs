@@ -1634,7 +1634,7 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
 /// Resolve a load candidate to an absolute path string, expanding `~/` and
 /// making relative paths absolute against the process cwd (which the elisp
 /// `default-directory` mirrors). No path is required to exist here.
-fn load_abspath(candidate: &str) -> std::path::PathBuf {
+pub(crate) fn load_abspath(candidate: &str) -> std::path::PathBuf {
     if let Some(rest) = candidate.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return std::path::PathBuf::from(home).join(rest);

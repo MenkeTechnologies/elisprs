@@ -112,6 +112,35 @@ pub fn format_error(e: &str) -> String {
     }
 }
 
+/// Bind `load-file-name`/`load-true-file-name`/`load-in-progress` to `path`'s
+/// absolute form for the duration of `run`, then restore them (even on error).
+///
+/// Emacs never evaluates an init/startup file "bare": it loads it via `load`
+/// (`emacs -l FILE`, and the startup init-file load), so `load-file-name` is
+/// bound to the file while its forms run. `eval_file` is elisprs's `emacs -l`
+/// path, so it binds the same vars — otherwise `(file-name-directory
+/// load-file-name)`, which real init files (e.g. Spacemacs `init.el`) use to
+/// locate sibling files, sees a void/nil variable.
+fn with_load_file_name<T>(
+    path: &str,
+    run: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let abs = Value::str(host::load_abspath(path).to_string_lossy().into_owned());
+    let depth = host::with_host(|h| {
+        let d = h.specdepth();
+        let lfn = h.intern("load-file-name");
+        let ltn = h.intern("load-true-file-name");
+        let lip = h.intern("load-in-progress");
+        let _ = h.specbind(&lfn, abs.clone());
+        let _ = h.specbind(&ltn, abs.clone());
+        let _ = h.specbind(&lip, Value::Bool(true));
+        d
+    });
+    let r = run();
+    host::with_host(|h| h.unbind_to(depth));
+    r
+}
+
 /// Run a `.el` file, using the rkyv bytecode cache at `~/.elisprs/scripts.rkyv`.
 /// On a fresh hit, the per-form chunks + a clean heap image are loaded and run
 /// directly — skipping read / macro-expand / lower AND the prelude rebuild.
@@ -138,11 +167,13 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
         }
         host::reset_host();
         host::with_host(|h| h.import_heap_image(heap));
-        let mut last = Value::Undef;
-        for chunk in chunks {
-            last = host::run_chunk(chunk)?;
-        }
-        return Ok(last);
+        return with_load_file_name(path, || {
+            let mut last = Value::Undef;
+            for chunk in chunks {
+                last = host::run_chunk(chunk)?;
+            }
+            Ok(last)
+        });
     }
     if debug {
         eprintln!("elisprs: cache MISS {path}");
@@ -157,7 +188,9 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
     let prelude_end = host::with_host(|h| h.arena_len());
     let baseline = host::with_host(|h| h.snapshot_values(builtin_count, prelude_end));
 
-    let (chunks, last) = run_top_forms(&src)?;
+    // Bind load-file-name only while the forms run; unbind before the clean heap
+    // image is captured so the cached image carries no transient load binding.
+    let (chunks, last) = with_load_file_name(path, || run_top_forms(&src))?;
     let heap = host::with_host(|h| h.export_heap_image_clean(prelude_end, &baseline));
     cache::put(path, mtime_ns, &schema_key, &chunks, &heap);
     Ok(last)
