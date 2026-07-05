@@ -227,6 +227,32 @@ All notable changes to elisprs are documented here. The format follows
   applicable) keyword arguments, and preserve the input sequence's type.
 
 ### Added
+- **Text buffers, point, narrowing & marker-based `save-excursion`** — the
+  buffer.c/editfns.c/insdel.c editing core, verified value-for-value against the
+  Emacs 30.2 binary. A global registry of **named live buffers**, each with its
+  own text (`Vec<char>`), 1-based point, mark, and narrowing bounds. New C
+  primitives (`src/builtins.rs`): registry — `current-buffer`, `set-buffer`,
+  `get-buffer`, `get-buffer-create`, `generate-new-buffer`,
+  `generate-new-buffer-name`, `buffer-name`, `buffer-live-p`, `bufferp`,
+  `kill-buffer`, `rename-buffer`, `buffer-list`; text — `insert` / `insert-char`
+  now shift point and every later marker-like position, `delete-region` /
+  `delete-char` / `erase-buffer`; position — `point-min` / `point-max` honor
+  narrowing, `goto-char` clamps into the accessible region (returning its raw
+  arg), `char-after` / `char-before` / `bolp` / `eolp` / `bobp` / `eobp` and line
+  motion respect `[begv, zv]`; mark — `set-mark`, `mark`, `region-beginning`,
+  `region-end`; narrowing — `narrow-to-region`, `widen`. `begv`/`zv`/`mark`/the
+  save stacks track edits with Emacs marker rules (insertion-type nil for `begv`,
+  t for `zv`). Prelude macros (`src/prelude.rs`): `save-current-buffer`,
+  `with-current-buffer`, `with-temp-buffer` (fresh ` *temp*` buffer, killed after),
+  `save-excursion` (restores current buffer **and** point via a marker that tracks
+  intervening insertions/deletions), and `save-restriction`. Buffer-local
+  resolution keys off the current buffer, and `buffer-local-value` now honors its
+  BUFFER argument. This carries `tabulated-list.el` past load into
+  `(tabulated-list-mode)` buffer initialization (blocked only at the named
+  redisplay + text-property boundaries). Boundaries named, not faked: **text
+  properties** (`propertize` / interval trees), **general marker objects**
+  (`make-marker` / `point-marker`), and **redisplay** (windows/header-line/faces)
+  are not modeled.
 - **Buffer-local variables + major/minor mode machinery** — the buffer.c/data.c
   local-binding primitives and the subr.el / derived.el / easy-mmode.el mode
   layer, verified byte-for-byte against the Emacs 30.2 binary. New C primitives
@@ -248,9 +274,9 @@ All notable changes to elisprs are documented here. The format follows
   `tabulated-list.el`, which now loads fully (all `define-derived-mode` /
   `defvar-keymap` forms and `(provide 'tabulated-list)`). Boundaries named, not
   faked: syntax tables and abbrev tables are placeholder constructors (separate
-  subsystems), docstrings are not line-filled (`fill-region` cosmetic), and only
-  a single implicit buffer is modeled (multi-buffer text editing is a separate
-  track). Also fixed two engine bugs the port exposed: the regexp translator now
+  subsystems) and docstrings are not line-filled (`fill-region` cosmetic).
+  (Multi-buffer text editing landed subsequently — see the text-buffer entry
+  above.) Also fixed two engine bugs the port exposed: the regexp translator now
   escapes a literal `[` inside a bracket expression (`[{[]`, per POSIX/Emacs) for
   the `regex` crate, and `macroexpand-all` no longer expands a `let`-binding
   variable as a macro call (a symbol can be both a special variable *and* a macro,

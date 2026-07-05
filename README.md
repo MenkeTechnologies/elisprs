@@ -144,7 +144,9 @@ elisp --version
 
 **Scope.** Both **lexical** (`lexical-binding: t`) and **dynamic** binding are honored — lexical closures capture their defining environment, while `defvar` / special variables bind dynamically.
 
-**Not in scope** — surfaced loudly rather than silently misread: this is a useful elisp core, **not** the ~1000-subr GNU Emacs surface, and it is not buffer-aware — editor integration (buffers, point, markers) is a separate track.
+**Buffers & text editing.** A global registry of named live buffers, each with its own text, 1-based point, mark, and narrowing bounds. `current-buffer` / `set-buffer` / `get-buffer-create` / `generate-new-buffer` / `kill-buffer` / `rename-buffer` / `buffer-list` manage the registry; `insert` / `delete-region` / `delete-char` / point motion (`forward-char`, `forward-line`, `beginning-of-line`, …) / `narrow-to-region` / `widen` edit the current buffer. `save-excursion` restores point via a marker that tracks intervening edits; `save-restriction` / `with-temp-buffer` / `with-current-buffer` scope the buffer and its restriction. Buffer-local variables key off the current buffer.
+
+**Not in scope** — surfaced loudly rather than silently misread: this is a useful elisp core, **not** the ~1000-subr GNU Emacs surface. Within the editor layer, **text properties** (`propertize` / interval trees), **general marker objects** (`make-marker` / `point-marker`), and **redisplay** (windows, header lines, faces) are not modeled — buffer text, point, insertion, and narrowing are.
 
 ---
 

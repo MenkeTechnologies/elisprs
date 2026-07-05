@@ -2577,14 +2577,34 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
         (let ((d (file-name-as-directory (expand-file-name dir))))
           (mapcar (lambda (n) (concat d n)) names))
       names)))
-;; with-temp-buffer: run BODY in a fresh editing buffer (text + point only — no
-;; markers/narrowing/save-excursion). Returns BODY's value, not the buffer text.
+;; save-current-buffer: restore the current buffer after BODY (if it is still live).
+(defmacro save-current-buffer (&rest body)
+  `(let ((--scb-- (current-buffer)))
+     (unwind-protect (progn ,@body)
+       (when (buffer-live-p --scb--) (set-buffer --scb--)))))
+;; with-current-buffer: evaluate BODY with BUFFER-OR-NAME current, restoring after.
+(defmacro with-current-buffer (buffer-or-name &rest body)
+  `(save-current-buffer (set-buffer ,buffer-or-name) ,@body))
+;; with-temp-buffer: run BODY in a fresh temporary buffer, killing it afterward.
+;; Returns BODY's value, not the buffer text.
 (defmacro with-temp-buffer (&rest body)
-  `(progn (--buffer-push--) (unwind-protect (progn ,@body) (--buffer-pop--))))
-;; save-excursion: restore point after BODY. (Integer save — no marker, so it
-;; doesn't track insertions/deletions before the saved point.)
+  `(let ((--tb-- (generate-new-buffer " *temp*")))
+     (unwind-protect
+         (with-current-buffer --tb-- ,@body)
+       (kill-buffer --tb--))))
+;; save-excursion: restore the current buffer AND point after BODY. Point is saved
+;; as a marker-like position that tracks insertions/deletions during BODY.
 (defmacro save-excursion (&rest body)
-  `(let ((--se-pt-- (point))) (unwind-protect (progn ,@body) (goto-char --se-pt--))))
+  `(let ((--se-b-- (current-buffer)))
+     (--se-push--)
+     (unwind-protect (progn ,@body)
+       (when (buffer-live-p --se-b--) (set-buffer --se-b--))
+       (--se-pop--))))
+;; save-restriction: restore the buffer's narrowing after BODY (the saved bounds
+;; track edits made in BODY, like Emacs markers).
+(defmacro save-restriction (&rest body)
+  `(progn (--save-restriction--)
+     (unwind-protect (progn ,@body) (--restore-restriction--))))
 ;; Region case conversion: rewrite [BEG,END) through FN (length-preserving, so
 ;; save-excursion's integer restore stays accurate).
 (defun buffer--map-region (beg end fn)
@@ -5056,12 +5076,12 @@ Mode-specific keymaps may want to use this as their parent keymap."
   "g" #'revert-buffer)
 
 ;;; ---- major/minor mode machinery (derived.el, easy-mmode.el, subr.el) ----
-;; Buffer objects are not modeled: there is a single implicit current buffer.
-;; Real text editing (point/insert/markers, multiple live buffers, save-excursion)
-;; is the text-editing subsystem. Syntax tables and abbrev tables are separate
-;; subsystems: the constructors below are placeholders sufficient for
-;; `define-derived-mode' to expand and load; they do not model syntax/abbrev
-;; semantics.
+;; Real text editing (point/insert, multiple named live buffers, narrowing, and
+;; marker-based save-excursion) is modeled by the text-editing subsystem
+;; (builtins.rs). Text properties, general marker objects, and redisplay are not.
+;; Syntax tables and abbrev tables are separate subsystems: the constructors below
+;; are placeholders sufficient for `define-derived-mode' to expand and load; they
+;; do not model syntax/abbrev semantics.
 
 ;; `interactive' is only meaningful as the first body form of a command; when a
 ;; command is called from Lisp (as in batch), it is a no-op. Modeling it as a
@@ -5069,10 +5089,9 @@ Mode-specific keymaps may want to use this as their parent keymap."
 ;; time, matching the non-interactive runtime behavior.
 (defmacro interactive (&rest _) nil)
 
-;; A single implicit buffer. `buffer-local-value'/`local-variable-p' act on it;
-;; a BUFFER argument is honored only as this current buffer.
-(defvar --the-current-buffer-- '--current-buffer--)
-(defun current-buffer () --the-current-buffer--)
+;; `current-buffer'/`set-buffer'/`get-buffer-create' and the rest of the buffer
+;; registry are C-level primitives (see builtins.rs). Buffers are not associated
+;; with files in this model, so `buffer-file-name' is always nil.
 (defun buffer-file-name (&optional _buffer) nil)
 
 ;;; ---- char-tables (public make-char-table over the make-char-table--new subr) ----

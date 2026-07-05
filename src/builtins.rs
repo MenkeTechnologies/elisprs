@@ -2483,6 +2483,7 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
             Some(Obj::Closure { .. }) => "function",
             Some(Obj::HashTable { .. }) => "hash-table",
             Some(Obj::CharTable(_)) => "char-table",
+            Some(Obj::Buffer(_)) => "buffer",
             None => "symbol",
         },
         _ => "symbol",
@@ -3906,18 +3907,139 @@ fn directory_files_raw(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.list_from(names.into_iter().map(Value::str).collect()))
 }
 
-// ── buffers (minimal model: char text + 1-based point) ──
-fn buffer_push(h: &mut ElispHost, _a: &[Value]) -> R {
-    h.buffers.push(crate::host::EditBuffer {
-        text: Vec::new(),
-        point: 1,
-        ..Default::default()
-    });
+// ── buffer registry (named, live buffers over a global registry) ──
+fn bufferp(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::Buffer(_)))))
+}
+fn current_buffer_fn(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(h.current_buffer())
+}
+fn set_buffer_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    h.set_buffer(&a[0])
+}
+fn get_buffer(h: &mut ElispHost, a: &[Value]) -> R {
+    // A buffer object returns itself if live; a name looks the buffer up.
+    match h.resolve_buffer(&a[0]) {
+        Some(idx) => Ok(h.buffers[idx].self_obj.clone()),
+        None => Ok(Value::Undef),
+    }
+}
+fn get_buffer_create(h: &mut ElispHost, a: &[Value]) -> R {
+    let name = as_string(&a[0])?;
+    Ok(h.get_buffer_create(&name))
+}
+fn generate_new_buffer(h: &mut ElispHost, a: &[Value]) -> R {
+    let base = as_string(&a[0])?;
+    let name = h.generate_new_buffer_name(&base);
+    // generate-new-buffer always makes a fresh buffer (the unique name is free).
+    Ok(h.get_buffer_create(&name))
+}
+fn generate_new_buffer_name(h: &mut ElispHost, a: &[Value]) -> R {
+    let base = as_string(&a[0])?;
+    Ok(Value::str(h.generate_new_buffer_name(&base)))
+}
+fn buffer_name(h: &mut ElispHost, a: &[Value]) -> R {
+    let idx = match a.first() {
+        Some(v) if !is_nil(v) => match h.resolve_buffer(v) {
+            Some(i) => i,
+            None => return Ok(Value::Undef),
+        },
+        _ => h.current,
+    };
+    Ok(match &h.buffers[idx].name {
+        Some(n) => Value::str(n.clone()),
+        None => Value::Undef,
+    })
+}
+fn buffer_live_p(h: &mut ElispHost, a: &[Value]) -> R {
+    let ok = matches!(h.obj(&a[0]), Some(Obj::Buffer(idx))
+        if h.buffers.get(*idx).is_some_and(|b| b.name.is_some()));
+    Ok(nil_or(ok))
+}
+fn kill_buffer(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(h.kill_buffer(a.first()))
+}
+fn rename_buffer(h: &mut ElispHost, a: &[Value]) -> R {
+    let newname = as_string(&a[0])?;
+    h.rename_buffer(&newname)
+}
+fn buffer_list(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(h.buffer_list())
+}
+
+// ── mark (a bare position; active-region / mark-ring not modeled) ──
+fn set_mark_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    buf.mark = match a.first() {
+        Some(v) if !is_nil(v) => Some(as_int(v)?.max(1) as usize),
+        _ => None,
+    };
+    Ok(a.first().cloned().unwrap_or(Value::Undef))
+}
+fn mark_fn(h: &mut ElispHost, _a: &[Value]) -> R {
+    // The optional FORCE argument is accepted but irrelevant here: with no active
+    // region tracking, `mark` simply reports the mark position (or nil).
+    Ok(match h.cur_buf().mark {
+        Some(m) => Value::Int(m as i64),
+        None => Value::Undef,
+    })
+}
+fn region_beginning(h: &mut ElispHost, _a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    let m = buf
+        .mark
+        .ok_or("error: The mark is not set now, so there is no region")?;
+    Ok(Value::Int(buf.point.min(m) as i64))
+}
+fn region_end(h: &mut ElispHost, _a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    let m = buf
+        .mark
+        .ok_or("error: The mark is not set now, so there is no region")?;
+    Ok(Value::Int(buf.point.max(m) as i64))
+}
+
+// ── narrowing ──
+fn narrow_to_region(h: &mut ElispHost, a: &[Value]) -> R {
+    let beg = as_int(&a[0])?.max(1) as usize;
+    let end = as_int(&a[1])?.max(1) as usize;
+    h.narrow(beg, end);
     Ok(Value::Undef)
 }
-fn buffer_pop(h: &mut ElispHost, _a: &[Value]) -> R {
-    if h.buffers.len() > 1 {
-        h.buffers.pop();
+fn widen_fn(h: &mut ElispHost, _a: &[Value]) -> R {
+    h.widen();
+    Ok(Value::Undef)
+}
+/// `--se-push--`: record point as a save-excursion marker on the current buffer.
+fn se_push(h: &mut ElispHost, _a: &[Value]) -> R {
+    let p = h.cur_buf().point;
+    h.cur_buf().se_markers.push(p);
+    Ok(Value::Undef)
+}
+/// `--se-pop--`: restore point from (and drop) the current buffer's top
+/// save-excursion marker.
+fn se_pop(h: &mut ElispHost, _a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    if let Some(m) = buf.se_markers.pop() {
+        buf.point = m.clamp(buf.begv, buf.zv);
+    }
+    Ok(Value::Undef)
+}
+/// `--save-restriction--`: push the current `(begv, zv)` so it tracks edits.
+fn save_restriction_push(h: &mut ElispHost, _a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    let (lo, hi) = (buf.begv, buf.zv);
+    buf.restrict_stack.push((lo, hi));
+    Ok(Value::Undef)
+}
+/// `--restore-restriction--`: pop and reinstate the saved narrowing.
+fn restore_restriction(h: &mut ElispHost, _a: &[Value]) -> R {
+    let buf = h.cur_buf();
+    if let Some((lo, hi)) = buf.restrict_stack.pop() {
+        let maxzv = buf.text.len() + 1;
+        buf.begv = lo.clamp(1, maxzv);
+        buf.zv = hi.clamp(1, maxzv);
+        buf.point = buf.point.clamp(buf.begv, buf.zv);
     }
     Ok(Value::Undef)
 }
@@ -3941,7 +4063,14 @@ fn buffer_local_symbols_fn(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(h.buffer_local_symbols())
 }
 fn buffer_local_value_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    h.buffer_local_or_default(&a[0])
+    // BUFFER (a[1]) selects the buffer; default to the current one.
+    let idx = match a.get(1) {
+        Some(v) if !is_nil(v) => h
+            .resolve_buffer(v)
+            .ok_or("error: Wrong type argument: bufferp")?,
+        _ => h.current,
+    };
+    h.buffer_local_or_default(&a[0], idx)
 }
 /// `(default-value SYMBOL)` — SYMBOL's default (global) value, ignoring any
 /// buffer-local binding. Signals `void-variable` when there is no default.
@@ -3974,39 +4103,45 @@ fn insert_fn(h: &mut ElispHost, a: &[Value]) -> R {
     for v in a {
         chunks.extend(insert_chars(v)?);
     }
-    let buf = h.cur_buf();
-    let at = (buf.point - 1).min(buf.text.len());
-    let n = chunks.len();
-    buf.text.splice(at..at, chunks);
-    buf.point = at + n + 1;
+    h.cur_insert(chunks, true);
     Ok(Value::Undef)
 }
 fn buffer_string(h: &mut ElispHost, _a: &[Value]) -> R {
-    Ok(Value::str(h.cur_buf().text.iter().collect::<String>()))
+    // Only the accessible (narrowed) portion `[begv, zv)`.
+    let buf = h.cur_buf_ref();
+    Ok(Value::str(
+        buf.text[(buf.begv - 1)..(buf.zv - 1)]
+            .iter()
+            .collect::<String>(),
+    ))
 }
 fn buffer_size(h: &mut ElispHost, _a: &[Value]) -> R {
+    // The full buffer size, ignoring any narrowing (like Emacs `buffer-size`).
     Ok(Value::Int(h.cur_buf().text.len() as i64))
 }
 fn point_fn(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(Value::Int(h.cur_buf().point as i64))
 }
-fn point_min(_h: &mut ElispHost, _a: &[Value]) -> R {
-    Ok(Value::Int(1))
+fn point_min(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::Int(h.cur_buf().begv as i64))
 }
 fn point_max(h: &mut ElispHost, _a: &[Value]) -> R {
-    Ok(Value::Int(h.cur_buf().text.len() as i64 + 1))
+    Ok(Value::Int(h.cur_buf().zv as i64))
 }
 fn goto_char(h: &mut ElispHost, a: &[Value]) -> R {
+    let arg = as_int(&a[0])?;
     let buf = h.cur_buf();
-    let max = buf.text.len() as i64 + 1;
-    let p = as_int(&a[0])?.clamp(1, max);
-    buf.point = p as usize;
-    Ok(Value::Int(p))
+    // Point is clamped to the accessible region, but `goto-char` returns its
+    // POSITION argument unchanged (verified against the binary).
+    buf.point = arg.clamp(buf.begv as i64, buf.zv as i64) as usize;
+    Ok(Value::Int(arg))
 }
 fn erase_buffer(h: &mut ElispHost, _a: &[Value]) -> R {
-    let buf = h.cur_buf();
-    buf.text.clear();
-    buf.point = 1;
+    // Delete the whole buffer (ignoring narrowing) and remove the restriction.
+    let len = h.cur_buf().text.len();
+    h.cur_delete(1, len + 1);
+    h.widen();
+    h.cur_buf().point = 1;
     Ok(Value::Undef)
 }
 fn char_after(h: &mut ElispHost, a: &[Value]) -> R {
@@ -4015,7 +4150,8 @@ fn char_after(h: &mut ElispHost, a: &[Value]) -> R {
         Some(v) if !is_nil(v) => as_int(v)? as usize,
         _ => buf.point,
     };
-    Ok(if pos >= 1 && pos <= buf.text.len() {
+    // Only positions inside the accessible region `[begv, zv)` hold a char.
+    Ok(if pos >= buf.begv && pos < buf.zv {
         Value::Int(buf.text[pos - 1] as i64)
     } else {
         Value::Undef
@@ -4023,9 +4159,9 @@ fn char_after(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn buffer_substring(h: &mut ElispHost, a: &[Value]) -> R {
     let buf = h.cur_buf();
-    let len = buf.text.len() as i64;
-    let s = as_int(&a[0])?.clamp(1, len + 1);
-    let e = as_int(&a[1])?.clamp(1, len + 1);
+    let (lo0, hi0) = (buf.begv as i64, buf.zv as i64);
+    let s = as_int(&a[0])?.clamp(lo0, hi0);
+    let e = as_int(&a[1])?.clamp(lo0, hi0);
     let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
     Ok(Value::str(
         buf.text[(lo - 1) as usize..(hi - 1) as usize]
@@ -4034,17 +4170,11 @@ fn buffer_substring(h: &mut ElispHost, a: &[Value]) -> R {
     ))
 }
 fn delete_region(h: &mut ElispHost, a: &[Value]) -> R {
-    let buf = h.cur_buf();
-    let len = buf.text.len() as i64;
+    let len = h.cur_buf().text.len() as i64;
     let s = as_int(&a[0])?.clamp(1, len + 1);
     let e = as_int(&a[1])?.clamp(1, len + 1);
     let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
-    buf.text.drain((lo - 1) as usize..(hi - 1) as usize);
-    if buf.point >= hi as usize {
-        buf.point -= (hi - lo) as usize;
-    } else if buf.point > lo as usize {
-        buf.point = lo as usize;
-    }
+    h.cur_delete(lo as usize, hi as usize);
     Ok(Value::Undef)
 }
 fn insert_file_contents(h: &mut ElispHost, a: &[Value]) -> R {
@@ -4053,11 +4183,7 @@ fn insert_file_contents(h: &mut ElispHost, a: &[Value]) -> R {
         .map_err(|_| format!("file-missing: Opening input file: No such file: {raw}"))?;
     let chars: Vec<char> = content.chars().collect();
     let n = chars.len() as i64;
-    let buf = h.cur_buf();
-    let start = buf.point;
-    let at = (buf.point - 1).min(buf.text.len());
-    buf.text.splice(at..at, chars);
-    buf.point = start; // leaves point at the beginning of the inserted text
+    h.cur_insert(chars, false); // leaves point at the beginning of the inserted text
     Ok(h.list_from(vec![Value::str(raw), Value::Int(n)]))
 }
 
@@ -4068,8 +4194,7 @@ fn forward_char(h: &mut ElispHost, a: &[Value]) -> R {
         _ => 1,
     };
     let buf = h.cur_buf();
-    let max = buf.text.len() as i64 + 1;
-    buf.point = (buf.point as i64 + n).clamp(1, max) as usize;
+    buf.point = (buf.point as i64 + n).clamp(buf.begv as i64, buf.zv as i64) as usize;
     Ok(Value::Undef)
 }
 fn backward_char(h: &mut ElispHost, a: &[Value]) -> R {
@@ -4078,43 +4203,43 @@ fn backward_char(h: &mut ElispHost, a: &[Value]) -> R {
         _ => 1,
     };
     let buf = h.cur_buf();
-    let max = buf.text.len() as i64 + 1;
-    buf.point = (buf.point as i64 - n).clamp(1, max) as usize;
+    buf.point = (buf.point as i64 - n).clamp(buf.begv as i64, buf.zv as i64) as usize;
     Ok(Value::Undef)
 }
-/// 1-based position of the beginning of POINT's line.
-fn bol_of(t: &[char], point: usize) -> usize {
+/// 1-based position of the beginning of POINT's line, not before `begv`.
+fn bol_of(t: &[char], point: usize, begv: usize) -> usize {
     let mut p = point;
-    while p > 1 && t[p - 2] != '\n' {
+    while p > begv && t[p - 2] != '\n' {
         p -= 1;
     }
     p
 }
-/// 1-based position of the end of POINT's line (before the newline / at eob).
-fn eol_of(t: &[char], point: usize) -> usize {
+/// 1-based position of the end of POINT's line (before the newline / at `zv`).
+fn eol_of(t: &[char], point: usize, zv: usize) -> usize {
     let mut p = point;
-    while p <= t.len() && t[p - 1] != '\n' {
+    while p < zv && t[p - 1] != '\n' {
         p += 1;
     }
     p
 }
 fn beginning_of_line(h: &mut ElispHost, _a: &[Value]) -> R {
     let buf = h.cur_buf();
-    buf.point = bol_of(&buf.text, buf.point);
+    buf.point = bol_of(&buf.text, buf.point, buf.begv);
     Ok(Value::Undef)
 }
 fn end_of_line(h: &mut ElispHost, _a: &[Value]) -> R {
     let buf = h.cur_buf();
-    buf.point = eol_of(&buf.text, buf.point);
+    buf.point = eol_of(&buf.text, buf.point, buf.zv);
     Ok(Value::Undef)
 }
-/// 1-based start of the line N-1 lines forward (N<1 = backward) from POINT's line.
-fn bol_after_lines(t: &[char], point: usize, n: i64) -> usize {
-    let mut p = bol_of(t, point);
+/// 1-based start of the line N-1 lines forward (N<1 = backward) from POINT's line,
+/// bounded by the accessible region `[begv, zv]`.
+fn bol_after_lines(t: &[char], point: usize, n: i64, begv: usize, zv: usize) -> usize {
+    let mut p = bol_of(t, point, begv);
     let mut k = n;
     while k > 0 {
-        let e = eol_of(t, p);
-        if e <= t.len() {
+        let e = eol_of(t, p, zv);
+        if e < zv {
             p = e + 1;
         } else {
             p = e;
@@ -4122,8 +4247,8 @@ fn bol_after_lines(t: &[char], point: usize, n: i64) -> usize {
         }
         k -= 1;
     }
-    while k < 0 && p > 1 {
-        p = bol_of(t, p - 1);
+    while k < 0 && p > begv {
+        p = bol_of(t, p - 1, begv);
         k += 1;
     }
     p
@@ -4135,7 +4260,7 @@ fn line_beginning_position(h: &mut ElispHost, a: &[Value]) -> R {
     };
     let buf = h.cur_buf();
     Ok(Value::Int(
-        bol_after_lines(&buf.text, buf.point, n - 1) as i64
+        bol_after_lines(&buf.text, buf.point, n - 1, buf.begv, buf.zv) as i64,
     ))
 }
 fn line_end_position(h: &mut ElispHost, a: &[Value]) -> R {
@@ -4144,25 +4269,28 @@ fn line_end_position(h: &mut ElispHost, a: &[Value]) -> R {
         _ => 1,
     };
     let buf = h.cur_buf();
-    let bol = bol_after_lines(&buf.text, buf.point, n - 1);
-    Ok(Value::Int(eol_of(&buf.text, bol) as i64))
+    let bol = bol_after_lines(&buf.text, buf.point, n - 1, buf.begv, buf.zv);
+    Ok(Value::Int(eol_of(&buf.text, bol, buf.zv) as i64))
 }
 fn bolp(h: &mut ElispHost, _a: &[Value]) -> R {
     let buf = h.cur_buf();
-    Ok(nil_or(buf.point == 1 || buf.text[buf.point - 2] == '\n'))
+    Ok(nil_or(
+        buf.point == buf.begv || buf.text[buf.point - 2] == '\n',
+    ))
 }
 fn eolp(h: &mut ElispHost, _a: &[Value]) -> R {
     let buf = h.cur_buf();
     Ok(nil_or(
-        buf.point > buf.text.len() || buf.text[buf.point - 1] == '\n',
+        buf.point == buf.zv || buf.text[buf.point - 1] == '\n',
     ))
 }
 fn bobp(h: &mut ElispHost, _a: &[Value]) -> R {
-    Ok(nil_or(h.cur_buf().point == 1))
+    let buf = h.cur_buf();
+    Ok(nil_or(buf.point == buf.begv))
 }
 fn eobp(h: &mut ElispHost, _a: &[Value]) -> R {
     let buf = h.cur_buf();
-    Ok(nil_or(buf.point == buf.text.len() + 1))
+    Ok(nil_or(buf.point == buf.zv))
 }
 fn forward_line(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
@@ -4170,7 +4298,7 @@ fn forward_line(h: &mut ElispHost, a: &[Value]) -> R {
         _ => 1,
     };
     let buf = h.cur_buf();
-    let len = buf.text.len();
+    let len = buf.zv - 1;
     let mut p = buf.point;
     let mut short = 0i64;
     if n >= 0 {
@@ -4191,14 +4319,14 @@ fn forward_line(h: &mut ElispHost, a: &[Value]) -> R {
             moved += 1;
         }
     } else {
-        p = bol_of(&buf.text, p);
+        p = bol_of(&buf.text, p, buf.begv);
         let mut moved = 0;
         while moved < -n {
-            if p == 1 {
+            if p == buf.begv {
                 short = -n - moved;
                 break;
             }
-            p = bol_of(&buf.text, p - 1);
+            p = bol_of(&buf.text, p - 1, buf.begv);
             moved += 1;
         }
     }
@@ -4410,10 +4538,11 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
         adapt_replacement_case(&matched, rep)
     };
     let rep_chars: Vec<char> = rep.chars().collect();
-    let rlen = rep_chars.len();
-    let buf = h.cur_buf();
-    buf.text.splice((b - 1)..(e - 1), rep_chars);
-    buf.point = b + rlen;
+    // Delete the matched span, then insert the replacement at its start (point is
+    // left after the replacement, matching Emacs and adjusting markers/narrowing).
+    h.cur_buf().point = b;
+    h.cur_delete(b, e);
+    h.cur_insert(rep_chars, true);
     Ok(Value::Undef)
 }
 
@@ -4509,11 +4638,7 @@ fn call_process(h: &mut ElispHost, a: &[Value]) -> R {
         .map_err(|_| format!("file-error: Searching for program: {program}"))?;
     if insert {
         let chars: Vec<char> = String::from_utf8_lossy(&out.stdout).chars().collect();
-        let buf = h.cur_buf();
-        let at = (buf.point - 1).min(buf.text.len());
-        let n = chars.len();
-        buf.text.splice(at..at, chars);
-        buf.point = at + n + 1;
+        h.cur_insert(chars, true);
     }
     Ok(Value::Int(out.status.code().unwrap_or(-1) as i64))
 }
@@ -4547,7 +4672,8 @@ fn char_before(h: &mut ElispHost, a: &[Value]) -> R {
         Some(v) if !is_nil(v) => as_int(v)? as usize,
         _ => buf.point,
     };
-    Ok(if pos >= 2 && pos - 1 <= buf.text.len() {
+    // The char at pos-1, only when pos-1 is inside the accessible region.
+    Ok(if pos > buf.begv && pos <= buf.zv {
         Value::Int(buf.text[pos - 2] as i64)
     } else {
         Value::Undef
@@ -4555,16 +4681,15 @@ fn char_before(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn delete_char(h: &mut ElispHost, a: &[Value]) -> R {
     let n = as_int(&a[0])?;
-    let buf = h.cur_buf();
-    let len = buf.text.len();
+    let point = h.cur_buf().point;
+    let zv = h.cur_buf().zv;
+    let begv = h.cur_buf().begv;
     if n >= 0 {
-        let end = (buf.point - 1 + n as usize).min(len);
-        buf.text.drain((buf.point - 1)..end);
+        let end = (point + n as usize).min(zv);
+        h.cur_delete(point, end);
     } else {
-        let cnt = (-n) as usize;
-        let start = (buf.point - 1).saturating_sub(cnt);
-        buf.text.drain(start..(buf.point - 1));
-        buf.point = start + 1;
+        let start = (point as i64 + n).max(begv as i64) as usize;
+        h.cur_delete(start, point);
     }
     Ok(Value::Undef)
 }
@@ -4574,10 +4699,7 @@ fn insert_char(h: &mut ElispHost, a: &[Value]) -> R {
         Some(v) if !is_nil(v) => as_int(v)?.max(0) as usize,
         _ => 1,
     };
-    let buf = h.cur_buf();
-    let at = buf.point - 1;
-    buf.text.splice(at..at, vec![c; count]);
-    buf.point = at + count + 1;
+    h.cur_insert(vec![c; count], true);
     Ok(Value::Undef)
 }
 fn count_lines(h: &mut ElispHost, a: &[Value]) -> R {
@@ -4609,7 +4731,7 @@ fn line_number_at_pos(h: &mut ElispHost, a: &[Value]) -> R {
 fn current_column(h: &mut ElispHost, _a: &[Value]) -> R {
     let buf = h.cur_buf();
     // Expand tabs to the next multiple of tab-width (8) like Emacs.
-    let bol = bol_of(&buf.text, buf.point);
+    let bol = bol_of(&buf.text, buf.point, buf.begv);
     let mut col = 0usize;
     for i in bol..buf.point {
         if buf.text[i - 1] == '\t' {
@@ -4911,9 +5033,35 @@ pub fn install(h: &mut ElispHost) {
     s("file-writable-p", 1, Some(1), file_writable_p);
     s("file-symlink-p", 1, Some(1), file_symlink_p);
     s("--directory-files--", 1, Some(3), directory_files_raw);
-    // buffers (minimal)
-    s("--buffer-push--", 0, Some(0), buffer_push);
-    s("--buffer-pop--", 0, Some(0), buffer_pop);
+    // buffer registry
+    s("bufferp", 1, Some(1), bufferp);
+    s("current-buffer", 0, Some(0), current_buffer_fn);
+    s("set-buffer", 1, Some(1), set_buffer_fn);
+    s("get-buffer", 1, Some(1), get_buffer);
+    s("get-buffer-create", 1, Some(2), get_buffer_create);
+    s("generate-new-buffer", 1, Some(3), generate_new_buffer);
+    s(
+        "generate-new-buffer-name",
+        1,
+        Some(2),
+        generate_new_buffer_name,
+    );
+    s("buffer-name", 0, Some(1), buffer_name);
+    s("buffer-live-p", 1, Some(1), buffer_live_p);
+    s("kill-buffer", 0, Some(1), kill_buffer);
+    s("rename-buffer", 1, Some(2), rename_buffer);
+    s("buffer-list", 0, Some(1), buffer_list);
+    // mark + narrowing
+    s("set-mark", 1, Some(1), set_mark_fn);
+    s("mark", 0, Some(1), mark_fn);
+    s("region-beginning", 0, Some(0), region_beginning);
+    s("region-end", 0, Some(0), region_end);
+    s("narrow-to-region", 2, Some(2), narrow_to_region);
+    s("widen", 0, Some(0), widen_fn);
+    s("--se-push--", 0, Some(0), se_push);
+    s("--se-pop--", 0, Some(0), se_pop);
+    s("--save-restriction--", 0, Some(0), save_restriction_push);
+    s("--restore-restriction--", 0, Some(0), restore_restriction);
     // buffer-local variables
     s("make-local-variable", 1, Some(1), make_local_variable);
     s(

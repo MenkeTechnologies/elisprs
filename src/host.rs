@@ -176,6 +176,11 @@ pub enum Obj {
     /// to values, with a `subtype` symbol, a `default` slot, an optional `parent`
     /// char-table for lookup fallback, and `extra` slots. See [`CharTable`].
     CharTable(CharTable),
+    /// An editing buffer object (`get-buffer-create`/`generate-new-buffer`). The
+    /// payload is the index into [`ElispHost::buffers`], which is stable for the
+    /// buffer's whole lifetime (killed buffers keep their slot, marked dead by a
+    /// `None` name). Buffer objects are runtime-only and never serialized.
+    Buffer(usize),
 }
 
 /// An Emacs char-table's payload. Per-char values use efficient range storage:
@@ -312,18 +317,46 @@ pub struct ElispHost {
     /// Output-capture stack for `with-output-to-string`: when non-empty,
     /// `princ`/`prin1`/`print`/`terpri` append to the top buffer instead of stdout.
     pub(crate) output_capture: Vec<String>,
-    /// A stack of editing buffers (text + 1-based point). Index 0 is the implicit
-    /// default buffer; `with-temp-buffer` pushes/pops a fresh one. Minimal model:
-    /// text + point only (no markers, narrowing, or save-excursion).
+    /// The global buffer registry. Index 0 is the default buffer (`*scratch*`).
+    /// Slots are never removed — `kill-buffer` marks a buffer dead (`name: None`)
+    /// so its index (and any live buffer object referencing it) stays valid.
     pub(crate) buffers: Vec<EditBuffer>,
+    /// Index into `buffers` of the current buffer (`current-buffer`/`set-buffer`).
+    pub(crate) current: usize,
 }
 
-/// A minimal editing buffer: a char vector and a 1-based point (1..=len+1),
-/// plus the buffer-local variable slots and the local keymap slot.
+/// An editing buffer: a char vector, a 1-based point, narrowing bounds, the mark,
+/// plus the buffer-local variable slots and the local keymap slot. Positions are
+/// 1-based (`point-min` = `begv`, `point-max` = `zv`). `begv`/`zv`/`mark`/the
+/// save stacks track edits with Emacs marker semantics (see
+/// [`ElispHost::cur_insert`]/[`ElispHost::cur_delete`]).
 #[derive(Default)]
 pub struct EditBuffer {
+    /// The buffer's name, or `None` once killed (the slot is retained so existing
+    /// buffer objects keep resolving; `buffer-live-p` reads this).
+    pub name: Option<String>,
+    /// This buffer's own `Obj::Buffer` handle, allocated once so buffer objects
+    /// are `eq`-stable. `Value::Undef` only during initial construction.
+    pub self_obj: Value,
     pub text: Vec<char>,
+    /// Point: 1-based, always kept within `[begv, zv]`.
     pub point: usize,
+    /// Narrowing lower bound (`point-min`); 1 when un-narrowed. Marker-like with
+    /// insertion-type nil.
+    pub begv: usize,
+    /// Narrowing upper bound (`point-max`); `text.len()+1` when un-narrowed.
+    /// Marker-like with insertion-type t (text inserted at `zv` extends the region).
+    pub zv: usize,
+    /// The mark, or `None` when unset. Marker-like (insertion-type nil). Active
+    /// region / mark-ring semantics are not modeled — this is a bare position.
+    pub mark: Option<usize>,
+    /// `save-excursion` point markers (insertion-type nil), a per-buffer LIFO
+    /// stack: unwind-protect guarantees strict nesting, so the top entry is always
+    /// the matching one.
+    pub se_markers: Vec<usize>,
+    /// `save-restriction` saved `(begv, zv)` pairs, adjusted for edits inside the
+    /// body so the restored restriction tracks intervening insertions/deletions.
+    pub restrict_stack: Vec<(usize, usize)>,
     /// Buffer-local variable bindings. `Some(v)` is a bound local; `None` is a
     /// *void* local (created by `make-local-variable` on a void variable — reading
     /// it still signals `void-variable`, but `local-variable-p` is non-nil). Key
@@ -331,6 +364,24 @@ pub struct EditBuffer {
     pub locals: HashMap<u32, Option<Value>>,
     /// The buffer's local keymap slot (`use-local-map`/`current-local-map`).
     pub local_map: Value,
+}
+
+/// Adjust a marker-like position `m` for an insertion of `len` chars at `pos`.
+/// `advance_at_pos` selects insertion-type t (a marker exactly at `pos` moves
+/// past the inserted text) vs nil (it stays before it).
+fn adj_ins(m: &mut usize, pos: usize, len: usize, advance_at_pos: bool) {
+    if *m > pos || (advance_at_pos && *m == pos) {
+        *m += len;
+    }
+}
+
+/// Adjust a marker-like position `m` for a deletion of the region `[from, to)`.
+fn adj_del(m: &mut usize, from: usize, to: usize) {
+    if *m >= to {
+        *m -= to - from;
+    } else if *m > from {
+        *m = from;
+    }
 }
 
 /// Result of the most recent `string-match`, in *character* positions (elisp
@@ -368,13 +419,26 @@ impl ElispHost {
             match_data: None,
             output_capture: Vec::new(),
             buffers: vec![EditBuffer {
+                name: Some("*scratch*".to_string()),
+                self_obj: Value::Undef,
                 text: Vec::new(),
                 point: 1,
+                begv: 1,
+                zv: 1,
+                mark: None,
+                se_markers: Vec::new(),
+                restrict_stack: Vec::new(),
                 locals: HashMap::new(),
                 local_map: Value::Undef,
             }],
+            current: 0,
         };
         crate::builtins::install(&mut h);
+        // The default buffer's own object handle (allocated after the arena
+        // exists, before `builtin_count` is fixed so it stays in the stable
+        // built-in prefix and is never serialized as user heap).
+        let scratch = h.alloc(Obj::Buffer(0));
+        h.buffers[0].self_obj = scratch;
         h.builtin_count = h.arena.len();
         h
     }
@@ -579,13 +643,13 @@ impl ElispHost {
     pub fn current_local_map(&self) -> Value {
         self.buffers[self.cur_buf_idx()].local_map.clone()
     }
-    /// `(buffer-local-value SYM BUFFER)` — SYM's value in the current buffer:
-    /// buffer-local slot if present, else the global default. Skips lexical
-    /// bindings (this reads a buffer's variable, not the caller's scope). The
-    /// BUFFER argument is honored only as the current buffer (single-buffer model).
-    pub fn buffer_local_or_default(&self, v: &Value) -> Result<Value, String> {
+    /// `(buffer-local-value SYM BUFFER)` — SYM's value in BUFFER: its buffer-local
+    /// slot if present, else the global default. Skips lexical bindings (this reads
+    /// a buffer's variable, not the caller's scope). `buf_idx` is BUFFER's slot; the
+    /// caller resolves it (defaulting to the current buffer).
+    pub fn buffer_local_or_default(&self, v: &Value, buf_idx: usize) -> Result<Value, String> {
         if let Some(id) = self.sym_handle(v) {
-            if let Some(slot) = self.buffers[self.cur_buf_idx()].locals.get(&id) {
+            if let Some(slot) = self.buffers[buf_idx].locals.get(&id) {
                 return slot.clone().ok_or_else(|| {
                     format!("void-variable: {}", self.sym_name(v).unwrap_or_default())
                 });
@@ -627,9 +691,9 @@ impl ElispHost {
             },
         }
     }
-    /// Index of the current buffer (the top of the buffer stack).
+    /// Index of the current buffer.
     fn cur_buf_idx(&self) -> usize {
-        self.buffers.len() - 1
+        self.current
     }
     /// The global (default) value cell, bypassing lexical and buffer-local
     /// bindings — the reader used by `default-value`/`default-boundp`.
@@ -872,6 +936,16 @@ impl ElispHost {
                     extra: t.extra.clone(),
                     ranges: t.ranges.clone(),
                 },
+                // Buffer objects are runtime-only (created after prelude load) and
+                // never appear in a compiled/AOT heap image; emit a harmless
+                // placeholder so the match stays exhaustive.
+                Obj::Buffer(_) => SerObj::Symbol {
+                    name: "--unexpected-buffer--".to_string(),
+                    value: None,
+                    function: None,
+                    special: false,
+                    buffer_local_auto: false,
+                },
                 Obj::Closure {
                     params,
                     body,
@@ -982,6 +1056,14 @@ impl ElispHost {
                         parent: t.parent.clone(),
                         extra: t.extra.clone(),
                         ranges: t.ranges.clone(),
+                    },
+                    // Runtime-only; never legitimately serialized (see above).
+                    Obj::Buffer(_) => SerObj::Symbol {
+                        name: "--unexpected-buffer--".to_string(),
+                        value: None,
+                        function: None,
+                        special: false,
+                        buffer_local_auto: false,
                     },
                     Obj::Closure {
                         params,
@@ -1289,6 +1371,12 @@ impl ElispHost {
                         self.print_inner(&t.subtype, readable, depth + 1),
                     )
                 }
+                Some(Obj::Buffer(idx)) => {
+                    match self.buffers.get(*idx).and_then(|b| b.name.as_ref()) {
+                        Some(name) => format!("#<buffer {name}>"),
+                        None => "#<killed buffer>".to_string(),
+                    }
+                }
                 Some(Obj::Subr { name, .. }) => format!("#<subr {name}>"),
                 Some(Obj::Closure { is_macro, .. }) => {
                     if *is_macro {
@@ -1410,9 +1498,222 @@ impl ElispHost {
         }
     }
 
-    /// The current editing buffer (top of the stack; index 0 is the default).
+    /// The current editing buffer.
     pub fn cur_buf(&mut self) -> &mut EditBuffer {
-        self.buffers.last_mut().expect("buffer stack never empty")
+        &mut self.buffers[self.current]
+    }
+    /// The current editing buffer (shared).
+    pub fn cur_buf_ref(&self) -> &EditBuffer {
+        &self.buffers[self.current]
+    }
+
+    // ── buffer registry ──────────────────────────────────────────────────────
+    /// The current buffer's object handle (`current-buffer`).
+    pub fn current_buffer(&self) -> Value {
+        self.buffers[self.current].self_obj.clone()
+    }
+    /// Resolve a buffer-or-name to a live buffer index. A buffer object resolves
+    /// to its slot (even if killed → `None`); a string is looked up by name.
+    pub fn resolve_buffer(&self, v: &Value) -> Option<usize> {
+        match self.obj(v) {
+            Some(Obj::Buffer(idx)) => {
+                let idx = *idx;
+                self.buffers.get(idx).filter(|b| b.name.is_some())?;
+                Some(idx)
+            }
+            _ => match v {
+                Value::Str(s) => self.find_buffer_by_name(s),
+                _ => None,
+            },
+        }
+    }
+    /// Index of the live buffer named `name`, if any.
+    pub fn find_buffer_by_name(&self, name: &str) -> Option<usize> {
+        self.buffers
+            .iter()
+            .position(|b| b.name.as_deref() == Some(name))
+    }
+    /// Allocate a fresh buffer slot named `name` and return its `Obj::Buffer`
+    /// handle. The caller guarantees `name` is not already taken.
+    fn new_buffer(&mut self, name: String) -> Value {
+        let idx = self.buffers.len();
+        self.buffers.push(EditBuffer {
+            name: Some(name),
+            self_obj: Value::Undef,
+            text: Vec::new(),
+            point: 1,
+            begv: 1,
+            zv: 1,
+            mark: None,
+            se_markers: Vec::new(),
+            restrict_stack: Vec::new(),
+            locals: HashMap::new(),
+            local_map: Value::Undef,
+        });
+        let handle = self.alloc(Obj::Buffer(idx));
+        self.buffers[idx].self_obj = handle.clone();
+        handle
+    }
+    /// `(get-buffer-create NAME)` — the live buffer named NAME, creating it if
+    /// absent. Returns its buffer object.
+    pub fn get_buffer_create(&mut self, name: &str) -> Value {
+        match self.find_buffer_by_name(name) {
+            Some(idx) => self.buffers[idx].self_obj.clone(),
+            None => self.new_buffer(name.to_string()),
+        }
+    }
+    /// `(generate-new-buffer-name STARTING)` — STARTING if free, else the first
+    /// `STARTING<N>` (N≥2) that is free.
+    pub fn generate_new_buffer_name(&self, starting: &str) -> String {
+        if self.find_buffer_by_name(starting).is_none() {
+            return starting.to_string();
+        }
+        let mut n = 2;
+        loop {
+            let cand = format!("{starting}<{n}>");
+            if self.find_buffer_by_name(&cand).is_none() {
+                return cand;
+            }
+            n += 1;
+        }
+    }
+    /// `(set-buffer BUFFER-OR-NAME)` — make it current, returning its object.
+    /// Signals if the buffer does not exist.
+    pub fn set_buffer(&mut self, v: &Value) -> Result<Value, String> {
+        let idx = self
+            .resolve_buffer(v)
+            .ok_or_else(|| format!("error: No buffer named {}", self.print(v, true)))?;
+        self.current = idx;
+        Ok(self.buffers[idx].self_obj.clone())
+    }
+    /// `(kill-buffer &optional BUFFER)` — mark BUFFER (default current) dead.
+    /// Returns t if a live buffer was killed, nil otherwise.
+    pub fn kill_buffer(&mut self, v: Option<&Value>) -> Value {
+        let idx = match v {
+            Some(v) if el_truthy(v) => match self.resolve_buffer(v) {
+                Some(i) => i,
+                None => return Value::Undef,
+            },
+            _ => self.current,
+        };
+        if self.buffers[idx].name.is_none() {
+            return Value::Undef;
+        }
+        // Clear the slot's contents but keep it so the object stays resolvable
+        // (as a killed buffer). If the current buffer is killed, fall back to the
+        // first live buffer (Emacs would switch to another buffer).
+        let b = &mut self.buffers[idx];
+        b.name = None;
+        b.text.clear();
+        b.locals.clear();
+        b.se_markers.clear();
+        b.restrict_stack.clear();
+        if self.current == idx {
+            self.current = self
+                .buffers
+                .iter()
+                .position(|b| b.name.is_some())
+                .unwrap_or(0);
+        }
+        Value::Bool(true)
+    }
+    /// `(rename-buffer NEWNAME)` — rename the current buffer. Returns the new name.
+    pub fn rename_buffer(&mut self, newname: &str) -> Result<Value, String> {
+        if let Some(other) = self.find_buffer_by_name(newname) {
+            if other != self.current {
+                return Err(format!("error: Buffer name '{newname}' is in use"));
+            }
+        }
+        self.buffers[self.current].name = Some(newname.to_string());
+        Ok(Value::str(newname.to_string()))
+    }
+    /// `(buffer-list)` — live buffer objects, in creation order.
+    pub fn buffer_list(&mut self) -> Value {
+        let items: Vec<Value> = self
+            .buffers
+            .iter()
+            .filter(|b| b.name.is_some())
+            .map(|b| b.self_obj.clone())
+            .collect();
+        self.list_from(items)
+    }
+
+    // ── text mutation (marker-adjusting) ─────────────────────────────────────
+    /// Apply an insertion of `len` chars at 1-based `pos` in the current buffer to
+    /// every marker-like position (begv/zv/mark and the save stacks). Point is
+    /// handled by the caller.
+    fn adjust_for_insert(&mut self, pos: usize, len: usize) {
+        let b = &mut self.buffers[self.current];
+        adj_ins(&mut b.begv, pos, len, false);
+        adj_ins(&mut b.zv, pos, len, true);
+        if let Some(m) = b.mark.as_mut() {
+            adj_ins(m, pos, len, false);
+        }
+        for m in b.se_markers.iter_mut() {
+            adj_ins(m, pos, len, false);
+        }
+        for (lo, hi) in b.restrict_stack.iter_mut() {
+            adj_ins(lo, pos, len, false);
+            adj_ins(hi, pos, len, true);
+        }
+    }
+    /// Apply a deletion of `[from, to)` in the current buffer to every marker-like
+    /// position, including point.
+    fn adjust_for_delete(&mut self, from: usize, to: usize) {
+        let b = &mut self.buffers[self.current];
+        adj_del(&mut b.point, from, to);
+        adj_del(&mut b.begv, from, to);
+        adj_del(&mut b.zv, from, to);
+        if let Some(m) = b.mark.as_mut() {
+            adj_del(m, from, to);
+        }
+        for m in b.se_markers.iter_mut() {
+            adj_del(m, from, to);
+        }
+        for (lo, hi) in b.restrict_stack.iter_mut() {
+            adj_del(lo, from, to);
+            adj_del(hi, from, to);
+        }
+    }
+    /// Insert `chars` at point in the current buffer. `leave_after` puts point
+    /// after the inserted text (the `insert` default); otherwise point is left at
+    /// the start (`insert-file-contents`). Markers are adjusted per Emacs rules.
+    pub fn cur_insert(&mut self, chars: Vec<char>, leave_after: bool) {
+        let pos = self.buffers[self.current].point;
+        let len = chars.len();
+        if len == 0 {
+            return;
+        }
+        self.buffers[self.current]
+            .text
+            .splice((pos - 1)..(pos - 1), chars);
+        self.adjust_for_insert(pos, len);
+        self.buffers[self.current].point = if leave_after { pos + len } else { pos };
+    }
+    /// Delete the region `[from, to)` (1-based, `from <= to`) from the current
+    /// buffer, adjusting point and all markers.
+    pub fn cur_delete(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        self.buffers[self.current].text.drain((from - 1)..(to - 1));
+        self.adjust_for_delete(from, to);
+    }
+    /// `(narrow-to-region BEG END)` on the current buffer: clamp `begv`/`zv` to the
+    /// region and pull point inside it.
+    pub fn narrow(&mut self, beg: usize, end: usize) {
+        let (lo, hi) = if beg <= end { (beg, end) } else { (end, beg) };
+        let b = &mut self.buffers[self.current];
+        let maxzv = b.text.len() + 1;
+        b.begv = lo.clamp(1, maxzv);
+        b.zv = hi.clamp(1, maxzv);
+        b.point = b.point.clamp(b.begv, b.zv);
+    }
+    /// `(widen)` — remove any narrowing on the current buffer.
+    pub fn widen(&mut self) {
+        let b = &mut self.buffers[self.current];
+        b.begv = 1;
+        b.zv = b.text.len() + 1;
     }
 
     /// Resolve char `c` in char-table `ct` with Emacs `char_table_ref` fallback:

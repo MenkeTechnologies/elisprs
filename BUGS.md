@@ -663,7 +663,8 @@ Areas probed in round 4 that PASSED: `while-let`, `dlet` (was R3-missing — now
 - (Hit the prelude-ordering gotcha once more — `multibyte-string-p` first used `dolist` before
   it's defined; rewrote with `while`.)
 - Still architectural/deferred: bool-vectors (`#&N…`), text properties (`propertize`/
-  `#("x" 0 1 (…))`), buffer functions (`with-temp-buffer`/`insert`).
+  `#("x" 0 1 (…))`). (Buffer functions `with-temp-buffer`/`insert` and the full
+  text-buffer/point/narrowing/`save-excursion` core landed later — see CHANGELOG.)
 
 ### R5-Q. More `cl-loop` clauses — ✅ FIXED
 - `for V across SEQ`, `for V being [the|each] {elements|hash-keys|hash-values} of SRC`,

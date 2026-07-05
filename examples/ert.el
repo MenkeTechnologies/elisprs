@@ -31,12 +31,11 @@
   (skip-unless nil)            ; precondition false → this test is skipped
   (should nil))                ; never reached
 
-(ert-deftest ert-known-limitation ()
-  "An expected failure (XFAIL) documents a not-yet-implemented feature without
-reddening the suite. elisprs has no buffer/editor object model yet, so buffer
-primitives are unbound. Drop :expected-result when buffers land."
-  :expected-result :failed
-  (should (bufferp (current-buffer))))
+(ert-deftest ert-buffer-object-model ()
+  "The buffer/editor object model: `current-buffer' returns a real buffer object."
+  (should (bufferp (current-buffer)))
+  (should (stringp (buffer-name)))
+  (should (buffer-live-p (current-buffer))))
 
-;; Exits 0: the skip and the XFAIL are both *expected*, so neither counts.
+;; Exits 0: the skip is *expected*, so it does not count as a failure.
 (ert-run-tests-batch-and-exit)
