@@ -719,8 +719,8 @@ autoload.  Returns FUNCTION when it installs the autoload, else nil."
 ;;; ---- predicates ----
 (defun booleanp (x) (if (or (eq x t) (eq x nil)) t nil))
 (defun characterp (x) (and (integerp x) (>= x 0) (<= x #x3FFFFF)))
-(defun sequencep (x) (or (listp x) (vectorp x) (stringp x)))
-(defun arrayp (x) (or (vectorp x) (stringp x)))
+(defun sequencep (x) (or (listp x) (vectorp x) (stringp x) (char-table-p x)))
+(defun arrayp (x) (or (vectorp x) (stringp x) (char-table-p x)))
 (defun string-or-null-p (x) (or (null x) (stringp x)))
 (defun nlistp (x) (not (listp x)))
 ;; ROT13: rotate ASCII letters by 13, leaving everything else unchanged.
@@ -5075,9 +5075,209 @@ Mode-specific keymaps may want to use this as their parent keymap."
 (defun current-buffer () --the-current-buffer--)
 (defun buffer-file-name (&optional _buffer) nil)
 
-;; Syntax / abbrev table placeholders (boundary: not real subsystems).
-(defun make-syntax-table (&optional _parent) (make-vector 3 nil))
-(defun make-abbrev-table (&optional _props) (make-vector 59 0))
+;;; ---- char-tables (public make-char-table over the make-char-table--new subr) ----
+;; make-char-table reads SUBTYPE's `char-table-extra-slots' property (0..10) to
+;; size the extra slots, then calls the low-level allocator.  Faithful to
+;; chartab.c `Fmake_char_table'.
+(defun make-char-table (subtype &optional init)
+  "Return a newly created char-table, with purpose SUBTYPE.
+Each element is initialized to INIT, which defaults to nil.
+
+The property `char-table-extra-slots' of SUBTYPE controls the number of
+extra slots to reserve in this char-table.  This slot number is an
+integer between 0 and 10, or nil, meaning 0."
+  (let ((n (get subtype 'char-table-extra-slots)))
+    (setq n (cond ((null n) 0)
+                  ((and (integerp n) (>= n 0) (<= n 10)) n)
+                  (t (error "Invalid number of extra slots"))))
+    (make-char-table--new subtype init n)))
+
+;;; ---- syntax tables (syntax.c documented behavior, over char-tables) ----
+;; A syntax table is a char-table with subtype `syntax-table'.  Each element is
+;; a cons (SYNTAX-CODE . MATCHING-CHAR) where SYNTAX-CODE encodes the syntax
+;; class in its low 16 bits plus flag bits; MATCHING-CHAR is the paired paren
+;; (nil if none).  Verified value-for-value against the Emacs 30.2 binary.
+
+;; syntax_code_spec (syntax.c): class index -> designator character.
+(defconst --syntax-code-spec-- " .w_()'\"$\\/<>@!|"
+  "Char at index N is the designator for syntax class N (see `string-to-syntax').")
+
+(defun syntax-class-to-char (syntax-class)
+  "Return the designator character for SYNTAX-CLASS (an integer 0..15)."
+  (aref --syntax-code-spec-- syntax-class))
+
+;; The flag descriptor characters and the bit each sets in the syntax code.
+(defconst --syntax-flag-alist--
+  '((?1 . 16) (?2 . 17) (?3 . 18) (?4 . 19) (?p . 20) (?b . 21) (?n . 22))
+  "Maps a `modify-syntax-entry' flag char to the bit it sets in the syntax code.")
+
+(defun string-to-syntax (descriptor)
+  "Convert syntax DESCRIPTOR string into the internal (CODE . MATCH) form.
+DESCRIPTOR's first char names the class, the second the matching char
+\(a space or missing means none), and any remaining chars are flags."
+  (when (or (null descriptor) (= (length descriptor) 0))
+    (error "Invalid syntax description string: %S" descriptor))
+  (let* ((c (aref descriptor 0))
+         ;; `-' is an alias for whitespace; otherwise look C up in the spec.
+         (class (if (eq c ?-) 0
+                  (let ((i 0) (found nil) (len (length --syntax-code-spec--)))
+                    (while (and (not found) (< i len))
+                      (when (eq (aref --syntax-code-spec-- i) c) (setq found i))
+                      (setq i (1+ i)))
+                    (or found (error "Invalid syntax description string: %S" descriptor)))))
+         (match (and (> (length descriptor) 1)
+                     (let ((m (aref descriptor 1)))
+                       (unless (eq m ?\s) m))))
+         (code class)
+         (i 2) (len (length descriptor)))
+    (while (< i len)
+      (let ((bit (cdr (assq (aref descriptor i) --syntax-flag-alist--))))
+        (when bit (setq code (logior code (ash 1 bit)))))
+      (setq i (1+ i)))
+    (cons code match)))
+
+(defun syntax-class (syntax)
+  "Return the syntax class part of the syntax code SYNTAX (a (CODE . MATCH) cons).
+Return nil if SYNTAX is nil."
+  (and syntax (logand (car syntax) 65535)))
+
+;; The standard syntax table, built once to mirror syntax.c `init_syntax_once'.
+;; ASCII entries reproduce the binary's `standard-syntax-table' exactly; all
+;; chars >= 128 default to word class (Emacs's dominant default), with U+00A0
+;; (no-break space) set to whitespace.  Full Unicode punctuation/whitespace
+;; categorization beyond that is not modeled (NAMED boundary).
+(defvar --standard-syntax-table-- nil
+  "The standard syntax table (see `standard-syntax-table').")
+
+(defun --init-standard-syntax-table-- ()
+  (let ((tbl (make-char-table 'syntax-table))
+        (word (string-to-syntax "w"))
+        (space (string-to-syntax " "))
+        (punct (string-to-syntax "."))
+        (symbol (string-to-syntax "_")))
+    ;; Word everywhere by default (letters, digits, most non-ASCII).
+    (set-char-table-range tbl t word)
+    ;; Control chars 0..31 are punctuation ...
+    (set-char-table-range tbl '(0 . 31) punct)
+    ;; ... except the whitespace ones, plus space and U+00A0.
+    (dolist (c '(?\t ?\n ?\f ?\r ?\s 160)) (aset tbl c space))
+    ;; ASCII punctuation.
+    (dolist (c '(?! ?# ?' ?, ?. ?: ?\; ?? ?@ ?^ ?` ?~ 127)) (aset tbl c punct))
+    ;; ASCII symbol constituents.
+    (dolist (c '(?& ?* ?+ ?- ?/ ?< ?= ?> ?_ ?|)) (aset tbl c symbol))
+    ;; String quote and escape.
+    (aset tbl ?\" (string-to-syntax "\""))
+    (aset tbl ?\\ (string-to-syntax "\\"))
+    ;; Balanced pairs: open matches close and vice versa.
+    (aset tbl ?\( (string-to-syntax "()"))
+    (aset tbl ?\) (string-to-syntax ")("))
+    (aset tbl ?\[ (string-to-syntax "(]"))
+    (aset tbl ?\] (string-to-syntax ")["))
+    (aset tbl ?\{ (string-to-syntax "(}"))
+    (aset tbl ?\} (string-to-syntax "){"))
+    tbl))
+
+(setq --standard-syntax-table-- (--init-standard-syntax-table--))
+
+(defun standard-syntax-table ()
+  "Return the standard syntax table.
+This is the one used for new buffers."
+  --standard-syntax-table--)
+
+;; The current buffer's syntax table is a buffer-local slot defaulting to the
+;; standard table (Emacs keeps it in the buffer object; buffer-local var here).
+(defvar-local --current-syntax-table-- nil
+  "The current buffer's syntax table (see `syntax-table').")
+
+(defun syntax-table ()
+  "Return the current syntax table.
+This is the one specified by the current buffer."
+  (or --current-syntax-table-- --standard-syntax-table--))
+
+(defun set-syntax-table (table)
+  "Select TABLE as the syntax table for the current buffer."
+  (setq --current-syntax-table-- table)
+  table)
+
+(defun copy-syntax-table (&optional table)
+  "Construct a new syntax table and return it.
+It is a copy of TABLE, which defaults to the standard syntax table."
+  (let* ((src (or table --standard-syntax-table--))
+         (new (make-char-table 'syntax-table)))
+    (set-char-table-parent new (char-table-parent src))
+    ;; Copy every set char over the char range.  Non-ASCII beyond the modeled
+    ;; range shares the source's word default via the range copy of ascii+.
+    (dotimes (c 128) (aset new c (char-table-range src c)))
+    (set-char-table-range new '(128 . #x3FFFFF) (char-table-range src 128))
+    new))
+
+(defun make-syntax-table (&optional parent)
+  "Return a new syntax table.
+Create a syntax table that inherits from PARENT (which defaults to the
+standard syntax table)."
+  (let ((table (make-char-table 'syntax-table)))
+    (set-char-table-parent table (or parent --standard-syntax-table--))
+    table))
+
+(defun syntax-table-p (object)
+  "Return t if OBJECT is a syntax table."
+  (and (char-table-p object) (eq (char-table-subtype object) 'syntax-table)))
+
+(defun modify-syntax-entry (char newentry &optional syntax-table)
+  "Set syntax for the characters CHAR to the string NEWENTRY.
+CHAR may be a cons (MIN . MAX), in which case, syntaxes of all characters
+in the range between MIN and MAX, inclusive, are set.  SYNTAX-TABLE
+defaults to the current buffer's syntax table."
+  (set-char-table-range (or syntax-table (syntax-table))
+                        char (string-to-syntax newentry))
+  nil)
+
+(defun char-syntax (character)
+  "Return the syntax class of CHARACTER, described by a character.
+For example, if CHARACTER is a word constituent, the character `?w' is
+returned.  The characters that correspond to various syntax codes are
+listed in the documentation of `modify-syntax-entry'."
+  (syntax-class-to-char (syntax-class (aref (syntax-table) character))))
+
+(defmacro with-syntax-table (table &rest body)
+  "Evaluate BODY with syntax table TABLE as the current syntax table.
+The syntax table of the current buffer is saved, BODY is evaluated, and
+the saved table is restored.  (Single-buffer model: the save/restore is
+over the one current buffer's syntax-table slot.)"
+  (declare (indent 1) (debug t))
+  (let ((old-table (make-symbol "table")))
+    `(let ((,old-table (syntax-table)))
+       (unwind-protect
+           (progn
+             (set-syntax-table ,table)
+             ,@body)
+         (set-syntax-table ,old-table)))))
+
+;; Abbrev table placeholder (boundary: the abbrev/obarray subsystem is not
+;; modeled).  An abbrev table is a plain vector here rather than a real obarray.
+;; `abbrev-table-get'/`abbrev-table-put' are ported for their observable
+;; behavior (get returns what put stored; unset props are nil) using a property
+;; side-table keyed by table identity, since the real accessors store props in
+;; the table's own "" symbol, which needs the obarray subsystem elisprs lacks.
+(defun make-abbrev-table (&optional props)
+  "Create a new, empty abbrev table object.
+PROPS is a list of properties."
+  (let ((table (make-vector 59 0)))
+    (while (consp props)
+      (abbrev-table-put table (car props) (cadr props))
+      (setq props (cddr props)))
+    table))
+(defvar --abbrev-table-props-- (make-hash-table :test 'eq)
+  "Maps an abbrev table object to its property plist (see `abbrev-table-get').")
+(defun abbrev-table-get (table prop)
+  "Get the PROP property of abbrev table TABLE."
+  (plist-get (gethash table --abbrev-table-props--) prop))
+(defun abbrev-table-put (table prop val)
+  "Set the PROP property of abbrev table TABLE to VAL."
+  (puthash table
+           (plist-put (gethash table --abbrev-table-props--) prop val)
+           --abbrev-table-props--)
+  val)
 (defun define-abbrev-table (tablename &rest _)
   (unless (and (boundp tablename) (vectorp (symbol-value tablename)))
     (set tablename (make-abbrev-table)))
@@ -5368,9 +5568,14 @@ which more-or-less shadow%s %s's corresponding table%s."
 No problems result if this variable is not bound.
 `add-hook' automatically binds it.  (This is true for all hook variables.)"
                        child)))
+       ;; Mark the map special (bare `defvar', no value) always, but only
+       ;; INITIALIZE it when unbound -- mirroring Emacs's no-clobber `defvar'
+       ;; and the syntax/abbrev guards below.  A mode whose map is preloaded
+       ;; (e.g. `special-mode-map' via `defvar-keymap') keeps its bindings.
+       (with-no-warnings (defvar ,map))
        (unless (boundp ',map)
-	 (put ',map 'definition-name ',child))
-       (with-no-warnings (defvar ,map (make-sparse-keymap)))
+	 (put ',map 'definition-name ',child)
+	 (defvar ,map (make-sparse-keymap)))
        (unless (get ',map 'variable-documentation)
 	 (put ',map 'variable-documentation
 	      (purecopy ,(format "Keymap for `%s'." child))))
@@ -5428,6 +5633,61 @@ No problems result if this variable is not bound.
 	 ,@(when after-hook
 	     `((push (lambda () ,after-hook) delayed-after-hook-functions)))
 	 (run-mode-hooks ',hook)))))
+
+;; ---- fundamental-mode + special-mode (simple.el) ----
+;; Buffer-local state slots these modes touch (buffer.c C variables in Emacs;
+;; buffer-local Lisp variables here).
+(defvar-local buffer-read-only nil
+  "Non-nil if this buffer is read-only.")
+(defvar-local buffer-undo-list nil
+  "List of undo entries in current buffer.
+A value of t means undo information is not being recorded.")
+
+;; buffer-disable-undo (simple.el): stop keeping undo information.
+(defun buffer-disable-undo (&optional _buffer)
+  "Make current buffer stop keeping undo information."
+  (setq buffer-undo-list t))
+(defun buffer-enable-undo (&optional _buffer)
+  "Start keeping undo information for the current buffer."
+  (when (eq buffer-undo-list t)
+    (setq buffer-undo-list nil)))
+
+;; fundamental-mode (simple.el): the root major mode.  Body is empty; it just
+;; resets local variables and installs itself as `major-mode'.
+(defun fundamental-mode ()
+  "Major mode not specialized for anything in particular.
+Other major modes are defined by comparison with this one."
+  (interactive)
+  (kill-all-local-variables)
+  (setq major-mode 'fundamental-mode)
+  (setq mode-name "Fundamental")
+  (run-mode-hooks))
+
+;; Display-engine state variables (C `character.c'/`xdisp.c' + `simple.el').
+;; These are the real variable declarations, not stubs; the redisplay engine
+;; that acts on them is a separate subsystem and is not modeled here.
+;; `glyphless-char-display' is itself a char-table (subtype glyphless-char-display,
+;; one extra slot), so it also exercises the char-table type.
+(put 'glyphless-char-display 'char-table-extra-slots 1)
+(defvar glyphless-char-display (make-char-table 'glyphless-char-display)
+  "Char-table defining glyphless characters.")
+(defvar-local truncate-lines nil
+  "Non-nil means do not display continuation lines.")
+(defvar-local bidi-paragraph-direction nil
+  "If non-nil, forces a paragraph direction in the current buffer.")
+(defvar-local text-scale-remap-header-line nil
+  "If non-nil, text scaling may change the height of the header line.")
+(defvar-local revert-buffer-function nil
+  "Function to use to revert this buffer.")
+
+;; special-mode (simple.el): parent mode for buffers that view formatted data.
+(put 'special-mode 'mode-class 'special)
+(define-derived-mode special-mode nil "Special"
+  "Parent major mode from which special major modes should inherit.
+
+A special major mode is intended to view specially formatted data
+rather than files.  These modes usually use read-only buffers."
+  (setq buffer-read-only t))
 
 ;; ---- define-minor-mode (easy-mmode.el) + supporting subr.el pieces ----
 

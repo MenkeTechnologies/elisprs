@@ -2,7 +2,7 @@
 //! ~irreducible core; the large derived surface (caar.., seq-*, cl-*, alist
 //! helpers) will be defined in an elisp prelude on top of these.
 
-use crate::host::{ElispHost, MatchData, Obj, Resolved};
+use crate::host::{CharTable, ElispHost, MatchData, Obj, Resolved};
 use fusevm::Value;
 
 type R = Result<Value, String>;
@@ -621,6 +621,12 @@ fn make_vector(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.alloc(Obj::Vector(vec![a[1].clone(); n as usize])))
 }
 fn aref(h: &mut ElispHost, a: &[Value]) -> R {
+    // A char-table indexes by character (0..=MAX_CHAR) with parent/default
+    // fallback, unlike a plain vector's positional index.
+    if matches!(h.obj(&a[0]), Some(Obj::CharTable(_))) {
+        let c = as_char(h, &a[1])?;
+        return Ok(h.char_table_ref(&a[0], c));
+    }
     let idx = as_num(&a[1])?.0;
     let oor = |h: &ElispHost| format!("args-out-of-range: {} {idx}", h.print(&a[0], true));
     if idx < 0 {
@@ -643,6 +649,16 @@ fn aref(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 fn aset(h: &mut ElispHost, a: &[Value]) -> R {
+    // A char-table indexes by character; `aset` sets that single char.
+    if matches!(h.obj(&a[0]), Some(Obj::CharTable(_))) {
+        let c = as_char(h, &a[1])?;
+        if let Value::Obj(id) = &a[0] {
+            if let Some(Obj::CharTable(t)) = h.arena.get_mut(*id as usize) {
+                t.set_range(c, c, a[2].clone());
+            }
+        }
+        return Ok(a[2].clone());
+    }
     let idx = as_num(&a[1])?.0;
     if idx < 0 {
         return Err(format!("args-out-of-range: {} {idx}", h.print(&a[0], true)));
@@ -674,6 +690,142 @@ fn fillarray(h: &mut ElispHost, a: &[Value]) -> R {
         "wrong-type-argument: arrayp {}",
         h.print(&a[0], true)
     ))
+}
+
+// ── char-tables ──
+/// `(make-char-table--new SUBTYPE INIT N-EXTRA)` — low-level allocator. The
+/// public `make-char-table` (prelude) reads N-EXTRA from SUBTYPE's
+/// `char-table-extra-slots' property before calling this. INIT fills every char
+/// slot; the `default` slot starts nil (Emacs `Fmake_char_table`).
+fn make_char_table_new(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_num(&a[2])?.0;
+    let n = if n < 0 { 0 } else { n as usize };
+    Ok(h.alloc(Obj::CharTable(CharTable::new(
+        a[0].clone(),
+        a[1].clone(),
+        n,
+    ))))
+}
+fn char_table_p(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::CharTable(_)))))
+}
+fn char_table_subtype(h: &mut ElispHost, a: &[Value]) -> R {
+    match h.obj(&a[0]) {
+        Some(Obj::CharTable(t)) => Ok(t.subtype.clone()),
+        _ => Err(wrong_char_table(h, &a[0])),
+    }
+}
+fn char_table_parent(h: &mut ElispHost, a: &[Value]) -> R {
+    match h.obj(&a[0]) {
+        Some(Obj::CharTable(t)) => Ok(t.parent.clone()),
+        _ => Err(wrong_char_table(h, &a[0])),
+    }
+}
+fn set_char_table_parent(h: &mut ElispHost, a: &[Value]) -> R {
+    if let Value::Obj(id) = &a[0] {
+        if let Some(Obj::CharTable(t)) = h.arena.get_mut(*id as usize) {
+            t.parent = a[1].clone();
+            return Ok(a[1].clone());
+        }
+    }
+    Err(wrong_char_table(h, &a[0]))
+}
+fn char_table_extra_slot(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_num(&a[1])?.0;
+    match h.obj(&a[0]) {
+        Some(Obj::CharTable(t)) => t
+            .extra
+            .get(n as usize)
+            .filter(|_| n >= 0)
+            .cloned()
+            .ok_or_else(|| format!("args-out-of-range: {} {n}", h.print(&a[0], true))),
+        _ => Err(wrong_char_table(h, &a[0])),
+    }
+}
+fn set_char_table_extra_slot(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_num(&a[1])?.0;
+    if let Value::Obj(id) = &a[0] {
+        if let Some(Obj::CharTable(t)) = h.arena.get_mut(*id as usize) {
+            if n >= 0 && (n as usize) < t.extra.len() {
+                t.extra[n as usize] = a[2].clone();
+                return Ok(a[2].clone());
+            }
+            return Err(format!("args-out-of-range: {} {n}", h.print(&a[0], true)));
+        }
+    }
+    Err(wrong_char_table(h, &a[0]))
+}
+/// `(char-table-range CHAR-TABLE RANGE)` — RANGE is nil (the default slot), a
+/// character, or a cons `(FROM . TO)` (value at FROM). `t` is invalid.
+fn char_table_range(h: &mut ElispHost, a: &[Value]) -> R {
+    if !matches!(h.obj(&a[0]), Some(Obj::CharTable(_))) {
+        return Err(wrong_char_table(h, &a[0]));
+    }
+    match &a[1] {
+        Value::Undef | Value::Bool(false) => match h.obj(&a[0]) {
+            Some(Obj::CharTable(t)) => Ok(t.default.clone()),
+            _ => unreachable!(),
+        },
+        Value::Bool(true) => Err("Invalid RANGE argument to 'char-table-range'".to_string()),
+        Value::Int(_) => {
+            let c = as_char(h, &a[1])?;
+            Ok(h.char_table_ref(&a[0], c))
+        }
+        _ => {
+            // A cons (FROM . TO): value at FROM (with fallback), like Emacs.
+            if let Some(Obj::Cons(from, _)) = h.obj(&a[1]) {
+                let from = from.clone();
+                let c = as_char(h, &from)?;
+                Ok(h.char_table_ref(&a[0], c))
+            } else {
+                Err("Invalid RANGE argument to 'char-table-range'".to_string())
+            }
+        }
+    }
+}
+/// `(set-char-table-range CHAR-TABLE RANGE VALUE)` — RANGE is nil (set default),
+/// `t` (set every char), a character, or a cons `(FROM . TO)`.
+fn set_char_table_range(h: &mut ElispHost, a: &[Value]) -> R {
+    let id = match &a[0] {
+        Value::Obj(id) if matches!(h.obj(&a[0]), Some(Obj::CharTable(_))) => *id,
+        _ => return Err(wrong_char_table(h, &a[0])),
+    };
+    let val = a[2].clone();
+    match &a[1] {
+        Value::Undef | Value::Bool(false) => {
+            if let Some(Obj::CharTable(t)) = h.arena.get_mut(id as usize) {
+                t.default = val;
+            }
+        }
+        Value::Bool(true) => {
+            if let Some(Obj::CharTable(t)) = h.arena.get_mut(id as usize) {
+                t.set_range(0, MAX_CHAR as u32, val);
+            }
+        }
+        Value::Int(_) => {
+            let c = as_char(h, &a[1])?;
+            if let Some(Obj::CharTable(t)) = h.arena.get_mut(id as usize) {
+                t.set_range(c, c, val);
+            }
+        }
+        _ => {
+            let (from, to) = match h.obj(&a[1]) {
+                Some(Obj::Cons(f, t)) => (f.clone(), t.clone()),
+                _ => return Err("Invalid RANGE argument to 'set-char-table-range'".to_string()),
+            };
+            let from = as_char(h, &from)?;
+            let to = as_char(h, &to)?;
+            if let Some(Obj::CharTable(t)) = h.arena.get_mut(id as usize) {
+                if from <= to {
+                    t.set_range(from, to, val);
+                }
+            }
+        }
+    }
+    Ok(a[2].clone())
+}
+fn wrong_char_table(h: &ElispHost, v: &Value) -> String {
+    format!("wrong-type-argument: char-table-p {}", h.print(v, true))
 }
 
 // ── symbols / cells ──
@@ -2330,6 +2482,7 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
             Some(Obj::Subr { .. }) => "subr",
             Some(Obj::Closure { .. }) => "function",
             Some(Obj::HashTable { .. }) => "hash-table",
+            Some(Obj::CharTable(_)) => "char-table",
             None => "symbol",
         },
         _ => "symbol",
@@ -4674,6 +4827,20 @@ pub fn install(h: &mut ElispHost) {
     s("aref", 2, Some(2), aref);
     s("aset", 3, Some(3), aset);
     s("fillarray", 2, Some(2), fillarray);
+    s("make-char-table--new", 3, Some(3), make_char_table_new);
+    s("char-table-p", 1, Some(1), char_table_p);
+    s("char-table-subtype", 1, Some(1), char_table_subtype);
+    s("char-table-parent", 1, Some(1), char_table_parent);
+    s("set-char-table-parent", 2, Some(2), set_char_table_parent);
+    s("char-table-extra-slot", 2, Some(2), char_table_extra_slot);
+    s(
+        "set-char-table-extra-slot",
+        3,
+        Some(3),
+        set_char_table_extra_slot,
+    );
+    s("char-table-range", 2, Some(2), char_table_range);
+    s("set-char-table-range", 3, Some(3), set_char_table_range);
     // symbols
     s("symbol-name", 1, Some(1), symbol_name);
     s("intern", 1, Some(2), intern_fn);

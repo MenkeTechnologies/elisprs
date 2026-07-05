@@ -23,6 +23,10 @@ use std::rc::Rc;
 /// Sentinel prefix marking the AOT heap image stashed in `chunk.names`.
 pub const HEAP_IMAGE_TAG: &str = "\u{0}ELHEAP\u{0}";
 
+/// Largest valid character code (`(max-char)` in Emacs 30.2 = #x3FFFFF). Char
+/// indices into a char-table run `0..=MAX_CHAR`.
+pub const MAX_CHAR: u32 = 0x3F_FFFF;
+
 /// A serializable mirror of a heap object — everything except `Subr` (a native
 /// fn pointer, re-installed by `install`). Used to ship the user/prelude heap
 /// into an AOT object so `Value::Obj` handles resolve in the AOT-runtime host.
@@ -41,6 +45,13 @@ pub enum SerObj {
     HashTable {
         test: u8,
         entries: Vec<(Value, Value)>,
+    },
+    CharTable {
+        subtype: Value,
+        default: Value,
+        parent: Value,
+        extra: Vec<Value>,
+        ranges: Vec<(u32, Value)>,
     },
     Closure {
         required: Vec<u32>,
@@ -161,6 +172,97 @@ pub enum Obj {
         test: u8,
         entries: Vec<(Value, Value)>,
     },
+    /// An Emacs char-table (`make-char-table`). Maps char codes `0..=MAX_CHAR`
+    /// to values, with a `subtype` symbol, a `default` slot, an optional `parent`
+    /// char-table for lookup fallback, and `extra` slots. See [`CharTable`].
+    CharTable(CharTable),
+}
+
+/// An Emacs char-table's payload. Per-char values use efficient range storage:
+/// `ranges` is a sorted list of `(start, value)` breakpoints whose first entry
+/// always starts at `0`; a breakpoint `(s, v)` means every char in `s..next_s`
+/// maps to `v` (the last breakpoint runs through `MAX_CHAR`). Setting a whole
+/// range is O(range-count), not O(chars), so `(set-char-table-range t …)` is cheap.
+///
+/// Lookup (`aref`, `char-table-range`) falls back like Emacs's `char_table_ref`:
+/// own char value; if nil → `default`; if that is nil and `parent` is a char-table
+/// → recurse into the parent.
+pub struct CharTable {
+    pub subtype: Value,
+    pub default: Value,
+    pub parent: Value,
+    pub extra: Vec<Value>,
+    pub ranges: Vec<(u32, Value)>,
+}
+
+/// Shallow `eq`-style equality for coalescing adjacent char-table breakpoints
+/// (identical adjacent runs collapse to one entry). Mirrors [`ElispHost::values_eq`]
+/// but is a free function usable while the arena is mutably borrowed.
+fn ct_val_eq(a: &Value, b: &Value) -> bool {
+    if !el_truthy(a) && !el_truthy(b) {
+        return true;
+    }
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        (Value::Obj(x), Value::Obj(y)) => x == y,
+        (Value::Bool(true), Value::Bool(true)) => true,
+        _ => false,
+    }
+}
+
+impl CharTable {
+    pub fn new(subtype: Value, init: Value, n_extra: usize) -> CharTable {
+        CharTable {
+            subtype,
+            default: Value::Undef,
+            parent: Value::Undef,
+            extra: vec![Value::Undef; n_extra],
+            ranges: vec![(0, init)],
+        }
+    }
+    /// The raw value stored for char `c` in this table alone (no parent/default
+    /// fallback): the value of the breakpoint that covers `c`.
+    pub fn raw_get(&self, c: u32) -> Value {
+        // `ranges` is sorted by start with ranges[0].0 == 0, so the covering
+        // breakpoint is the last one whose start <= c.
+        let idx = match self.ranges.binary_search_by(|(s, _)| s.cmp(&c)) {
+            Ok(i) => i,
+            Err(0) => 0,
+            Err(i) => i - 1,
+        };
+        self.ranges[idx].1.clone()
+    }
+    /// Set every char in `from..=to` to `val`, splicing/coalescing breakpoints.
+    pub fn set_range(&mut self, from: u32, to: u32, val: Value) {
+        // The value covering the char just past the range (to restore after it).
+        let after = if to < MAX_CHAR {
+            Some(self.raw_get(to + 1))
+        } else {
+            None
+        };
+        // Drop breakpoints strictly inside (from, to].
+        self.ranges.retain(|(s, _)| *s <= from || *s > to);
+        Self::upsert(&mut self.ranges, from, val);
+        if let Some(after) = after {
+            Self::upsert(&mut self.ranges, to + 1, after);
+        }
+        // Coalesce adjacent equal-valued runs.
+        let mut i = 1;
+        while i < self.ranges.len() {
+            if ct_val_eq(&self.ranges[i].1, &self.ranges[i - 1].1) {
+                self.ranges.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    fn upsert(ranges: &mut Vec<(u32, Value)>, start: u32, val: Value) {
+        match ranges.binary_search_by(|(s, _)| s.cmp(&start)) {
+            Ok(i) => ranges[i].1 = val,
+            Err(i) => ranges.insert(i, (start, val)),
+        }
+    }
 }
 
 /// Resolution of a function designator to something callable.
@@ -763,6 +865,13 @@ impl ElispHost {
                     test: *test,
                     entries: entries.clone(),
                 },
+                Obj::CharTable(t) => SerObj::CharTable {
+                    subtype: t.subtype.clone(),
+                    default: t.default.clone(),
+                    parent: t.parent.clone(),
+                    extra: t.extra.clone(),
+                    ranges: t.ranges.clone(),
+                },
                 Obj::Closure {
                     params,
                     body,
@@ -867,6 +976,13 @@ impl ElispHost {
                         test: *test,
                         entries: entries.clone(),
                     },
+                    Obj::CharTable(t) => SerObj::CharTable {
+                        subtype: t.subtype.clone(),
+                        default: t.default.clone(),
+                        parent: t.parent.clone(),
+                        extra: t.extra.clone(),
+                        ranges: t.ranges.clone(),
+                    },
                     Obj::Closure {
                         params,
                         body,
@@ -915,6 +1031,19 @@ impl ElispHost {
                 }
                 SerObj::Vector(v) => Obj::Vector(v),
                 SerObj::HashTable { test, entries } => Obj::HashTable { test, entries },
+                SerObj::CharTable {
+                    subtype,
+                    default,
+                    parent,
+                    extra,
+                    ranges,
+                } => Obj::CharTable(CharTable {
+                    subtype,
+                    default,
+                    parent,
+                    extra,
+                    ranges,
+                }),
                 SerObj::Closure {
                     required,
                     optional,
@@ -1145,6 +1274,21 @@ impl ElispHost {
                         format!("[{}]", parts.join(" "))
                     }
                 }
+                Some(Obj::CharTable(t)) => {
+                    // Emacs prints char-tables as `#^[DEFAULT PARENT SUBTYPE …]`
+                    // where `…` is the raw sub-char-table tree layout. Reproducing
+                    // that tree byte-for-byte is infeasible without modeling the
+                    // exact multi-level bucket structure, so we print the readable
+                    // header slots only. Identity/`char-table-p`/`aref`/`equal`
+                    // (all `eq`-based) behave correctly regardless; only the printed
+                    // per-char body differs from the binary. NAMED limitation.
+                    format!(
+                        "#^[{} {} {}]",
+                        self.print_inner(&t.default, readable, depth + 1),
+                        self.print_inner(&t.parent, readable, depth + 1),
+                        self.print_inner(&t.subtype, readable, depth + 1),
+                    )
+                }
                 Some(Obj::Subr { name, .. }) => format!("#<subr {name}>"),
                 Some(Obj::Closure { is_macro, .. }) => {
                     if *is_macro {
@@ -1234,7 +1378,9 @@ impl ElispHost {
             count += 1;
             let next = d.clone();
             match next {
-                Value::Undef => break,
+                // Both nil representations terminate the list (a `(1 . nil)` cdr
+                // is the one-element list `(1)`, never a dotted pair).
+                Value::Undef | Value::Bool(false) => break,
                 Value::Obj(id) if matches!(self.arena.get(id as usize), Some(Obj::Cons(..))) => {
                     cur = next;
                 }
@@ -1267,6 +1413,32 @@ impl ElispHost {
     /// The current editing buffer (top of the stack; index 0 is the default).
     pub fn cur_buf(&mut self) -> &mut EditBuffer {
         self.buffers.last_mut().expect("buffer stack never empty")
+    }
+
+    /// Resolve char `c` in char-table `ct` with Emacs `char_table_ref` fallback:
+    /// the table's own char value; if nil, its `default`; if that is also nil and
+    /// `parent` is a char-table, recurse into the parent. `ct` must be a
+    /// `Value::Obj` pointing at an `Obj::CharTable`.
+    pub fn char_table_ref(&self, ct: &Value, c: u32) -> Value {
+        let mut cur = ct.clone();
+        // Iterate the parent chain instead of recursing.
+        loop {
+            let Some(Obj::CharTable(t)) = self.obj(&cur) else {
+                return Value::Undef;
+            };
+            let v = t.raw_get(c);
+            if el_truthy(&v) {
+                return v;
+            }
+            if el_truthy(&t.default) {
+                return t.default.clone();
+            }
+            if matches!(self.obj(&t.parent), Some(Obj::CharTable(_))) {
+                cur = t.parent.clone();
+            } else {
+                return Value::Undef;
+            }
+        }
     }
 
     /// `eq`-style identity comparison (used for `catch`/`throw` tags).
