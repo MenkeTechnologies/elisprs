@@ -37,6 +37,27 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--aot") {
         return run_aot(&args, false);
     }
+    if args.iter().any(|a| a == "--cache-stats") {
+        let (count, bytes) = elisprs::cache::stats();
+        println!("elisprs bytecode cache");
+        println!("  path:    {}", elisprs::cache::default_cache_path().display());
+        println!("  entries: {count}");
+        println!("  bytes:   {bytes}");
+        println!("  enabled: {}", elisprs::cache::cache_enabled());
+        return ExitCode::SUCCESS;
+    }
+    if args.iter().any(|a| a == "--cache-clear") {
+        return match elisprs::cache::clear() {
+            Ok(()) => {
+                println!("elisprs: cleared {}", elisprs::cache::default_cache_path().display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("elisp --cache-clear: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if let Some(pos) = args.iter().position(|a| a == "-e" || a == "--eval") {
         let Some(expr) = args.get(pos + 1) else {
             eprintln!("elisp: -e requires an expression");
@@ -183,6 +204,12 @@ fn print_help() {
          \x20 elisp --lsp              language server over stdio (stub)\n\
          \x20 elisp --dap              debug adapter over stdio (stub)\n\
          \x20 elisp --aot FILE -o OUT  lower to a fusevm chunk / native object\n\
-         \x20 elisp --version"
+         \x20 elisp --cache-stats     show the rkyv bytecode cache stats\n\
+         \x20 elisp --cache-clear     delete the rkyv bytecode cache\n\
+         \x20 elisp --version\n\
+         \n\
+         ENV:\n\
+         \x20 ELISPRS_CACHE=0          disable the bytecode cache\n\
+         \x20 ELISPRS_CACHE_DEBUG=1    log cache HIT/MISS to stderr"
     );
 }
