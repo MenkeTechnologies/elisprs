@@ -40,7 +40,10 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--cache-stats") {
         let (count, bytes) = elisprs::cache::stats();
         println!("elisprs bytecode cache");
-        println!("  path:    {}", elisprs::cache::default_cache_path().display());
+        println!(
+            "  path:    {}",
+            elisprs::cache::default_cache_path().display()
+        );
         println!("  entries: {count}");
         println!("  bytes:   {bytes}");
         println!("  enabled: {}", elisprs::cache::cache_enabled());
@@ -49,7 +52,10 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--cache-clear") {
         return match elisprs::cache::clear() {
             Ok(()) => {
-                println!("elisprs: cleared {}", elisprs::cache::default_cache_path().display());
+                println!(
+                    "elisprs: cleared {}",
+                    elisprs::cache::default_cache_path().display()
+                );
                 ExitCode::SUCCESS
             }
             Err(e) => {

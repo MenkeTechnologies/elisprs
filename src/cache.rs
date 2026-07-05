@@ -344,10 +344,12 @@ pub fn evict_stale() -> usize {
         return 0;
     };
     let before = shard.entries.len();
-    shard.entries.retain(|p, e| match file_mtime_ns(Path::new(p)) {
-        Some(ns) => ns == e.mtime_ns,
-        None => false,
-    });
+    shard
+        .entries
+        .retain(|p, e| match file_mtime_ns(Path::new(p)) {
+            Some(ns) => ns == e.mtime_ns,
+            None => false,
+        });
     let evicted = before - shard.entries.len();
     if evicted > 0 {
         let _ = write_shard(&shard);

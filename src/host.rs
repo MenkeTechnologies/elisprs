@@ -1644,9 +1644,7 @@ fn load_abspath(candidate: &str) -> std::path::PathBuf {
     if p.is_absolute() {
         p
     } else {
-        std::env::current_dir()
-            .map(|d| d.join(&p))
-            .unwrap_or(p)
+        std::env::current_dir().map(|d| d.join(&p)).unwrap_or(p)
     }
 }
 
@@ -1668,7 +1666,10 @@ fn intrinsic_load(args: &[Value]) -> Result<Value, String> {
     let file = match args.first() {
         Some(Value::Str(s)) => s.to_string(),
         Some(other) => {
-            return Err(format!("wrong-type-argument: stringp {}", other.as_str_cow()))
+            return Err(format!(
+                "wrong-type-argument: stringp {}",
+                other.as_str_cow()
+            ))
         }
         None => return Err("wrong-number-of-arguments: load".to_string()),
     };
@@ -1743,9 +1744,8 @@ fn intrinsic_load(args: &[Value]) -> Result<Value, String> {
         }
     };
 
-    let src = std::fs::read_to_string(&path).map_err(|e| {
-        format!("file-error: Cannot open load file: {}: {e}", path.display())
-    })?;
+    let src = std::fs::read_to_string(&path)
+        .map_err(|e| format!("file-error: Cannot open load file: {}: {e}", path.display()))?;
     let abs = Value::str(path.to_string_lossy().into_owned());
 
     // Dynamically bind the load vars, remembering the pre-load specstack depth
