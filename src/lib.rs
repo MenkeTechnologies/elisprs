@@ -44,17 +44,32 @@ fn splice_top_forms(h: &mut host::ElispHost, forms: Vec<Value>) -> Vec<Value> {
     out
 }
 
-/// Evaluate a sequence of top-level forms (macro-expand → lower → run).
-fn eval_forms(src: &str) -> Result<Value, String> {
+/// Read every top-level form from `src` and evaluate them IN THE CURRENT host,
+/// one at a time (read → splice → macro-expand → lower → run), so an in-file
+/// `defmacro`/`defvar` is already in effect for the forms that follow it. Does
+/// NOT reset the host or (re)load the prelude — the caller owns host lifecycle.
+///
+/// Returns the compiled per-form chunks (for the bytecode cache) and the value
+/// of the last form. This is the single "run these forms in the live host"
+/// machinery shared by `eval_forms`, `eval_file`'s cache-miss path, and the
+/// `load` builtin, so none of them re-implement a divergent evaluator.
+pub(crate) fn run_top_forms(src: &str) -> Result<(Vec<fusevm::Chunk>, Value), String> {
     let forms = host::with_host(|h| reader::read_all(h, src).map(|fs| splice_top_forms(h, fs)))?;
+    let mut chunks = Vec::with_capacity(forms.len());
     let mut last = Value::Undef;
     for form in &forms {
         // Macro-expand before lowering (a prior form's `defmacro` is in effect).
         let expanded = host::macroexpand_all(form)?;
         let chunk = host::with_host(|h| compiler::compile_top(h, &expanded))?;
+        chunks.push(chunk.clone());
         last = host::run_chunk(chunk)?;
     }
-    Ok(last)
+    Ok((chunks, last))
+}
+
+/// Evaluate a sequence of top-level forms (macro-expand → lower → run).
+fn eval_forms(src: &str) -> Result<Value, String> {
+    run_top_forms(src).map(|(_, last)| last)
 }
 
 /// Load the derived-surface prelude once per host, best-effort (a broken
@@ -142,15 +157,7 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
     let prelude_end = host::with_host(|h| h.arena_len());
     let baseline = host::with_host(|h| h.snapshot_values(builtin_count, prelude_end));
 
-    let forms = host::with_host(|h| reader::read_all(h, &src).map(|fs| splice_top_forms(h, fs)))?;
-    let mut chunks = Vec::with_capacity(forms.len());
-    let mut last = Value::Undef;
-    for form in &forms {
-        let expanded = host::macroexpand_all(form)?;
-        let chunk = host::with_host(|h| compiler::compile_top(h, &expanded))?;
-        chunks.push(chunk.clone());
-        last = host::run_chunk(chunk)?;
-    }
+    let (chunks, last) = run_top_forms(&src)?;
     let heap = host::with_host(|h| h.export_heap_image_clean(prelude_end, &baseline));
     cache::put(path, mtime_ns, &schema_key, &chunks, &heap);
     Ok(last)

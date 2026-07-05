@@ -1359,6 +1359,10 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 }
                 return Ok(Value::Undef);
             }
+            // `load` reads a file's forms and evaluates them in the live host —
+            // re-entrant (nested VM per form) and it dynamically rebinds
+            // `load-file-name` &c, so it lives here, outside any host borrow.
+            "load" => return intrinsic_load(args),
             // `eval` macroexpands, compiles, and runs a form — re-entrant, so it
             // lives here (outside any host borrow), like the other intrinsics.
             "eval" => {
@@ -1627,6 +1631,142 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
 
 /// `(catch TAG THUNK)` — run the thunk; if a `throw` to a matching tag unwinds
 /// out of it, return the thrown value; otherwise re-propagate.
+/// Resolve a load candidate to an absolute path string, expanding `~/` and
+/// making relative paths absolute against the process cwd (which the elisp
+/// `default-directory` mirrors). No path is required to exist here.
+fn load_abspath(candidate: &str) -> std::path::PathBuf {
+    if let Some(rest) = candidate.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    let p = std::path::PathBuf::from(candidate);
+    if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir()
+            .map(|d| d.join(&p))
+            .unwrap_or(p)
+    }
+}
+
+/// `(load FILE &optional NOERROR NOMESSAGE NOSUFFIX MUST-SUFFIX)` — port of
+/// Emacs's `Fload`/`openp` semantics (behavior, not line numbers; this repo has
+/// no vendored C).
+///
+/// Resolution: if FILE has a directory component (or is absolute/`~`), it is
+/// used as-is; otherwise each directory in `load-path` is tried (falling back to
+/// cwd when `load-path` is empty). For each base, suffixes are tried in order:
+/// `.el` then the exact name (Emacs would try `.elc` first, but elisprs emits no
+/// bytecode so no `.elc` ever exists). NOSUFFIX limits the search to the exact
+/// name; MUST-SUFFIX requires a `load-suffixes` extension (only `.el` here).
+///
+/// While the file's forms run, `load-file-name`, `load-true-file-name` and
+/// `load-in-progress` are dynamically bound and restored afterward — even if a
+/// form errors (the specstack is unwound to the pre-load depth).
+fn intrinsic_load(args: &[Value]) -> Result<Value, String> {
+    let file = match args.first() {
+        Some(Value::Str(s)) => s.to_string(),
+        Some(other) => {
+            return Err(format!("wrong-type-argument: stringp {}", other.as_str_cow()))
+        }
+        None => return Err("wrong-number-of-arguments: load".to_string()),
+    };
+    let noerror = args.get(1).is_some_and(el_truthy);
+    let nosuffix = args.get(3).is_some_and(el_truthy);
+    let must_suffix = args.get(4).is_some_and(el_truthy);
+
+    // Suffixes to append (`.elc` skipped — elisprs writes no bytecode files).
+    let suffixes: &[&str] = if nosuffix {
+        &[""]
+    } else if must_suffix {
+        &[".el"]
+    } else {
+        &[".el", ""]
+    };
+
+    // Base names: FILE alone if it carries a directory component, else each
+    // `load-path` entry joined with FILE (cwd when `load-path` is empty/unset).
+    let has_dir = file.contains('/') || file.starts_with('~');
+    let bases: Vec<String> = if has_dir {
+        vec![file.clone()]
+    } else {
+        let lp = with_host(|h| {
+            let sym = h.intern("load-path");
+            h.get_value(&sym).ok().and_then(|v| h.list_vec(&v))
+        });
+        let dirs: Vec<String> = lp
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| match v {
+                Value::Str(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect();
+        if dirs.is_empty() {
+            vec![format!("./{file}")]
+        } else {
+            dirs.iter()
+                .map(|d| {
+                    if d.ends_with('/') {
+                        format!("{d}{file}")
+                    } else {
+                        format!("{d}/{file}")
+                    }
+                })
+                .collect()
+        }
+    };
+
+    // First existing (base + suffix) wins.
+    let mut resolved: Option<std::path::PathBuf> = None;
+    'search: for base in &bases {
+        for suf in suffixes {
+            let cand = load_abspath(&format!("{base}{suf}"));
+            if cand.is_file() {
+                resolved = Some(cand);
+                break 'search;
+            }
+        }
+    }
+
+    let path = match resolved {
+        Some(p) => p,
+        None => {
+            if noerror {
+                return Ok(Value::Undef);
+            }
+            // Emacs signals `file-missing` "Cannot open load file: FILE".
+            return Err(format!(
+                "file-missing: Cannot open load file: No such file or directory, {file}"
+            ));
+        }
+    };
+
+    let src = std::fs::read_to_string(&path).map_err(|e| {
+        format!("file-error: Cannot open load file: {}: {e}", path.display())
+    })?;
+    let abs = Value::str(path.to_string_lossy().into_owned());
+
+    // Dynamically bind the load vars, remembering the pre-load specstack depth
+    // so we can unwind them even if a form errors.
+    let depth = with_host(|h| {
+        let d = h.specdepth();
+        let lfn = h.intern("load-file-name");
+        let ltn = h.intern("load-true-file-name");
+        let lip = h.intern("load-in-progress");
+        let _ = h.specbind(&lfn, abs.clone());
+        let _ = h.specbind(&ltn, abs.clone());
+        let _ = h.specbind(&lip, Value::Bool(true));
+        d
+    });
+
+    let result = crate::run_top_forms(&src);
+    with_host(|h| h.unbind_to(depth));
+
+    result.map(|_| Value::Bool(true))
+}
+
 fn intrinsic_catch(args: &[Value]) -> Result<Value, String> {
     let tag = args.first().cloned().unwrap_or(Value::Undef);
     let thunk = args.get(1).cloned().unwrap_or(Value::Undef);

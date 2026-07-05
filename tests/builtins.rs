@@ -1032,3 +1032,30 @@ fn func_arity_of_special_forms_and_macros() {
     assert_eq!(eval("(func-arity 'format)"), "(1 . many)");
     assert_eq!(eval("(func-arity (lambda (a &optional b) 1))"), "(1 . 2)");
 }
+
+#[test]
+fn load_evaluates_file_binds_load_file_name_and_unwinds() {
+    use std::io::Write;
+    // Write a fixture with a directory component so `load` uses it as-is.
+    let path = std::env::temp_dir().join(format!("elisprs_load_{}.el", std::process::id()));
+    let mut f = std::fs::File::create(&path).unwrap();
+    // The fixture proves: forms run in the caller's host (defvar visible after),
+    // and `load-file-name` is dynamically bound to this file during the load.
+    writeln!(f, "(defvar loadtest-x 42)").unwrap();
+    writeln!(f, "(setq loadtest-captured load-file-name)").unwrap();
+    drop(f);
+    let p = path.to_string_lossy().into_owned();
+    // load returns t; the fixture's defvar is visible; load-file-name was bound
+    // to a ".el" path during load and is unwound back to nil afterward.
+    let src = format!(
+        "(progn (defvar loadtest-captured nil) \
+           (list (load \"{p}\") loadtest-x \
+                 (string-suffix-p \".el\" loadtest-captured) load-file-name))"
+    );
+    assert_eq!(eval(&src), "(t 42 t nil)");
+    // A missing file with NOERROR returns nil; without NOERROR it signals.
+    assert_eq!(eval("(load \"/no/such/elisprs/file\" t)"), "nil");
+    reset_host();
+    assert!(eval_str("(load \"/no/such/elisprs/file\")").is_err());
+    let _ = std::fs::remove_file(&path);
+}

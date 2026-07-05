@@ -2414,6 +2414,23 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 ;; POSIX: standard file names need no conversion.
 (defun convert-standard-filename (filename) filename)
 (defvar default-directory (file-name-as-directory (--current-directory--)))
+;; `load' machinery. These are dynamic (special) variables the `load' builtin
+;; rebinds around a file's evaluation and restores afterward. At top level
+;; `load-file-name'/`load-true-file-name' are nil and `load-in-progress' is nil,
+;; matching Emacs. `load-path' is searched for a bare (directory-less) FILE;
+;; `load-suffixes' are the extensions tried (elisprs has no bytecode, so `.elc'
+;; is never found — only `.el' and the exact name resolve).
+(defvar load-path nil)
+(defvar load-file-name nil)
+(defvar load-true-file-name nil)
+(defvar load-in-progress nil)
+(defvar load-suffixes '(".elc" ".el"))
+(defvar load-file-rep-suffixes '(""))
+;; Emacs startup variables (startup.el). `init-file-debug' gates verbose init
+;; error reporting; nil by default. `user-init-file'/`user-emacs-directory' are
+;; set by real Emacs before init loads — nil here until a caller binds them.
+(defvar init-file-debug nil)
+(defvar user-init-file nil)
 (defun expand-file-name (name &optional dir)
   ;; Expand NAME against DIR (default `default-directory'), `~/' via $HOME, and
   ;; collapse `.', `..' and `//'. (No remote/`~user' handling.)
@@ -2627,7 +2644,8 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
   (string-trim (string-replace "%%" "%" string)))
 (defun char-displayable-p (_char &optional _display) t)
 ;; Feature/module system: the libraries elisprs bundles are always "provided",
-;; so (require 'cl-lib) etc. are no-ops. There is no file loading.
+;; so (require 'cl-lib) etc. are no-ops — `require' checks `features' and never
+;; loads a file. (Arbitrary .el files ARE loadable via the `load' builtin.)
 (defvar features '(emacs cl-lib cl-macs cl-seq cl-extra seq subr-x map rx pcase json gv ert))
 (defun provide (feature &optional _subfeatures)
   (unless (memq feature features) (setq features (cons feature features)))
