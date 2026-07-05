@@ -2,7 +2,7 @@
 name = "elisprs"
 version = "0.1.2"
 edition = "2021"
-authors = ["MenkeTechnologies"]
+authors = ["MenkeTechnologies <linux.dev25@gmail.com>"]
 description = "Emacs Lisp as a fusevm frontend: a reader and compiler to fusevm::Chunk on an ElispHost object heap, with no bespoke VM or JIT"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MenkeTechnologies/elisprs"
