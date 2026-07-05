@@ -18,6 +18,17 @@
   ;; emacs -Q: (get 'brd-empty-p 'byte-optimizer) => byte-compile-inline-expand
   (should (eq 'byte-compile-inline-expand (get 'brd-empty-p 'byte-optimizer))))
 
+;; ---- declare-function (subr.el:31): a pure byte-compiler hint; the
+;; interpreter expands it to nil regardless of arity. ----
+(ert-deftest byte-run-declare-function ()
+  ;; emacs -Q: (macroexpand '(declare-function foo "bar")) => nil
+  (should (eq nil (macroexpand '(declare-function foo "bar"))))
+  ;; emacs -Q: (macroexpand '(declare-function foo "bar" (a b) t)) => nil
+  (should (eq nil (macroexpand '(declare-function foo "bar" (a b) t))))
+  ;; Evaluating a declaration is a no-op returning nil, and does NOT define FN.
+  (should (eq nil (declare-function brd-undefined "nowhere" (x))))
+  (should (eq nil (fboundp 'brd-undefined))))
+
 ;; ---- make-obsolete / make-obsolete-variable (byte-run.el) ----
 (ert-deftest byte-run-make-obsolete ()
   (defun brd-oldf () 1)

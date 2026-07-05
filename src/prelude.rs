@@ -568,6 +568,16 @@ pub const PRELUDE: &str = r#"
 (defmacro with-no-warnings (&rest body) `(progn ,@body))
 ;; declare: a no-op at runtime (specs are advisory; defun/lambda ignore them).
 (defmacro declare (&rest _specs) nil)
+;; declare-function (subr.el:31): a pure byte-compiler hint that FN is defined
+;; in FILE; `byte-compile-macroexpand-declare-function' does the real work.  In
+;; the interpreter it expands to nil (matching `emacs -Q --batch').
+(defmacro declare-function (_fn _file &rest _args)
+  "Tell the byte-compiler that function FN is defined, in FILE.
+Optional ARGLIST specifies FN's arguments.  Does nothing in the
+interpreter; expands to nil."
+  (declare (advertised-calling-convention
+	    (fn file &optional arglist fileonly) nil))
+  nil)
 ;; Compile-time evaluation: elisprs interprets, so these just run BODY.
 (defmacro eval-when-compile (&rest body) (cons 'progn body))
 (defmacro eval-and-compile (&rest body) (cons 'progn body))
