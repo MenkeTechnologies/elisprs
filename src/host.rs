@@ -2347,6 +2347,30 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
             let _ = kw;
             Ok(with_host(|h| h.list_from(out)))
         }
+        // `(lambda ARGLIST . BODY)`: the ARGLIST is a parameter list, not code —
+        // a parameter named after a macro (e.g. `rx`) must NOT be macroexpanded.
+        // Keep head + ARGLIST verbatim; expand only the body forms.
+        Some("lambda") if elems.len() >= 2 => {
+            let mut out = Vec::with_capacity(elems.len());
+            out.push(elems[0].clone());
+            out.push(elems[1].clone()); // ARGLIST, untouched
+            for e in &elems[2..] {
+                out.push(macroexpand_all(e)?);
+            }
+            Ok(with_host(|h| h.list_from(out)))
+        }
+        // `(defun|defmacro NAME ARGLIST . BODY)`: same protection for the ARGLIST
+        // (and NAME); only the body forms are expression positions.
+        Some("defun" | "defmacro") if elems.len() >= 3 => {
+            let mut out = Vec::with_capacity(elems.len());
+            out.push(elems[0].clone());
+            out.push(elems[1].clone()); // NAME, untouched
+            out.push(elems[2].clone()); // ARGLIST, untouched
+            for e in &elems[3..] {
+                out.push(macroexpand_all(e)?);
+            }
+            Ok(with_host(|h| h.list_from(out)))
+        }
         _ => {
             let mut out = Vec::with_capacity(elems.len());
             for e in &elems {

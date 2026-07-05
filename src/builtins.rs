@@ -4188,23 +4188,36 @@ fn insert_file_contents(h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── buffer motion ──
+/// Move point by DELTA characters, faithful to `Fforward_char` (cmds.c): on
+/// overshoot, point is set to the boundary (BEGV/ZV) *and* the corresponding
+/// `beginning-of-buffer`/`end-of-buffer` condition is signaled.
+fn move_point_by(h: &mut ElispHost, delta: i64) -> R {
+    let buf = h.cur_buf();
+    let target = buf.point as i64 + delta;
+    if target < buf.begv as i64 {
+        buf.point = buf.begv;
+        return Err("beginning-of-buffer".to_string());
+    }
+    if target > buf.zv as i64 {
+        buf.point = buf.zv;
+        return Err("end-of-buffer".to_string());
+    }
+    buf.point = target as usize;
+    Ok(Value::Undef)
+}
 fn forward_char(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
         Some(v) if !is_nil(v) => as_int(v)?,
         _ => 1,
     };
-    let buf = h.cur_buf();
-    buf.point = (buf.point as i64 + n).clamp(buf.begv as i64, buf.zv as i64) as usize;
-    Ok(Value::Undef)
+    move_point_by(h, n)
 }
 fn backward_char(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
         Some(v) if !is_nil(v) => as_int(v)?,
         _ => 1,
     };
-    let buf = h.cur_buf();
-    buf.point = (buf.point as i64 - n).clamp(buf.begv as i64, buf.zv as i64) as usize;
-    Ok(Value::Undef)
+    move_point_by(h, -n)
 }
 /// 1-based position of the beginning of POINT's line, not before `begv`.
 fn bol_of(t: &[char], point: usize, begv: usize) -> usize {

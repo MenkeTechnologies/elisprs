@@ -140,4 +140,29 @@
                  '(2 2 4)))
   (should (null (with-temp-buffer (insert "abc") (mark)))))
 
+(ert-deftest be-char-motion-bounds ()
+  "forward-char/backward-char clamp point to the boundary AND signal
+`beginning-of-buffer'/`end-of-buffer' on overshoot (faithful to cmds.c);
+within bounds they move silently.  Values checked against GNU Emacs 30.2."
+  ;; Overshoot backward: point pinned at BEGV, condition is beginning-of-buffer.
+  (should (equal (with-temp-buffer
+                   (insert "abc") (goto-char (point-min))
+                   (list (condition-case e (backward-char 5) (error (car e))) (point)))
+                 '(beginning-of-buffer 1)))
+  ;; Overshoot forward: point pinned at ZV, condition is end-of-buffer.
+  (should (equal (with-temp-buffer
+                   (insert "abc") (goto-char (point-max))
+                   (list (condition-case e (forward-char 5) (error (car e))) (point)))
+                 '(end-of-buffer 4)))
+  ;; Negative argument reverses direction: (forward-char -5) hits the beginning.
+  (should (equal (with-temp-buffer
+                   (insert "abc") (goto-char (point-min))
+                   (list (condition-case e (forward-char -5) (error (car e))) (point)))
+                 '(beginning-of-buffer 1)))
+  ;; In-bounds motion returns nil and just moves point.
+  (should (equal (with-temp-buffer
+                   (insert "abcde") (goto-char (point-min))
+                   (list (forward-char 2) (point) (backward-char 1) (point)))
+                 '(nil 3 nil 2))))
+
 (ert-run-tests-batch-and-exit)

@@ -1352,18 +1352,6 @@ pub const SUBRS: &[Entry] = &[
         doc: "Run PROGRAM with ARGS and return its output as a list of lines.",
     },
     Entry {
-        name: "--buffer-push--",
-        kind: Kind::Function,
-        sig: "(--buffer-push--)",
-        doc: "Internal: push a fresh edit buffer onto the buffer stack.",
-    },
-    Entry {
-        name: "--buffer-pop--",
-        kind: Kind::Function,
-        sig: "(--buffer-pop--)",
-        doc: "Internal: pop the current edit buffer off the buffer stack.",
-    },
-    Entry {
         name: "insert",
         kind: Kind::Function,
         sig: "(insert &rest ARGS)",
