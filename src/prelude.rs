@@ -4603,6 +4603,462 @@ or the result is already atomic/grouped."
 (defmacro defface (face spec doc &rest args)
   (nconc (list 'custom-declare-face (list 'quote face) spec doc) args))
 
+;;; ---- keymaps (data subsystem: keymap.c primitives + keymap.el string API) ----
+;; A keymap is a list whose car is the symbol `keymap'.  Bindings follow as
+;; (EVENT . DEFINITION) conses; a bare `keymap' element in the tail begins the
+;; PARENT keymap (shared structure).  These are faithful ports of the DOCUMENTED
+;; behavior of the C primitives in keymap.c, verified value-for-value against the
+;; Emacs 30.2 binary.  make-keymap (full char-table keymap) is NOT implemented:
+;; it needs a char-table Value type elisprs lacks -- see report.  command-remapping
+;; returns nil (correct with no active global/local remap keymaps).
+
+;; With no buffer-local/global remap keymaps in effect, no command is remapped.
+(defun command-remapping (_command &optional _position _keymaps) nil)
+
+(defun make-sparse-keymap (&optional string)
+  "Construct and return a new sparse keymap.
+Optional STRING is a menu name for the keymap."
+  (if string (list 'keymap string) (list 'keymap)))
+
+(defun keymapp (object)
+  "Return t if OBJECT is a keymap.
+A keymap is a list (keymap . ALIST), or a symbol whose function
+definition is itself a keymap."
+  (if (symbolp object)
+      (and object (keymapp (symbol-function object)))
+    (and (consp object) (eq (car object) 'keymap))))
+
+;; Resolve a keymap that may be a symbol standing for a keymap (a prefix command).
+(defun keymap--get (object)
+  (if (symbolp object) (symbol-function object) object))
+
+(defun make-composed-keymap (maps &optional parent)
+  "Construct a new keymap composed of MAPS and inheriting from PARENT.
+MAPS can be a single keymap or a list of keymaps.  PARENT, if non-nil,
+should be a keymap."
+  (cons 'keymap (append (if (keymapp maps) (list maps) maps) parent)))
+
+;; Return the (EVENT . DEF) cons in KM's own bindings (before the parent), or nil.
+(defun keymap--own-binding (km event)
+  (let ((tail (cdr km)) (res nil))
+    (while (and (consp tail) (not res))
+      (let ((el (car tail)))
+        (cond ((eq el 'keymap) (setq tail nil))
+              ((and (consp el) (equal (car el) event)) (setq res el))
+              (t (setq tail (cdr tail))))))
+    res))
+
+;; Replace or prepend a binding for EVENT in KM's own bindings.
+(defun keymap--set-binding (km event def)
+  (let ((cell (keymap--own-binding km event)))
+    (if cell
+        (setcdr cell def)
+      (setcdr km (cons (cons event def) (cdr km))))))
+
+;; Delete EVENT's own binding from KM.
+(defun keymap--remove-binding (km event)
+  (let ((cell (keymap--own-binding km event)))
+    (when cell (setcdr km (delq cell (cdr km))))))
+
+;; Expand meta-modified integer events (bit 2^27) into ESC (27) + base char,
+;; matching how keymap.c stores/looks up meta bindings.  Symbol events (e.g.
+;; `M-left') are stored verbatim and are not expanded.
+(defun keymap--expand-meta (events)
+  (let ((res nil))
+    (dolist (e events)
+      (if (and (integerp e) (/= 0 (logand e (ash 1 27))))
+          (progn (push 27 res) (push (logand e (lognot (ash 1 27))) res))
+        (push e res)))
+    (nreverse res)))
+
+(defun define-key (keymap key def &optional remove)
+  "In KEYMAP, define key sequence KEY as DEF.
+KEY is a string or vector of events.  DEF is anything that can be a
+key definition (a command symbol, a keymap for a prefix key, nil, etc.).
+If optional REMOVE is non-nil, remove the binding instead.
+Returns DEF."
+  (let ((events (keymap--expand-meta (append key nil)))
+        (km keymap))
+    (while (cdr events)
+      (let ((sub (keymap--get (cdr (or (keymap--own-binding km (car events))
+                                       (cons nil nil))))))
+        (if (keymapp sub)
+            (setq km (keymap--get sub))
+          (let ((new (make-sparse-keymap)))
+            (keymap--set-binding km (car events) new)
+            (setq km new))))
+      (setq events (cdr events)))
+    (if remove
+        (keymap--remove-binding km (car events))
+      (keymap--set-binding km (car events) def))
+    def))
+
+;; Look up EVENT in KM's own bindings, then (transparently) its parent chain.
+;; ACCEPT-DEFAULT recognizes a (t . DEF) default binding.
+(defun lookup-key--event (km event accept-default)
+  (let ((tail (cdr km)) (res nil) (deflt nil) (done nil))
+    (while (and (consp tail) (not done))
+      (let ((el (car tail)))
+        (cond
+         ((eq el 'keymap)
+          (setq res (lookup-key--event tail event accept-default) done t))
+         ((and (consp el) (eq (car el) 'keymap))
+          (let ((r (lookup-key--event el event accept-default)))
+            (when r (setq res r done t))))
+         ((and (consp el) (equal (car el) event))
+          (setq res (cdr el) done t))
+         ((and (consp el) (eq (car el) t))
+          (setq deflt (cdr el)))))
+      (unless done (setq tail (cdr tail))))
+    (or res (and accept-default deflt))))
+
+(defun lookup-key (keymap key &optional accept-default)
+  "Look up key sequence KEY in KEYMAP; return the definition.
+KEY is a string or vector.  Returns nil if undefined.  If KEY is longer
+than needed to reach a non-prefix binding, returns the number of events
+at the front of KEY that were used.  ACCEPT-DEFAULT recognizes default
+(t) bindings."
+  (let ((events (keymap--expand-meta (append key nil)))
+        (km (keymap--get keymap)) (i 0) (res nil) (done nil))
+    (if (null events)
+        keymap
+      (while (and events (not done))
+        (setq res (lookup-key--event km (car events) accept-default))
+        (setq events (cdr events))
+        (setq i (1+ i))
+        (cond
+         ((null res) (setq done t))
+         ((null events) (setq done t))
+         ((keymapp res) (setq km (keymap--get res)))
+         (t (setq res i done t))))
+      res)))
+
+(defun keymap-parent (keymap)
+  "Return the parent keymap of KEYMAP, or nil if it has none."
+  (let ((tail (cdr keymap)) (res nil))
+    (while (and (consp tail) (not res))
+      (if (eq (car tail) 'keymap)
+          (setq res tail)
+        (setq tail (cdr tail))))
+    res))
+
+(defun set-keymap-parent (keymap parent)
+  "Modify KEYMAP to set its parent keymap to PARENT.  Return PARENT."
+  (let ((prev keymap) (tail (cdr keymap)))
+    (while (and (consp tail) (not (eq (car tail) 'keymap)))
+      (setq prev tail tail (cdr tail)))
+    (setcdr prev parent)
+    parent))
+
+(defun define-prefix-command (command &optional mapvar _name)
+  "Define COMMAND as a prefix command with a new sparse keymap.
+Set COMMAND's function cell to the keymap, and its value cell (or MAPVAR
+if given and not t) to the same keymap.  Return COMMAND."
+  (let ((map (make-sparse-keymap)))
+    (fset command map)
+    (if (and mapvar (not (eq mapvar t)))
+        (set mapvar map)
+      (set command map))
+    command))
+
+(defun suppress-keymap (map &optional nodigits)
+  "Make MAP override all normally self-inserting keys to be undefined.
+Normally, as an exception, digits and minus-sign are set to make prefix
+args, but optional second arg NODIGITS non-nil treats them like other chars."
+  (define-key map [remap self-insert-command] #'undefined)
+  (or nodigits
+      (let (loop)
+        (define-key map "-" #'negative-argument)
+        (setq loop ?0)
+        (while (<= loop ?9)
+          (define-key map (char-to-string loop) #'digit-argument)
+          (setq loop (1+ loop))))))
+
+;; ---- keymap.el: the string-based key API (faithful ports) ----
+
+(defun key-parse (keys)
+  "Convert KEYS to the internal Emacs key representation.
+KEYS should be a string describing a key sequence in the format
+returned by \\[describe-key] (`describe-key')."
+  (save-match-data
+    (let ((case-fold-search nil)
+          (len (length keys))
+          (pos 0)
+          (res []))
+      (while (and (< pos len)
+                  (string-match "[^ \t\n\f]+" keys pos))
+        (let* ((word-beg (match-beginning 0))
+               (word-end (match-end 0))
+               (word (substring keys word-beg len))
+               (times 1)
+               key)
+          (if (string-match "\\`<[^ <>\t\n\f][^>\t\n\f]*>" word)
+              (setq word (match-string 0 word)
+                    pos (+ word-beg (match-end 0)))
+            (setq word (substring keys word-beg word-end)
+                  pos word-end))
+          (when (string-match "\\([0-9]+\\)\\*." word)
+            (setq times (string-to-number (substring word 0 (match-end 1))))
+            (setq word (substring word (1+ (match-end 1)))))
+          (cond ((string-match "^<<.+>>$" word)
+                 (setq key (vconcat (if (eq (key-binding [?\M-x])
+                                            'execute-extended-command)
+                                        [?\M-x]
+                                      (or (car (where-is-internal
+                                                'execute-extended-command))
+                                          [?\M-x]))
+                                    (substring word 2 -2) "\r")))
+                ((and (string-match "^\\(\\([ACHMsS]-\\)*\\)<\\(.+\\)>$" word)
+                      (progn
+                        (setq word (concat (match-string 1 word)
+                                           (match-string 3 word)))
+                        (not (string-match
+                              "\\<\\(NUL\\|RET\\|LFD\\|TAB\\|ESC\\|SPC\\|DEL\\)$"
+                              word))))
+                 (setq key (list (intern word))))
+                ((or (equal word "REM") (string-match "^;;" word))
+                 (setq pos (string-match "$" keys pos)))
+                (t
+                 (let ((orig-word word) (prefix 0) (bits 0))
+                   (while (string-match "^[ACHMsS]-." word)
+                     (setq bits (+ bits
+                                   (cdr
+                                    (assq (aref word 0)
+                                          '((?A . ?\A-\0) (?C . ?\C-\0)
+                                            (?H . ?\H-\0) (?M . ?\M-\0)
+                                            (?s . ?\s-\0) (?S . ?\S-\0))))))
+                     (setq prefix (+ prefix 2))
+                     (setq word (substring word 2)))
+                   (when (string-match "^\\^.$" word)
+                     (setq bits (+ bits ?\C-\0))
+                     (setq prefix (1+ prefix))
+                     (setq word (substring word 1)))
+                   (let ((found (assoc word '(("NUL" . "\0") ("RET" . "\r")
+                                              ("LFD" . "\n") ("TAB" . "\t")
+                                              ("ESC" . "\e") ("SPC" . " ")
+                                              ("DEL" . "\177")))))
+                     (when found (setq word (cdr found))))
+                   (when (string-match "^\\\\[0-7]+$" word)
+                     (let ((n 0))
+                       (dolist (ch (cdr (string-to-list word)))
+                         (setq n (+ (* n 8) ch -48)))
+                       (setq word (vector n))))
+                   (cond ((= bits 0)
+                          (setq key word))
+                         ((and (= bits ?\M-\0) (stringp word)
+                               (string-match "^-?[0-9]+$" word))
+                          (setq key (mapcar (lambda (x) (+ x bits))
+                                            (append word nil))))
+                         ((/= (length word) 1)
+                          (error "%s must prefix a single character, not %s"
+                                 (substring orig-word 0 prefix) word))
+                         ((and (/= (logand bits ?\C-\0) 0) (stringp word)
+                               (string-match "[@-_a-z]" word))
+                          (setq key (list (+ bits (- ?\C-\0)
+                                             (logand (aref word 0) 31)))))
+                         (t
+                          (setq key (list (+ bits (aref word 0)))))))))
+          (when key
+            (dolist (_ (number-sequence 1 times))
+              (setq res (vconcat res key))))))
+      res)))
+
+(defun key-valid-p (keys)
+  "Return non-nil if KEYS, a string, is a valid key sequence.
+KEYS should be a string consisting of one or more key strokes, with a
+single space character separating one key stroke from another."
+  (let ((case-fold-search nil))
+    (and
+     (stringp keys)
+     (string-match-p "\\`[^ ]+\\( [^ ]+\\)*\\'" keys)
+     (save-match-data
+       (catch 'exit
+         (let ((prefixes
+                "\\(A-\\)?\\(C-\\)?\\(H-\\)?\\(M-\\)?\\(S-\\)?\\(s-\\)?"))
+           (dolist (key (split-string keys " "))
+             (when (string-match (concat "\\`" prefixes) key)
+               (setq key (substring key (match-end 0))))
+             (unless (or (and (= (length key) 1)
+                              (not (< (aref key 0) ?\s))
+                              (or (multibyte-string-p key)
+                                  (not (<= 127 (aref key 0) 255))))
+                         (and (string-match-p "\\`<[-_A-Za-z0-9]+>\\'" key)
+                              (= (progn
+                                   (string-match
+                                    (concat "\\`<" prefixes) key)
+                                   (match-end 0))
+                                 1))
+                         (string-match-p
+                          "\\`\\(NUL\\|RET\\|TAB\\|LFD\\|ESC\\|SPC\\|DEL\\)\\'"
+                          key))
+               (throw 'exit nil)))
+           t))))))
+
+(defun keymap--check (key)
+  "Signal an error if KEY doesn't have a valid syntax."
+  (unless (key-valid-p key)
+    (error "%S is not a valid key definition; see `key-valid-p'" key)))
+
+(defun keymap-set (keymap key definition)
+  "Set KEY to DEFINITION in KEYMAP.
+KEY is a string that satisfies `key-valid-p'."
+  (keymap--check key)
+  (when (stringp definition)
+    (keymap--check definition)
+    (setq definition (key-parse definition)))
+  (define-key keymap (key-parse key) definition))
+
+(defun keymap-unset (keymap key &optional remove)
+  "Remove KEY from KEYMAP.
+If REMOVE is non-nil, remove the binding instead of setting it to nil."
+  (keymap--check key)
+  (define-key keymap (key-parse key) nil remove))
+
+(defun keymap-lookup (keymap key &optional accept-default no-remap position)
+  "Return the binding for command KEY in KEYMAP.
+KEY is a string that satisfies `key-valid-p'.  KEYMAP must be non-nil
+here: looking up in the current buffer-local/global keymaps (KEYMAP nil)
+needs live buffer state that elisprs does not provide."
+  (keymap--check key)
+  (when (and keymap position)
+    (error "Can't pass in both keymap and position"))
+  (if keymap
+      (let ((value (lookup-key keymap (key-parse key) accept-default)))
+        (if (and (not no-remap)
+                 (symbolp value))
+            (or (command-remapping value) value)
+          value))
+    (error "keymap-lookup with no keymap needs buffer-local current keymaps (unsupported)")))
+
+(defun define-keymap (&rest definitions)
+  "Create a new keymap and define KEY/DEFINITION pairs as key bindings.
+Return the new keymap.  Options may be given as keywords before the
+pairs: :full :suppress :parent :keymap :name :prefix."
+  (let (full suppress parent name prefix keymap)
+    (while (and definitions
+                (keywordp (car definitions))
+                (not (eq (car definitions) :menu)))
+      (let ((keyword (pop definitions)))
+        (unless definitions
+          (error "Missing keyword value for %s" keyword))
+        (let ((value (pop definitions)))
+          (pcase keyword
+            (:full (setq full value))
+            (:keymap (setq keymap value))
+            (:parent (setq parent value))
+            (:suppress (setq suppress value))
+            (:name (setq name value))
+            (:prefix (setq prefix value))
+            (_ (error "Invalid keyword: %s" keyword))))))
+
+    (when (and prefix
+               (or full parent suppress keymap))
+      (error "A prefix keymap can't be defined with :full/:parent/:suppress/:keymap keywords"))
+
+    (when (and keymap full)
+      (error "Invalid combination: :keymap with :full"))
+
+    (let ((keymap (cond
+                   (keymap keymap)
+                   (prefix (define-prefix-command prefix nil name))
+                   (full (make-keymap name))
+                   (t (make-sparse-keymap name))))
+          seen-keys)
+      (when suppress
+        (suppress-keymap keymap (eq suppress 'nodigits)))
+      (when parent
+        (set-keymap-parent keymap parent))
+
+      (while definitions
+        (let ((key (pop definitions)))
+          (unless definitions
+            (error "Uneven number of key/definition pairs"))
+          (let ((def (pop definitions)))
+            (if (eq key :menu)
+                (easy-menu-define nil keymap "" def)
+              (when (member key seen-keys)
+                (message "Duplicate definition for key: %S %s" key keymap))
+              (push key seen-keys)
+              (keymap-set keymap key def)))))
+      keymap)))
+
+(defmacro defvar-keymap (variable-name &rest defs)
+  "Define VARIABLE-NAME as a variable with a keymap definition.
+See `define-keymap' for an explanation of the keywords and KEY/DEFINITION.
+Also accepts a `:doc' keyword for the variable documentation string, and
+a `:repeat' keyword controlling `repeat-mode' behavior."
+  (declare (indent 1))
+  (let ((opts nil)
+        doc repeat props)
+    (while (and defs
+                (keywordp (car defs))
+                (not (eq (car defs) :menu)))
+      (let ((keyword (pop defs)))
+        (unless defs
+          (error "Uneven number of keywords"))
+        (cond
+         ((eq keyword :doc) (setq doc (pop defs)))
+         ((eq keyword :repeat) (setq repeat (pop defs)))
+         (t (push keyword opts)
+            (push (pop defs) opts)))))
+    (unless (zerop (% (length defs) 2))
+      (error "Uneven number of key/definition pairs: %s" defs))
+
+    (let ((defs defs)
+          key seen-keys)
+      (while defs
+        (setq key (pop defs))
+        (pop defs)
+        (when (not (eq key :menu))
+          (if (member key seen-keys)
+              (error "Duplicate definition for key '%s' in keymap '%s'"
+                     key variable-name)
+            (push key seen-keys)))))
+
+    (when repeat
+      (let ((defs defs)
+            def)
+        (dolist (def (plist-get repeat :enter))
+          (push (list 'put (list 'quote def) ''repeat-map (list 'quote variable-name)) props))
+        (while defs
+          (pop defs)
+          (setq def (pop defs))
+          (when (and (memq (car def) '(function quote))
+                     (not (memq (cadr def) (plist-get repeat :exit))))
+            (push (list 'put def ''repeat-map (list 'quote variable-name)) props)))
+        (dolist (def (plist-get repeat :hints))
+          (push (list 'put (list 'quote (car def)) ''repeat-hint (list 'quote (cdr def))) props))))
+
+    (let ((defvar-form
+           (append (list 'defvar variable-name
+                         (append (list 'define-keymap) (nreverse opts) defs))
+                   (and doc (list doc)))))
+      (if props
+          (append (list 'progn defvar-form) (nreverse props))
+        defvar-form))))
+
+;; button-buffer-map (button.el) and special-mode-map (simple.el) are pure
+;; keymap data that tabulated-list-mode-map inherits from via :parent.  Ported
+;; from their upstream defvar-keymap forms.
+(defvar-keymap button-buffer-map
+  :doc "Keymap useful for buffers containing buttons.
+Mode-specific keymaps may want to use this as their parent keymap."
+  "TAB" #'forward-button
+  "ESC TAB" #'backward-button
+  "<backtab>" #'backward-button)
+
+(defvar-keymap special-mode-map
+  :suppress t
+  "q" #'quit-window
+  "SPC" #'scroll-up-command
+  "S-SPC" #'scroll-down-command
+  "DEL" #'scroll-down-command
+  "?" #'describe-mode
+  "h" #'describe-mode
+  ">" #'end-of-buffer
+  "<" #'beginning-of-buffer
+  "g" #'revert-buffer)
+
 ;;; ---- ERT: Emacs Lisp Regression Testing (subset) ----
 ;; Ported from ERT: `should` / `should-not` / `should-error` / `skip-unless`
 ;; assertions, `ert-fail` / `ert-pass`, and `ert-deftest` with an optional
