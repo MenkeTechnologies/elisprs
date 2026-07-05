@@ -227,6 +227,21 @@ All notable changes to elisprs are documented here. The format follows
   applicable) keyword arguments, and preserve the input sequence's type.
 
 ### Added
+- Customize **declaration** machinery — faithful port of custom.el / cus-face.el:
+  `defgroup` / `defcustom` / `defface` and the `custom-declare-group` /
+  `custom-declare-variable` / `custom-declare-face` functions they expand into,
+  plus the `custom-initialize-*` handlers, `custom-handle-keyword`,
+  `custom-add-*`, `face-spec-set`, `documentation-stringp`, and the
+  `internal--define-uninitialized-variable` subr. `defcustom` defines the
+  variable like `defvar` (respecting an existing binding) and stores the same
+  observable symbol properties Emacs stores at declaration time —
+  `standard-value`, `custom-type`, `custom-requests`, `custom-group`,
+  `group-documentation`, `face-defface-spec` — verified byte-for-byte against
+  the Emacs 30.2 binary. This unblocks libraries that declare options at load;
+  `ansi-color.el` (1 `defgroup` + 5 `defcustom` + 23 `defface`) now loads clean.
+  Scope is declaration only: the Customize UI (widget.el, `custom-set-variables`
+  persistence) and live face objects / frame recalculation are out of scope
+  (`face-spec-set` stores the spec prop but creates no face object).
 - `pcase` — structural dispatch (non-backquote subset): `_` wildcard,
   self-quoting literals, `'x` / `(quote x)`, symbol binders, `(pred FN)` /
   `(pred (FN ARGS...))`, `(guard EXPR)`, `(and …)`, `(or …)`. Plus a minimal

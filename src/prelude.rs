@@ -4253,6 +4253,346 @@ or the result is already atomic/grouped."
               m))
     (map--into result type)))
 
+
+;;; ---- Customize declaration machinery (custom.el / cus-face.el) ----
+;; Faithful port of the DECLARATION half of custom.el: `defgroup', `defcustom',
+;; `defface' and the `custom-declare-*' functions they expand into, storing the
+;; same observable symbol properties real Emacs stores at declaration time
+;; (standard-value, custom-type, custom-requests, custom-group,
+;; group-documentation, face-defface-spec, ...). This lets libraries that
+;; declare options (sort.el, ansi-color.el, ...) load. The Customize *UI*
+;; (widget.el, cus-edit.el, `custom-set-variables' persistence) and live face
+;; objects/frames are out of scope; where a facet needs them the boundary is
+;; named below.
+;;
+;; elisprs binds dynamically this milestone, so `lexical-binding' is nil; the
+;; `defcustom' macro (custom.el:249) branches on it to decide how STANDARD is
+;; stashed. With nil it quotes STANDARD directly, so `standard-value' is
+;; (list DEFAULT) — exactly what GNU Emacs leaves for a lexical-binding:nil file.
+(defvar lexical-binding nil)
+(defvar purify-flag nil)
+(defvar custom-define-hook nil)          ; custom.el:38
+(defvar custom-dont-initialize nil)      ; custom.el:42
+(defvar custom-current-group-alist nil)  ; custom.el:47
+;; C `current-load-list' (lread.c): `load' accumulates definitions on it. A
+;; plain global is enough for `custom-declare-face' to push onto here.
+(defvar current-load-list nil)
+
+;; custom.el:52 — set SYMBOL to EXP only if it has no default binding yet.
+(defun custom-initialize-default (symbol exp)
+  (condition-case nil
+      (default-toplevel-value symbol)
+    (void-variable
+     (set-default-toplevel-value
+      symbol (eval (let ((sv (get symbol 'saved-value)))
+                     (if sv (car sv) exp))
+                   t)))))
+
+;; custom.el:68
+(defun custom-initialize-set (symbol exp)
+  (condition-case nil
+      (default-toplevel-value symbol)
+    (error
+     (funcall (or (get symbol 'custom-set) #'set-default-toplevel-value)
+              symbol
+              (eval (let ((sv (get symbol 'saved-value)))
+                      (if sv (car sv) exp)))))))
+
+;; custom.el:84 — the default `:initialize' every plain `defcustom' uses.
+(defun custom-initialize-reset (symbol exp)
+  ;; The `custom-check-value'/widget branch only fires for options previously
+  ;; set via `setopt'; it never runs at declaration (custom-check-value is nil),
+  ;; so `widget-convert'/`widget-apply' — part of the out-of-scope widget UI —
+  ;; are never called here.
+  (let ((value (get symbol 'custom-check-value)))
+    (when value
+      (let ((type (get symbol 'custom-type)))
+        (when (and type
+                   (boundp symbol)
+                   (eq (car value) (symbol-value symbol))
+                   (not (widget-apply (widget-convert type)
+                                      :match (car value))))
+          (warn "Value `%S' for `%s' does not match type %s"
+                value symbol type)))))
+  (funcall (or (get symbol 'custom-set) #'set-default-toplevel-value)
+           symbol
+           (condition-case nil
+               (let ((def (default-toplevel-value symbol))
+                     (getter (get symbol 'custom-get)))
+                 (if getter (funcall getter symbol) def))
+             (error
+              (eval (let ((sv (get symbol 'saved-value)))
+                      (if sv (car sv) exp)))))))
+
+;; custom.el:117
+(defun custom-initialize-changed (symbol exp)
+  (condition-case nil
+      (let ((def (default-toplevel-value symbol)))
+        (funcall (or (get symbol 'custom-set) #'set-default-toplevel-value)
+                 symbol
+                 (let ((getter (get symbol 'custom-get)))
+                   (if getter (funcall getter symbol) def))))
+    (error
+     (cond
+      ((get symbol 'saved-value)
+       (funcall (or (get symbol 'custom-set) #'set-default-toplevel-value)
+                symbol
+                (eval (car (get symbol 'saved-value)))))
+      (t
+       (set-default-toplevel-value symbol (eval exp)))))))
+
+;; C subr (eval.c): mark SYMBOL special (dynamically bound) and record DOC,
+;; without touching its value. Bare `(defvar SYMBOL)' marks special without
+;; binding; the docstring lives on the `variable-documentation' property.
+(defun internal--define-uninitialized-variable (symbol &optional doc)
+  (eval (list 'defvar symbol))
+  (when doc (put symbol 'variable-documentation doc))
+  nil)
+
+;; custom.el:479
+(defun custom-current-group ()
+  (cdr (assoc load-file-name custom-current-group-alist)))
+
+;; custom.el:545
+(defun custom-add-to-group (group option widget)
+  (let ((members (get group 'custom-group))
+        (entry (list option widget)))
+    (unless (member entry members)
+      (put group 'custom-group (nconc members (list entry))))))
+
+;; custom.el:626
+(defun custom-add-option (symbol option)
+  (let ((options (get symbol 'custom-options)))
+    (unless (member option options)
+      (put symbol 'custom-options (cons option options)))))
+
+;; custom.el:652
+(defun custom-add-load (symbol load)
+  (let ((loads (get symbol 'custom-loads)))
+    (unless (member load loads)
+      (put symbol 'custom-loads (cons (purecopy load) loads)))))
+
+;; custom.el:638
+(defun custom-add-link (symbol widget)
+  (let ((links (get symbol 'custom-links)))
+    (unless (member widget links)
+      (put symbol 'custom-links (cons (purecopy widget) links)))))
+
+;; custom.el:644
+(defun custom-add-version (symbol version)
+  (put symbol 'custom-version (purecopy version)))
+
+;; custom.el:648
+(defun custom-add-package-version (symbol version)
+  (put symbol 'custom-package-version (purecopy version)))
+
+;; custom.el:607
+(defun custom-add-dependencies (symbol value)
+  (unless (listp value)
+    (error "Invalid custom dependency `%s'" value))
+  (let* ((deps (get symbol 'custom-dependencies))
+         (new-deps deps))
+    (while value
+      (let ((dep (car value)))
+        (unless (symbolp dep)
+          (error "Invalid custom dependency `%s'" dep))
+        (unless (memq dep new-deps)
+          (setq new-deps (cons dep new-deps)))
+        (setq value (cdr value))))
+    (unless (eq deps new-deps)
+      (put symbol 'custom-dependencies new-deps))))
+
+;; custom.el:585
+(defun custom-handle-keyword (symbol keyword value type)
+  (if purify-flag
+      (setq value (purecopy value)))
+  (cond ((eq keyword :group)
+         (custom-add-to-group value symbol type))
+        ((eq keyword :version)
+         (custom-add-version symbol value))
+        ((eq keyword :package-version)
+         (custom-add-package-version symbol value))
+        ((eq keyword :link)
+         (custom-add-link symbol value))
+        ((eq keyword :load)
+         (custom-add-load symbol value))
+        ((eq keyword :tag)
+         (put symbol 'custom-tag value))
+        ((eq keyword :set-after)
+         (custom-add-dependencies symbol value))
+        (t
+         (error "Unknown keyword %s" keyword))))
+
+;; custom.el:566
+(defun custom-handle-all-keywords (symbol args type)
+  (unless (memq :group args)
+    (let ((cg (custom-current-group)))
+      (when cg
+        (custom-add-to-group cg symbol type))))
+  (while args
+    (let ((arg (car args)))
+      (setq args (cdr args))
+      (unless (symbolp arg)
+        (error "Junk in args %S" args))
+      (let ((keyword arg)
+            (value (car args)))
+        (unless args
+          (error "Keyword %s is missing an argument" keyword))
+        (setq args (cdr args))
+        (custom-handle-keyword symbol keyword value type)))))
+
+;; custom.el:161
+(defun custom-declare-variable (symbol default doc &rest args)
+  (put symbol 'standard-value (purecopy (list default)))
+  (when (get symbol 'force-value)
+    (put symbol 'force-value nil))
+  (if (keywordp doc)
+      (error "Doc string is missing"))
+  (let ((initialize #'custom-initialize-reset)
+        (requests nil)
+        buffer-local)
+    (unless (memq :group args)
+      (let ((cg (custom-current-group)))
+        (when cg
+          (custom-add-to-group cg symbol 'custom-variable))))
+    (while args
+      (let ((keyword (pop args)))
+        (unless (symbolp keyword)
+          (error "Junk in args %S" args))
+        (unless args
+          (error "Keyword %s is missing an argument" keyword))
+        (let ((value (pop args)))
+          (cond ((eq keyword :initialize)
+                 (setq initialize value))
+                ((eq keyword :set)
+                 (put symbol 'custom-set value))
+                ((eq keyword :get)
+                 (put symbol 'custom-get value))
+                ((eq keyword :require)
+                 (push value requests))
+                ((eq keyword :risky)
+                 (put symbol 'risky-local-variable value))
+                ((eq keyword :safe)
+                 (put symbol 'safe-local-variable value))
+                ((eq keyword :local)
+                 (when (memq value '(t permanent))
+                   (setq buffer-local t))
+                 (when (eq value 'permanent)
+                   (put symbol 'permanent-local t)))
+                ((eq keyword :type)
+                 (put symbol 'custom-type (purecopy value)))
+                ((eq keyword :options)
+                 (if (get symbol 'custom-options)
+                     (mapc (lambda (option)
+                             (custom-add-option symbol option))
+                           value)
+                   (put symbol 'custom-options (copy-sequence value))))
+                (t
+                 (custom-handle-keyword symbol keyword value
+                                        'custom-variable))))))
+    (internal--define-uninitialized-variable symbol doc)
+    (put symbol 'custom-requests requests)
+    (unless custom-dont-initialize
+      (funcall initialize symbol default)
+      (let ((theme (caar (get symbol 'theme-value))))
+        (when (and theme (not (eq theme 'user)) (get symbol 'saved-value))
+          (put symbol 'saved-value nil))))
+    (when buffer-local
+      (make-variable-buffer-local symbol)))
+  (run-hooks 'custom-define-hook)
+  symbol)
+
+;; custom.el:482
+(defun custom-declare-group (symbol members doc &rest args)
+  (while members
+    (apply #'custom-add-to-group symbol (car members))
+    (setq members (cdr members)))
+  (when doc
+    (put symbol 'group-documentation (purecopy doc)))
+  (while args
+    (let ((arg (car args)))
+      (setq args (cdr args))
+      (unless (symbolp arg)
+        (error "Junk in args %S" args))
+      (let ((keyword arg)
+            (value (car args)))
+        (unless args
+          (error "Keyword %s is missing an argument" keyword))
+        (setq args (cdr args))
+        (cond ((eq keyword :prefix)
+               (put symbol 'custom-prefix (purecopy value)))
+              (t
+               (custom-handle-keyword symbol keyword value
+                                      'custom-group))))))
+  (let ((elt (assoc load-file-name custom-current-group-alist)))
+    (if elt (setcdr elt symbol)
+      (push (cons load-file-name symbol) custom-current-group-alist)))
+  (run-hooks 'custom-define-hook)
+  symbol)
+
+;; C subr: t if OBJECT can serve as a documentation string — a string, an
+;; integer DOC-file offset, or a (string . offset) cons.
+(defun documentation-stringp (object)
+  (or (stringp object)
+      (integerp object)
+      (and (consp object) (stringp (car object)) (integerp (cdr object)))))
+
+;; faces.el:662
+(defun set-face-documentation (face string)
+  (put face 'face-documentation (purecopy string)))
+
+;; faces.el:1685 — declaration-scope port: store the face spec under the
+;; requested property (this is the observable half). BOUNDARY: real
+;; `face-spec-set' then calls `make-empty-face' and recalculates the face on
+;; every frame (`face-spec-recalc'). elisprs has no display subsystem — no face
+;; objects, no frames — so those are omitted; no face object is created.
+(defun face-spec-set (face spec &optional spec-type)
+  (if (get face 'face-alias)
+      (setq face (get face 'face-alias)))
+  (unless spec-type
+    (setq spec-type 'face-override-spec))
+  (if (memq spec-type '(face-defface-spec face-override-spec
+                        customized-face saved-face))
+      (put face spec-type spec))
+  (if (memq spec-type '(reset saved-face))
+      (put face 'customized-face nil))
+  (if (memq spec-type '(customized-face saved-face reset))
+      (put face 'face-override-spec nil))
+  (unless (eq face 'face-override-spec)
+    (put face 'face-modified nil)))
+
+;; cus-face.el:32
+(defun custom-declare-face (face spec doc &rest args)
+  (when (and doc
+             (not (documentation-stringp doc)))
+    (error "Invalid (or missing) doc string %S" doc))
+  (unless (get face 'face-defface-spec)
+    (face-spec-set face (purecopy spec) 'face-defface-spec)
+    (push (cons 'defface face) current-load-list)
+    (when doc
+      (set-face-documentation face (purecopy doc)))
+    (custom-handle-all-keywords face args 'custom-face)
+    (run-hooks 'custom-define-hook))
+  face)
+
+;; custom.el:512 — no backquote here, matching the upstream bootstrap note.
+(defmacro defgroup (symbol members doc &rest args)
+  (nconc (list 'custom-declare-group (list 'quote symbol) members doc) args))
+
+;; custom.el:249
+(defmacro defcustom (symbol standard doc &rest args)
+  `(custom-declare-variable
+    ',symbol
+    ,(if lexical-binding
+         ``(funcall #',(lambda () "" ,standard))
+       `',standard)
+    ,doc
+    ,@args))
+
+;; custom.el:409
+(defmacro defface (face spec doc &rest args)
+  (nconc (list 'custom-declare-face (list 'quote face) spec doc) args))
+
 ;;; ---- ERT: Emacs Lisp Regression Testing (subset) ----
 ;; Ported from ERT: `should` / `should-not` / `should-error` / `skip-unless`
 ;; assertions, `ert-fail` / `ert-pass`, and `ert-deftest` with an optional
