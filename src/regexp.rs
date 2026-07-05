@@ -145,23 +145,29 @@ fn copy_class(it: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
         it.next();
     }
     while let Some(c) = it.next() {
-        if c == '\\' {
+        match c {
             // In an elisp char class a backslash is an ordinary character (no
             // escapes), so escape it for the `regex` crate: `[\"]` matches `\`/`"`.
-            out.push_str("\\\\");
-            continue;
-        }
-        out.push(c);
-        if c == '[' && it.peek() == Some(&':') {
+            '\\' => out.push_str("\\\\"),
             // POSIX class `[:alpha:]` — copy through its closing `:]`.
-            for n in it.by_ref() {
-                out.push(n);
-                if n == ']' {
-                    break;
+            '[' if it.peek() == Some(&':') => {
+                out.push('[');
+                for n in it.by_ref() {
+                    out.push(n);
+                    if n == ']' {
+                        break;
+                    }
                 }
             }
-        } else if c == ']' {
-            break;
+            // A bare `[` is an ordinary member in elisp/POSIX bracket expressions
+            // (e.g. `[{[]` matches `{` or `[`), but the `regex` crate rejects an
+            // unescaped `[` inside a class — escape it.
+            '[' => out.push_str("\\["),
+            ']' => {
+                out.push(']');
+                break;
+            }
+            _ => out.push(c),
         }
     }
 }
@@ -199,6 +205,10 @@ mod tests {
         assert_eq!(t(r"[]ab]"), "[]ab]");
         assert_eq!(t(r"[[:alpha:]]"), "[[:alpha:]]");
         assert_eq!(t(r"[^()]"), "[^()]");
+        // A bare `[` is a literal class member in elisp (`\{[` keymap check in
+        // derived.el's `derived-mode-make-docstring`); the crate needs it escaped.
+        assert_eq!(t(r"[{[]"), r"[{\[]");
+        assert_eq!(t(r"\\[{[]"), r"\\[{\[]");
     }
 
     #[test]

@@ -34,6 +34,8 @@ pub enum SerObj {
         value: Option<Value>,
         function: Option<Value>,
         special: bool,
+        #[serde(default)]
+        buffer_local_auto: bool,
     },
     Vector(Vec<Value>),
     HashTable {
@@ -64,6 +66,17 @@ pub mod ops {
 }
 
 pub type SubrFn = fn(&mut ElispHost, &[Value]) -> Result<Value, String>;
+
+/// One dynamic (`let`) binding recorded on the specstack, restored by `unbind_to`.
+enum SpecEntry {
+    /// A binding of a symbol's global (default) value cell: (sym, previous value).
+    Global(u32, Option<Value>),
+    /// A binding of a buffer-local slot, matching Emacs `let` over a buffer-local
+    /// variable: (sym, buffer index, previous local slot). The previous slot is
+    /// `None` when no local existed (a temporary local created for the binding's
+    /// extent) or `Some(prev)` when one did.
+    Local(u32, usize, Option<Option<Value>>),
+}
 
 /// A parsed lambda list (symbol handles).
 pub struct Params {
@@ -119,6 +132,10 @@ pub struct SymbolData {
     pub value: Option<Value>,
     pub function: Option<Value>, // points at an Obj::Subr / Obj::Closure / alias symbol
     pub special: bool,
+    /// Set by `make-variable-buffer-local`: any `set`/`setq` in a buffer that has
+    /// no local binding yet automatically creates one (Emacs "automatically
+    /// buffer-local"). Persisted in the AOT heap image so a cache hit keeps it.
+    pub buffer_local_auto: bool,
 }
 
 pub enum Obj {
@@ -168,8 +185,9 @@ pub struct ElispHost {
     /// Arena length right after `install` (the builtin objects). Everything at or
     /// above this index is user/prelude data — the portion serialized for AOT.
     builtin_count: usize,
-    /// Dynamic-binding save stack: (symbol handle, previous value cell).
-    specstack: Vec<(u32, Option<Value>)>,
+    /// Dynamic-binding save stack. Each `let`/param binding of a special variable
+    /// pushes one entry; `unbind_to` pops and restores.
+    specstack: Vec<SpecEntry>,
     /// Current lexical environment (the chain of `let`/closure frames).
     lex: Lex,
     /// Per-scope unwind info: (saved lexical env, specstack depth at entry).
@@ -198,11 +216,19 @@ pub struct ElispHost {
     pub(crate) buffers: Vec<EditBuffer>,
 }
 
-/// A minimal editing buffer: a char vector and a 1-based point (1..=len+1).
+/// A minimal editing buffer: a char vector and a 1-based point (1..=len+1),
+/// plus the buffer-local variable slots and the local keymap slot.
 #[derive(Default)]
 pub struct EditBuffer {
     pub text: Vec<char>,
     pub point: usize,
+    /// Buffer-local variable bindings. `Some(v)` is a bound local; `None` is a
+    /// *void* local (created by `make-local-variable` on a void variable — reading
+    /// it still signals `void-variable`, but `local-variable-p` is non-nil). Key
+    /// absence means the variable is not local in this buffer.
+    pub locals: HashMap<u32, Option<Value>>,
+    /// The buffer's local keymap slot (`use-local-map`/`current-local-map`).
+    pub local_map: Value,
 }
 
 /// Result of the most recent `string-match`, in *character* positions (elisp
@@ -242,6 +268,8 @@ impl ElispHost {
             buffers: vec![EditBuffer {
                 text: Vec::new(),
                 point: 1,
+                locals: HashMap::new(),
+                local_map: Value::Undef,
             }],
         };
         crate::builtins::install(&mut h);
@@ -265,6 +293,7 @@ impl ElispHost {
             value: None,
             function: None,
             special: false,
+            buffer_local_auto: false,
         }));
         self.obarray.insert(name.to_string(), id);
         Value::Obj(id)
@@ -277,6 +306,7 @@ impl ElispHost {
             value: None,
             function: None,
             special: false,
+            buffer_local_auto: false,
         }))
     }
     pub fn obj(&self, v: &Value) -> Option<&Obj> {
@@ -349,14 +379,117 @@ impl ElispHost {
     // ── symbol cells (dynamic / value cell) ──
     pub fn set_value(&mut self, v: &Value, val: Value) -> Result<(), String> {
         let id = self.sym_handle(v).ok_or("set: not a symbol")?;
-        // A lexical binding shadows the value cell.
+        // A lexical binding shadows both the buffer-local and global cells.
         if self.lex.as_ref().is_some_and(|s| s.set(id, &val)) {
+            return Ok(());
+        }
+        // Write the current buffer's local slot if it already has one, or if the
+        // variable is automatically buffer-local (create the local on first set).
+        let bi = self.cur_buf_idx();
+        if self.buffers[bi].locals.contains_key(&id) || self.is_auto_local(id) {
+            self.buffers[bi].locals.insert(id, Some(val));
             return Ok(());
         }
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.value = Some(val);
         }
         Ok(())
+    }
+    fn is_auto_local(&self, id: u32) -> bool {
+        matches!(self.arena.get(id as usize), Some(Obj::Symbol(s)) if s.buffer_local_auto)
+    }
+
+    // ── buffer-local variables ──
+    /// `(make-local-variable SYM)` — give SYM a buffer-local binding in the
+    /// current buffer. The local starts with the value SYM currently has (its
+    /// default), snapshotting it; a void default yields a void local. No-op if a
+    /// local already exists. Returns SYM.
+    pub fn make_local_variable(&mut self, v: &Value) -> Result<Value, String> {
+        let id = self
+            .sym_handle(v)
+            .ok_or("make-local-variable: not a symbol")?;
+        let bi = self.cur_buf_idx();
+        if !self.buffers[bi].locals.contains_key(&id) {
+            let snapshot = match &self.arena[id as usize] {
+                Obj::Symbol(s) => s.value.clone(),
+                _ => None,
+            };
+            self.buffers[bi].locals.insert(id, snapshot);
+        }
+        Ok(v.clone())
+    }
+    /// `(make-variable-buffer-local SYM)` — mark SYM automatically buffer-local
+    /// (and special, like Emacs). Returns SYM.
+    pub fn make_variable_buffer_local(&mut self, v: &Value) -> Result<Value, String> {
+        let id = self
+            .sym_handle(v)
+            .ok_or("make-variable-buffer-local: not a symbol")?;
+        if let Obj::Symbol(s) = &mut self.arena[id as usize] {
+            s.buffer_local_auto = true;
+            s.special = true;
+        }
+        Ok(v.clone())
+    }
+    /// `(local-variable-p SYM)` — non-nil if SYM has a buffer-local binding in the
+    /// current buffer.
+    pub fn local_variable_p(&self, v: &Value) -> bool {
+        match self.sym_handle(v) {
+            Some(id) => self.buffers[self.cur_buf_idx()].locals.contains_key(&id),
+            None => false,
+        }
+    }
+    /// `(local-variable-if-set-p SYM)` — non-nil if SYM is local in the current
+    /// buffer or would become local when set (automatically buffer-local).
+    pub fn local_variable_if_set_p(&self, v: &Value) -> bool {
+        match self.sym_handle(v) {
+            Some(id) => {
+                self.buffers[self.cur_buf_idx()].locals.contains_key(&id) || self.is_auto_local(id)
+            }
+            None => false,
+        }
+    }
+    /// `(kill-local-variable SYM)` — remove the current buffer's local binding for
+    /// SYM (the default becomes effective again). Returns SYM.
+    pub fn kill_local_variable(&mut self, v: &Value) -> Result<Value, String> {
+        if let Some(id) = self.sym_handle(v) {
+            let bi = self.cur_buf_idx();
+            self.buffers[bi].locals.remove(&id);
+        }
+        Ok(v.clone())
+    }
+    /// Symbol handles with a buffer-local binding in the current buffer, for the
+    /// prelude port of `kill-all-local-variables`/`buffer-local-variables`.
+    pub fn buffer_local_symbols(&mut self) -> Value {
+        let ids: Vec<u32> = self.buffers[self.cur_buf_idx()]
+            .locals
+            .keys()
+            .copied()
+            .collect();
+        let items: Vec<Value> = ids.into_iter().map(Value::Obj).collect();
+        self.list_from(items)
+    }
+    /// `(use-local-map MAP)` — install MAP as the current buffer's local keymap.
+    pub fn use_local_map(&mut self, map: Value) {
+        let bi = self.cur_buf_idx();
+        self.buffers[bi].local_map = map;
+    }
+    /// `(current-local-map)` — the current buffer's local keymap, or nil.
+    pub fn current_local_map(&self) -> Value {
+        self.buffers[self.cur_buf_idx()].local_map.clone()
+    }
+    /// `(buffer-local-value SYM BUFFER)` — SYM's value in the current buffer:
+    /// buffer-local slot if present, else the global default. Skips lexical
+    /// bindings (this reads a buffer's variable, not the caller's scope). The
+    /// BUFFER argument is honored only as the current buffer (single-buffer model).
+    pub fn buffer_local_or_default(&self, v: &Value) -> Result<Value, String> {
+        if let Some(id) = self.sym_handle(v) {
+            if let Some(slot) = self.buffers[self.cur_buf_idx()].locals.get(&id) {
+                return slot.clone().ok_or_else(|| {
+                    format!("void-variable: {}", self.sym_name(v).unwrap_or_default())
+                });
+            }
+        }
+        self.raw_global_value(v)
     }
     /// Clear a symbol's global value cell (`makunbound`). Lexical bindings are
     /// left untouched — they shadow the cell and unwind on their own.
@@ -369,8 +502,15 @@ impl ElispHost {
     }
     pub fn get_value(&self, v: &Value) -> Result<Value, String> {
         if let Some(id) = self.sym_handle(v) {
+            // Precedence: lexical binding, then the current buffer's local
+            // binding, then the global (default) value cell.
             if let Some(val) = self.lex.as_ref().and_then(|s| s.lookup(id)) {
                 return Ok(val);
+            }
+            if let Some(slot) = self.buffers[self.cur_buf_idx()].locals.get(&id) {
+                return slot.clone().ok_or_else(|| {
+                    format!("void-variable: {}", self.sym_name(v).unwrap_or_default())
+                });
             }
         }
         match self.obj(v) {
@@ -384,6 +524,38 @@ impl ElispHost {
                 _ => Err("not a symbol".to_string()),
             },
         }
+    }
+    /// Index of the current buffer (the top of the buffer stack).
+    fn cur_buf_idx(&self) -> usize {
+        self.buffers.len() - 1
+    }
+    /// The global (default) value cell, bypassing lexical and buffer-local
+    /// bindings — the reader used by `default-value`/`default-boundp`.
+    pub fn raw_global_value(&self, v: &Value) -> Result<Value, String> {
+        match self.obj(v) {
+            Some(Obj::Symbol(s)) => s
+                .value
+                .clone()
+                .ok_or_else(|| format!("void-variable: {}", s.name)),
+            _ => match v {
+                Value::Bool(true) => Ok(Value::Bool(true)),
+                Value::Undef => Ok(Value::Undef),
+                _ => Err("not a symbol".to_string()),
+            },
+        }
+    }
+    /// True if the global (default) value cell is bound (`default-boundp`).
+    pub fn default_boundp_raw(&self, v: &Value) -> bool {
+        matches!(self.obj(v), Some(Obj::Symbol(s)) if s.value.is_some())
+    }
+    /// Write the global (default) value cell directly (`set-default`), bypassing
+    /// lexical and buffer-local bindings.
+    pub fn set_raw_global(&mut self, v: &Value, val: Value) -> Result<(), String> {
+        let id = self.sym_handle(v).ok_or("set-default: not a symbol")?;
+        if let Obj::Symbol(s) = &mut self.arena[id as usize] {
+            s.value = Some(val);
+        }
+        Ok(())
     }
     /// Mark a symbol special (dynamically scoped) — used by `defvar`/`defconst`.
     pub fn set_special(&mut self, v: &Value) {
@@ -447,12 +619,21 @@ impl ElispHost {
     }
     pub fn specbind(&mut self, sym: &Value, val: Value) -> Result<(), String> {
         let id = self.sym_handle(sym).ok_or("cannot bind a non-symbol")?;
+        let bi = self.cur_buf_idx();
+        // `let` over a buffer-local variable rebinds the current buffer's local
+        // slot (Emacs SPECPDL_LET_LOCAL), not the global default.
+        if self.buffers[bi].locals.contains_key(&id) || self.is_auto_local(id) {
+            let old = self.buffers[bi].locals.get(&id).cloned();
+            self.specstack.push(SpecEntry::Local(id, bi, old));
+            self.buffers[bi].locals.insert(id, Some(val));
+            return Ok(());
+        }
         let old = if let Obj::Symbol(s) = &self.arena[id as usize] {
             s.value.clone()
         } else {
             None
         };
-        self.specstack.push((id, old));
+        self.specstack.push(SpecEntry::Global(id, old));
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.value = Some(val);
         }
@@ -460,9 +641,24 @@ impl ElispHost {
     }
     pub fn unbind_to(&mut self, depth: usize) {
         while self.specstack.len() > depth {
-            let (id, old) = self.specstack.pop().unwrap();
-            if let Obj::Symbol(s) = &mut self.arena[id as usize] {
-                s.value = old;
+            match self.specstack.pop().unwrap() {
+                SpecEntry::Global(id, old) => {
+                    if let Obj::Symbol(s) = &mut self.arena[id as usize] {
+                        s.value = old;
+                    }
+                }
+                SpecEntry::Local(id, buf, old) => {
+                    if let Some(b) = self.buffers.get_mut(buf) {
+                        match old {
+                            None => {
+                                b.locals.remove(&id);
+                            }
+                            Some(prev) => {
+                                b.locals.insert(id, prev);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -560,6 +756,7 @@ impl ElispHost {
                     value: s.value.clone(),
                     function: s.function.clone(),
                     special: s.special,
+                    buffer_local_auto: s.buffer_local_auto,
                 },
                 Obj::Vector(v) => SerObj::Vector(v.clone()),
                 Obj::HashTable { test, entries } => SerObj::HashTable {
@@ -584,6 +781,7 @@ impl ElispHost {
                     value: None,
                     function: None,
                     special: false,
+                    buffer_local_auto: false,
                 },
             })
             .collect()
@@ -660,6 +858,7 @@ impl ElispHost {
                             value,
                             function: s.function.clone(),
                             special: s.special,
+                            buffer_local_auto: s.buffer_local_auto,
                         }
                     }
                     Obj::Cons(a, b) => SerObj::Cons(a.clone(), b.clone()),
@@ -685,6 +884,7 @@ impl ElispHost {
                         value: None,
                         function: None,
                         special: false,
+                        buffer_local_auto: false,
                     },
                 }
             })
@@ -702,6 +902,7 @@ impl ElispHost {
                     value,
                     function,
                     special,
+                    buffer_local_auto,
                 } => {
                     self.obarray.insert(name.clone(), id);
                     Obj::Symbol(SymbolData {
@@ -709,6 +910,7 @@ impl ElispHost {
                         value,
                         function,
                         special,
+                        buffer_local_auto,
                     })
                 }
                 SerObj::Vector(v) => Obj::Vector(v),
@@ -1602,7 +1804,14 @@ pub fn macroexpand_1(form: &Value) -> Result<Option<Value>, String> {
 }
 
 /// Fully expand macros in `form` (top-level to fixpoint, then recursively into
-/// sub-forms), without descending into quoted data. Run before lowering.
+/// sub-forms), without descending into quoted data or into positions that are
+/// not expression forms. Run before lowering.
+///
+/// Special forms with irregular shapes are handled explicitly so their
+/// non-expression subparts are never mistaken for macro calls: a `let` binding
+/// `(VAR INIT)` must not have `VAR` expanded, which matters because a symbol can
+/// be *both* a special variable and a macro (e.g. `delay-mode-hooks`) — expanding
+/// the binding head there loops forever.
 pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
     let mut f = form.clone();
     while let Some(e) = macroexpand_1(&f)? {
@@ -1619,14 +1828,60 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
     if elems.is_empty() {
         return Ok(f);
     }
-    if with_host(|h| h.sym_name(&elems[0])).as_deref() == Some("quote") {
-        return Ok(f);
+    let head = with_host(|h| h.sym_name(&elems[0]));
+    match head.as_deref() {
+        // Quoted data is never expanded.
+        Some("quote") | Some("function") => Ok(f),
+        // Binding forms: expand each binding's INIT (never the VAR, which may name
+        // a macro) and the body forms; keep the head and the binding names as-is.
+        Some(kw @ ("let" | "let*")) => {
+            let bindings = with_host(|h| h.list_vec(elems.get(1).unwrap_or(&Value::Undef)));
+            let new_bindings = match bindings {
+                Some(bs) => {
+                    let mut out = Vec::with_capacity(bs.len());
+                    for bd in &bs {
+                        // A bare symbol binding stays as-is; a `(VAR INIT...)`
+                        // list has only its INIT expressions expanded.
+                        let parts = with_host(|h| {
+                            if matches!(h.obj(bd), Some(Obj::Cons(..))) {
+                                h.list_vec(bd)
+                            } else {
+                                None
+                            }
+                        });
+                        match parts {
+                            Some(parts) if !parts.is_empty() => {
+                                let mut np = Vec::with_capacity(parts.len());
+                                np.push(parts[0].clone()); // VAR, untouched
+                                for p in &parts[1..] {
+                                    np.push(macroexpand_all(p)?);
+                                }
+                                out.push(with_host(|h| h.list_from(np)));
+                            }
+                            _ => out.push(bd.clone()),
+                        }
+                    }
+                    with_host(|h| h.list_from(out))
+                }
+                None => elems.get(1).cloned().unwrap_or(Value::Undef),
+            };
+            let mut out = Vec::with_capacity(elems.len());
+            out.push(elems[0].clone());
+            out.push(new_bindings);
+            for e in &elems[2..] {
+                out.push(macroexpand_all(e)?);
+            }
+            let _ = kw;
+            Ok(with_host(|h| h.list_from(out)))
+        }
+        _ => {
+            let mut out = Vec::with_capacity(elems.len());
+            for e in &elems {
+                out.push(macroexpand_all(e)?);
+            }
+            Ok(with_host(|h| h.list_from(out)))
+        }
     }
-    let mut out = Vec::with_capacity(elems.len());
-    for e in &elems {
-        out.push(macroexpand_all(e)?);
-    }
-    Ok(with_host(|h| h.list_from(out)))
 }
 
 /// `(catch TAG THUNK)` — run the thunk; if a `throw` to a matching tag unwinds

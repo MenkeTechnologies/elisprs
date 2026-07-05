@@ -227,6 +227,34 @@ All notable changes to elisprs are documented here. The format follows
   applicable) keyword arguments, and preserve the input sequence's type.
 
 ### Added
+- **Buffer-local variables + major/minor mode machinery** — the buffer.c/data.c
+  local-binding primitives and the subr.el / derived.el / easy-mmode.el mode
+  layer, verified byte-for-byte against the Emacs 30.2 binary. New C primitives
+  (`src/builtins.rs`, backed by a per-buffer local-binding table on the current
+  buffer): `make-local-variable` (snapshots the current default into the local),
+  `make-variable-buffer-local` (auto-local + special), `local-variable-p`,
+  `local-variable-if-set-p`, `kill-local-variable`, `buffer-local-value`,
+  `default-value` / `set-default` (now read/write the global cell directly,
+  bypassing locals), and `use-local-map` / `current-local-map` (a per-buffer
+  keymap slot). `symbol-value` / `set` (and `let`) now resolve
+  lexical → buffer-local → global, so `(setq x 5)` after `(make-local-variable
+  'x)` shadows the default per Emacs. Ported the mode plumbing in `src/prelude.rs`:
+  `run-mode-hooks`, `delay-mode-hooks`, `setq-local`, `kill-all-local-variables`
+  (honors `permanent-local`), `derived-mode-set-parent` / `derived-mode-all-parents`
+  / `derived-mode-p` / `provided-mode-derived-p`, `merge-ordered-lists`, and the
+  macros `define-derived-mode` and `define-minor-mode` (with `add-minor-mode`,
+  `easy-mmode-pretty-mode-name`, `easy-mmode--mode-docstring`, `ensure-empty-lines`,
+  `prefix-numeric-value`, and the minor-mode registries). This unblocks
+  `tabulated-list.el`, which now loads fully (all `define-derived-mode` /
+  `defvar-keymap` forms and `(provide 'tabulated-list)`). Boundaries named, not
+  faked: syntax tables and abbrev tables are placeholder constructors (separate
+  subsystems), docstrings are not line-filled (`fill-region` cosmetic), and only
+  a single implicit buffer is modeled (multi-buffer text editing is a separate
+  track). Also fixed two engine bugs the port exposed: the regexp translator now
+  escapes a literal `[` inside a bracket expression (`[{[]`, per POSIX/Emacs) for
+  the `regex` crate, and `macroexpand-all` no longer expands a `let`-binding
+  variable as a macro call (a symbol can be both a special variable *and* a macro,
+  e.g. `delay-mode-hooks`, which previously looped forever).
 - Customize **declaration** machinery — faithful port of custom.el / cus-face.el:
   `defgroup` / `defcustom` / `defface` and the `custom-declare-group` /
   `custom-declare-variable` / `custom-declare-face` functions they expand into,

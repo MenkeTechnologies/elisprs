@@ -473,10 +473,8 @@ pub const PRELUDE: &str = r#"
 ;;; ---- misc functions ----
 (defun ignore (&rest _args) nil)
 (defun always (&rest _args) t)
-;; No buffer-local bindings in this model, so default-value == symbol-value and
-;; set-default / setq-default are just the global setters.
-(defun default-value (sym) (symbol-value sym))
-(defun set-default (sym val) (set sym val))
+;; `default-value'/`set-default' are C primitives (builtins.rs) that read/write
+;; the global (default) value cell, bypassing any buffer-local binding.
 (defmacro setq-default (&rest args)
   (let ((forms nil))
     (while args
@@ -2803,12 +2801,10 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
                        lisp-file feature)))
           nil)))))
 (defmacro bound-and-true-p (var) (list 'and (list 'boundp (list 'quote var)) var))
-;; No buffer-local model: these are no-ops returning the symbol.
-(defun make-local-variable (sym) sym)
-(defun make-variable-buffer-local (sym) sym)
-;; With no buffer-local bindings, no variable is ever locally set.
-(defun local-variable-if-set-p (_variable &optional _buffer) nil)
-(defun set-default-toplevel-value (sym val) (set sym val))
+;; `make-local-variable', `make-variable-buffer-local', `local-variable-p',
+;; `local-variable-if-set-p', `kill-local-variable' and `buffer-local-value' are
+;; C primitives (builtins.rs) backed by the current buffer's local-binding table.
+(defun set-default-toplevel-value (sym val) (set-default sym val))
 (defun defalias (symbol definition &optional _docstring) (fset symbol definition) symbol)
 (defalias 'string-split 'split-string)
 ;; with-memoization: cache BODY's value in PLACE; reuse it on later calls.
@@ -5058,6 +5054,729 @@ Mode-specific keymaps may want to use this as their parent keymap."
   ">" #'end-of-buffer
   "<" #'beginning-of-buffer
   "g" #'revert-buffer)
+
+;;; ---- major/minor mode machinery (derived.el, easy-mmode.el, subr.el) ----
+;; Buffer objects are not modeled: there is a single implicit current buffer.
+;; Real text editing (point/insert/markers, multiple live buffers, save-excursion)
+;; is the text-editing subsystem. Syntax tables and abbrev tables are separate
+;; subsystems: the constructors below are placeholders sufficient for
+;; `define-derived-mode' to expand and load; they do not model syntax/abbrev
+;; semantics.
+
+;; `interactive' is only meaningful as the first body form of a command; when a
+;; command is called from Lisp (as in batch), it is a no-op. Modeling it as a
+;; macro that expands to nil drops its (unevaluated) interactive spec at compile
+;; time, matching the non-interactive runtime behavior.
+(defmacro interactive (&rest _) nil)
+
+;; A single implicit buffer. `buffer-local-value'/`local-variable-p' act on it;
+;; a BUFFER argument is honored only as this current buffer.
+(defvar --the-current-buffer-- '--current-buffer--)
+(defun current-buffer () --the-current-buffer--)
+(defun buffer-file-name (&optional _buffer) nil)
+
+;; Syntax / abbrev table placeholders (boundary: not real subsystems).
+(defun make-syntax-table (&optional _parent) (make-vector 3 nil))
+(defun make-abbrev-table (&optional _props) (make-vector 59 0))
+(defun define-abbrev-table (tablename &rest _)
+  (unless (and (boundp tablename) (vectorp (symbol-value tablename)))
+    (set tablename (make-abbrev-table)))
+  tablename)
+
+;; merge-ordered-lists (subr.el): merge LISTS into one, removing duplicates and
+;; obeying each list's relative order (C3-style). Used by derived-mode-all-parents.
+(defun merge-ordered-lists (lists &optional error-function)
+  "Merge LISTS in a consistent order.
+LISTS is a list of lists of elements."
+  (let ((result '()))
+    (setq lists (remq nil lists))
+    (while (cdr (setq lists (delq nil lists)))
+      (let* ((next nil)
+	     (tail lists))
+	(while tail
+	  (let ((candidate (caar tail))
+	        (other-lists lists))
+	    (while other-lists
+	      (if (not (memql candidate (cdr (car other-lists))))
+	          (setq other-lists (cdr other-lists))
+	        (setq candidate nil)
+	        (setq other-lists nil)))
+	    (if (not candidate)
+	        (setq tail (cdr tail))
+	      (setq next candidate)
+	      (setq tail nil))))
+	(unless next
+	  (setq next (funcall (or error-function #'caar) lists))
+	  (unless (assoc next lists #'eql)
+	    (error "Invalid candidate returned by error-function: %S" next)))
+	(push next result)
+	(setq lists
+	      (mapcar (lambda (l) (if (eql (car l) next) (cdr l) l))
+		      lists))))
+    (if (null result) (car lists)
+      (append (nreverse result) (car lists)))))
+
+;; Mode-line/hook variables (subr.el, buffer.c defaults).
+(defvar-local major-mode 'fundamental-mode
+  "Symbol for current buffer's major mode.")
+(defvar-local mode-name nil
+  "Pretty name of current buffer's major mode.")
+(defvar delay-mode-hooks nil
+  "If non-nil, `run-mode-hooks' should delay running the hooks.")
+(defvar-local delayed-mode-hooks nil
+  "List of delayed mode hooks waiting to be run.")
+(put 'delay-mode-hooks 'permanent-local t)
+(defvar-local delayed-after-hook-functions nil
+  "List of delayed :after-hook forms waiting to be run.")
+(defvar change-major-mode-after-body-hook nil
+  "Normal hook run in major mode functions, before the mode hooks.")
+(defvar after-change-major-mode-hook nil
+  "Normal hook run at the very end of major mode functions.")
+(defvar change-major-mode-hook nil
+  "Normal hook run by `kill-all-local-variables' before it kills locals.")
+(defvar-local local-abbrev-table nil
+  "Local (mode-specific) abbrev table of current buffer.")
+
+;; kill-all-local-variables (buffer.c documented behavior): run
+;; `change-major-mode-hook', then eliminate the current buffer's local variables
+;; except those with a non-nil `permanent-local' property, and reset the local
+;; keymap. (Syntax-table/abbrev-table resets belong to subsystems not modeled.)
+(defun kill-all-local-variables (&optional kill-permanent)
+  "Switch to Fundamental mode by killing current buffer's local variables."
+  (run-hooks 'change-major-mode-hook)
+  (dolist (sym (--buffer-local-symbols--))
+    (unless (and (not kill-permanent) (get sym 'permanent-local))
+      (kill-local-variable sym)))
+  (use-local-map nil)
+  nil)
+
+;; run-mode-hooks / delay-mode-hooks (subr.el, ported faithfully). The
+;; `hack-local-variables' branch is inert here — `buffer-file-name' is always nil
+;; (no file-visiting buffers).
+(defun run-mode-hooks (&rest hooks)
+  "Run mode hooks `delayed-mode-hooks' and HOOKS, or delay HOOKS."
+  (if delay-mode-hooks
+      (dolist (hook hooks)
+	(push hook delayed-mode-hooks))
+    (setq hooks (nconc (nreverse delayed-mode-hooks) hooks))
+    (and (bound-and-true-p syntax-propertize-function)
+         (not (local-variable-p 'parse-sexp-lookup-properties))
+         (setq-local parse-sexp-lookup-properties t))
+    (setq delayed-mode-hooks nil)
+    (apply #'run-hooks (cons 'change-major-mode-after-body-hook hooks))
+    (if (buffer-file-name)
+        (with-demoted-errors "File local-variables error: %s"
+          (hack-local-variables 'no-mode)))
+    (run-hooks 'after-change-major-mode-hook)
+    (dolist (fun (prog1 (nreverse delayed-after-hook-functions)
+                    (setq delayed-after-hook-functions nil)))
+      (funcall fun))))
+(defmacro delay-mode-hooks (&rest body)
+  "Execute BODY, but delay any `run-mode-hooks'."
+  (declare (debug t) (indent 0))
+  `(progn
+     (make-local-variable 'delay-mode-hooks)
+     (let ((delay-mode-hooks t))
+       ,@body)))
+
+;; setq-local (subr.el): make each SYM buffer-local and set it.
+(defmacro setq-local (&rest pairs)
+  "Make each SYMBOL local to the current buffer and set it to its VALUE."
+  (let ((expansion nil) (sym nil))
+    (unless (zerop (mod (length pairs) 2))
+      (error "PAIRS must have an even number of variable/value members"))
+    (while pairs
+      (setq sym (car pairs))
+      (push `(set (make-local-variable ',sym) ,(cadr pairs)) expansion)
+      (setq pairs (cddr pairs)))
+    (cons 'progn (nreverse expansion))))
+
+;; Derived-mode parent tracking (subr.el).
+(defun derived-mode--flush (mode)
+  (put mode 'derived-mode--all-parents nil)
+  (let ((followers (get mode 'derived-mode--followers)))
+    (when followers
+      (put mode 'derived-mode--followers nil)
+      (mapc #'derived-mode--flush followers))))
+(defun derived-mode-set-parent (mode parent)
+  "Declare PARENT to be the parent of MODE."
+  (put mode 'derived-mode-parent parent)
+  (derived-mode--flush mode))
+(defun derived-mode-add-parents (mode extra-parents)
+  "Add EXTRA-PARENTS to the parents of MODE."
+  (put mode 'derived-mode-extra-parents extra-parents)
+  (derived-mode--flush mode))
+(defun derived-mode-all-parents (mode &optional known-children)
+  "Return all the parents of MODE, starting with MODE."
+  (let ((ps (get mode 'derived-mode--all-parents)))
+    (cond
+     (ps ps)
+     ((memq mode known-children)
+      (memq mode (reverse known-children)))
+     (t
+      (let* ((new-children (cons mode known-children))
+             (get-all-parents
+              (lambda (parent)
+                (let ((followers (get parent 'derived-mode--followers)))
+                  (unless (memq mode followers)
+                    (put parent 'derived-mode--followers
+                         (cons mode followers))))
+                (derived-mode-all-parents parent new-children)))
+             (parent (or (get mode 'derived-mode-parent)
+                         (let ((alias (symbol-function mode)))
+                           (and (symbolp alias) alias))))
+             (extras (get mode 'derived-mode-extra-parents))
+             (all-parents
+              (merge-ordered-lists
+               (cons (if (and parent (not (memq parent extras)))
+                         (funcall get-all-parents parent))
+                     (mapcar get-all-parents extras)))))
+        (if (and (memq mode all-parents) known-children)
+            (cons mode (remq mode all-parents))
+          (put mode 'derived-mode--all-parents (cons mode all-parents))))))))
+(defun provided-mode-derived-p (mode &optional modes &rest old-modes)
+  "Non-nil if MODE is derived from a mode that is a member of the list MODES."
+  (cond
+   (old-modes (setq modes (cons modes old-modes)))
+   ((not (listp modes)) (setq modes (list modes))))
+  (let ((ps (derived-mode-all-parents mode)))
+    (while (and modes (not (memq (car modes) ps)))
+      (setq modes (cdr modes)))
+    (car modes)))
+(defun derived-mode-p (&optional modes &rest old-modes)
+  "Return non-nil if the current major mode is derived from one of MODES."
+  (provided-mode-derived-p major-mode (if old-modes (cons modes old-modes)
+                                        modes)))
+
+;; use-local-map / current-local-map are C primitives (builtins.rs) backed by the
+;; current buffer's local keymap slot.
+
+;; Docstring helpers (subr.el / derived.el). internal--format-docstring-line does
+;; not fill/wrap here (fill is cosmetic; the string content matches Emacs).
+(defun internal--format-docstring-line (string &rest objects)
+  "Format a single documentation line from STRING and OBJECTS."
+  (when (string-match "\n" string)
+    (error "Unable to fill string containing newline: %S" string))
+  (apply #'format string objects))
+(defsubst derived-mode-hook-name (mode)
+  "Construct a mode-hook name based on the symbol MODE."
+  (intern (concat (symbol-name mode) "-hook")))
+(defsubst derived-mode-map-name (mode)
+  "Construct a map name based on the symbol MODE."
+  (intern (concat (symbol-name mode) "-map")))
+(defsubst derived-mode-syntax-table-name (mode)
+  "Construct a syntax-table name based on the symbol MODE."
+  (intern (concat (symbol-name mode) "-syntax-table")))
+(defsubst derived-mode-abbrev-table-name (mode)
+  "Construct an abbrev-table name based on the symbol MODE."
+  (intern (concat (symbol-name mode) "-abbrev-table")))
+(defun derived-mode-make-docstring (parent child &optional
+					   docstring syntax abbrev)
+  "Construct a docstring for a new mode if none is provided."
+  (let ((map (derived-mode-map-name child))
+	(hook (derived-mode-hook-name child)))
+    (unless (stringp docstring)
+      (setq docstring
+	    (if (null parent)
+                (concat
+                 "Major-mode.\n"
+                 (internal--format-docstring-line
+                  "Uses keymap `%s'%s%s." map
+                  (if abbrev (format "%s abbrev table `%s'"
+                                     (if syntax "," " and") abbrev) "")
+                  (if syntax (format " and syntax-table `%s'" syntax) "")))
+	      (format "Major mode derived from `%s' by `define-derived-mode'.
+It inherits all of the parent's attributes, but has its own keymap%s:
+
+%s
+
+which more-or-less shadow%s %s's corresponding table%s."
+		      parent
+		      (cond ((and abbrev syntax)
+			     ",\nabbrev table and syntax table")
+			    (abbrev "\nand abbrev table")
+			    (syntax "\nand syntax table")
+			    (t ""))
+                      (internal--format-docstring-line
+                       "  `%s'%s"
+                       map
+                       (cond ((and abbrev syntax)
+                              (format ", `%s' and `%s'" abbrev syntax))
+                             ((or abbrev syntax)
+                              (format " and `%s'" (or abbrev syntax)))
+                             (t "")))
+		      (if (or abbrev syntax) "" "s")
+		      parent
+		      (if (or abbrev syntax) "s" "")))))
+    (unless (string-match (regexp-quote (symbol-name hook)) docstring)
+      (setq docstring
+            (concat docstring "\n\n"
+                    (internal--format-docstring-line
+                     "%s%s%s"
+                     (if (null parent)
+                         "This mode "
+                       (concat
+                        "In addition to any hooks its parent mode "
+                        (if (string-match (format "[`‘]%s['’]"
+                                                  (regexp-quote
+                                                   (symbol-name parent)))
+                                          docstring)
+                            nil
+                          (format "`%s' " parent))
+                        "might have run, this mode "))
+                     (format "runs the hook `%s'" hook)
+                     ", as the final or penultimate step during initialization."))))
+    (unless (string-match "\\\\[{[]" docstring)
+      (setq docstring (concat docstring "\n\n\\{" (symbol-name map) "}")))
+    docstring))
+
+;; define-derived-mode (derived.el), ported faithfully.
+(defmacro define-derived-mode (child parent name &optional docstring &rest body)
+  "Create a new mode CHILD which is a variant of an existing mode PARENT."
+  (declare (debug (&define name symbolp sexp [&optional stringp]
+			   [&rest keywordp sexp] def-body))
+	   (doc-string 4)
+	   (indent defun))
+  (when (and docstring (not (stringp docstring)))
+    (push docstring body)
+    (setq docstring nil))
+  (when (eq parent 'fundamental-mode) (setq parent nil))
+  (let ((map (derived-mode-map-name child))
+	(syntax (derived-mode-syntax-table-name child))
+	(abbrev (derived-mode-abbrev-table-name child))
+	(declare-abbrev t)
+	(declare-syntax t)
+	(hook (derived-mode-hook-name child))
+	(group nil)
+        (interactive t)
+        (after-hook nil))
+    (while (keywordp (car body))
+      (pcase (pop body)
+	(:group (setq group (pop body)))
+	(:abbrev-table (setq abbrev (pop body)) (setq declare-abbrev nil))
+	(:syntax-table (setq syntax (pop body)) (setq declare-syntax nil))
+        (:after-hook (setq after-hook (pop body)))
+        (:interactive (setq interactive (pop body)))
+	(_ (pop body))))
+    (setq docstring (derived-mode-make-docstring
+		     parent child docstring syntax abbrev))
+    `(progn
+       (defvar ,hook nil)
+       (unless (get ',hook 'variable-documentation)
+         (put ',hook 'variable-documentation
+              ,(format "Hook run after entering `%S'.
+No problems result if this variable is not bound.
+`add-hook' automatically binds it.  (This is true for all hook variables.)"
+                       child)))
+       (unless (boundp ',map)
+	 (put ',map 'definition-name ',child))
+       (with-no-warnings (defvar ,map (make-sparse-keymap)))
+       (unless (get ',map 'variable-documentation)
+	 (put ',map 'variable-documentation
+	      (purecopy ,(format "Keymap for `%s'." child))))
+       ,(if declare-syntax
+	    `(progn
+               (defvar ,syntax)
+	       (unless (boundp ',syntax)
+		 (put ',syntax 'definition-name ',child)
+		 (defvar ,syntax (make-syntax-table)))
+	       (unless (get ',syntax 'variable-documentation)
+		 (put ',syntax 'variable-documentation
+		      (purecopy ,(format "Syntax table for `%s'." child))))))
+       ,(if declare-abbrev
+	    `(progn
+               (defvar ,abbrev)
+	       (unless (boundp ',abbrev)
+		 (put ',abbrev 'definition-name ',child)
+		 (defvar ,abbrev
+		   (progn (define-abbrev-table ',abbrev nil) ,abbrev)))
+	       (unless (get ',abbrev 'variable-documentation)
+		 (put ',abbrev 'variable-documentation
+		      (purecopy ,(format "Abbrev table for `%s'." child))))))
+       (if (fboundp 'derived-mode-set-parent)
+           (derived-mode-set-parent ',child ',parent)
+         (put ',child 'derived-mode-parent ',parent))
+       ,(if group `(put ',child 'custom-mode-group ,group))
+       (defun ,child ()
+	 ,docstring
+	 ,(and interactive '(interactive))
+	 (delay-mode-hooks
+	  (,(or parent 'kill-all-local-variables))
+	  (setq major-mode (quote ,child))
+	  (setq mode-name ,name)
+	  ,(when parent
+	     `(progn
+		(if (get (quote ,parent) 'mode-class)
+		    (put (quote ,child) 'mode-class
+			 (get (quote ,parent) 'mode-class)))
+		(unless (keymap-parent ,map)
+		  (set-keymap-parent ,map (current-local-map)))
+		,(when declare-syntax
+		   `(let ((parent (char-table-parent ,syntax)))
+		      (unless (and parent
+				   (not (eq parent (standard-syntax-table))))
+			(set-char-table-parent ,syntax (syntax-table)))))
+                ,(when declare-abbrev
+                   `(unless (or (abbrev-table-get ,abbrev :parents)
+                                (eq ,abbrev local-abbrev-table))
+                      (abbrev-table-put ,abbrev :parents
+                                        (list local-abbrev-table))))))
+	  (use-local-map ,map)
+	  ,(when syntax `(set-syntax-table ,syntax))
+	  ,(when abbrev `(setq local-abbrev-table ,abbrev))
+	  ,@body)
+	 ,@(when after-hook
+	     `((push (lambda () ,after-hook) delayed-after-hook-functions)))
+	 (run-mode-hooks ',hook)))))
+
+;; ---- define-minor-mode (easy-mmode.el) + supporting subr.el pieces ----
+
+;; prefix-numeric-value (C callint.c documented behavior): the numeric value of a
+;; raw prefix argument. nil -> 1, `-' -> -1, (N) -> N, a number -> itself.
+(defun prefix-numeric-value (arg)
+  "Return numeric meaning of raw prefix argument ARG."
+  (cond ((null arg) 1)
+        ((eq arg '-) -1)
+        ((consp arg) (car arg))
+        ((integerp arg) arg)
+        (t 1)))
+(defvar current-prefix-arg nil
+  "The raw prefix argument for the next command.")
+;; Interactive invocation is not modeled (no `call-interactively'); a command
+;; called from Lisp — the only path here — is never an interactive call.
+(defun called-interactively-p (&optional _kind) nil)
+;; Batch has no echo area / mode line.
+(defun current-message () nil)
+(defun force-mode-line-update (&optional _all) nil)
+;; Warnings are not modeled; return the form unchanged.
+(defun macroexp-warn-and-return (_msg form &rest _) form)
+;; custom-set-minor-mode (custom.el): a defcustom :set that toggles the mode.
+;; (Reached only via Customize, which is out of the mode-run path.)
+(defun custom-set-minor-mode (variable value)
+  (funcall variable (if value 1 0)))
+
+;; minor-mode registries (subr.el defvars).
+(defvar minor-mode-list nil
+  "List of all minor mode functions.")
+(defvar minor-mode-alist nil
+  "Alist saying how to show minor modes in the mode line.")
+(defvar minor-mode-map-alist nil
+  "Alist of keymaps to use for minor modes.")
+(defvar global-minor-modes nil
+  "A list of the currently enabled global minor modes.")
+(defvar-local local-minor-modes nil
+  "A list of the currently enabled minor modes in the current buffer.")
+(defvar mode-line-mode-menu (make-sparse-keymap "Minor Modes")
+  "Menu of mode operations in the mode line.")
+
+;; add-minor-mode (subr.el), ported faithfully.
+(defun add-minor-mode (toggle name &optional keymap after toggle-fun)
+  "Register a new minor mode."
+  (unless (memq toggle minor-mode-list)
+    (push toggle minor-mode-list))
+  (unless toggle-fun (setq toggle-fun toggle))
+  (unless (eq toggle-fun toggle)
+    (put toggle :minor-mode-function toggle-fun))
+  (when name
+    (let ((existing (assq toggle minor-mode-alist)))
+      (if existing
+	  (setcdr existing (list name))
+	(let ((tail minor-mode-alist) found)
+	  (while (and tail (not found))
+	    (if (eq after (caar tail))
+		(setq found tail)
+	      (setq tail (cdr tail))))
+	  (if found
+	      (let ((rest (cdr found)))
+		(setcdr found nil)
+		(nconc found (list (list toggle name)) rest))
+	    (push (list toggle name) minor-mode-alist))))))
+  (when (get toggle :included)
+    (define-key mode-line-mode-menu
+      (vector toggle)
+      (list 'menu-item
+	    (concat
+	     (or (get toggle :menu-tag)
+		 (if (stringp name) name (symbol-name toggle)))
+	     (let ((mode-name (if (symbolp name) (symbol-value name))))
+	       (if (and (stringp mode-name) (string-match "[^ ]+" mode-name))
+		   (concat " (" (match-string 0 mode-name) ")"))))
+	    toggle-fun
+	    :button (cons :toggle toggle))))
+  (when keymap
+    (let ((existing (assq toggle minor-mode-map-alist)))
+      (if existing
+	  (setcdr existing keymap)
+	(let ((tail minor-mode-map-alist) found)
+	  (while (and tail (not found))
+	    (if (eq after (caar tail))
+		(setq found tail)
+	      (setq tail (cdr tail))))
+	  (if found
+	      (let ((rest (cdr found)))
+		(setcdr found nil)
+		(nconc found (list (cons toggle keymap)) rest))
+	    (push (cons toggle keymap) minor-mode-map-alist)))))))
+
+;; easy-mmode-pretty-mode-name (easy-mmode.el).
+(defun easy-mmode-pretty-mode-name (mode &optional lighter)
+  "Turn the symbol MODE into a string intended for the user."
+  (let* ((case-fold-search t)
+	 (name (concat (replace-regexp-in-string
+			"-Minor" " minor"
+			(capitalize (replace-regexp-in-string
+				     "toggle-\\|-mode\\'" ""
+                                     (symbol-name mode))))
+		       " mode")))
+    (setq name (replace-regexp-in-string "\\`Global-" "Global " name))
+    (if (not (stringp lighter)) name
+      (setq lighter (replace-regexp-in-string "\\`\\s-+\\|\\s-+\\'" ""
+					      lighter))
+      (replace-regexp-in-string (regexp-quote lighter) lighter name t t))))
+
+;; ensure-empty-lines (subr.el): ensure LINES empty lines before point.
+(defun ensure-empty-lines (&optional lines)
+  "Ensure that there are LINES number of empty lines before point."
+  (unless (bolp)
+    (insert "\n"))
+  (let ((lines (or lines 1))
+        (start (save-excursion
+                 (if (re-search-backward "[^\n]" nil t)
+                     (+ (point) 2)
+                   (point-min)))))
+    (cond
+     ((> (- (point) start) lines)
+      (delete-region (point) (- (point) (- (point) start lines))))
+     ((< (- (point) start) lines)
+      (insert (make-string (- lines (- (point) start)) ?\n))))))
+
+(defconst easy-mmode--arg-docstring
+  "This is a %sminor mode.  If called interactively, toggle the
+`%s' mode.  If the prefix argument is positive, enable the mode,
+and if it is zero or negative, disable the mode.
+
+If called from Lisp, toggle the mode if ARG is `toggle'.
+Enable the mode if ARG is nil, omitted, or is a positive number.
+Disable the mode if ARG is a negative number.
+
+To check whether the minor mode is enabled in the current buffer,
+evaluate %s.
+
+The mode's hook is called both when the mode is enabled and when
+it is disabled.")
+;; easy-mmode--mode-docstring (easy-mmode.el). Uses a temp buffer to compose the
+;; docstring; `fill-region' is skipped when unbound (no line-wrap; cosmetic).
+(defun easy-mmode--mode-docstring (doc mode-pretty-name keymap-sym getter global)
+  (if (and doc (string-match-p "\\bARG\\b" doc))
+      doc
+    (with-temp-buffer
+      (let ((lines (if doc
+                       (string-lines doc)
+                     (list (format "Toggle %s on or off." mode-pretty-name)))))
+        (insert (pop lines))
+        (ensure-empty-lines)
+        (while (and lines (equal (car lines) ""))
+          (pop lines))
+        (dolist (line lines)
+          (insert line "\n"))
+        (ensure-empty-lines)
+        (let* ((fill-prefix nil)
+               (docs-fc (bound-and-true-p emacs-lisp-docstring-fill-column))
+               (fill-column (if (integerp docs-fc) docs-fc 65))
+               (argdoc (format
+                        easy-mmode--arg-docstring
+                        (if global "global " "")
+                        mode-pretty-name
+                        (concat
+                         (if (symbolp getter) "the variable ")
+                         (format "`%s'"
+                                 (string-replace "'" "\\='" (format "%S" getter)))))))
+          (let ((start (point)))
+            (insert argdoc)
+            (when (fboundp 'fill-region)
+              (fill-region start (point) 'left t))))
+        (when (and (boundp keymap-sym)
+                   (or (not doc)
+                       (not (string-search "\\{" doc))))
+          (ensure-empty-lines)
+          (insert (format "\\{%s}" keymap-sym)))
+        (buffer-string)))))
+
+;; define-minor-mode (easy-mmode.el), ported faithfully.
+(defmacro define-minor-mode (mode doc &rest body)
+  "Define a new minor mode MODE."
+  (declare (doc-string 2) (indent defun))
+  (let* ((last-message (make-symbol "last-message"))
+         (mode-name (symbol-name mode))
+         (init-value nil)
+         (keymap nil)
+         (lighter nil)
+	 (pretty-name nil)
+	 (globalp nil)
+	 (set nil)
+	 (initialize nil)
+	 (type nil)
+	 (extra-args nil)
+	 (extra-keywords nil)
+         (variable nil)
+         (setter `(setq ,mode))
+         (getter mode)
+         (modefun mode)
+	 (after-hook nil)
+	 (hook (intern (concat mode-name "-hook")))
+	 (hook-on (intern (concat mode-name "-on-hook")))
+	 (hook-off (intern (concat mode-name "-off-hook")))
+         (interactive t)
+         (warnwrap (if (or (null body) (keywordp (car body))) #'identity
+                     (lambda (exp)
+                       (macroexp-warn-and-return
+                        (format-message
+                         "Use keywords rather than deprecated positional arguments to `define-minor-mode'")
+                        exp))))
+	 keyw keymap-sym tmp)
+    (unless (keywordp (car body))
+      (setq init-value (pop body))
+      (unless (keywordp (car body))
+        (setq lighter (pop body))
+        (unless (keywordp (car body))
+          (setq keymap (pop body)))))
+    (while (keywordp (setq keyw (car body)))
+      (setq body (cdr body))
+      (pcase keyw
+	(:init-value (setq init-value (pop body)))
+	(:lighter (setq lighter (purecopy (pop body))))
+	(:global (setq globalp (pop body))
+                 (when (and globalp (symbolp mode))
+                   (setq setter `(setq-default ,mode))
+                   (setq getter `(default-value ',mode))))
+	(:extra-args (setq extra-args (pop body)))
+	(:set (setq set (list :set (pop body))))
+	(:initialize (setq initialize (list :initialize (pop body))))
+	(:type (setq type (list :type (pop body))))
+	(:keymap (setq keymap (pop body)))
+	(:interactive (setq interactive (pop body)))
+        (:variable (setq variable (pop body))
+                   (if (not (and (setq tmp (cdr-safe variable))
+                                 (or (symbolp tmp)
+                                     (functionp tmp))))
+                       (progn
+                         (setq setter `(setf ,variable))
+                         (setq getter variable))
+                     (setq getter (car variable))
+                     (setq setter `(funcall #',(cdr variable)))))
+	(:after-hook (setq after-hook (pop body)))
+	(_ (push keyw extra-keywords) (push (pop body) extra-keywords))))
+    (setq pretty-name (easy-mmode-pretty-mode-name mode lighter))
+    (setq keymap-sym (if (and keymap (symbolp keymap)) keymap
+		       (intern (concat mode-name "-map"))))
+    (unless set (setq set '(:set #'custom-set-minor-mode)))
+    (unless initialize
+      (setq initialize '(:initialize #'custom-initialize-default)))
+    (unless type (setq type '(:type 'boolean)))
+    `(progn
+       ,(cond
+         (variable nil)
+         ((not globalp)
+          `(progn
+             :autoload-end
+             (defvar-local ,mode ,init-value
+               ,(concat (format "Non-nil if %s is enabled.\n" pretty-name)
+                        (internal--format-docstring-line
+                         "Use the command `%s' to change this variable." mode)))))
+         (t
+	  (let ((base-doc-string
+                 (concat "Non-nil if %s is enabled.
+See the `%s' command
+for a description of this minor mode."
+                         (if body "
+Setting this variable directly does not take effect;
+either customize it (see the info node `Easy Customization')
+or call the function `%s'."))))
+	    `(defcustom ,mode ,init-value
+	       ,(format base-doc-string pretty-name mode mode)
+	       ,@set
+	       ,@initialize
+	       ,@type
+               ,@(nreverse extra-keywords)))))
+       ,(funcall
+         warnwrap
+         `(defun ,modefun (&optional arg ,@extra-args)
+            ,(easy-mmode--mode-docstring doc pretty-name keymap-sym
+                                         getter globalp)
+            ,(when interactive
+               (if (consp interactive)
+                   `(interactive
+                     (list (if current-prefix-arg
+                               (prefix-numeric-value current-prefix-arg)
+                             'toggle))
+                     ,@interactive)
+		 '(interactive
+                   (list (if current-prefix-arg
+                             (prefix-numeric-value current-prefix-arg)
+                           'toggle)))))
+	    (let ((,last-message (current-message)))
+              (,@setter
+               (cond ((eq arg 'toggle)
+                      (not ,getter))
+                     ((and (numberp arg)
+                           (< arg 1))
+                      nil)
+                     (t
+                      t)))
+              ,@(if globalp
+                    `((when (boundp 'global-minor-modes)
+                        (setq global-minor-modes
+                              (delq ',modefun global-minor-modes))
+                        (when ,getter
+                          (push ',modefun global-minor-modes))))
+                  `((when (boundp 'local-minor-modes)
+                      (setq local-minor-modes
+                            (delq ',modefun local-minor-modes))
+                      (when ,getter
+                        (push ',modefun local-minor-modes)))))
+              ,@body
+              (run-hooks ',hook (if ,getter ',hook-on ',hook-off))
+              (if (called-interactively-p 'any)
+                  (progn
+                    ,(if (and globalp (not variable))
+                         `(customize-mark-as-set ',mode))
+                    (unless (and (current-message)
+                                 (not (equal ,last-message
+                                             (current-message))))
+                      (let ((local ,(if globalp "" " in current buffer")))
+			(message "%s %sabled%s" ,pretty-name
+			         (if ,getter "en" "dis") local)))))
+	      ,@(when after-hook `(,after-hook)))
+	    (force-mode-line-update)
+	    ,getter))
+       :autoload-end
+       (defvar ,hook nil)
+       (unless (get ',hook 'variable-documentation)
+         (put ',hook 'variable-documentation
+              ,(format "Hook run after entering or leaving `%s'.
+No problems result if this variable is not bound.
+`add-hook' automatically binds it.  (This is true for all hook variables.)"
+                       modefun)))
+       (put ',hook 'custom-type 'hook)
+       (put ',hook 'standard-value (list nil))
+       ,(unless (symbolp keymap)
+	  `(defvar ,keymap-sym
+	     (let ((m ,keymap))
+	       (cond ((keymapp m) m)
+		     ((listp m)
+                      (easy-mmode-define-keymap m))
+		     (t (error "Invalid keymap %S" m))))
+	     ,(format "Keymap for `%s'." mode-name)))
+       ,(let ((modevar (pcase getter (`(default-value ',v) v) (_ getter))))
+          (if (not (symbolp modevar))
+              (if (or lighter keymap)
+                  (error ":lighter and :keymap unsupported with mode expression %S" getter))
+            `(with-no-warnings
+               (add-minor-mode ',modevar ',lighter
+                               ,(if keymap keymap-sym
+                                  `(if (boundp ',keymap-sym) ,keymap-sym))
+                               nil
+                               ,(unless (eq mode modefun) `',modefun))))))))
 
 ;;; ---- ERT: Emacs Lisp Regression Testing (subset) ----
 ;; Ported from ERT: `should` / `should-not` / `should-error` / `skip-unless`

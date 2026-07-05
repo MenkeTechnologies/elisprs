@@ -3110,18 +3110,16 @@ fn subr_name(h: &mut ElispHost, a: &[Value]) -> R {
         )),
     }
 }
-/// `(default-boundp SYMBOL)` — non-nil if SYMBOL has a default value. This model
-/// has no buffer-local bindings, so the default value is the toplevel value and
-/// this coincides with `boundp`.
+/// `(default-boundp SYMBOL)` — non-nil if SYMBOL has a default value, i.e. its
+/// global value cell is bound (ignoring any buffer-local binding).
 fn default_boundp(h: &mut ElispHost, a: &[Value]) -> R {
-    let bound = is_nil(&a[0]) || matches!(a[0], Value::Bool(true)) || h.get_value(&a[0]).is_ok();
+    let bound = is_nil(&a[0]) || matches!(a[0], Value::Bool(true)) || h.default_boundp_raw(&a[0]);
     Ok(nil_or(bound))
 }
-/// `(default-toplevel-value SYMBOL)` — SYMBOL's default (toplevel) value. Without
-/// buffer-local bindings this is `symbol-value`; signals `void-variable` when
-/// SYMBOL is unbound.
+/// `(default-toplevel-value SYMBOL)` — SYMBOL's default (toplevel) value, ignoring
+/// any buffer-local binding; signals `void-variable` when the default is unbound.
 fn default_toplevel_value(h: &mut ElispHost, a: &[Value]) -> R {
-    h.get_value(&a[0])
+    h.raw_global_value(&a[0])
 }
 /// `(read STRING)` — read the first Lisp form from STRING.
 fn read_fn(h: &mut ElispHost, a: &[Value]) -> R {
@@ -3760,6 +3758,7 @@ fn buffer_push(h: &mut ElispHost, _a: &[Value]) -> R {
     h.buffers.push(crate::host::EditBuffer {
         text: Vec::new(),
         point: 1,
+        ..Default::default()
     });
     Ok(Value::Undef)
 }
@@ -3768,6 +3767,47 @@ fn buffer_pop(h: &mut ElispHost, _a: &[Value]) -> R {
         h.buffers.pop();
     }
     Ok(Value::Undef)
+}
+// ── buffer-local variables ──
+fn make_local_variable(h: &mut ElispHost, a: &[Value]) -> R {
+    h.make_local_variable(&a[0])
+}
+fn make_variable_buffer_local(h: &mut ElispHost, a: &[Value]) -> R {
+    h.make_variable_buffer_local(&a[0])
+}
+fn local_variable_p(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(h.local_variable_p(&a[0])))
+}
+fn local_variable_if_set_p(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(h.local_variable_if_set_p(&a[0])))
+}
+fn kill_local_variable(h: &mut ElispHost, a: &[Value]) -> R {
+    h.kill_local_variable(&a[0])
+}
+fn buffer_local_symbols_fn(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(h.buffer_local_symbols())
+}
+fn buffer_local_value_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    h.buffer_local_or_default(&a[0])
+}
+/// `(default-value SYMBOL)` — SYMBOL's default (global) value, ignoring any
+/// buffer-local binding. Signals `void-variable` when there is no default.
+fn default_value_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    h.raw_global_value(&a[0])
+}
+/// `(set-default SYMBOL VALUE)` — set SYMBOL's default (global) value, bypassing
+/// any buffer-local binding. Returns VALUE.
+fn set_default_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    h.set_raw_global(&a[0], a[1].clone())?;
+    Ok(a[1].clone())
+}
+// ── buffer-local keymap slot ──
+fn use_local_map_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    h.use_local_map(a[0].clone());
+    Ok(Value::Undef)
+}
+fn current_local_map_fn(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(h.current_local_map())
 }
 fn insert_chars(v: &Value) -> Result<Vec<char>, String> {
     match v {
@@ -4707,6 +4747,33 @@ pub fn install(h: &mut ElispHost) {
     // buffers (minimal)
     s("--buffer-push--", 0, Some(0), buffer_push);
     s("--buffer-pop--", 0, Some(0), buffer_pop);
+    // buffer-local variables
+    s("make-local-variable", 1, Some(1), make_local_variable);
+    s(
+        "make-variable-buffer-local",
+        1,
+        Some(1),
+        make_variable_buffer_local,
+    );
+    s("local-variable-p", 1, Some(2), local_variable_p);
+    s(
+        "local-variable-if-set-p",
+        1,
+        Some(2),
+        local_variable_if_set_p,
+    );
+    s("kill-local-variable", 1, Some(1), kill_local_variable);
+    s(
+        "--buffer-local-symbols--",
+        0,
+        Some(0),
+        buffer_local_symbols_fn,
+    );
+    s("buffer-local-value", 2, Some(2), buffer_local_value_fn);
+    s("default-value", 1, Some(1), default_value_fn);
+    s("set-default", 2, Some(2), set_default_fn);
+    s("use-local-map", 1, Some(1), use_local_map_fn);
+    s("current-local-map", 0, Some(0), current_local_map_fn);
     s("insert", 0, None, insert_fn);
     s("buffer-string", 0, Some(0), buffer_string);
     s("buffer-size", 0, Some(1), buffer_size);
