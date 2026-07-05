@@ -578,11 +578,109 @@ pub const PRELUDE: &str = r#"
       (cons 'progn body)
     nil))
 (defun byte-code-function-p (_object) nil)
+;; compiled-function-p: non-nil for a function whose implementation is compiled.
+;; elisprs has no byte-code or native functions, so only primitive subrs qualify
+;; (interpreted closures return nil, matching `emacs -Q --batch').
+(defun compiled-function-p (object)
+  "Return non-nil if OBJECT is a function that is compiled (a primitive subr)."
+  (and (subrp object) t))
+;; Bound by `macroexpand-all' while it walks a form; libraries (e.g. rx) read it
+;; to thread local macro environments.  Defaults to nil outside expansion.
+(defvar macroexpand-all-environment nil)
 ;; A form that evaluates to V (self-quoting literals as-is, else (quote V)).
 (defun macroexp-quote (v)
   (if (and (not (consp v)) (or (not (symbolp v)) (null v) (eq v t) (keywordp v)))
       v
     (list 'quote v)))
+;; defsubst: define an inline function.  In the interpreter this is exactly a
+;; `defun'; the `byte-optimizer' property is what the byte-compiler consults to
+;; inline calls (byte-run.el:481).  elisprs has no byte-compiler, so the
+;; property is set for faithfulness but never acted upon.
+(defmacro defsubst (name arglist &rest body)
+  "Define an inline function.  The syntax is just like that of `defun'."
+  (declare (debug defun) (doc-string 3) (indent 2))
+  `(prog1
+       (defun ,name ,arglist ,@body)
+     (put ',name 'byte-optimizer 'byte-compile-inline-expand)))
+;; purecopy: copy an object into pure space.  elisprs has no pure space, so this
+;; returns its argument unchanged — observably equal to Emacs's result.
+(defun purecopy (object)
+  "Return a copy of OBJECT (identity — elisprs has no pure space)."
+  object)
+;; autoloadp / autoload: mark a symbol to load its defining file on first call
+;; (subr.el `autoloadp'; C `Fautoload').  elisprs installs the autoload object
+;; faithfully; the on-call load trigger is the autoload subsystem (not wired).
+(defun autoloadp (object)
+  "Non-nil if OBJECT is an autoload."
+  (eq 'autoload (car-safe object)))
+(defun autoload (function file &optional docstring interactive type)
+  "Define FUNCTION to autoload from FILE.
+Does nothing if FUNCTION is already defined as something other than an
+autoload.  Returns FUNCTION when it installs the autoload, else nil."
+  (if (and (fboundp function)
+           (not (autoloadp (symbol-function function))))
+      nil
+    (fset function (list 'autoload file docstring interactive type))
+    function))
+;; make-obsolete family (byte-run.el).  These only record properties the
+;; byte-compiler reads to emit warnings; in the interpreter they are inert but
+;; ported so obsolete declarations in real libraries load cleanly.
+(defun byte-run--constant-obsolete-warning (obsolete-name)
+  (if (memq obsolete-name '(nil t))
+      (error "Can't make `%s' obsolete; did you forget a quote mark?"
+             obsolete-name)))
+(defun make-obsolete (obsolete-name current-name when)
+  "Make the byte-compiler warn that function OBSOLETE-NAME is obsolete."
+  (byte-run--constant-obsolete-warning obsolete-name)
+  (put obsolete-name 'byte-obsolete-info
+       (purecopy (list current-name nil when)))
+  obsolete-name)
+(defun make-obsolete-variable (obsolete-name current-name when &optional access-type)
+  "Make the byte-compiler warn that OBSOLETE-NAME is obsolete."
+  (byte-run--constant-obsolete-warning obsolete-name)
+  (put obsolete-name 'byte-obsolete-variable
+       (purecopy (list current-name access-type when)))
+  obsolete-name)
+(defmacro define-obsolete-function-alias (obsolete-name current-name when &optional docstring)
+  "Set OBSOLETE-NAME's function definition to CURRENT-NAME and mark it obsolete."
+  (declare (doc-string 4) (indent defun))
+  `(progn
+     (defalias ,obsolete-name ,current-name ,docstring)
+     (make-obsolete ,obsolete-name ,current-name ,when)))
+;; eval-after-load (subr.el): register FORM to run after FILE loads; run now if
+;; FILE (a feature symbol) is already provided.  The string-file regexp path and
+;; the fire-on-future-load path are the after-load subsystem (not wired); the
+;; feature-symbol registration path used by real libraries is faithful.
+(defvar after-load-alist nil)
+(defun eval-after-load (file form)
+  "Arrange that if FILE is loaded, FORM will be run immediately afterwards."
+  (declare (indent 1))
+  (let* ((elt (assoc file after-load-alist))
+         (func (if (functionp form) form (eval (list 'lambda nil form) t))))
+    (unless elt
+      (setq elt (list file))
+      (push elt after-load-alist))
+    (when (and (symbolp file) (featurep file))
+      (funcall func))))
+(defmacro with-eval-after-load (file &rest body)
+  "Execute BODY after FILE is loaded (see `eval-after-load')."
+  (declare (indent 1) (debug (form def-body)))
+  (list 'eval-after-load file (list 'quote (cons 'progn body))))
+;; def-edebug-elem-spec (subr.el): record an Edebug spec element as a property.
+;; Edebug is advisory in elisprs, but real libraries register specs at load time.
+(defun def-edebug-elem-spec (name spec)
+  "Define a new Edebug spec element NAME as shorthand for SPEC."
+  (declare (indent 1))
+  (when (string-match "\\`[&:]" (symbol-name name))
+    (error "Edebug spec name cannot start with '&' or ':'"))
+  (unless (consp spec)
+    (error "Edebug spec has to be a list: %S" spec))
+  (put name 'edebug-elem-spec spec))
+;; Declaration handler alists (byte-run.el).  elisprs's `declare' is a no-op, so
+;; these are not consulted for defun/defmacro expansion; they exist only because
+;; libraries (e.g. gv) push their own gv-expander/gv-setter handlers onto them.
+(defvar defun-declarations-alist nil)
+(defvar macro-declarations-alist nil)
 (defmacro defvar-local (var val &optional doc)
   `(progn (defvar ,var ,val ,doc) (make-variable-buffer-local ',var)))
 (defmacro with-demoted-errors (fmt &rest body) `(condition-case --err-- (progn ,@body) (error (message ,fmt --err--) nil)))
@@ -2681,6 +2779,8 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 ;; No buffer-local model: these are no-ops returning the symbol.
 (defun make-local-variable (sym) sym)
 (defun make-variable-buffer-local (sym) sym)
+;; With no buffer-local bindings, no variable is ever locally set.
+(defun local-variable-if-set-p (_variable &optional _buffer) nil)
 (defun set-default-toplevel-value (sym val) (set sym val))
 (defun defalias (symbol definition &optional _docstring) (fset symbol definition) symbol)
 (defalias 'string-split 'split-string)
@@ -3468,6 +3568,8 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
        ((eq head 'aref) (list 'aset (car args) (car (cdr args)) val))
        ((eq head 'gethash) (list 'puthash (car args) val (car (cdr args))))
        ((eq head 'symbol-value) (list 'set (car args) val))
+       ;; (setf (default-value SYM) V) -> (set-default SYM V) (gv.el simple setter).
+       ((eq head 'default-value) (list 'set-default (car args) val))
        ((eq head 'symbol-function) (list 'fset (car args) val))
        ;; (setf (get SYM PROP) V) -> (put SYM PROP V).
        ((eq head 'get) (list 'put (car args) (car (cdr args)) val))
@@ -3522,13 +3624,108 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
               (list 'cl-replace (car args) '--ss-v--
                     :start1 (car (cdr args)) :end1 (car (cddr args)))
               '--ss-v--))
-       (t (error "setf: unsupported place %S" place))))))
+       ;; Control-flow places (gv.el): setf threads into the value position of
+       ;; each branch.  Only one branch runs, so VAL may appear textually more
+       ;; than once without being evaluated twice.
+       ;; (setf (if C THEN ELSE...) V) -> (if C (setf THEN V) (setf (progn ELSE...) V))
+       ((eq head 'if)
+        (list 'if (car args)
+              (setf--expand (car (cdr args)) val)
+              (setf--expand (cons 'progn (cdr (cdr args))) val)))
+       ;; (setf (progn A B C) V) -> (progn A B (setf C V))
+       ((eq head 'progn)
+        (append (list 'progn) (butlast args)
+                (list (setf--expand (car (last args)) val))))
+       ;; (setf (cond (T A B) ...) V) -> (cond (T A (setf B V)) ...)
+       ((eq head 'cond)
+        (cons 'cond
+              (mapcar (lambda (clause)
+                        (append (list (car clause)) (butlast (cdr clause))
+                                (list (setf--expand (car (last clause)) val))))
+                      args)))
+       ;; Unknown head: if PLACE is a macro call, expand it once and retry —
+       ;; this is how `gv-get' handles macro-defined places such as
+       ;; `(cl--generic name)' -> `(get name 'cl--generic)' (gv.el:103).
+       (t (let ((me (macroexpand-1 place)))
+            (if (eq me place)
+                (error "setf: unsupported place %S" place)
+              (setf--expand me val))))))))
 (defmacro setf (&rest pairs)
   (let ((forms nil))
     (while pairs
       (setq forms (cons (setf--expand (car pairs) (car (cdr pairs))) forms))
       (setq pairs (cdr (cdr pairs))))
     (cons 'progn (reverse forms))))
+
+;; ---- hooks (subr.el `add-hook'; C `run-hooks'/`run-hook-with-args') ----
+;; Defined after the full `setf' (add-hook's depth-alist branch uses a `get'
+;; place).  add-hook is ported verbatim; the depth-alist / buffer-local branches
+;; are dead in elisprs's global-only, no-buffer-local model but kept faithful.
+(defun add-hook (hook function &optional depth local)
+  "Add to the value of HOOK the function FUNCTION.
+FUNCTION is not added if already present."
+  (or (boundp hook) (set hook nil))
+  (or (default-boundp hook) (set-default hook nil))
+  (unless (numberp depth) (setq depth (if depth 90 0)))
+  (if local (unless (local-variable-if-set-p hook)
+	      (set (make-local-variable hook) (list t)))
+    (when (and (local-variable-if-set-p hook)
+               (not (and (consp (symbol-value hook))
+                         (memq t (symbol-value hook)))))
+      (setq local t)))
+  (let ((hook-value (if local (symbol-value hook) (default-value hook))))
+    (when (or (not (listp hook-value)) (functionp hook-value))
+      (setq hook-value (list hook-value)))
+    (unless (member function hook-value)
+      (let ((depth-sym (get hook 'hook--depth-alist)))
+        (unless (zerop depth)
+          (unless depth-sym
+            (setq depth-sym (make-symbol "depth-alist"))
+            (set depth-sym nil)
+            (setf (get hook 'hook--depth-alist) depth-sym))
+          (if local (make-local-variable depth-sym))
+          (setf (alist-get function
+                           (if local (symbol-value depth-sym)
+                             (default-value depth-sym))
+                           0)
+                depth))
+        (setq hook-value
+	      (if (< 0 depth)
+		  (append hook-value (list function))
+		(cons function hook-value)))
+        (when depth-sym
+          (let ((depth-alist (if local (symbol-value depth-sym)
+                               (default-value depth-sym))))
+            (when depth-alist
+              (setq hook-value
+                    (sort (if (< 0 depth) hook-value (copy-sequence hook-value))
+                          (lambda (f1 f2)
+                            (< (alist-get f1 depth-alist 0 nil #'eq)
+                               (alist-get f2 depth-alist 0 nil #'eq))))))))))
+    (if local
+	(progn
+	  (and (symbolp function)
+	       (get function 'permanent-local-hook)
+	       (not (get hook 'permanent-local))
+	       (put hook 'permanent-local 'permanent-local-hook))
+	  (set hook hook-value))
+      (set-default hook hook-value))))
+(defun run-hook-with-args (hook &rest args)
+  "Run HOOK with the specified arguments ARGS.
+HOOK should be a symbol; its value is a function or a list of functions."
+  (when (boundp hook)
+    (let ((value (symbol-value hook)))
+      (if (functionp value)
+          (apply value args)
+        (dolist (f value)
+          (unless (eq f t)
+            (apply f args)))
+        nil))))
+(defun run-hooks (&rest hooks)
+  "Run each hook in HOOKS, which are symbols whose values are lists of functions."
+  (dolist (hook hooks)
+    (run-hook-with-args hook))
+  nil)
 
 ;; ---- pcase: structural `cond` (non-backquote subset) ----
 ;; Supported patterns (compiled to tests + bindings at macroexpansion time):
