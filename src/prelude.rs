@@ -2431,6 +2431,11 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 ;; set by real Emacs before init loads — nil here until a caller binds them.
 (defvar init-file-debug nil)
 (defvar user-init-file nil)
+;; custom.el:1216 — searched by `load-theme'/`customize-themes'. Faithful port of
+;; the preloaded defvar; value is the literal list `(custom-theme-directory t)'
+;; (the two symbols are quoted, not evaluated), matching the real Emacs default.
+(defvar custom-theme-load-path (list 'custom-theme-directory t)
+  "List of directories to search for custom theme files.")
 (defun expand-file-name (name &optional dir)
   ;; Expand NAME against DIR (default `default-directory'), `~/' via $HOME, and
   ;; collapse `.', `..' and `//'. (No remote/`~user' handling.)
@@ -2651,10 +2656,27 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
   (unless (memq feature features) (setq features (cons feature features)))
   feature)
 (defun featurep (feature &optional _subfeature) (and (memq feature features) t))
-(defun require (feature &optional _filename noerror)
-  (cond ((memq feature features) feature)
-        (noerror nil)
-        (t (signal 'file-missing (list "Cannot open load file" (symbol-name feature))))))
+;; Faithful port of C `Frequire' (fns.c): if FEATURE is already provided, return
+;; it; otherwise `load' its file (FILENAME, else the feature's name) with a
+;; recursion guard, then verify the load actually provided FEATURE. Loading uses
+;; MUST-SUFFIX when FILENAME is nil (require a `.el'/`.elc', never a bare name),
+;; matching `Fload (…, Qnil, Qt, Qnil, NILP (filename) ? Qt : Qnil)'.
+(defvar require--nesting-list nil
+  "Features whose `require' is currently in progress (recursion guard).")
+(defun require (feature &optional filename noerror)
+  (if (featurep feature)
+      feature
+    (let ((lisp-file (if filename filename (symbol-name feature))))
+      (when (member lisp-file require--nesting-list)
+        (error "Recursive `require' for feature `%s'" feature))
+      (let ((require--nesting-list (cons lisp-file require--nesting-list)))
+        (if (load lisp-file noerror t nil (if filename nil t))
+            (if (featurep feature)
+                feature
+              (unless noerror
+                (error "Loading file %s failed to provide feature `%s'"
+                       lisp-file feature)))
+          nil)))))
 (defmacro bound-and-true-p (var) (list 'and (list 'boundp (list 'quote var)) var))
 ;; No buffer-local model: these are no-ops returning the symbol.
 (defun make-local-variable (sym) sym)
