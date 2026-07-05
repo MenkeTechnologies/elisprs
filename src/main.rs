@@ -199,23 +199,59 @@ fn parens_balanced(s: &str) -> bool {
     depth <= 0
 }
 
+/// Print the `--help` / `-h` screen in the MenkeTechnologies house style (see
+/// `tp -h`): ANSI-Shadow banner, a status box padded at runtime so its right
+/// border never drifts as the version grows, yellow `USAGE:`, cyan section
+/// rules, green `//` comment separators, and a SYSTEM footer.
 fn print_help() {
-    println!(
-        "elisp (elisprs) — Emacs Lisp on fusevm\n\
-         \n\
-         USAGE:\n\
-         \x20 elisp FILE.el            evaluate a file\n\
-         \x20 elisp -e EXPR            evaluate an expression and print its value\n\
-         \x20 elisp                    start a REPL\n\
-         \x20 elisp --lsp              language server over stdio (stub)\n\
-         \x20 elisp --dap              debug adapter over stdio (stub)\n\
-         \x20 elisp --aot FILE -o OUT  lower to a fusevm chunk / native object\n\
-         \x20 elisp --cache-stats     show the rkyv bytecode cache stats\n\
-         \x20 elisp --cache-clear     delete the rkyv bytecode cache\n\
-         \x20 elisp --version\n\
-         \n\
-         ENV:\n\
-         \x20 ELISPRS_CACHE=0          disable the bytecode cache\n\
-         \x20 ELISPRS_CACHE_DEBUG=1    log cache HIT/MISS to stderr"
+    const BOX_W: usize = 54;
+    let ver = env!("CARGO_PKG_VERSION");
+    let status = format!(" STATUS: ONLINE  // SIGNAL: ████████░░ // v{ver}");
+    let space = " ".repeat(BOX_W.saturating_sub(status.chars().count()));
+    let rule = "─".repeat(BOX_W);
+    print!(
+        concat!(
+            "\n",
+            "\x1b[36m ███████╗██╗     ██╗███████╗██████╗ ██████╗ ███████╗\x1b[0m\n",
+                "\x1b[36m ██╔════╝██║     ██║██╔════╝██╔══██╗██╔══██╗██╔════╝\x1b[0m\n",
+                "\x1b[35m █████╗  ██║     ██║███████╗██████╔╝██████╔╝███████╗\x1b[0m\n",
+                "\x1b[35m ██╔══╝  ██║     ██║╚════██║██╔═══╝ ██╔══██╗╚════██║\x1b[0m\n",
+                "\x1b[31m ███████╗███████╗██║███████║██║     ██║  ██║███████║\x1b[0m\n",
+                "\x1b[31m ╚══════╝╚══════╝╚═╝╚══════╝╚═╝     ╚═╝  ╚═╝╚══════╝\x1b[0m\n",
+                " \x1b[36m┌{rule}┐\x1b[0m\n",
+                " \x1b[36m│\x1b[0m{status}{space}\x1b[36m│\x1b[0m\n",
+                " \x1b[36m└{rule}┘\x1b[0m\n",
+                "\x1b[35m  >> EMACS LISP ON FUSEVM // FULL SPECTRUM <<\x1b[0m\n",
+                "\n",
+                "  Emacs Lisp interpreter on the fusevm bytecode VM\n",
+                "\n",
+                "\x1b[33m  USAGE:\x1b[0m elisp [OPTIONS] [FILE]\n",
+                "\n",
+                "\x1b[36m  ── MODES ──────────────────────────────────────────────\x1b[0m\n",
+                "  elisp FILE.el            \x1b[32m//\x1b[0m evaluate a file\n",
+                "  elisp -e EXPR            \x1b[32m//\x1b[0m evaluate an expression and print its value\n",
+                "  elisp                    \x1b[32m//\x1b[0m start a REPL\n",
+                "  elisp --lsp              \x1b[32m//\x1b[0m language server over stdio (stub)\n",
+                "  elisp --dap              \x1b[32m//\x1b[0m debug adapter over stdio (stub)\n",
+                "  elisp --aot FILE -o OUT  \x1b[32m//\x1b[0m lower to a fusevm chunk / native object\n",
+                "  elisp --cache-stats      \x1b[32m//\x1b[0m show the rkyv bytecode cache stats\n",
+                "  elisp --cache-clear      \x1b[32m//\x1b[0m delete the rkyv bytecode cache\n",
+                "  elisp --version          \x1b[32m//\x1b[0m print version\n",
+                "  elisp --help             \x1b[32m//\x1b[0m print this help\n",
+                "\n",
+                "\x1b[36m  ── ENV ────────────────────────────────────────────────\x1b[0m\n",
+                "  ELISPRS_CACHE=0          \x1b[32m//\x1b[0m disable the bytecode cache\n",
+                "  ELISPRS_CACHE_DEBUG=1    \x1b[32m//\x1b[0m log cache HIT/MISS to stderr\n",
+                "\n",
+                "\x1b[36m  ── SYSTEM ─────────────────────────────────────────────\x1b[0m\n",
+                "  \x1b[35mv{ver} \x1b[0m// \x1b[33m(c) Jacob Menke and contributors\x1b[0m\n",
+                "  \x1b[35mThe parens are balanced. The runtime is vast.\x1b[0m\n",
+                "  \x1b[33m>>> JACK IN. EVAL THE FORM. RUN ELISP EVERYWHERE. <<<\x1b[0m\n",
+                " \x1b[36m░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░\x1b[0m\n",
+            ),
+            rule = rule,
+            status = status,
+            space = space,
+            ver = ver,
     );
 }
