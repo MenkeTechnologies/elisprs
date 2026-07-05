@@ -2008,11 +2008,16 @@ fn log_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Float(match a.get(1) {
         // Emacs uses `log10`/`log2` for base 10/2 (exact for powers of the base:
         // (log 1000 10) => 3.0), falling back to ln(x)/ln(base) otherwise.
-        Some(b) => match as_num(b)?.1 {
-            base if base == 10.0 => x.log10(),
-            base if base == 2.0 => x.log2(),
-            base => x.ln() / base.ln(),
-        },
+        Some(b) => {
+            let base = as_num(b)?.1;
+            if base == 10.0 {
+                x.log10()
+            } else if base == 2.0 {
+                x.log2()
+            } else {
+                x.ln() / base.ln()
+            }
+        }
         None => x.ln(),
     }))
 }
@@ -2984,9 +2989,7 @@ fn char_resolve_modifiers(_h: &mut ElispHost, a: &[Value]) -> R {
             c &= !0o177 & !CHAR_CTL;
         } else if base == b'?' as i64 {
             c = 0o177 | (c & !0o177 & !CHAR_CTL);
-        } else if (0o101..=0o132).contains(&(c & 0o137)) {
-            c &= 0o37 | (!0o177 & !CHAR_CTL);
-        } else if (0o100..=0o137).contains(&(c & 0o177)) {
+        } else if (0o101..=0o132).contains(&(c & 0o137)) || (0o100..=0o137).contains(&(c & 0o177)) {
             c &= 0o37 | (!0o177 & !CHAR_CTL);
         }
     }
