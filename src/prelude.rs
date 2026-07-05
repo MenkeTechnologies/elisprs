@@ -2659,9 +2659,26 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (defun time-less-p (a b) (< (float-time a) (float-time b)))
 (defun time-equal-p (a b) (= (float-time a) (float-time b)))
 (defun time-convert (time &optional form)
+  ;; FORM t asks for the highest-resolution (TICKS . HZ) pair.  Ported from
+  ;; timefns.c `time_convert' / `decode_float_time': an integer stays (N . 1);
+  ;; a float f is decomposed exactly as emacs does — scale = DBL_MANT_DIG-1-ilogb(f)
+  ;; (ilogb(f) = (cdr (frexp f)) - 1, so scale = 53 - (cdr (frexp f))), giving
+  ;; ticks = f*2^scale (an exact integer) over hz = 2^scale.  Zero maps to (0 . 1).
+  ;; A numeric FORM is an explicit HZ.
   (cond ((eq form 'integer) (truncate (float-time time)))
         ((eq form 'list) (let ((s (truncate (float-time time))))
                            (list (ash s -16) (logand s #xffff))))
+        ((eq form t)
+         (if (integerp time)
+             (cons time 1)
+           (let ((f (float-time time)))
+             (if (= f 0.0)
+                 (cons 0 1)
+               (let* ((scale (- 53 (cdr (frexp f))))
+                      (hz (expt 2 scale)))
+                 (cons (round (* f hz)) hz))))))
+        ((integerp form)
+         (cons (round (* (float-time time) form)) form))
         (t (time--norm (float-time time)))))
 (defun current-time-zone (&optional time zone)
   ;; (OFFSET NAME). The local zone's offset comes from decode-time's zone field;
@@ -3582,6 +3599,25 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
                                      (cl-seventh . 6) (cl-eighth . 7) (cl-ninth . 8)
                                      (cl-tenth . 9))))))
           (list 'setcar (list 'nthcdr idx (car args)) val)))
+       ;; `decoded-time' is `(cl-defstruct (decoded-time (:type list)) ...)' in
+       ;; Emacs (simple.el:11111), so its accessors are list-position places whose
+       ;; setter is `(setcar (nthcdr INDEX TIME) VAL)' — the same expansion a
+       ;; `:type list' struct generates.  time-date.el relies on it (e.g.
+       ;; `(setf (decoded-time-month time) ...)', `(cl-incf (decoded-time-year time) ...)').
+       ((assq head '((decoded-time-second . 0) (decoded-time-minute . 1)
+                     (decoded-time-hour . 2) (decoded-time-day . 3)
+                     (decoded-time-month . 4) (decoded-time-year . 5)
+                     (decoded-time-weekday . 6) (decoded-time-dst . 7)
+                     (decoded-time-zone . 8)))
+        (list 'setcar
+              (list 'nthcdr
+                    (cdr (assq head '((decoded-time-second . 0) (decoded-time-minute . 1)
+                                      (decoded-time-hour . 2) (decoded-time-day . 3)
+                                      (decoded-time-month . 4) (decoded-time-year . 5)
+                                      (decoded-time-weekday . 6) (decoded-time-dst . 7)
+                                      (decoded-time-zone . 8))))
+                    (car args))
+              val))
        ;; (setf (alist-get K AL &optional DEFAULT REMOVE TESTFN) V): setcdr an
        ;; existing pair (found via TESTFN or eq), else prepend. With REMOVE, a V
        ;; equal to DEFAULT deletes the entry instead.
