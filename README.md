@@ -255,7 +255,7 @@ The HUD-themed HTML docs share `hud-static.css`, `hud-theme.js`, and `tutorial.c
 ## [0xFF] LICENSE
 
  ┌──────────────────────────────────────────────────────────────┐
- │ MIT OR APACHE-2.0 // BUNDLES rust_lisp (MIT) // FREE / OSS   │
+ │ MIT // BUNDLES rust_lisp (MIT) // FREE / OSS   │
  └──────────────────────────────────────────────────────────────┘
 
 ---
