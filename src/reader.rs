@@ -87,7 +87,17 @@ impl Reader {
         }
     }
 
+    /// Read one form. Recursive descent nests one Rust frame per `(`, `[`, `'`,
+    /// etc., so deeply-nested input (`((((…))))` thousands deep) would overflow
+    /// the fixed OS thread stack. `stacker::maybe_grow` extends the stack on the
+    /// same thread when it runs low, so the reader stays unbounded like Emacs's
+    /// (which reads 500k-deep nesting without error) while keeping the
+    /// thread-local host reachable.
     fn read_form(&mut self, h: &mut ElispHost) -> Result<Value, String> {
+        stacker::maybe_grow(128 * 1024, 16 * 1024 * 1024, || self.read_form_inner(h))
+    }
+
+    fn read_form_inner(&mut self, h: &mut ElispHost) -> Result<Value, String> {
         self.skip_ws();
         let c = self.peek().ok_or("unexpected end of input")?;
         match c {
