@@ -3394,6 +3394,60 @@ fn multibyte_char_to_unibyte(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Int(byte))
 }
 
+/// Read a `decode-char` CODE-POINT argument: an integer, an integral float, or
+/// a cons `(HIGH . LOW)` giving `HIGH * 0x10000 + LOW` (the obsolescent form).
+/// This mirrors the `CONSP`/`FIXNUM`/`FLOATP` dispatch in `Fdecode_char`
+/// (src/charset.c).
+fn decode_char_code_point(h: &ElispHost, v: &Value) -> Result<i64, String> {
+    if let Some(Obj::Cons(hi, lo)) = h.obj(v) {
+        let hi = as_int(h, &hi.clone())?;
+        let lo = as_int(h, &lo.clone())?;
+        return Ok((hi << 16) | lo);
+    }
+    as_int(h, v)
+}
+
+/// `(decode-char CHARSET CODE-POINT)` — port of `Fdecode_char` (src/charset.c).
+/// Decode CODE-POINT in CHARSET to a character, or nil if the code point is not
+/// valid in CHARSET. CODE-POINT must lie in `0..=0xFFFFFFFF`; anything else
+/// signals the `error` "Not an in-range integer, integral float, or cons of
+/// integers".
+///
+/// Only charsets whose mapping is pure arithmetic — no external mule map tables
+/// — are supported faithfully: `ascii`, `eight-bit`, `iso-8859-1`, and the
+/// Unicode charsets `ucs`/`unicode` (full range) and `unicode-bmp` (BMP only).
+/// Every other symbol takes the `CHECK_CHARSET_GET_CHARSET` failure path and
+/// signals `wrong-type-argument charsetp SYM`, exactly as Emacs does for an
+/// unknown charset (the mule-table national charsets like `japanese-jisx0208`
+/// are not registered here, so they land on that path rather than being
+/// approximated).
+fn decode_char(h: &mut ElispHost, a: &[Value]) -> R {
+    let name = h
+        .sym_name(&a[0])
+        .filter(|n| {
+            matches!(
+                n.as_str(),
+                "ascii" | "eight-bit" | "iso-8859-1" | "ucs" | "unicode" | "unicode-bmp"
+            )
+        })
+        .ok_or_else(|| format!("wrong-type-argument: charsetp {}", h.print(&a[0], true)))?;
+    let code = decode_char_code_point(h, &a[1])?;
+    if !(0..=0xFFFF_FFFF).contains(&code) {
+        return Err(
+            "error: Not an in-range integer, integral float, or cons of integers".to_string(),
+        );
+    }
+    let ch = match name.as_str() {
+        "ascii" => (0..=0x7F).contains(&code).then_some(code),
+        "eight-bit" => (0x80..=0xFF).contains(&code).then_some(0x3F_FF00 + code),
+        "iso-8859-1" => (0..=0xFF).contains(&code).then_some(code),
+        "unicode-bmp" => (0..=0xFFFF).contains(&code).then_some(code),
+        // "ucs" | "unicode"
+        _ => (0..=0x10_FFFF).contains(&code).then_some(code),
+    };
+    Ok(ch.map(Value::Int).unwrap_or(Value::Undef))
+}
+
 /// `(emacs-pid)` — the process id of the running interpreter.
 fn emacs_pid(_h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(Value::Int(std::process::id() as i64))
@@ -5914,6 +5968,7 @@ pub fn install(h: &mut ElispHost) {
         Some(1),
         multibyte_char_to_unibyte,
     );
+    s("decode-char", 2, Some(2), decode_char);
     s("emacs-pid", 0, Some(0), emacs_pid);
     s("load-average", 0, Some(1), load_average);
     s("read", 1, Some(1), read_fn);
