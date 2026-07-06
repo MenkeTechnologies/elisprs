@@ -5187,6 +5187,26 @@ This is like the `&' operator of the C language."
       (t
        (set-default-toplevel-value symbol (eval exp)))))))
 
+;; custom.el:137
+(defvar custom-delayed-init-variables nil
+  "List of variables whose initialization is pending until startup.
+Once this list has been processed, this var is set to a non-list value.")
+
+;; custom.el:141
+(defun custom-initialize-delay (symbol value)
+  "Delay initialization of SYMBOL to the next Emacs start.
+This is used in files that are preloaded (or for autoloaded
+variables), so that the initialization is done in the run-time
+context rather than the build-time context."
+  ;; Defvar it so as to mark it special, etc (bug#25770).
+  (internal--define-uninitialized-variable symbol)
+  ;; Until the var is actually initialized, it is kept unbound.
+  (if (listp custom-delayed-init-variables)
+      (push symbol custom-delayed-init-variables)
+    ;; In case this is called after startup, there is no "later" to which to
+    ;; delay it, so initialize it "normally" (bug#47072).
+    (custom-initialize-reset symbol value)))
+
 ;; C subr (eval.c): mark SYMBOL special (dynamically bound) and record DOC,
 ;; without touching its value. Bare `(defvar SYMBOL)' marks special without
 ;; binding; the docstring lives on the `variable-documentation' property.
