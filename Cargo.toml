@@ -62,3 +62,10 @@ libc = "0.2"
 # backreferences (\1..\9) while keeping the linear `regex` crate fast path for
 # patterns that don't need it.
 fancy-regex = "0.14"
+# Deeply-nested reader input and deep Lisp recursion would overflow the fixed
+# 8 MiB OS thread stack (the reader is recursive-descent; each Lisp call runs a
+# nested fusevm VM). `stacker` grows the stack on demand on the SAME thread, so
+# the thread-local `ElispHost` stays reachable — Emacs's reader is likewise
+# unbounded, and Lisp recursion is bounded by `max-lisp-eval-depth`, not a
+# crash. rust-lang maintained, vendorable, durable.
+stacker = "0.1"
