@@ -2490,7 +2490,11 @@ impl ElispHost {
         // readable form, so re-read them into separate elements.
         if matches!(
             sym.as_str(),
-            "wrong-type-argument" | "args-out-of-range" | "void-variable" | "void-function"
+            "wrong-type-argument"
+                | "args-out-of-range"
+                | "void-variable"
+                | "void-function"
+                | "wrong-number-of-arguments"
         ) {
             if let Some(data) = self.read_all_forms(&msg) {
                 let s = self.intern(&sym);
@@ -2610,16 +2614,40 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
     // host borrow (which would deadlock the nested call).
     if let Some(name) = with_host(|h| h.sym_name(f)) {
         match name.as_str() {
-            "funcall" => return call_function(&args[0], &args[1..]),
-            "apply" => {
-                let mut a = args[1..args.len().saturating_sub(1)].to_vec();
-                if let Some(last) = args.last() {
-                    let tail = with_host(|h| h.list_vec(last)).ok_or("apply: not a list")?;
-                    a.extend(tail);
+            "funcall" => {
+                // `(funcall)` with no function designator: Emacs signals
+                // `(wrong-number-of-arguments funcall 0)`, not a panic.
+                if args.is_empty() {
+                    return Err("wrong-number-of-arguments: funcall 0".to_string());
                 }
+                return call_function(&args[0], &args[1..]);
+            }
+            "apply" => {
+                if args.is_empty() {
+                    return Err("wrong-number-of-arguments: apply 0".to_string());
+                }
+                // apply spreads its LAST argument, which must be a list; with a
+                // single argument that last IS `args[0]` (so `(apply '+)` fails
+                // with `(wrong-type-argument listp +)`, matching Emacs).
+                let spread = args.last().unwrap();
+                let tail = with_host(|h| h.list_vec(spread)).ok_or_else(|| {
+                    format!(
+                        "wrong-type-argument: listp {}",
+                        with_host(|h| h.print(spread, true))
+                    )
+                })?;
+                let mut a: Vec<Value> = if args.len() >= 2 {
+                    args[1..args.len() - 1].to_vec()
+                } else {
+                    Vec::new()
+                };
+                a.extend(tail);
                 return call_function(&args[0], &a);
             }
             "mapcar" => {
+                if args.len() < 2 {
+                    return Err(format!("wrong-number-of-arguments: mapcar {}", args.len()));
+                }
                 let seq = with_host(|h| h.seq_vec(&args[1])).ok_or("mapcar: not a sequence")?;
                 let mut out = Vec::with_capacity(seq.len());
                 for e in seq {
@@ -2628,6 +2656,9 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 return Ok(with_host(|h| h.list_from(out)));
             }
             "mapc" => {
+                if args.len() < 2 {
+                    return Err(format!("wrong-number-of-arguments: mapc {}", args.len()));
+                }
                 let seq = with_host(|h| h.seq_vec(&args[1])).ok_or("mapc: not a sequence")?;
                 for e in seq {
                     call_function(&args[0], &[e])?;
@@ -2640,6 +2671,9 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 // (sort SEQ &key :lessp :key :reverse), and (sort SEQ) which
                 // falls back to the default `value<` ordering. Re-enters elisp
                 // for PRED/:key so it lives here, not as a plain subr.
+                if args.is_empty() {
+                    return Err("wrong-number-of-arguments: sort 0".to_string());
+                }
                 let (items, was_vec) = with_host(|h| match h.obj(&args[0]) {
                     Some(Obj::Vector(v)) => (v.clone(), true),
                     _ => (h.list_vec(&args[0]).unwrap_or_default(), false),
@@ -2726,6 +2760,9 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 }));
             }
             "maphash" => {
+                if args.len() < 2 {
+                    return Err(format!("wrong-number-of-arguments: maphash {}", args.len()));
+                }
                 let entries = with_host(|h| match h.obj(&args[1]) {
                     Some(Obj::HashTable { entries, .. }) => Some(entries.clone()),
                     _ => None,

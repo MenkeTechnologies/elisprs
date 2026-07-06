@@ -1098,12 +1098,40 @@ fn format_radix(n: i64, radix: u32, upper: bool, alt: bool, prec: Option<usize>)
     format!("{sign}{prefix}{body}")
 }
 
+/// Rust's `core::fmt` stores a dynamic precision in a `u16`, so `format!` with
+/// a precision >= 65536 panics ("Formatting argument out of range"). Emacs (via
+/// C `printf`) accepts an arbitrary precision, padding past the value's exact
+/// decimal expansion with zeros. `FMT_PREC_CAP` is the largest precision Rust's
+/// formatter accepts; beyond it we render at the cap and append the remaining
+/// zeros ourselves, reproducing Emacs's output without the panic.
+const FMT_PREC_CAP: usize = 65535;
+
+/// A finite `f64`'s exact decimal expansion has at most ~1074 fractional (767
+/// significant) digits; past that every additional digit is `0`. `%g` trims
+/// trailing zeros, so any precision at or above this cap yields the identical
+/// trimmed string — clamping here keeps `format_g` under `FMT_PREC_CAP` without
+/// changing its output.
+const FMT_G_CAP: usize = 1100;
+
+/// `%f` body: `v` with exactly `prec` fractional digits, avoiding Rust's
+/// `u16`-precision panic for huge `prec` by rendering at `FMT_PREC_CAP` and
+/// zero-padding the tail (which C `printf`/Emacs also emit as zeros).
+fn format_fixed(v: f64, prec: usize) -> String {
+    if prec <= FMT_PREC_CAP {
+        format!("{:.*}", prec, v)
+    } else {
+        let mut s = format!("{:.*}", FMT_PREC_CAP, v);
+        s.push_str(&"0".repeat(prec - FMT_PREC_CAP));
+        s
+    }
+}
+
 /// C-style `%e`: a `prec`-digit mantissa, then `e`, a sign, and a ≥2-digit
 /// exponent (`1000.0` => `1.000000e+03`). Rust's `{:e}` omits the padding/sign.
 /// C-printf `%g`: pick `%e` or `%f` by the decimal exponent, with PREC
 /// significant digits; trailing zeros are trimmed unless `alt` (the `#` flag).
 fn format_g(v: f64, prec: usize, alt: bool) -> String {
-    let p = prec.max(1);
+    let p = prec.clamp(1, FMT_G_CAP);
     let strip = |mant: &str| -> String {
         if mant.contains('.') {
             mant.trim_end_matches('0').trim_end_matches('.').to_string()
@@ -1139,7 +1167,22 @@ fn format_g(v: f64, prec: usize, alt: bool) -> String {
     }
 }
 fn format_e(v: f64, prec: usize) -> String {
-    let s = format!("{:.*e}", prec, v);
+    // Beyond FMT_PREC_CAP, render the mantissa at the cap and zero-pad the extra
+    // fractional digits before the exponent (Rust's u16 precision would panic).
+    let s = if prec <= FMT_PREC_CAP {
+        format!("{:.*e}", prec, v)
+    } else {
+        let capped = format!("{:.*e}", FMT_PREC_CAP, v);
+        match capped.find('e') {
+            Some(epos) => {
+                let mut m = capped[..epos].to_string();
+                m.push_str(&"0".repeat(prec - FMT_PREC_CAP));
+                m.push_str(&capped[epos..]);
+                m
+            }
+            None => capped,
+        }
+    };
     match s.find('e') {
         Some(epos) => {
             let (mant, rest) = s.split_at(epos);
@@ -1336,7 +1379,7 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
                 if v.is_finite() {
                     let raw = match conv {
                         'e' => format_e(v, spec.prec.unwrap_or(6)),
-                        'f' => format!("{:.*}", spec.prec.unwrap_or(6), v),
+                        'f' => format_fixed(v, spec.prec.unwrap_or(6)),
                         _ => format_g(v, spec.prec.unwrap_or(6), spec.alt),
                     };
                     apply_sign(raw, &spec)
