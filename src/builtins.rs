@@ -895,6 +895,24 @@ fn indirect_function(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(cur)
 }
+/// `(defvaralias NEW-ALIAS BASE-VARIABLE &optional DOCSTRING)` — make NEW-ALIAS a
+/// variable alias for BASE-VARIABLE: value operations on either affect both. The
+/// optional DOCSTRING is accepted and ignored (no interactive doc store). Returns
+/// BASE-VARIABLE.
+fn defvaralias(h: &mut ElispHost, a: &[Value]) -> R {
+    h.defvaralias(&a[0], &a[1])
+}
+/// `(indirect-variable OBJECT)` — follow the `defvaralias` chain from OBJECT to the
+/// base variable symbol, or return OBJECT unchanged when it is not a symbol.
+fn indirect_variable(h: &mut ElispHost, a: &[Value]) -> R {
+    match &a[0] {
+        Value::Obj(id) => {
+            let base = h.indirect_var(*id);
+            Ok(Value::Obj(base))
+        }
+        _ => Ok(a[0].clone()),
+    }
+}
 /// `(boundp SYMBOL)` — non-nil if SYMBOL currently has a value.
 fn boundp(h: &mut ElispHost, a: &[Value]) -> R {
     // nil and t are always bound; otherwise the value cell must resolve.
@@ -5399,6 +5417,8 @@ pub fn install(h: &mut ElispHost) {
     s("default-toplevel-value", 1, Some(1), default_toplevel_value);
     s("bare-symbol-p", 1, Some(1), bare_symbol_p);
     s("makunbound", 1, Some(1), makunbound);
+    s("defvaralias", 2, Some(3), defvaralias);
+    s("indirect-variable", 1, Some(1), indirect_variable);
     s("sha1", 1, Some(4), sha1_fn);
     s("md5", 1, Some(5), md5_fn);
     s("secure-hash", 2, Some(5), secure_hash);

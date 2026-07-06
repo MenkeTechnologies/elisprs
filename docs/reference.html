@@ -1340,6 +1340,18 @@
 </code></pre>
         <p>Inverse of decode-time: turn decoded components into a (HIGH LOW) time value.</p>
       </article>
+      <article class="doc-entry" id="doc-defvaralias">
+        <h3><a class="doc-anchor" href="#doc-defvaralias">#</a> <code>defvaralias</code></h3>
+        <pre><code class="lang-elisp">(defvaralias NEW-ALIAS BASE-VARIABLE &amp;optional DOCSTRING)
+</code></pre>
+        <p>Make NEW-ALIAS a variable alias for BASE-VARIABLE: value operations on either affect both. Returns BASE-VARIABLE.</p>
+      </article>
+      <article class="doc-entry" id="doc-indirect-variable">
+        <h3><a class="doc-anchor" href="#doc-indirect-variable">#</a> <code>indirect-variable</code></h3>
+        <pre><code class="lang-elisp">(indirect-variable OBJECT)
+</code></pre>
+        <p>Follow the `defvaralias&#39; chain from OBJECT to the base variable symbol, or return OBJECT if it is not a symbol.</p>
+      </article>
       <article class="doc-entry" id="doc-sha1">
         <h3><a class="doc-anchor" href="#doc-sha1">#</a> <code>sha1</code></h3>
         <pre><code class="lang-elisp">(sha1 OBJECT &amp;optional START END BINARY)
@@ -1531,18 +1543,6 @@
         <pre><code class="lang-elisp">(process-lines PROGRAM &amp;rest ARGS)
 </code></pre>
         <p>Run PROGRAM with ARGS and return its output as a list of lines.</p>
-      </article>
-      <article class="doc-entry" id="doc-buffer-push">
-        <h3><a class="doc-anchor" href="#doc-buffer-push">#</a> <code>--buffer-push--</code></h3>
-        <pre><code class="lang-elisp">(--buffer-push--)
-</code></pre>
-        <p>Internal: push a fresh edit buffer onto the buffer stack.</p>
-      </article>
-      <article class="doc-entry" id="doc-buffer-pop">
-        <h3><a class="doc-anchor" href="#doc-buffer-pop">#</a> <code>--buffer-pop--</code></h3>
-        <pre><code class="lang-elisp">(--buffer-pop--)
-</code></pre>
-        <p>Internal: pop the current edit buffer off the buffer stack.</p>
       </article>
       <article class="doc-entry" id="doc-insert">
         <h3><a class="doc-anchor" href="#doc-insert">#</a> <code>insert</code></h3>

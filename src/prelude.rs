@@ -709,6 +709,18 @@ Return t if there isn't any."
   `(progn
      (defalias ,obsolete-name ,current-name ,docstring)
      (make-obsolete ,obsolete-name ,current-name ,when)))
+(defmacro define-obsolete-variable-alias (obsolete-name current-name when &optional docstring)
+  "Make OBSOLETE-NAME a variable alias for CURRENT-NAME and mark it obsolete.
+Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
+  (declare (doc-string 4) (indent defun))
+  `(progn
+     (defvaralias ,obsolete-name ,current-name ,docstring)
+     ;; See Bug#4706.
+     (dolist (prop '(saved-value saved-variable-comment))
+       (and (get ,obsolete-name prop)
+            (null (get ,current-name prop))
+            (put ,current-name prop (get ,obsolete-name prop))))
+     (make-obsolete-variable ,obsolete-name ,current-name ,when)))
 ;; eval-after-load (subr.el): register FORM to run after FILE loads; run now if
 ;; FILE (a feature symbol) is already provided.  The string-file regexp path and
 ;; the fire-on-future-load path are the after-load subsystem (not wired); the
@@ -2245,6 +2257,7 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (define-error 'invalid-function "Invalid function")
 (define-error 'wrong-length-argument "Wrong length argument")
 (define-error 'invalid-regexp "Invalid regexp")
+(define-error 'cyclic-variable-indirection "Cyclic variable indirection")
 (define-error 'cl-assertion-failed "Assertion failed")
 (define-error 'end-of-file "End of file during parsing")
 (defun add-to-list (var elt &optional append compare-fn)
@@ -5521,6 +5534,68 @@ over the one current buffer's syntax-table slot.)"
              (set-syntax-table ,table)
              ,@body)
          (set-syntax-table ,old-table)))))
+
+;; ---- Lisp-mode syntax tables (lisp-mode.el / elisp-mode.el) ----
+;; Pure make-syntax-table + modify-syntax-entry constructions; ported verbatim so
+;; libraries that base their own parse tables on them (ietf-drums, rfc2047, the
+;; url-* parsers, mail-parse) load with the exact upstream syntax classes.
+(defvar lisp-data-mode-syntax-table
+  (let ((table (make-syntax-table))
+        (i 0))
+    (while (< i ?0)
+      (modify-syntax-entry i "_   " table)
+      (setq i (1+ i)))
+    (setq i (1+ ?9))
+    (while (< i ?A)
+      (modify-syntax-entry i "_   " table)
+      (setq i (1+ i)))
+    (setq i (1+ ?Z))
+    (while (< i ?a)
+      (modify-syntax-entry i "_   " table)
+      (setq i (1+ i)))
+    (setq i (1+ ?z))
+    (while (< i 128)
+      (modify-syntax-entry i "_   " table)
+      (setq i (1+ i)))
+    (modify-syntax-entry ?\s "    " table)
+    ;; Non-break space acts as whitespace.
+    (modify-syntax-entry ?\xa0 "    " table)
+    (modify-syntax-entry ?\t "    " table)
+    (modify-syntax-entry ?\f "    " table)
+    (modify-syntax-entry ?\n ">   " table)
+    (modify-syntax-entry ?\; "<   " table)
+    (modify-syntax-entry ?` "'   " table)
+    (modify-syntax-entry ?' "'   " table)
+    (modify-syntax-entry ?, "'   " table)
+    (modify-syntax-entry ?@ "_ p" table)
+    ;; Used to be singlequote; changed for flonums.
+    (modify-syntax-entry ?. "_   " table)
+    (modify-syntax-entry ?# "'   " table)
+    (modify-syntax-entry ?\" "\"    " table)
+    (modify-syntax-entry ?\\ "\\   " table)
+    (modify-syntax-entry ?\( "()  " table)
+    (modify-syntax-entry ?\) ")(  " table)
+    (modify-syntax-entry ?\[ "(]" table)
+    (modify-syntax-entry ?\] ")[" table)
+    table)
+  "Parent syntax table used in Lisp modes.")
+
+(defvar lisp-mode-syntax-table
+  (let ((table (make-syntax-table lisp-data-mode-syntax-table)))
+    (modify-syntax-entry ?\[ "_   " table)
+    (modify-syntax-entry ?\] "_   " table)
+    (modify-syntax-entry ?# "' 14" table)
+    (modify-syntax-entry ?| "\" 23bn" table)
+    table)
+  "Syntax table used in `lisp-mode'.")
+
+(defvar emacs-lisp-mode-syntax-table
+  (let ((table (make-syntax-table lisp-data-mode-syntax-table)))
+    ;; Remove the "p" flag from the entry of `@' because we use instead
+    ;; `syntax-propertize' to take care of `,@', which is more precise.
+    (modify-syntax-entry ?@ "_" table)
+    table)
+  "Syntax table used in `emacs-lisp-mode'.")
 
 ;; Abbrev table placeholder (boundary: the abbrev/obarray subsystem is not
 ;; modeled).  An abbrev table is a plain vector here rather than a real obarray.

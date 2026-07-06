@@ -41,6 +41,8 @@ pub enum SerObj {
         special: bool,
         #[serde(default)]
         buffer_local_auto: bool,
+        #[serde(default)]
+        alias_of: Option<u32>,
     },
     Vector(Vec<Value>),
     HashTable {
@@ -148,6 +150,10 @@ pub struct SymbolData {
     /// no local binding yet automatically creates one (Emacs "automatically
     /// buffer-local"). Persisted in the AOT heap image so a cache hit keeps it.
     pub buffer_local_auto: bool,
+    /// Set by `defvaralias`: this symbol is a variable alias forwarding all value
+    /// operations to the base symbol at this arena handle (Emacs `SYMBOL_VARALIAS`).
+    /// `None` for an ordinary variable. Chains are followed by `indirect_var`.
+    pub alias_of: Option<u32>,
 }
 
 pub enum Obj {
@@ -519,6 +525,7 @@ impl ElispHost {
             function: None,
             special: false,
             buffer_local_auto: false,
+            alias_of: None,
         }));
         self.obarray.insert(name.to_string(), id);
         Value::Obj(id)
@@ -532,6 +539,7 @@ impl ElispHost {
             function: None,
             special: false,
             buffer_local_auto: false,
+            alias_of: None,
         }))
     }
     pub fn obj(&self, v: &Value) -> Option<&Obj> {
@@ -607,8 +615,74 @@ impl ElispHost {
     }
 
     // ── symbol cells (dynamic / value cell) ──
+    /// Follow the `defvaralias` chain from SYM's handle to the base variable's
+    /// handle (Emacs `indirect_variable`). Ordinary variables resolve to
+    /// themselves. Bounded to break any accidental cycle.
+    pub fn indirect_var(&self, id: u32) -> u32 {
+        let mut cur = id;
+        for _ in 0..64 {
+            match self.arena.get(cur as usize) {
+                Some(Obj::Symbol(s)) => match s.alias_of {
+                    Some(base) if base != cur => cur = base,
+                    _ => return cur,
+                },
+                _ => return cur,
+            }
+        }
+        cur
+    }
+    /// `(defvaralias ALIAS BASE)` — make ALIAS forward all value operations to
+    /// BASE (Emacs `Fdefvaralias`). If BASE is unbound and ALIAS holds a value,
+    /// BASE inherits it; BASE (and thus ALIAS) becomes special. Returns BASE.
+    /// Signals `cyclic-variable-indirection` if the alias chain would loop.
+    pub fn defvaralias(&mut self, alias: &Value, base: &Value) -> Result<Value, String> {
+        let aid = self.sym_handle(alias).ok_or("defvaralias: not a symbol")?;
+        let bid = self.sym_handle(base).ok_or("defvaralias: not a symbol")?;
+        // Reject a chain that would make BASE indirect back to ALIAS.
+        let mut probe = bid;
+        for _ in 0..64 {
+            if probe == aid {
+                return Err(format!(
+                    "cyclic-variable-indirection: {}",
+                    self.sym_name(alias).unwrap_or_default()
+                ));
+            }
+            match self.arena.get(probe as usize) {
+                Some(Obj::Symbol(s)) => match s.alias_of {
+                    Some(next) if next != probe => probe = next,
+                    _ => break,
+                },
+                _ => break,
+            }
+        }
+        let base_id = self.indirect_var(bid);
+        // If BASE is void but ALIAS has a value, BASE inherits ALIAS's value.
+        let base_void =
+            matches!(self.arena.get(base_id as usize), Some(Obj::Symbol(s)) if s.value.is_none());
+        if base_void {
+            let alias_val = match self.arena.get(aid as usize) {
+                Some(Obj::Symbol(s)) => s.value.clone(),
+                _ => None,
+            };
+            if let Some(val) = alias_val {
+                if let Obj::Symbol(s) = &mut self.arena[base_id as usize] {
+                    s.value = Some(val);
+                }
+            }
+        }
+        // Aliased variables are special (Emacs marks the base variable forwarded).
+        if let Obj::Symbol(s) = &mut self.arena[base_id as usize] {
+            s.special = true;
+        }
+        if let Obj::Symbol(s) = &mut self.arena[aid as usize] {
+            s.alias_of = Some(base_id);
+            s.special = true;
+        }
+        Ok(base.clone())
+    }
     pub fn set_value(&mut self, v: &Value, val: Value) -> Result<(), String> {
-        let id = self.sym_handle(v).ok_or("set: not a symbol")?;
+        let id0 = self.sym_handle(v).ok_or("set: not a symbol")?;
+        let id = self.indirect_var(id0);
         // A lexical binding shadows both the buffer-local and global cells.
         if self.lex.as_ref().is_some_and(|s| s.set(id, &val)) {
             return Ok(());
@@ -635,9 +709,10 @@ impl ElispHost {
     /// default), snapshotting it; a void default yields a void local. No-op if a
     /// local already exists. Returns SYM.
     pub fn make_local_variable(&mut self, v: &Value) -> Result<Value, String> {
-        let id = self
+        let id0 = self
             .sym_handle(v)
             .ok_or("make-local-variable: not a symbol")?;
+        let id = self.indirect_var(id0);
         let bi = self.cur_buf_idx();
         if !self.buffers[bi].locals.contains_key(&id) {
             let snapshot = match &self.arena[id as usize] {
@@ -651,9 +726,10 @@ impl ElispHost {
     /// `(make-variable-buffer-local SYM)` — mark SYM automatically buffer-local
     /// (and special, like Emacs). Returns SYM.
     pub fn make_variable_buffer_local(&mut self, v: &Value) -> Result<Value, String> {
-        let id = self
+        let id0 = self
             .sym_handle(v)
             .ok_or("make-variable-buffer-local: not a symbol")?;
+        let id = self.indirect_var(id0);
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.buffer_local_auto = true;
             s.special = true;
@@ -664,7 +740,9 @@ impl ElispHost {
     /// current buffer.
     pub fn local_variable_p(&self, v: &Value) -> bool {
         match self.sym_handle(v) {
-            Some(id) => self.buffers[self.cur_buf_idx()].locals.contains_key(&id),
+            Some(id) => self.buffers[self.cur_buf_idx()]
+                .locals
+                .contains_key(&self.indirect_var(id)),
             None => false,
         }
     }
@@ -672,7 +750,8 @@ impl ElispHost {
     /// buffer or would become local when set (automatically buffer-local).
     pub fn local_variable_if_set_p(&self, v: &Value) -> bool {
         match self.sym_handle(v) {
-            Some(id) => {
+            Some(id0) => {
+                let id = self.indirect_var(id0);
                 self.buffers[self.cur_buf_idx()].locals.contains_key(&id) || self.is_auto_local(id)
             }
             None => false,
@@ -681,7 +760,8 @@ impl ElispHost {
     /// `(kill-local-variable SYM)` — remove the current buffer's local binding for
     /// SYM (the default becomes effective again). Returns SYM.
     pub fn kill_local_variable(&mut self, v: &Value) -> Result<Value, String> {
-        if let Some(id) = self.sym_handle(v) {
+        if let Some(id0) = self.sym_handle(v) {
+            let id = self.indirect_var(id0);
             let bi = self.cur_buf_idx();
             self.buffers[bi].locals.remove(&id);
         }
@@ -712,7 +792,8 @@ impl ElispHost {
     /// a buffer's variable, not the caller's scope). `buf_idx` is BUFFER's slot; the
     /// caller resolves it (defaulting to the current buffer).
     pub fn buffer_local_or_default(&self, v: &Value, buf_idx: usize) -> Result<Value, String> {
-        if let Some(id) = self.sym_handle(v) {
+        if let Some(id0) = self.sym_handle(v) {
+            let id = self.indirect_var(id0);
             if let Some(slot) = self.buffers[buf_idx].locals.get(&id) {
                 return slot.clone().ok_or_else(|| {
                     format!("void-variable: {}", self.sym_name(v).unwrap_or_default())
@@ -724,14 +805,16 @@ impl ElispHost {
     /// Clear a symbol's global value cell (`makunbound`). Lexical bindings are
     /// left untouched — they shadow the cell and unwind on their own.
     pub fn unset_value(&mut self, v: &Value) -> Result<(), String> {
-        let id = self.sym_handle(v).ok_or("makunbound: not a symbol")?;
+        let id0 = self.sym_handle(v).ok_or("makunbound: not a symbol")?;
+        let id = self.indirect_var(id0);
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.value = None;
         }
         Ok(())
     }
     pub fn get_value(&self, v: &Value) -> Result<Value, String> {
-        if let Some(id) = self.sym_handle(v) {
+        if let Some(id0) = self.sym_handle(v) {
+            let id = self.indirect_var(id0);
             // Precedence: lexical binding, then the current buffer's local
             // binding, then the global (default) value cell.
             if let Some(val) = self.lex.as_ref().and_then(|s| s.lookup(id)) {
@@ -742,17 +825,18 @@ impl ElispHost {
                     format!("void-variable: {}", self.sym_name(v).unwrap_or_default())
                 });
             }
-        }
-        match self.obj(v) {
-            Some(Obj::Symbol(s)) => s
-                .value
-                .clone()
-                .ok_or_else(|| format!("void-variable: {}", s.name)),
-            _ => match v {
-                Value::Bool(true) => Ok(Value::Bool(true)),
-                Value::Undef => Ok(Value::Undef),
+            return match &self.arena[id as usize] {
+                Obj::Symbol(s) => s
+                    .value
+                    .clone()
+                    .ok_or_else(|| format!("void-variable: {}", s.name)),
                 _ => Err("not a symbol".to_string()),
-            },
+            };
+        }
+        match v {
+            Value::Bool(true) => Ok(Value::Bool(true)),
+            Value::Undef => Ok(Value::Undef),
+            _ => Err("not a symbol".to_string()),
         }
     }
     /// Index of the current buffer.
@@ -762,26 +846,37 @@ impl ElispHost {
     /// The global (default) value cell, bypassing lexical and buffer-local
     /// bindings — the reader used by `default-value`/`default-boundp`.
     pub fn raw_global_value(&self, v: &Value) -> Result<Value, String> {
-        match self.obj(v) {
-            Some(Obj::Symbol(s)) => s
-                .value
-                .clone()
-                .ok_or_else(|| format!("void-variable: {}", s.name)),
-            _ => match v {
-                Value::Bool(true) => Ok(Value::Bool(true)),
-                Value::Undef => Ok(Value::Undef),
+        if let Some(id0) = self.sym_handle(v) {
+            let id = self.indirect_var(id0);
+            return match &self.arena[id as usize] {
+                Obj::Symbol(s) => s
+                    .value
+                    .clone()
+                    .ok_or_else(|| format!("void-variable: {}", s.name)),
                 _ => Err("not a symbol".to_string()),
-            },
+            };
+        }
+        match v {
+            Value::Bool(true) => Ok(Value::Bool(true)),
+            Value::Undef => Ok(Value::Undef),
+            _ => Err("not a symbol".to_string()),
         }
     }
     /// True if the global (default) value cell is bound (`default-boundp`).
     pub fn default_boundp_raw(&self, v: &Value) -> bool {
-        matches!(self.obj(v), Some(Obj::Symbol(s)) if s.value.is_some())
+        match self.sym_handle(v) {
+            Some(id0) => {
+                let id = self.indirect_var(id0);
+                matches!(self.arena.get(id as usize), Some(Obj::Symbol(s)) if s.value.is_some())
+            }
+            None => false,
+        }
     }
     /// Write the global (default) value cell directly (`set-default`), bypassing
     /// lexical and buffer-local bindings.
     pub fn set_raw_global(&mut self, v: &Value, val: Value) -> Result<(), String> {
-        let id = self.sym_handle(v).ok_or("set-default: not a symbol")?;
+        let id0 = self.sym_handle(v).ok_or("set-default: not a symbol")?;
+        let id = self.indirect_var(id0);
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.value = Some(val);
         }
@@ -801,7 +896,7 @@ impl ElispHost {
     /// True if V is a symbol marked special (defvar/defconst), for `special-variable-p`.
     pub fn symbol_special(&self, v: &Value) -> bool {
         self.sym_handle(v)
-            .map(|id| self.is_special(id))
+            .map(|id| self.is_special(self.indirect_var(id)))
             .unwrap_or(false)
     }
     pub fn set_function_value(&mut self, sym: &Value, def: Value) -> Result<(), String> {
@@ -837,7 +932,13 @@ impl ElispHost {
         self.set_function(name, subr);
     }
     pub fn is_bound(&self, v: &Value) -> bool {
-        matches!(self.obj(v), Some(Obj::Symbol(s)) if s.value.is_some())
+        match self.sym_handle(v) {
+            Some(id0) => {
+                let id = self.indirect_var(id0);
+                matches!(self.arena.get(id as usize), Some(Obj::Symbol(s)) if s.value.is_some())
+            }
+            None => false,
+        }
     }
     pub fn is_fbound(&self, v: &Value) -> bool {
         matches!(self.obj(v), Some(Obj::Symbol(s)) if s.function.is_some())
@@ -848,7 +949,8 @@ impl ElispHost {
         self.specstack.len()
     }
     pub fn specbind(&mut self, sym: &Value, val: Value) -> Result<(), String> {
-        let id = self.sym_handle(sym).ok_or("cannot bind a non-symbol")?;
+        let id0 = self.sym_handle(sym).ok_or("cannot bind a non-symbol")?;
+        let id = self.indirect_var(id0);
         let bi = self.cur_buf_idx();
         // `let` over a buffer-local variable rebinds the current buffer's local
         // slot (Emacs SPECPDL_LET_LOCAL), not the global default.
@@ -1111,6 +1213,7 @@ impl ElispHost {
                     function: s.function.clone(),
                     special: s.special,
                     buffer_local_auto: s.buffer_local_auto,
+                    alias_of: s.alias_of,
                 },
                 Obj::Vector(v) => SerObj::Vector(v.clone()),
                 Obj::HashTable { test, entries } => SerObj::HashTable {
@@ -1133,6 +1236,7 @@ impl ElispHost {
                     function: None,
                     special: false,
                     buffer_local_auto: false,
+                    alias_of: None,
                 },
                 Obj::Closure {
                     params,
@@ -1153,6 +1257,7 @@ impl ElispHost {
                     function: None,
                     special: false,
                     buffer_local_auto: false,
+                    alias_of: None,
                 },
             })
             .collect()
@@ -1230,6 +1335,7 @@ impl ElispHost {
                             function: s.function.clone(),
                             special: s.special,
                             buffer_local_auto: s.buffer_local_auto,
+                            alias_of: s.alias_of,
                         }
                     }
                     Obj::Cons(a, b) => SerObj::Cons(a.clone(), b.clone()),
@@ -1252,6 +1358,7 @@ impl ElispHost {
                         function: None,
                         special: false,
                         buffer_local_auto: false,
+                        alias_of: None,
                     },
                     Obj::Closure {
                         params,
@@ -1271,6 +1378,7 @@ impl ElispHost {
                         function: None,
                         special: false,
                         buffer_local_auto: false,
+                        alias_of: None,
                     },
                 }
             })
@@ -1289,6 +1397,7 @@ impl ElispHost {
                     function,
                     special,
                     buffer_local_auto,
+                    alias_of,
                 } => {
                     self.obarray.insert(name.clone(), id);
                     Obj::Symbol(SymbolData {
@@ -1297,6 +1406,7 @@ impl ElispHost {
                         function,
                         special,
                         buffer_local_auto,
+                        alias_of,
                     })
                 }
                 SerObj::Vector(v) => Obj::Vector(v),

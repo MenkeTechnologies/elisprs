@@ -914,6 +914,18 @@ pub const SUBRS: &[Entry] = &[
         doc: "Chase symbol function cells from OBJECT to the underlying function.",
     },
     Entry {
+        name: "defvaralias",
+        kind: Kind::Function,
+        sig: "(defvaralias NEW-ALIAS BASE-VARIABLE &optional DOCSTRING)",
+        doc: "Make NEW-ALIAS a variable alias for BASE-VARIABLE: value operations on either affect both. Returns BASE-VARIABLE.",
+    },
+    Entry {
+        name: "indirect-variable",
+        kind: Kind::Function,
+        sig: "(indirect-variable OBJECT)",
+        doc: "Follow the `defvaralias' chain from OBJECT to the base variable symbol, or return OBJECT if it is not a symbol.",
+    },
+    Entry {
         name: "func-arity",
         kind: Kind::Function,
         sig: "(func-arity FUNCTION)",
