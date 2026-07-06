@@ -5692,6 +5692,36 @@ included; callers should bind `case-fold-search' to t."
   :version "30.1"
   :group 'processes)
 
+;;; ---- files.el pure-data regexps ----
+;; files.el:1180 `locate-dominating-stop-dir-regexp': a plain `defvar' whose
+;; value is a fixed, build-independent regexp string (purecopy'd in the C tree).
+;; Read by `locate-dominating-file' to decide which directory names terminate an
+;; upward search. Ported value-for-value from GNU Emacs 30.2 files.el.
+(defvar locate-dominating-stop-dir-regexp
+  (purecopy "\\`\\(?:[\\/][\\/][^\\/]+[\\/]\\|/\\(?:net\\|afs\\|\\.\\.\\.\\)/\\)\\'")
+  "Regexp of directory names that stop the search in `locate-dominating-file'.
+Any directory whose name matches this regexp will be treated like
+a kind of root directory by `locate-dominating-file', which will stop its
+search when it bumps into it.
+The default regexp prevents fruitless and time-consuming attempts to find
+special files in directories in which file names are interpreted as host names,
+or mount points potentially requiring authentication as a different user.")
+;; files.el:1722 `mounted-file-systems': a `defcustom' regexp. The standard
+;; value is platform-conditional; the `if' is kept intact so the value is
+;; correct on any `system-type' (Windows/Cygwin get "^//[^/]+/", the rest get
+;; the regexp-opt-precomputed alternation). Ported value-for-value; oracle on
+;; darwin yields the else branch. `:require 'regexp-opt' is honored by
+;; `custom-declare-variable' (pushed onto its requests list).
+(defcustom mounted-file-systems
+  (if (memq system-type '(windows-nt cygwin))
+      "^//[^/]+/"
+    "^\\(?:/\\(?:afs/\\|m\\(?:edia/\\|nt\\)\\|\\(?:ne\\|tmp_mn\\)t/\\)\\)")
+  "File systems that ought to be mounted."
+  :group 'files
+  :version "26.1"
+  :require 'regexp-opt
+  :type 'regexp)
+
 ;;; ---- per-user Emacs file location (files.el / startup.el) ----
 ;; startup.el:597 sets `user-emacs-directory' at startup; the defvar itself is
 ;; nil ("The value does not matter since Emacs sets this at startup").  elisprs
