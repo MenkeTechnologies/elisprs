@@ -4166,6 +4166,25 @@ fn system_type(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(h.intern(sym))
 }
 
+// `system-name' (Fsystem_name, editfns.c): return the host name of the machine
+// as a string. Emacs caches Vsystem_name from gethostname(2) at init; we query
+// it directly. gethostname failure is effectively unreachable; the "unknown"
+// fallback mirrors Emacs's own default when the host name is unavailable.
+fn system_name(_h: &mut ElispHost, _a: &[Value]) -> R {
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return Ok(Value::str("unknown"));
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    if end == 0 {
+        return Ok(Value::str("unknown"));
+    }
+    Ok(Value::str(
+        String::from_utf8_lossy(&buf[..end]).into_owned(),
+    ))
+}
+
 /// Raw temp-dir string behind Emacs C `Vtemporary_file_directory`
 /// (callproc.c `init_callproc`). The caller wraps this in
 /// `file-name-as-directory`, exactly as the C does (`build_string` then
@@ -5743,6 +5762,7 @@ pub fn install(h: &mut ElispHost) {
     s("subr-name", 1, Some(1), subr_name);
     s("--current-directory--", 0, Some(0), current_directory);
     s("--system-type--", 0, Some(0), system_type);
+    s("system-name", 0, Some(0), system_name);
     s("--temp-directory--", 0, Some(0), temp_directory);
     s("file-exists-p", 1, Some(1), file_exists_p);
     s("file-directory-p", 1, Some(1), file_directory_p);

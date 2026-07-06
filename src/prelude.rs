@@ -35,6 +35,14 @@ pub const PRELUDE: &str = r#"
 (defconst emacs-minor-version
   (progn (string-match "^[0-9]+\\.\\([0-9]+\\)" emacs-version)
          (string-to-number (match-string 1 emacs-version))))
+;; `emacs-build-system'/`emacs-build-time'/`emacs-build-number' are defined in
+;; lisp/version.el exactly like this (minus the Android build branches, which
+;; never apply here); kept here because version.el is not preloaded. Because
+;; `emacs-build-system' is non-nil, `emacs-build-time' evaluates to a
+;; `current-time' timestamp, matching a normally-dumped `emacs -Q --batch'.
+(defconst emacs-build-system (system-name))
+(defconst emacs-build-time (if emacs-build-system (current-time)))
+(defconst emacs-build-number 1)
 ;; `system-type' (Vsystem_type) is platform-derived; the Rust primitive maps the
 ;; running OS to Emacs's symbol (darwin/gnu-linux/berkeley-unix/windows-nt).
 (defvar system-type (--system-type--))
