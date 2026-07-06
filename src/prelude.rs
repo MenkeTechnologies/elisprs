@@ -41,6 +41,8 @@ pub const PRELUDE: &str = r#"
 ;; No GUI and non-interactive batch execution, matching `emacs -Q --batch'.
 (defvar window-system nil)
 (defvar noninteractive t)
+;; `temporary-file-directory' is defined below, right after
+;; `file-name-as-directory', which its initializer depends on.
 
 ;;; ---- numeric helpers ----
 ;; Fixnum bounds match GNU Emacs on a 64-bit build (62-bit tagged integers).
@@ -2723,6 +2725,17 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
   (cond ((string= f "") "./")
         ((eq (aref f (1- (length f))) ?/) f)
         (t (concat f "/"))))
+;; `temporary-file-directory' (Vtemporary_file_directory, callproc.c
+;; `init_callproc') is a C variable read at load time by stock lisp (files.el,
+;; jka-compr.el, url-*.el, ...). The Rust primitive returns the raw dir
+;; ($TMPDIR if present -- even empty -- else the macOS Darwin per-user temp dir
+;; from confstr(_CS_DARWIN_USER_TEMP_DIR), else "/tmp/"); `file-name-as-directory'
+;; adds the trailing slash exactly as the C `Ffile_name_as_directory' call does.
+;; Values verified against GNU Emacs 30.2 for TMPDIR set/unset/empty.
+(defvar temporary-file-directory
+  (file-name-as-directory (--temp-directory--)))
+;; No separate small-file temp dir by default, matching `emacs -Q'.
+(defvar small-temporary-file-directory nil)
 (defun directory-file-name (f)
   (if (and (> (length f) 1) (eq (aref f (1- (length f))) ?/))
       (substring f 0 (1- (length f)))

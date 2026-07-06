@@ -4045,6 +4045,43 @@ fn system_type(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(h.intern(sym))
 }
 
+/// Raw temp-dir string behind Emacs C `Vtemporary_file_directory`
+/// (callproc.c `init_callproc`). The caller wraps this in
+/// `file-name-as-directory`, exactly as the C does (`build_string` then
+/// `Ffile_name_as_directory`). Resolution order matches Emacs:
+///   1. `$TMPDIR` if present in the environment — even when empty, so an empty
+///      `TMPDIR` yields `""` which `file-name-as-directory` turns into `"./"`.
+///   2. otherwise on macOS the per-user Darwin temp dir from
+///      `confstr(_CS_DARWIN_USER_TEMP_DIR)` (e.g. `/var/folders/.../T/`).
+///   3. otherwise `"/tmp/"`.
+fn temp_directory(_h: &mut ElispHost, _a: &[Value]) -> R {
+    // `std::env::var` returns Ok("") when TMPDIR is set but empty, and
+    // Err(NotPresent) only when it is absent — matching Emacs's `egetenv`
+    // "non-NULL means present" test.
+    if let Ok(v) = std::env::var("TMPDIR") {
+        return Ok(Value::str(v));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0u8; 1024];
+        let n = unsafe {
+            libc::confstr(
+                libc::_CS_DARWIN_USER_TEMP_DIR,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+            )
+        };
+        // confstr returns the byte length including the trailing NUL; 0 means
+        // the name is unknown, > buf.len() means it was truncated.
+        if n > 1 && n <= buf.len() {
+            if let Ok(s) = std::str::from_utf8(&buf[..n - 1]) {
+                return Ok(Value::str(s.to_string()));
+            }
+        }
+    }
+    Ok(Value::str("/tmp/".to_string()))
+}
+
 // ── filesystem (read-only queries) ──
 /// Expand a leading `~/` against $HOME; relative paths resolve against the
 /// process cwd (= `default-directory`), as elisp expects.
@@ -5582,6 +5619,7 @@ pub fn install(h: &mut ElispHost) {
     s("subr-name", 1, Some(1), subr_name);
     s("--current-directory--", 0, Some(0), current_directory);
     s("--system-type--", 0, Some(0), system_type);
+    s("--temp-directory--", 0, Some(0), temp_directory);
     s("file-exists-p", 1, Some(1), file_exists_p);
     s("file-directory-p", 1, Some(1), file_directory_p);
     s("file-regular-p", 1, Some(1), file_regular_p);
