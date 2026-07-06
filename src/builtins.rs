@@ -4000,6 +4000,22 @@ fn file_symlink_p(_h: &mut ElispHost, a: &[Value]) -> R {
         Err(_) => Ok(Value::Undef),
     }
 }
+fn file_executable_p(_h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(fs_access(
+        &fs_expand(&as_string(&a[0])?),
+        libc::X_OK,
+    )))
+}
+/// Internal: absolute path of the running `elisp` binary, backing
+/// `invocation-name'/`invocation-directory'/`exec-directory'. Falls back to the
+/// bare name `"elisp"` if the OS cannot report the executable path.
+fn invocation_file(_h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::str(
+        std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "elisp".to_string()),
+    ))
+}
 fn directory_files_raw(h: &mut ElispHost, a: &[Value]) -> R {
     let raw = as_string(&a[0])?;
     let match_re = match a.get(1) {
@@ -5477,6 +5493,8 @@ pub fn install(h: &mut ElispHost) {
     s("file-readable-p", 1, Some(1), file_readable_p);
     s("file-writable-p", 1, Some(1), file_writable_p);
     s("file-symlink-p", 1, Some(1), file_symlink_p);
+    s("file-executable-p", 1, Some(1), file_executable_p);
+    s("--invocation-file--", 0, Some(0), invocation_file);
     s("--directory-files--", 1, Some(3), directory_files_raw);
     // buffer registry
     s("bufferp", 1, Some(1), bufferp);

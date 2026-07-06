@@ -1304,6 +1304,18 @@ pub const SUBRS: &[Entry] = &[
         doc: "If FILENAME is a symbolic link, return its target; else nil.",
     },
     Entry {
+        name: "file-executable-p",
+        kind: Kind::Function,
+        sig: "(file-executable-p FILENAME)",
+        doc: "Non-nil if FILENAME names a file you can execute (search permission for a directory).",
+    },
+    Entry {
+        name: "--invocation-file--",
+        kind: Kind::Function,
+        sig: "(--invocation-file--)",
+        doc: "Internal: absolute path of the running `elisp' binary, backing `invocation-name', `invocation-directory', and `exec-directory'.",
+    },
+    Entry {
         name: "--directory-files--",
         kind: Kind::Function,
         sig: "(--directory-files-- DIRECTORY &optional MATCH-REGEXP NOSORT)",

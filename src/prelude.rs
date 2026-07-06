@@ -2786,6 +2786,114 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
         (let ((d (file-name-as-directory (expand-file-name dir))))
           (mapcar (lambda (n) (concat d n)) names))
       names)))
+
+;; ── exec-path / file-location subsystem ──────────────────────────────────
+;; Faithful port of the process/file-search machinery Emacs builds on:
+;; `path-separator', `exec-suffixes', `exec-directory', `exec-path',
+;; `invocation-name'/`invocation-directory', `executable-find', `locate-file'
+;; (the last two are verbatim from files.el; `locate-file-internal' reimplements
+;; the C `openp' search from lread.c). Values match `emacs -Q --batch' on unix
+;; for the parts that are OS-defined (path-separator, exec-suffixes) and mirror
+;; Emacs's structure for the rest.
+(defvar path-separator ":"
+  "The directory separator in search paths, as a string.")
+(defvar exec-suffixes '("")
+  "List of suffixes to try to find executable file names (empty on POSIX).")
+;; Emacs's `exec-directory' is the libexec dir holding its C helper programs;
+;; elisprs has none, so it points at the directory of the running `elisp'
+;; binary — a sensible, real directory that keeps `exec-path's structure
+;; (PATH dirs + exec-directory) intact. `invocation-name'/`invocation-directory'
+;; are the binary's basename and directory, mirroring Emacs's C-level values.
+(defvar invocation-name (file-name-nondirectory (--invocation-file--))
+  "The program name that was used to run this instance of elisprs.")
+(defvar invocation-directory (file-name-directory (--invocation-file--))
+  "The directory in which the elisprs executable was found, to run subprocesses.")
+(defvar exec-directory (file-name-as-directory (file-name-directory (--invocation-file--)))
+  "Directory of architecture-dependent files that come with elisprs.")
+;; Built exactly like Emacs's `init_callproc' (callproc.c): `decode_env_path'
+;; on $PATH (splitting on `path-separator', empty elements → ".") followed by
+;; `exec-directory' with its trailing slash removed (`directory-file-name').
+(defvar exec-path
+  (append (mapcar (lambda (d) (if (string= d "") "." d))
+                  (split-string (or (getenv "PATH") "") path-separator))
+          (list (directory-file-name exec-directory)))
+  "List of directories to search programs to run in subprocesses.")
+;; elisprs models no remote/TRAMP files, so every file name is local: this
+;; returns nil for all inputs (Emacs returns nil for local names too), which
+;; makes `executable-find's remote branch dead code (as intended here).
+(defun file-remote-p (file &optional _identification _connected)
+  "Test whether FILE specifies a location on a remote system.
+elisprs has no remote-file support, so this is always nil."
+  (ignore file) nil)
+(defun locate-file-internal (filename path &optional suffixes predicate)
+  "Faithful reimplementation of the C `openp' search backing `locate-file'.
+Search each directory in PATH, trying each suffix in SUFFIXES (defaulting to
+`(\"\")'), for FILENAME.  Return the first absolute candidate satisfying
+PREDICATE, else nil.  PREDICATE nil means `file-readable-p'; an integer is a
+POSIX access(2) mode bitmask (1=X_OK 2=W_OK 4=R_OK, 0=existence); a function is
+called on the candidate.  Directories are skipped unless PREDICATE is a function
+that returns the symbol `dir-ok'.  An absolute or `~'-prefixed FILENAME is tried
+once regardless of PATH."
+  (let ((suffixes (or suffixes '("")))
+        (absolute (and (> (length filename) 0) (memq (aref filename 0) '(?/ ?~)))))
+    (catch 'found
+      (dolist (dir (if absolute '(nil) path))
+        (dolist (suffix suffixes)
+          (let* ((candidate (expand-file-name (concat filename suffix) dir))
+                 (isdir (file-directory-p candidate)))
+            (cond
+             ((integerp predicate)
+              (when (and (not isdir) (locate-file--access-ok candidate predicate))
+                (throw 'found candidate)))
+             ((functionp predicate)
+              (let ((res (funcall predicate candidate)))
+                (when (and res (or (not isdir) (eq res 'dir-ok)))
+                  (throw 'found candidate))))
+             (t
+              (when (and (not isdir) (file-readable-p candidate))
+                (throw 'found candidate)))))))
+      nil)))
+(defun locate-file--access-ok (file mode)
+  "Non-nil if FILE passes the POSIX access(2) MODE bitmask (see `locate-file-internal')."
+  (and (or (zerop (logand mode 1)) (file-executable-p file))
+       (or (zerop (logand mode 2)) (file-writable-p file))
+       (or (zerop (logand mode 4)) (file-readable-p file))
+       (file-exists-p file)))
+(defun locate-file (filename path &optional suffixes predicate)
+  "Search for FILENAME through PATH.
+If found, return the absolute file name of FILENAME; otherwise return nil.
+PATH should be a list of directories to look in, like the lists in `exec-path'
+or `load-path'.  If SUFFIXES is non-nil, it should be a list of suffixes to
+append to file name when searching.  If SUFFIXES is nil, it is equivalent to
+`(\"\")'.  If non-nil, PREDICATE is used instead of `file-readable-p'.
+PREDICATE can also be an integer access(2) mode, or one of the symbols
+`executable', `readable', `writable', `exists', or a list of them."
+  (if (and predicate (symbolp predicate) (not (functionp predicate)))
+      (setq predicate (list predicate)))
+  (when (and (consp predicate) (not (functionp predicate)))
+    (setq predicate
+          (logior (if (memq 'executable predicate) 1 0)
+                  (if (memq 'writable predicate) 2 0)
+                  (if (memq 'readable predicate) 4 0))))
+  (locate-file-internal filename path suffixes predicate))
+(defun executable-find (command &optional remote)
+  "Search for COMMAND in `exec-path' and return the absolute file name.
+Return nil if COMMAND is not found anywhere in `exec-path'.
+If REMOTE is non-nil, search on a remote host if `default-directory' is
+remote, otherwise search locally."
+  (if (and remote (file-remote-p default-directory))
+      (let ((res (locate-file
+                  command
+                  (mapcar
+                   (lambda (x) (concat (file-remote-p default-directory) x))
+                   (exec-path))
+                  exec-suffixes 'file-executable-p)))
+        (when (stringp res) (file-local-name res)))
+    ;; Use 1 rather than file-executable-p to better match the
+    ;; behavior of call-process.
+    (let ((default-directory (file-name-quote default-directory 'top)))
+      (locate-file command exec-path exec-suffixes 1))))
+
 ;; save-current-buffer: restore the current buffer after BODY (if it is still live).
 (defmacro save-current-buffer (&rest body)
   `(let ((--scb-- (current-buffer)))
