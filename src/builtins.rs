@@ -872,11 +872,74 @@ fn symbol_name(h: &mut ElispHost, a: &[Value]) -> R {
         )),
     }
 }
-fn intern_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    match &a[0] {
-        Value::Str(s) => Ok(h.intern(&s.to_string())),
-        _ => Err("wrong-type-argument: stringp".to_string()),
+/// Classify the optional obarray argument shared by `intern`/`intern-soft`/
+/// `unintern`: `None` (absent/nil → the global obarray), `Some(Some(id))` for a
+/// private obarray, or an `obarrayp` type error. A non-nil, non-obarray value
+/// signals `(wrong-type-argument obarrayp VALUE)`, matching Emacs's `CHECK_OBARRAY`.
+fn obarray_arg(h: &ElispHost, v: Option<&Value>) -> Result<Option<u32>, String> {
+    match v {
+        None | Some(Value::Undef) | Some(Value::Bool(false)) => Ok(None),
+        Some(ob) => match h.obj(ob) {
+            Some(Obj::Obarray(d)) if d.global => Ok(None),
+            Some(Obj::Obarray(_)) => match ob {
+                Value::Obj(id) => Ok(Some(*id)),
+                _ => Ok(None),
+            },
+            _ => Err(format!(
+                "wrong-type-argument: obarrayp {}",
+                h.print(ob, true)
+            )),
+        },
     }
+}
+fn intern_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let name = match &a[0] {
+        Value::Str(s) => s.to_string(),
+        _ => return Err("wrong-type-argument: stringp".to_string()),
+    };
+    match obarray_arg(h, a.get(1))? {
+        None => Ok(h.intern(&name)),
+        Some(id) => Ok(h.obarray_intern(id, &name)),
+    }
+}
+/// `(obarray-make &optional SIZE)` — a fresh, empty private obarray. SIZE (a
+/// vestigial capacity hint since Emacs 29's obarrays auto-grow) must be a
+/// wholenum when supplied, matching Emacs's `CHECK_FIXNAT`.
+fn obarray_make_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    if let Some(v) = a.first() {
+        match v {
+            Value::Int(n) if *n >= 0 => {}
+            Value::Undef | Value::Bool(false) => {}
+            _ => {
+                return Err(format!(
+                    "wrong-type-argument: wholenump {}",
+                    h.print(v, true)
+                ))
+            }
+        }
+    }
+    Ok(h.alloc(Obj::Obarray(crate::host::ObarrayData {
+        symbols: std::collections::HashMap::new(),
+        global: false,
+    })))
+}
+/// `(obarrayp OBJECT)` — t iff OBJECT is an obarray. (Emacs 30 no longer accepts
+/// a plain vector as an obarray, so neither do we.)
+fn obarrayp_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::Obarray(_)))))
+}
+/// `(unintern NAME &optional OBARRAY)` — remove NAME (a symbol or string) from
+/// OBARRAY, returning t if a symbol was removed, nil otherwise.
+fn unintern_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let name = match &a[0] {
+        Value::Str(s) => s.to_string(),
+        _ => h.sym_name(&a[0]).ok_or("wrong-type-argument: stringp")?,
+    };
+    let removed = match obarray_arg(h, a.get(1))? {
+        None => h.obarray_unintern_global(&name),
+        Some(id) => h.obarray_unintern(id, &name),
+    };
+    Ok(nil_or(removed))
 }
 fn make_symbol_fn(h: &mut ElispHost, a: &[Value]) -> R {
     match &a[0] {
@@ -2591,6 +2654,7 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
             Some(Obj::CharTable(_)) => "char-table",
             Some(Obj::Buffer(_)) => "buffer",
             Some(Obj::Marker(_)) => "marker",
+            Some(Obj::Obarray(_)) => "obarray",
             None => "symbol",
         },
         _ => "symbol",
@@ -2732,7 +2796,10 @@ fn intern_soft(h: &mut ElispHost, a: &[Value]) -> R {
         Value::Str(s) => s.to_string(),
         _ => h.sym_name(&a[0]).ok_or("wrong-type-argument: stringp")?,
     };
-    Ok(h.find_symbol(&name).unwrap_or(Value::Undef))
+    match obarray_arg(h, a.get(1))? {
+        None => Ok(h.find_symbol(&name).unwrap_or(Value::Undef)),
+        Some(id) => Ok(h.obarray_intern_soft(id, &name)),
+    }
 }
 fn subrp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::Subr { .. }))))
@@ -5610,6 +5677,9 @@ pub fn install(h: &mut ElispHost) {
     // symbols
     s("symbol-name", 1, Some(1), symbol_name);
     s("intern", 1, Some(2), intern_fn);
+    s("obarray-make", 0, Some(1), obarray_make_fn);
+    s("obarrayp", 1, Some(1), obarrayp_fn);
+    s("unintern", 1, Some(2), unintern_fn);
     s("make-symbol", 1, Some(1), make_symbol_fn);
     s("set", 2, Some(2), set_fn);
     s("symbol-value", 1, Some(1), symbol_value);
@@ -5945,7 +6015,7 @@ pub fn install(h: &mut ElispHost) {
     s("abs", 1, Some(1), abs_fn);
     s("logcount", 1, Some(1), logcount_fn);
     s("symbol-function", 1, Some(1), symbol_function);
-    s("intern-soft", 1, Some(1), intern_soft);
+    s("intern-soft", 1, Some(2), intern_soft);
     s("subrp", 1, Some(1), subrp);
     s("macrop", 1, Some(1), macrop);
     s("special-form-p", 1, Some(1), special_form_p);

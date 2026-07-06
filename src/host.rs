@@ -193,6 +193,21 @@ pub enum Obj {
     /// so a single edit updates every reference; see [`MarkerData`]. Runtime-only,
     /// never serialized.
     Marker(Rc<RefCell<MarkerData>>),
+    /// A first-class obarray (`obarray-make`): a private namespace of interned
+    /// symbols. Each name maps to a distinct symbol arena id created via
+    /// [`ElispHost::make_symbol`], so a private obarray's symbols never collide
+    /// with the global ones. The single global obarray (the value of the
+    /// `obarray` variable) is the one with `global == true`; its symbol set is
+    /// [`ElispHost::obarray`], not `symbols`. See [`ObarrayData`].
+    Obarray(ObarrayData),
+}
+
+/// An `Obj::Obarray` payload. A private obarray owns its `symbols` map
+/// (name → symbol arena id); the global obarray (`global == true`) leaves
+/// `symbols` empty and routes every operation to [`ElispHost::obarray`].
+pub struct ObarrayData {
+    pub symbols: HashMap<String, u32>,
+    pub global: bool,
 }
 
 /// The mutable state of an Emacs marker. A marker points into a buffer at a
@@ -515,6 +530,20 @@ impl ElispHost {
         // built-in prefix and is never serialized as user heap).
         let scratch = h.alloc(Obj::Buffer(0));
         h.buffers[0].self_obj = scratch;
+        // The global obarray object — the value of the `obarray` variable. Its
+        // symbol set lives in `self.obarray` (the HashMap), so its own `symbols`
+        // map stays empty and `global` routes every lookup there. Allocated in
+        // the built-in prefix so it is never serialized as user heap.
+        let global_ob = h.alloc(Obj::Obarray(ObarrayData {
+            symbols: HashMap::new(),
+            global: true,
+        }));
+        if let Value::Obj(sid) = h.intern("obarray") {
+            if let Some(Obj::Symbol(s)) = h.arena.get_mut(sid as usize) {
+                s.value = Some(global_ob);
+                s.special = true;
+            }
+        }
         h.builtin_count = h.arena.len();
         h
     }
@@ -557,6 +586,62 @@ impl ElispHost {
         match v {
             Value::Obj(id) => self.arena.get(*id as usize),
             _ => None,
+        }
+    }
+    // ── first-class obarrays (`obarray-make` and friends) ──
+    /// `(intern NAME OB)` into the private obarray at arena id `ob_id`: return the
+    /// existing interned symbol if present, else create a fresh symbol (like
+    /// `make-symbol`) and record it. Mirrors C `intern`, which allocates a new
+    /// symbol on a miss.
+    pub fn obarray_intern(&mut self, ob_id: u32, name: &str) -> Value {
+        if let Some(Obj::Obarray(d)) = self.arena.get(ob_id as usize) {
+            if let Some(&sid) = d.symbols.get(name) {
+                return Value::Obj(sid);
+            }
+        }
+        let sym = self.make_symbol(name);
+        if let Value::Obj(sid) = sym {
+            if let Some(Obj::Obarray(d)) = self.arena.get_mut(ob_id as usize) {
+                d.symbols.insert(name.to_string(), sid);
+            }
+        }
+        sym
+    }
+    /// `(intern-soft NAME OB)` into the private obarray at arena id `ob_id`: the
+    /// interned symbol if present, else `nil` (`Value::Undef`).
+    pub fn obarray_intern_soft(&self, ob_id: u32, name: &str) -> Value {
+        match self.arena.get(ob_id as usize) {
+            Some(Obj::Obarray(d)) => d
+                .symbols
+                .get(name)
+                .map(|&sid| Value::Obj(sid))
+                .unwrap_or(Value::Undef),
+            _ => Value::Undef,
+        }
+    }
+    /// `(unintern NAME OB)` from the private obarray at arena id `ob_id`: remove
+    /// the mapping, returning whether a symbol was actually removed.
+    pub fn obarray_unintern(&mut self, ob_id: u32, name: &str) -> bool {
+        match self.arena.get_mut(ob_id as usize) {
+            Some(Obj::Obarray(d)) => d.symbols.remove(name).is_some(),
+            _ => false,
+        }
+    }
+    /// `(unintern NAME)` from the global obarray: drop NAME's mapping (the symbol
+    /// object itself survives in the arena but is no longer interned), returning
+    /// whether it was present.
+    pub fn obarray_unintern_global(&mut self, name: &str) -> bool {
+        self.obarray.remove(name).is_some()
+    }
+    /// The symbol objects interned in an obarray (private map values, or the
+    /// global obarray's), for `mapatoms`.
+    pub fn obarray_symbols(&self, ob: &Value) -> Vec<Value> {
+        match self.obj(ob) {
+            Some(Obj::Obarray(d)) if d.global => {
+                self.obarray.values().map(|&id| Value::Obj(id)).collect()
+            }
+            Some(Obj::Obarray(d)) => d.symbols.values().map(|&id| Value::Obj(id)).collect(),
+            _ => Vec::new(),
         }
     }
     /// Public form of [`Self::sym_handle`]: the arena handle of `v` if it is a
@@ -1238,10 +1323,10 @@ impl ElispHost {
                     extra: t.extra.clone(),
                     ranges: t.ranges.clone(),
                 },
-                // Buffer/marker objects are runtime-only (created after prelude
-                // load) and never appear in a compiled/AOT heap image; emit a
-                // harmless placeholder so the match stays exhaustive.
-                Obj::Buffer(_) | Obj::Marker(_) => SerObj::Symbol {
+                // Buffer/marker/obarray objects are runtime-only (created after
+                // prelude load) and never appear in a compiled/AOT heap image;
+                // emit a harmless placeholder so the match stays exhaustive.
+                Obj::Buffer(_) | Obj::Marker(_) | Obj::Obarray(_) => SerObj::Symbol {
                     name: "--unexpected-runtime-obj--".to_string(),
                     value: None,
                     function: None,
@@ -1363,7 +1448,7 @@ impl ElispHost {
                         ranges: t.ranges.clone(),
                     },
                     // Runtime-only; never legitimately serialized (see above).
-                    Obj::Buffer(_) | Obj::Marker(_) => SerObj::Symbol {
+                    Obj::Buffer(_) | Obj::Marker(_) | Obj::Obarray(_) => SerObj::Symbol {
                         name: "--unexpected-runtime-obj--".to_string(),
                         value: None,
                         function: None,
@@ -1721,6 +1806,14 @@ impl ElispHost {
                         Some(name) => format!("#<marker at {} in {}>", md.pos, name),
                         None => "#<marker in no buffer>".to_string(),
                     }
+                }
+                Some(Obj::Obarray(d)) => {
+                    let n = if d.global {
+                        self.obarray.len()
+                    } else {
+                        d.symbols.len()
+                    };
+                    format!("#<obarray n={n}>")
                 }
                 Some(Obj::Subr { name, .. }) => format!("#<subr {name}>"),
                 Some(Obj::Closure { is_macro, .. }) => {
@@ -2801,6 +2894,27 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 .ok_or("maphash: not a hash table")?;
                 for (k, v) in entries {
                     call_function(&args[0], &[k, v])?;
+                }
+                return Ok(Value::Undef);
+            }
+            "mapatoms" => {
+                if args.is_empty() {
+                    return Err(format!(
+                        "wrong-number-of-arguments: mapatoms {}",
+                        args.len()
+                    ));
+                }
+                // The obarray defaults to the global one (the `obarray` variable).
+                let ob = match args.get(1) {
+                    Some(v) if !matches!(v, Value::Undef | Value::Bool(false)) => v.clone(),
+                    _ => with_host(|h| {
+                        let sym = h.find_symbol("obarray").unwrap_or(Value::Undef);
+                        h.get_value(&sym).unwrap_or(Value::Undef)
+                    }),
+                };
+                let syms = with_host(|h| h.obarray_symbols(&ob));
+                for s in syms {
+                    call_function(&args[0], &[s])?;
                 }
                 return Ok(Value::Undef);
             }
