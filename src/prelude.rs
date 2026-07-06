@@ -637,6 +637,73 @@ interpreter; expands to nil."
 ;; Bound by `macroexpand-all' while it walks a form; libraries (e.g. rx) read it
 ;; to thread local macro environments.  Defaults to nil outside expansion.
 (defvar macroexpand-all-environment nil)
+;; macroexp-compiling-p (macroexp.el:141): non-nil only when expanding for the
+;; byte-compiler.  elisprs interprets, so `macroexpand-all-environment' never
+;; carries the compiler's declare-function cons — this returns nil.
+(defun macroexp-compiling-p ()
+  "Return non-nil if we're macroexpanding for the compiler."
+  (member '(declare-function . byte-compile-macroexpand-declare-function)
+          macroexpand-all-environment))
+;; cl-lib global declarations (cl-lib.el:252 / cl-macs.el:2645-2686).  Real
+;; init files reach these via `(cl-declaim (optimize (speed 3) (safety 0)))'
+;; near the top of eieio-core, ede, auth-source, etc.  Faithful port: the
+;; `optimize'/`special'/`inline'/`warn' specs all target byte-compiler state
+;; that elisprs (an interpreter) never consults, so `cl--do-proclaim' records
+;; the optimize levels and otherwise no-ops.
+(defvar cl--proclaims-deferred nil)
+(defvar cl--proclaim-history t)
+(defvar cl--optimize-safety)
+(defvar cl--optimize-speed)
+(defun cl--do-proclaim (spec hist)
+  (and hist (listp cl--proclaim-history) (push spec cl--proclaim-history))
+  (cond ((eq (car-safe spec) 'special)
+	 (if (boundp 'byte-compile-bound-variables)
+	     (setq byte-compile-bound-variables
+		   (append (cdr spec) byte-compile-bound-variables))))
+
+	((eq (car-safe spec) 'inline)
+	 (while (setq spec (cdr spec))
+	   (or (memq (get (car spec) 'byte-optimizer)
+		     '(nil byte-compile-inline-expand))
+	       (error "%s already has a byte-optimizer, can't make it inline"
+		      (car spec)))
+	   (put (car spec) 'byte-optimizer #'byte-compile-inline-expand)))
+
+	((eq (car-safe spec) 'notinline)
+	 (while (setq spec (cdr spec))
+	   (if (eq (get (car spec) 'byte-optimizer)
+		   #'byte-compile-inline-expand)
+	       (put (car spec) 'byte-optimizer nil))))
+
+	((eq (car-safe spec) 'optimize)
+	 (let ((speed (assq (nth 1 (assq 'speed (cdr spec)))
+			    '((0 nil) (1 t) (2 t) (3 t))))
+	       (safety (assq (nth 1 (assq 'safety (cdr spec)))
+			     '((0 t) (1 nil) (2 nil) (3 nil)))))
+	   (if speed (setq cl--optimize-speed (car speed)
+			   byte-optimize (nth 1 speed)))
+	   (if safety (setq cl--optimize-safety (car safety)
+			    byte-compile-delete-errors (nth 1 safety)))))
+
+	((and (eq (car-safe spec) 'warn) (boundp 'byte-compile-warnings))
+	 (while (setq spec (cdr spec))
+	   (if (consp (car spec))
+               (if (eq (cadar spec) 0)
+                   (byte-compile-disable-warning (caar spec))
+                 (byte-compile-enable-warning (caar spec)))))))
+  nil)
+(defun cl-proclaim (spec)
+  "Record a global declaration specified by SPEC."
+  (if (fboundp 'cl--do-proclaim) (cl--do-proclaim spec t)
+    (push spec cl--proclaims-deferred))
+  nil)
+(defmacro cl-declaim (&rest specs)
+  "Like `cl-proclaim', but takes any number of unevaluated, unquoted arguments.
+Puts `(cl-eval-when (compile load eval) ...)' around the declarations
+so that they are registered at compile-time as well as run-time."
+  (let ((body (mapcar (lambda (x) `(cl-proclaim ',x)) specs)))
+    (if (macroexp-compiling-p) `(cl-eval-when (compile load eval) ,@body)
+      `(progn ,@body))))
 ;; A form that evaluates to V (self-quoting literals as-is, else (quote V)).
 (defun macroexp-quote (v)
   (if (and (not (consp v)) (or (not (symbolp v)) (null v) (eq v t) (keywordp v)))
