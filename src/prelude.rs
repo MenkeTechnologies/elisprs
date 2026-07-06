@@ -8265,4 +8265,227 @@ They means `unix', `dos', and `mac' respectively."
           ((progn (setq orig-eol-type (coding-system-eol-type base))
                   (vectorp orig-eol-type))
            (aref orig-eol-type eol-type)))))
+
+;;; ---- language environments (mule-cmds.el data surface) ----
+;; Faithful port of GNU Emacs 30.2's `language-info-alist' machinery: the
+;; registry that `set-language-info-alist' populates when a language/*.el file
+;; declares a language environment.  `bindings--define-key' (bindings.el) and
+;; `define-key-after' (subr.el) are the two supporting keymap helpers these
+;; functions need for their menu-map bookkeeping; both are copied verbatim.
+;; The heavy `set-language-environment*' switch functions are NOT ported here —
+;; they only fire when a definition targets the CURRENT environment; declaring a
+;; new environment (the load-time case) never touches them.  Bodies are verbatim
+;; from mule-cmds.el / subr.el / bindings.el.
+
+(defun bindings--define-key (map key item)
+  "Define KEY in keymap MAP according to ITEM from a menu.
+This is like `define-key', but it takes the definition from the
+specified menu item, and makes pure copies of as much as possible
+of the menu's data."
+  (declare (indent 2))
+  (define-key map key
+    (cond
+     ((not (consp item)) item)
+     ((keymapp item) item)
+     ((stringp (car item))
+      (if (keymapp (cdr item))
+          (cons (purecopy (car item)) (cdr item))
+        (purecopy item)))
+     ((eq 'menu-item (car item))
+      (if (keymapp (nth 2 item))
+          `(menu-item ,(purecopy (nth 1 item)) ,(nth 2 item)
+                      ,@(purecopy (nthcdr 3 item)))
+        (purecopy item)))
+     (t (message "non-menu-item: %S" item) item))))
+
+(defun define-key-after (keymap key definition &optional after)
+  "Add binding in KEYMAP for KEY => DEFINITION, right after AFTER's binding.
+This is like `define-key' except that the binding for KEY is placed
+just after the binding for the event AFTER, instead of at the beginning
+of the map.  Note that AFTER must be an event type (like KEY), NOT a command
+\(like DEFINITION).
+
+If AFTER is t or omitted, the new binding goes at the end of the keymap.
+AFTER should be a single event type--a symbol or a character, not a sequence.
+
+Bindings are always added before any inherited map.
+
+The order of bindings in a keymap matters only when it is used as
+a menu, so this function is not useful for non-menu keymaps."
+  (declare (indent defun))
+  (unless after (setq after t))
+  (or (keymapp keymap)
+      (signal 'wrong-type-argument (list 'keymapp keymap)))
+  (setq key
+	(if (<= (length key) 1) (aref key 0)
+	  (setq keymap (lookup-key keymap
+				   (apply #'vector
+					  (butlast (mapcar #'identity key)))))
+	  (aref key (1- (length key)))))
+  (let ((tail keymap) done inserted)
+    (while (and (not done) tail)
+      ;; Delete any earlier bindings for the same key.
+      (if (eq (car-safe (car (cdr tail))) key)
+	  (setcdr tail (cdr (cdr tail))))
+      ;; If we hit an included map, go down that one.
+      (if (keymapp (car tail)) (setq tail (car tail)))
+      ;; When we reach AFTER's binding, insert the new binding after.
+      ;; If we reach an inherited keymap, insert just before that.
+      ;; If we reach the end of this keymap, insert at the end.
+      (if (or (and (eq (car-safe (car tail)) after)
+		   (not (eq after t)))
+	      (eq (car (cdr tail)) 'keymap)
+	      (null (cdr tail)))
+	  (progn
+	    ;; Stop the scan only if we find a parent keymap.
+	    ;; Keep going past the inserted element
+	    ;; so we can delete any duplications that come later.
+	    (if (eq (car (cdr tail)) 'keymap)
+		(setq done t))
+	    ;; Don't insert more than once.
+	    (or inserted
+		(setcdr tail (cons (cons key definition) (cdr tail))))
+	    (setq inserted t)))
+      (setq tail (cdr tail)))))
+
+(defvar language-info-alist nil
+  "Alist of language environment definitions.
+Each element looks like:
+	(LANGUAGE-NAME . ((KEY . INFO) ...))
+where LANGUAGE-NAME is a string, the name of the language environment,
+KEY is a symbol denoting the kind of information, and
+INFO is the data associated with KEY.")
+
+(defvar current-language-environment "English"
+  "The last language environment specified with `set-language-environment'.")
+
+(defvar describe-language-environment-map
+  (let ((map (make-sparse-keymap "Describe Language Environment")))
+    (bindings--define-key map
+      [Default] '(menu-item "Default" describe-specified-language-support))
+    map))
+
+(defvar setup-language-environment-map
+  (let ((map (make-sparse-keymap "Set Language Environment")))
+    (bindings--define-key map
+      [Default] '(menu-item "Default" setup-specified-language-environment))
+    map))
+
+(defun get-language-info (lang-env key)
+  "Return information listed under KEY for language environment LANG-ENV.
+KEY is a symbol denoting the kind of information.
+For a list of useful values for KEY and their meanings,
+see `language-info-alist'."
+  (if (symbolp lang-env)
+      (setq lang-env (symbol-name lang-env)))
+  (let ((lang-slot (assoc-string lang-env language-info-alist t)))
+    (if lang-slot
+	(cdr (assq key (cdr lang-slot))))))
+
+(defun set-language-info (lang-env key info)
+  "Modify part of the definition of language environment LANG-ENV.
+Specifically, this stores the information INFO under KEY
+in the definition of this language environment.
+KEY is a symbol denoting the kind of information.
+INFO is the value for that information.
+
+For a list of useful values for KEY and their meanings,
+see `language-info-alist'."
+  (if (symbolp lang-env)
+      (setq lang-env (symbol-name lang-env)))
+  (set-language-info-internal lang-env key info)
+  (if (equal lang-env current-language-environment)
+      (cond ((eq key 'coding-priority)
+	     (set-language-environment-coding-systems lang-env)
+	     (set-language-environment-charset lang-env))
+	    ((eq key 'input-method)
+	     (set-language-environment-input-method lang-env))
+	    ((eq key 'nonascii-translation)
+	     (set-language-environment-nonascii-translation lang-env))
+	    ((eq key 'charset)
+	     (set-language-environment-charset lang-env)))))
+
+(defun set-language-info-internal (lang-env key info)
+  "Internal use only.
+Arguments are the same as `set-language-info'."
+  (let (lang-slot key-slot)
+    (setq lang-slot (assoc lang-env language-info-alist))
+    (if (null lang-slot)		; If no slot for the language, add it.
+	(setq lang-slot (list lang-env)
+	      language-info-alist (cons lang-slot language-info-alist)))
+    (setq key-slot (assq key lang-slot))
+    (if (null key-slot)			; If no slot for the key, add it.
+	(progn
+	  (setq key-slot (list key))
+	  (setcdr lang-slot (cons key-slot (cdr lang-slot)))))
+    (setcdr key-slot (purecopy info))
+    ;; Update the custom-type of `current-language-environment'.
+    (put 'current-language-environment 'custom-type
+	 (cons 'choice (mapcar
+			(lambda (lang)
+			  (list 'const lang))
+			(sort (mapcar 'car language-info-alist) 'string<))))))
+
+(defun set-language-info-setup-keymap (lang-env alist describe-map setup-map)
+  "Setup menu items for LANG-ENV.
+See `set-language-info-alist' for details of other arguments."
+  (let ((doc (assq 'documentation alist)))
+    (when doc
+      (define-key-after describe-map (vector (intern lang-env))
+	(cons lang-env 'describe-specified-language-support))))
+  (define-key-after setup-map (vector (intern lang-env))
+    (cons lang-env 'setup-specified-language-environment)))
+
+(defun set-language-info-alist (lang-env alist &optional parents)
+  "Store ALIST as the definition of language environment LANG-ENV.
+ALIST is an alist of KEY and INFO values.  See the documentation of
+`language-info-alist' for the meanings of KEY and INFO.
+
+Optional arg PARENTS is a list of parent menu names; it specifies
+where to put this language environment in the
+Describe Language Environment and Set Language Environment menus.
+For example, (\"European\") means to put this language environment
+in the European submenu in each of those two menus."
+  (cond ((symbolp lang-env)
+	 (setq lang-env (symbol-name lang-env)))
+	((stringp lang-env)
+	 (setq lang-env (purecopy lang-env))))
+  (if parents
+      (while parents
+	(let (describe-map setup-map parent-symbol parent prompt)
+	  (if (symbolp (setq parent-symbol (car parents)))
+	      (setq parent (symbol-name parent))
+	    (setq parent parent-symbol parent-symbol (intern parent)))
+	  (setq describe-map (lookup-key describe-language-environment-map
+                                         (vector parent-symbol)))
+	  ;; This prompt string is for define-prefix-command, so
+	  ;; that the map it creates will be suitable for a menu.
+	  (or describe-map (setq prompt (format "%s Environment" parent)))
+	  (unless describe-map
+	    (setq describe-map (intern (format "describe-%s-environment-map"
+					       (downcase parent))))
+	    (define-prefix-command describe-map nil prompt)
+	    (define-key-after
+              describe-language-environment-map
+              (vector parent-symbol) (cons parent describe-map)))
+	  (setq setup-map (lookup-key setup-language-environment-map
+                                      (vector parent-symbol)))
+	  (unless setup-map
+	    (setq setup-map (intern (format "setup-%s-environment-map"
+                                            (downcase parent))))
+	    (define-prefix-command setup-map nil prompt)
+	    (define-key-after
+              setup-language-environment-map
+              (vector parent-symbol) (cons parent setup-map)))
+	  (setq parents (cdr parents))
+          (set-language-info-setup-keymap
+           lang-env alist
+           (symbol-value describe-map) (symbol-value setup-map))))
+    (set-language-info-setup-keymap
+     lang-env alist
+     describe-language-environment-map setup-language-environment-map))
+  (dolist (elt alist)
+    (set-language-info-internal lang-env (car elt) (cdr elt)))
+  (if (equal lang-env current-language-environment)
+      (set-language-environment lang-env)))
 "#;
