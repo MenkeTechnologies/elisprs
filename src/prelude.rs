@@ -2741,6 +2741,33 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (defvar load-in-progress nil)
 (defvar load-suffixes '(".elc" ".el"))
 (defvar load-file-rep-suffixes '(""))
+;; get-load-suffixes (C `Fget_load_suffixes', lread.c): the cross product of
+;; `load-suffixes' with `load-file-rep-suffixes', in the same order the C loop
+;; conses then nreverses — suffix0+rep0, suffix0+rep1, suffix1+rep0, ...
+(defun get-load-suffixes ()
+  "Return the list of suffixes that `load' should try, in order."
+  (let ((lst nil))
+    (dolist (suffix load-suffixes)
+      (dolist (ext load-file-rep-suffixes)
+        (setq lst (cons (concat suffix ext) lst))))
+    (nreverse lst)))
+;; locate-library (subr.el:3153): resolve LIBRARY to the file `load' would pick,
+;; searching `load-path' (or PATH) with the load + rep suffixes.
+(defun locate-library (library &optional nosuffix path interactive-call)
+  "Show the precise file name of Emacs library LIBRARY.
+LIBRARY should be a relative file name of the library, a string.
+Optional second arg NOSUFFIX non-nil means don't add suffixes.
+Optional third arg PATH is a list of directories to search instead
+of `load-path'."
+  (let ((file (locate-file library
+			   (or path load-path)
+			   (append (unless nosuffix (get-load-suffixes))
+				   load-file-rep-suffixes))))
+    (if interactive-call
+	(if file
+	    (message "Library is file %s" (abbreviate-file-name file))
+	  (message "No library %s in search path" library)))
+    file))
 ;; Emacs startup variables (startup.el). `init-file-debug' gates verbose init
 ;; error reporting; nil by default. `user-init-file'/`user-emacs-directory' are
 ;; set by real Emacs before init loads — nil here until a caller binds them.
@@ -2810,6 +2837,12 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
   "The directory in which the elisprs executable was found, to run subprocesses.")
 (defvar exec-directory (file-name-as-directory (file-name-directory (--invocation-file--)))
   "Directory of architecture-dependent files that come with elisprs.")
+;; Emacs's `data-directory' is the `etc/' dir of the installation (a string,
+;; used by libraries such as `shadow' via `expand-file-name'); elisprs ships no
+;; `etc/', so — like `exec-directory' — it points at the running binary's
+;; directory, keeping it a real, absolute string.
+(defvar data-directory (file-name-as-directory (file-name-directory (--invocation-file--)))
+  "Directory of machine-independent files that come with elisprs.")
 ;; Built exactly like Emacs's `init_callproc' (callproc.c): `decode_env_path'
 ;; on $PATH (splitting on `path-separator', empty elements → ".") followed by
 ;; `exec-directory' with its trailing slash removed (`directory-file-name').
