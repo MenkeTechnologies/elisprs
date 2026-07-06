@@ -5618,6 +5618,80 @@ If NOSET is non-nil, don't bother autoloading LOAD when setting the variable."
 (defmacro defface (face spec doc &rest args)
   (nconc (list 'custom-declare-face (list 'quote face) spec doc) args))
 
+;;; ---- password-prompt recognition data (international/mule-conf.el) ----
+;; mule-conf.el is preloaded in Emacs, so these are always bound. Both are
+;; fixed, build-independent i18n data lists — captured value-for-value from GNU
+;; Emacs 30.2 mule-conf.el:1681/1739. Used by comint.el/shell.el and friends to
+;; build `comint-password-prompt-regexp'. Placed after `defcustom' is defined.
+;; mule-conf.el:1681
+(defcustom password-word-equivalents
+  '("password" "passcode" "passphrase" "pass phrase" "pin"
+    "decryption key" "encryption key" ; From ccrypt.
+    ; These are sorted according to the GNU en_US locale.
+    "암호"		; ko
+    "パスワード"	; ja
+    "ପ୍ରବେଶ ସଙ୍କେତ"	; or
+    "ពាក្យសម្ងាត់"		; km
+    "adgangskode"	; da
+    "contraseña"	; es
+    "contrasenya"	; ca
+    "geslo"		; sl
+    "hasło"		; pl
+    "heslo"		; cs, sk
+    "iphasiwedi"	; zu
+    "jelszó"		; hu
+    "lösenord"		; sv
+    "lozinka"		; hr, sr
+    "mật khẩu"		; vi
+    "mot de passe"	; fr
+    "parola"		; tr
+    "pasahitza"		; eu
+    "passord"		; nb
+    "passwort"		; de
+    "pasvorto"		; eo
+    "salasana"		; fi
+    "senha"		; pt
+    "slaptažodis"	; lt
+    "wachtwoord"	; nl
+    "كلمة السر"		; ar
+    "ססמה"		; he
+    "лозинка"		; sr
+    "пароль"		; kk, ru, uk
+    "गुप्तशब्द"		; mr
+    "शब्दकूट"		; hi
+    "પાસવર્ડ"		; gu
+    "సంకేతపదము"		; te
+    "ਪਾਸਵਰਡ"		; pa
+    "ಗುಪ್ತಪದ"		; kn
+    "கடவுச்சொல்"		; ta
+    "അടയാളവാക്ക്"		; ml
+    "গুপ্তশব্দ"		; as
+    "পাসওয়ার্ড"		; bn_IN
+    "රහස්පදය"		; si
+    "密码"		; zh_CN
+    "密碼"		; zh_TW
+    )
+  "List of words equivalent to \"password\".
+This is used by Shell mode and other parts of Emacs to recognize
+password prompts, including prompts in languages other than
+English.  Different case choices should not be assumed to be
+included; callers should bind `case-fold-search' to t."
+  :type '(repeat string)
+  :version "27.1"
+  :group 'processes)
+;; mule-conf.el:1739
+(defcustom password-colon-equivalents
+  '(?: ; ?\N{COLON}
+    ?： ; ?\N{FULLWIDTH COLON}
+    ?﹕ ; ?\N{SMALL COLON}
+    ?︓ ; ?\N{PRESENTATION FORM FOR VERTICAL COLON}
+    ?៖ ; ?\N{KHMER SIGN CAMNUC PII KUUH}
+    )
+  "List of characters equivalent to trailing colon in \"password\" prompts."
+  :type '(repeat character)
+  :version "30.1"
+  :group 'processes)
+
 ;;; ---- per-user Emacs file location (files.el / startup.el) ----
 ;; startup.el:597 sets `user-emacs-directory' at startup; the defvar itself is
 ;; nil ("The value does not matter since Emacs sets this at startup").  elisprs
