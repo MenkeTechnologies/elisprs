@@ -5218,6 +5218,13 @@ This is like the `&' operator of the C language."
     (unless (member load loads)
       (put symbol 'custom-loads (cons (purecopy load) loads)))))
 
+;; custom.el:659
+(defun custom-autoload (symbol load &optional noset)
+  "Mark SYMBOL as autoloaded custom variable and add dependency LOAD.
+If NOSET is non-nil, don't bother autoloading LOAD when setting the variable."
+  (put symbol 'custom-autoload (if noset 'noset t))
+  (custom-add-load symbol load))
+
 ;; custom.el:638
 (defun custom-add-link (symbol widget)
   (let ((links (get symbol 'custom-links)))
