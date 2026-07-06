@@ -8009,4 +8009,74 @@ If valid, return CODING-SYSTEM, else signal a `coding-system-error'."
   (if (coding-system-p coding-system)
       coding-system
     (signal 'coding-system-error (list coding-system))))
+
+(defconst coding-system--eol-fixed
+  '(no-conversion no-conversion-multibyte binary)
+  "Registered coding systems whose EOL type is fixed to `unix' (0), GNU Emacs 30.2.
+These have no -dos/-mac subsidiary variants, so `coding-system-eol-type'
+returns the integer 0 for them rather than a vector, and no subsidiary
+NAME-dos/NAME-mac coding system exists.")
+
+(defun coding-system-eol-type (coding-system)
+  "Return the EOL (end-of-line) conversion type of CODING-SYSTEM.
+The value is an integer 0, 1, or 2 when CODING-SYSTEM has a fixed EOL
+type (`unix', `dos', or `mac' respectively), or a vector
+[BASE-unix BASE-dos BASE-mac] of the three subsidiary coding systems
+when the EOL type is undecided.  BASE is the base of CODING-SYSTEM.
+CODING-SYSTEM nil is treated as `no-conversion'.
+Return nil if CODING-SYSTEM is not a valid coding system."
+  (when (null coding-system)
+    (setq coding-system 'no-conversion))
+  (and (symbolp coding-system)
+       (let ((name (symbol-name coding-system)))
+         (cond
+          ;; A directly registered base or alias (no EOL suffix to strip).
+          ((memq coding-system coding-system--all)
+           (if (memq coding-system coding-system--eol-fixed)
+               0
+             (let ((base (symbol-name (coding-system-base coding-system))))
+               (vector (intern (concat base "-unix"))
+                       (intern (concat base "-dos"))
+                       (intern (concat base "-mac"))))))
+          ;; A subsidiary NAME-unix/-dos/-mac of an EOL-undecided system.
+          (t
+           (let ((stem (coding-system--strip-eol name)))
+             (and (not (string= stem name))
+                  (let ((base (intern stem)))
+                    (and (memq base coding-system--all)
+                         (not (memq base coding-system--eol-fixed))
+                         (cond ((string-suffix-p "-unix" name) 0)
+                               ((string-suffix-p "-dos" name) 1)
+                               (t 2)))))))))))
+
+(defun coding-system-change-eol-conversion (coding-system eol-type)
+  "Return a coding system which differs from CODING-SYSTEM in EOL conversion.
+The returned coding system converts end-of-line by EOL-TYPE
+but text as the same way as CODING-SYSTEM.
+EOL-TYPE should be `unix', `dos', `mac', or nil.
+If EOL-TYPE is nil, the returned coding system detects
+how end-of-line is formatted automatically while decoding.
+
+EOL-TYPE can be specified by an integer 0, 1, or 2.
+They means `unix', `dos', and `mac' respectively."
+  (if (symbolp eol-type)
+      (setq eol-type (cond ((eq eol-type 'unix) 0)
+                           ((eq eol-type 'dos) 1)
+                           ((eq eol-type 'mac) 2)
+                           (t eol-type))))
+  ;; We call `coding-system-base' before `coding-system-eol-type',
+  ;; because the coding-system may not be initialized until then.
+  (let* ((base (coding-system-base coding-system))
+         (orig-eol-type (coding-system-eol-type coding-system)))
+    (cond ((vectorp orig-eol-type)
+           (if (not eol-type)
+               coding-system
+             (aref orig-eol-type eol-type)))
+          ((not eol-type)
+           base)
+          ((= eol-type orig-eol-type)
+           coding-system)
+          ((progn (setq orig-eol-type (coding-system-eol-type base))
+                  (vectorp orig-eol-type))
+           (aref orig-eol-type eol-type)))))
 "#;

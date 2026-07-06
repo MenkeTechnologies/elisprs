@@ -99,4 +99,92 @@
     ;; utf-16-le is a real alias in 30.2, so the fallback branch is skipped.
     (should (funcall mm-cs 'utf-16-le))))
 
+;; ---- coding-system-eol-type: fixed integer vs subsidiary vector ----
+(ert-deftest cs-eol-type ()
+  ;; Fixed-EOL systems return the integer 0 (unix), never a vector.
+  (should (eq (coding-system-eol-type 'no-conversion) 0))
+  (should (eq (coding-system-eol-type 'no-conversion-multibyte) 0))
+  (should (eq (coding-system-eol-type 'binary) 0))
+  ;; nil is treated as `no-conversion'.
+  (should (eq (coding-system-eol-type nil) 0))
+  ;; The three EOL subsidiaries map to 0/1/2 by suffix.
+  (should (eq (coding-system-eol-type 'utf-8-unix) 0))
+  (should (eq (coding-system-eol-type 'utf-8-dos) 1))
+  (should (eq (coding-system-eol-type 'utf-8-mac) 2))
+  ;; An EOL-undecided base returns the [base-unix base-dos base-mac] vector.
+  (should (equal (coding-system-eol-type 'utf-8)
+                 [utf-8-unix utf-8-dos utf-8-mac]))
+  (should (equal (coding-system-eol-type 'raw-text)
+                 [raw-text-unix raw-text-dos raw-text-mac]))
+  (should (equal (coding-system-eol-type 'undecided)
+                 [undecided-unix undecided-dos undecided-mac]))
+  ;; For an alias the vector is built from the resolved BASE, not the alias
+  ;; name: `latin-1' -> `iso-latin-1', so the vector is iso-latin-1-*.
+  (should (equal (coding-system-eol-type 'latin-1)
+                 [iso-latin-1-unix iso-latin-1-dos iso-latin-1-mac]))
+  ;; A subsidiary of a fixed-EOL system does not exist -> nil.
+  (should (eq (coding-system-eol-type 'no-conversion-dos) nil))
+  ;; A non-coding-system returns nil, not an error.
+  (should (eq (coding-system-eol-type 'no-such-charset) nil)))
+
+;; ---- coding-system-eol-type: structural over the whole registry ----
+(ert-deftest cs-eol-type-registry ()
+  ;; Every base (non-alias, non-fixed) system yields the derived vector, and
+  ;; its three subsidiaries invert back to 0/1/2.  Derive over the registry so
+  ;; the assertion tracks the real table instead of drifting literals.
+  (dolist (cs (coding-system-list t))
+    (let ((eol (coding-system-eol-type cs)))
+      (if (integerp eol)
+          ;; Every fixed-EOL base system in 30.2 is `unix' (0).
+          (should (eq eol 0))
+        (let ((name (symbol-name cs)))
+          (should (equal eol (vector (intern (concat name "-unix"))
+                                     (intern (concat name "-dos"))
+                                     (intern (concat name "-mac")))))
+          (should (eq (coding-system-eol-type (aref eol 0)) 0))
+          (should (eq (coding-system-eol-type (aref eol 1)) 1))
+          (should (eq (coding-system-eol-type (aref eol 2)) 2)))))))
+
+;; ---- coding-system-change-eol-conversion: symbol and integer EOL args ----
+(ert-deftest cs-change-eol ()
+  ;; Symbol EOL types select the matching subsidiary of an undecided system.
+  (should (eq (coding-system-change-eol-conversion 'utf-8 'unix) 'utf-8-unix))
+  (should (eq (coding-system-change-eol-conversion 'utf-8 'dos) 'utf-8-dos))
+  (should (eq (coding-system-change-eol-conversion 'utf-8 'mac) 'utf-8-mac))
+  ;; nil EOL returns the base (undecided) system.
+  (should (eq (coding-system-change-eol-conversion 'utf-8 nil) 'utf-8))
+  ;; Integer EOL types 0/1/2 are accepted just like the symbols.
+  (should (eq (coding-system-change-eol-conversion 'utf-8 0) 'utf-8-unix))
+  (should (eq (coding-system-change-eol-conversion 'utf-8 1) 'utf-8-dos))
+  (should (eq (coding-system-change-eol-conversion 'utf-8 2) 'utf-8-mac))
+  ;; Starting from a subsidiary, changing EOL crosses to the sibling.
+  (should (eq (coding-system-change-eol-conversion 'utf-8-dos 'unix) 'utf-8-unix))
+  (should (eq (coding-system-change-eol-conversion 'utf-8-unix 'mac) 'utf-8-mac))
+  ;; Same EOL as the current one returns the coding system unchanged.
+  (should (eq (coding-system-change-eol-conversion 'utf-8-unix 'unix) 'utf-8-unix))
+  ;; nil EOL on a subsidiary returns the undecided base.
+  (should (eq (coding-system-change-eol-conversion 'utf-8-unix nil) 'utf-8))
+  ;; Aliases resolve through the base: latin-1 -> iso-latin-1-mac.
+  (should (eq (coding-system-change-eol-conversion 'latin-1 'mac) 'iso-latin-1-mac))
+  ;; A fixed-EOL system: unix keeps it, but dos/mac have no variant -> nil.
+  (should (eq (coding-system-change-eol-conversion 'no-conversion 'unix) 'no-conversion))
+  (should (eq (coding-system-change-eol-conversion 'no-conversion 'dos) nil))
+  (should (eq (coding-system-change-eol-conversion 'no-conversion 'mac) nil))
+  ;; `binary' is an alias of no-conversion: unix keeps binary, nil -> base.
+  (should (eq (coding-system-change-eol-conversion 'binary 'unix) 'binary))
+  (should (eq (coding-system-change-eol-conversion 'binary nil) 'no-conversion)))
+
+;; ---- change-eol-conversion: structural round-trip over the registry ----
+(ert-deftest cs-change-eol-registry ()
+  ;; For every undecided base system, change-eol to dos must equal the second
+  ;; slot of its eol-type vector; changing back to nil returns the base.
+  (dolist (cs (coding-system-list t))
+    (let ((eol (coding-system-eol-type cs)))
+      (when (vectorp eol)
+        (should (eq (coding-system-change-eol-conversion cs 'unix) (aref eol 0)))
+        (should (eq (coding-system-change-eol-conversion cs 'dos) (aref eol 1)))
+        (should (eq (coding-system-change-eol-conversion cs 'mac) (aref eol 2)))
+        (should (eq (coding-system-change-eol-conversion cs nil)
+                    (coding-system-base cs)))))))
+
 (ert-run-tests-batch-and-exit)
