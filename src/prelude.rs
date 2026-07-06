@@ -2736,6 +2736,44 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
   (file-name-as-directory (--temp-directory--)))
 ;; No separate small-file temp dir by default, matching `emacs -Q'.
 (defvar small-temporary-file-directory nil)
+;; `make-temp-name' (Fmake_temp_name, fileio.c) delegates to
+;; `make-temp-file-internal' with DIR-FLAG 0, which calls the gnulib
+;; `gen_tempname' (tempname.c) in its GT_NOCREATE mode: it replaces a run of
+;; 6 `X's with random characters drawn from the 62-char base
+;; "a..zA..Z0..9", and loops (up to 62^3 = 238328 attempts) until the name
+;; belongs to no existing file (glibc `try_nocreate' uses lstat, so a broken
+;; symlink also counts as existing). The random suffix makes the result
+;; non-deterministic, so this matches Emacs's observable contract -- PREFIX +
+;; 6 base62 chars naming a nonexistent file -- rather than a fixed value.
+(defvar make-temp-name--letters
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+  "The 62-char base gnulib `gen_tempname' draws temp-name suffix chars from.")
+(defun make-temp-name (prefix)
+  "Generate temporary file name (string) starting with PREFIX (a string).
+
+This function tries to choose a name that has no existing file.
+For this to work, PREFIX should be an absolute file name, and PREFIX
+and the returned string should both be non-magic."
+  (unless (stringp prefix)
+    (signal 'wrong-type-argument (list 'stringp prefix)))
+  (let ((attempts 238328)          ; 62 * 62 * 62, gnulib ATTEMPTS_MIN
+        (result nil))
+    (while (and (null result) (> attempts 0))
+      (setq attempts (1- attempts))
+      (let ((candidate prefix)
+            (i 0))
+        (while (< i 6)
+          (setq candidate
+                (concat candidate
+                        (char-to-string
+                         (aref make-temp-name--letters (random 62)))))
+          (setq i (1+ i)))
+        ;; lstat semantics: a real file OR a (possibly broken) symlink counts.
+        (unless (or (file-exists-p candidate) (file-symlink-p candidate))
+          (setq result candidate))))
+    (unless result
+      (signal 'file-error (list "Creating file name with prefix" prefix)))
+    result))
 (defun directory-file-name (f)
   (if (and (> (length f) 1) (eq (aref f (1- (length f))) ?/))
       (substring f 0 (1- (length f)))
