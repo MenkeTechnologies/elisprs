@@ -7392,6 +7392,226 @@ this sets the local binding in that buffer instead."
 	(set variable value))
     (set-default-toplevel-value variable value)))
 
+;; ---------------------------------------------------------------------------
+;; custom-set-variables / custom-theme-set-variables (custom.el).
+;;
+;; This is the machinery a user's Customize block generates.  Ported faithfully
+;; from custom.el (Emacs 30.2).  It is pure Lisp: no widgets, keymaps, eieio, or
+;; face machinery on this path -- only theme-value/saved-value bookkeeping via
+;; get/put plus the default :set (custom-set-default).
+;; ---------------------------------------------------------------------------
+
+;; load-history (lread.c global): normally a list of loaded files and the
+;; symbols they defined.  elisprs does not track it; nil means "nothing known
+;; to be loaded", which only affects the autoload branch of custom-load-symbol.
+(defvar load-history nil
+  "Alist mapping loaded file names to symbols and features.")
+
+;; custom.el:690
+(defvar custom-load-recursion nil
+  "Hack to avoid recursive dependencies.")
+
+;; custom.el:884
+(defvar custom-known-themes '(user changed)
+  "Themes that have been defined with `deftheme'.")
+
+;; custom.el:892
+(defsubst custom-theme-p (theme)
+  "Non-nil when THEME has been defined."
+  (memq theme custom-known-themes))
+
+;; custom.el:895
+(defsubst custom-check-theme (theme)
+  "Check whether THEME is valid, and signal an error if it is not."
+  (unless (custom-theme-p theme)
+    (error "Unknown theme `%s'" theme)))
+
+;; custom.el:753
+(defun custom-quote (sexp)
+  "Quote SEXP if it is not self quoting."
+  (if (and (not (consp sexp))
+           (or (keywordp sexp)
+               (not (symbolp sexp))
+               (booleanp sexp)))
+      sexp
+    (list 'quote sexp)))
+
+;; custom.el:1234
+(defvar custom--inhibit-theme-enable 'apply-only-user
+  "Whether the custom-theme-set-* functions act immediately.
+If nil, `custom-theme-set-variables' and `custom-theme-set-faces'
+change the current values of the given variable or face.  If t,
+they just make a record of the theme's settings.  If the value is
+`apply-only-user', then only the `user' theme is allowed to
+change the current values.")
+
+;; custom.el:901
+(defun custom--should-apply-setting (theme)
+  (or (null custom--inhibit-theme-enable)
+      (and (eq custom--inhibit-theme-enable 'apply-only-user)
+           (eq theme 'user))))
+
+;; custom.el:906
+(defun custom-push-theme (prop symbol theme mode &optional value)
+  "Record VALUE for face or variable SYMBOL in custom theme THEME.
+PROP is `theme-face' for a face, `theme-value' for a variable.
+MODE can be either the symbol `set' or the symbol `reset'."
+  (unless (memq prop '(theme-value theme-face theme-icon))
+    (error "Unknown theme property"))
+  (let* ((old (get symbol prop))
+	 (setting (assq theme old))
+	 (theme-settings
+	  (get theme 'theme-settings)))
+    (cond
+     ((eq mode 'reset)
+      (when setting
+	(let (res)
+	  (dolist (theme-setting theme-settings)
+	    (if (and (eq (car  theme-setting) prop)
+		     (eq (cadr theme-setting) symbol))
+		(setq res theme-setting)))
+	  (put theme 'theme-settings (delq res theme-settings)))
+	(put symbol prop (delq setting old))))
+     (setting
+      (let (res)
+	(dolist (theme-setting theme-settings)
+	  (if (and (eq (car  theme-setting) prop)
+		   (eq (cadr theme-setting) symbol))
+	      (setq res theme-setting)))
+	(put theme 'theme-settings
+	     (cons (list prop symbol theme value)
+		   (delq res theme-settings)))
+        (put symbol prop (cons (list theme value) (delq setting old)))))
+     (t
+      (when (custom--should-apply-setting theme)
+	(unless old
+	  (when (and (eq prop 'theme-value)
+		     (boundp symbol))
+	    (let ((sv  (get symbol 'standard-value))
+		  (val (symbol-value symbol)))
+	      (unless (or
+                       (and sv (equal (eval (car sv)) val))
+                       (and (eq theme 'user) (equal (custom-quote val) value)))
+		(setq old `((changed ,(custom-quote val))))))))
+	(put symbol prop (cons (list theme value) old)))
+      (put theme 'theme-settings
+	   (cons (list prop symbol theme value) theme-settings))))))
+
+;; custom.el:693
+(defun custom-load-symbol (symbol)
+  "Load all dependencies for SYMBOL."
+  (unless custom-load-recursion
+    (let ((custom-load-recursion t))
+      (ignore-errors
+        (require 'cus-load))
+      (ignore-errors
+        (require 'cus-start))
+      (dolist (load (get symbol 'custom-loads))
+        (cond ((symbolp load) (ignore-errors (require load)))
+	      ((assoc load load-history))
+	      ((let ((regexp (concat "\\(\\`\\|/\\)" (regexp-quote load)
+				     "\\(\\'\\|\\.\\)"))
+		     (found nil))
+		 (dolist (loaded load-history)
+		   (and (stringp (car loaded))
+			(string-match-p regexp (car loaded))
+			(setq found t)))
+		 found))
+	      ((equal load "cus-edit"))
+              (t (ignore-errors (load load))))))))
+
+;; custom.el:1085 (defvars for the topological sort)
+(defvar custom--sort-vars-table)
+(defvar custom--sort-vars-result)
+
+;; custom.el:1123
+(defun custom--sort-vars-1 (sym &optional _ignored)
+  (let ((elt (gethash sym custom--sort-vars-table)))
+    (when elt
+      (cond
+       ((eq (car elt) 'dependant)
+	(error "Circular custom dependency on `%s'" sym))
+       ((car elt)
+	(setcar elt 'dependant)
+	(dolist (dep (get sym 'custom-dependencies))
+	  (custom--sort-vars-1 dep))
+	(setcar elt nil)
+	(push (cdr elt) custom--sort-vars-result))))))
+
+;; custom.el:1088
+(defun custom--sort-vars (vars)
+  "Sort VARS based on custom dependencies."
+  (let ((custom--sort-vars-table (make-hash-table))
+	(dependants (make-hash-table))
+	(custom--sort-vars-result nil)
+	last)
+    (dolist (var vars)
+      (puthash (car var) (cons t var) custom--sort-vars-table)
+      (puthash (car var) var dependants))
+    (dolist (var vars)
+      (dolist (dep (get (car var) 'custom-dependencies))
+	(remhash dep dependants)))
+    (maphash (lambda (sym var)
+	       (when (and (null (get sym 'custom-dependencies))
+			  (or (nth 3 var)
+			      (eq (get sym 'custom-set)
+				  'custom-set-minor-mode)))
+		 (remhash sym dependants)
+		 (push var last)))
+	     dependants)
+    (maphash #'custom--sort-vars-1 dependants)
+    (nconc (nreverse custom--sort-vars-result) last)))
+
+;; custom.el:1017
+(defun custom-theme-set-variables (theme &rest args)
+  "Initialize variables for theme THEME according to settings in ARGS.
+Each of the arguments in ARGS should be a list of this form:
+
+  (SYMBOL EXP [NOW [REQUEST [COMMENT]]])"
+  (custom-check-theme theme)
+  (dolist (entry args)
+    (let* ((symbol (indirect-variable (nth 0 entry))))
+      (unless (or (get symbol 'standard-value)
+                  (memq (get symbol 'custom-autoload) '(nil noset)))
+        (custom-load-symbol symbol))))
+  (setq args (custom--sort-vars args))
+  (dolist (entry args)
+    (unless (listp entry)
+      (error "Incompatible Custom theme spec"))
+    (let* ((symbol (indirect-variable (nth 0 entry)))
+	   (value (nth 1 entry)))
+      (custom-push-theme 'theme-value symbol theme 'set value)
+      (when (custom--should-apply-setting theme)
+	(let* ((now (nth 2 entry))
+	       (requests (nth 3 entry))
+	       (comment (nth 4 entry))
+	       set)
+	  (when requests
+	    (put symbol 'custom-requests requests)
+            (mapc (lambda (lib) (require lib nil t)) requests))
+          (setq set (or (get symbol 'custom-set) #'custom-set-default))
+	  (put symbol 'saved-value (list value))
+	  (put symbol 'saved-variable-comment comment)
+	  (condition-case data
+	      (cond (now
+		     (put symbol 'force-value t)
+		     (funcall set symbol (eval value)))
+		    ((default-boundp symbol)
+		     (funcall set symbol (eval value))))
+	    (error
+	     (message "Error setting %s: %s" symbol data)))
+	  (and (or now (default-boundp symbol))
+	       (put symbol 'variable-comment comment)))))))
+
+;; custom.el:1001
+(defun custom-set-variables (&rest args)
+  "Install user customizations of variable values specified in ARGS.
+These settings are registered as theme `user'.
+The arguments should each be a list of the form:
+
+  (SYMBOL EXP [NOW [REQUEST [COMMENT]]])"
+  (apply #'custom-theme-set-variables 'user args))
+
 ;; custom-set-minor-mode (custom.el): a defcustom :set that toggles the mode.
 ;; (Reached only via Customize, which is out of the mode-run path.)
 (defun custom-set-minor-mode (variable value)

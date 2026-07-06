@@ -29,6 +29,12 @@
   (should (= (eval '(+ 1 2 3) t) 6))
   (should (equal (read "(a (b c) . d)") '(a (b c) . d)))
   (should (= (eval (read "(* 6 7)") t) 42))
+  ;; Self-evaluating constant symbols: `t' is its own value (Emacs `eval_sub'
+  ;; returns the symbol's value slot, which for t/nil/keywords holds itself).
+  (should (eq (eval t) t))
+  (should (eq (eval 't) t))
+  (should (eq (eval nil) nil))
+  (should (eq (eval :kw) :kw))
   (should (equal (macroexpand '(my-when c x)) '(if c (progn x)))))
 
 (ert-deftest meta-apply-funcall ()

@@ -2926,6 +2926,13 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             // lives here (outside any host borrow), like the other intrinsics.
             "eval" => {
                 let form = args.first().ok_or("wrong-number-of-arguments: eval")?;
+                // `t` is a self-evaluating constant symbol (Emacs `eval_sub`:
+                // its value slot holds itself).  It is represented as
+                // `Value::Bool(true)`, which `compile_top` would lower to the
+                // integer 1, so short-circuit it here to return `t` itself.
+                if matches!(form, Value::Bool(true)) {
+                    return Ok(form.clone());
+                }
                 let expanded = macroexpand_all(form)?;
                 let chunk = with_host(|h| crate::compiler::compile_top(h, &expanded))?;
                 return run_chunk(chunk);
