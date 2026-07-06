@@ -1617,6 +1617,19 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
                         forms)))
     (when copier
       (setq forms (cons `(defun ,(intern copier) (--s--) (vconcat --s--)) forms)))
+    ;; Register a `cl-structure-class' so cl-generic's typeof generalizer can
+    ;; dispatch on this struct type (cl-preloaded.el:205).  Guarded so the many
+    ;; structs defined before the class registry is bootstrapped are skipped.
+    (setq forms
+          (cons `(when (and (fboundp 'cl--struct-new-class)
+                            (cl--find-class 'cl-structure-object))
+                   (put ',name 'cl--class
+                        (cl--struct-new-class
+                         ',name ,--doc--
+                         (list (or ,(if parent `(cl--find-class ',parent))
+                                   (cl--find-class 'cl-structure-object)))
+                         nil nil nil nil nil nil nil)))
+                forms))
     (let ((j 1) (ros readonly))
       (dolist (sn snames)
         (let ((acc (intern (concat conc (symbol-name sn)))))
@@ -6510,6 +6523,195 @@ No problems result if this variable is not bound.
 
 (cl-defstruct (oclosure--class (:include cl--class))
   allparents)
+
+;; -- built-in type class registry (faithful port of cl-preloaded.el) --
+;; cl-generic's typeof generalizer dispatches on the class DAG registered here:
+;; `cl--generic-type-specializers' looks up the class of `cl-type-of' and walks
+;; `cl--class-allparents'.  Without this, cl-generic-generalizers signals
+;; "Unknown specializer integer" on the built-in-type prefill in cl-generic.el.
+
+;; cl-preloaded.el:299 — the linearised parent list, most specific first.
+(defun cl--class-allparents (class)
+  (cons (cl--class-name class)
+        (merge-ordered-lists (mapcar #'cl--class-allparents
+                                     (cl--class-parents class)))))
+
+;; cl-preloaded.el:304 — type descriptors for built-in types.
+(cl-defstruct (built-in-class
+               (:include cl--class)
+               (:noinline t)
+               (:constructor nil)
+               (:constructor built-in-class--make (name docstring parents))
+               (:copier nil))
+  "Type descriptors for built-in types.
+The `slots' (and hence `index-table') are currently unused."
+  )
+
+;; cl-preloaded.el:314 — register a built-in type NAME with PARENTS.
+(defmacro cl--define-built-in-type (name parents &optional docstring &rest slots)
+  (declare (indent 2) (doc-string 3))
+  (unless (listp parents) (setq parents (list parents)))
+  (unless (or parents (eq name t))
+    (error "Missing parents for %S: %S" name parents))
+  (let ((predicate (intern-soft (format
+                                 (if (string-match "-" (symbol-name name))
+                                     "%s-p" "%sp")
+                                 name))))
+    (unless (fboundp predicate) (setq predicate nil))
+    (while (keywordp (car slots))
+      (let ((kw (pop slots)) (val (pop slots)))
+        (pcase kw
+          (:predicate (setq predicate val))
+          (_ (error "Unknown keyword arg: %S" kw)))))
+    `(progn
+       ,(if predicate `(put ',name 'cl-deftype-satisfies #',predicate)
+          nil)
+       (put ',name 'cl--class
+            (built-in-class--make ',name ,docstring
+                                  (mapcar (lambda (type)
+                                            (let ((class (get type 'cl--class)))
+                                              (unless class
+                                                (error "Unknown type: %S" type))
+                                              class))
+                                          ',parents))))))
+
+;; cl-preloaded.el:353 — like `functionp' but nil for lists and symbols.
+(defun cl-functionp (object)
+  "Return non-nil if OBJECT is a member of type `function'.
+This is like `functionp' except that it returns nil for all lists and symbols,
+regardless if `funcall' would accept to call them."
+  (memq (cl-type-of object)
+        '(primitive-function native-comp-function module-function
+          interpreted-function byte-code-function)))
+
+;; cl-preloaded.el:361-472 — the built-in type DAG, parents before children.
+(cl--define-built-in-type t nil "Abstract supertype of everything.")
+(cl--define-built-in-type atom t "Abstract supertype of anything but cons cells."
+                          :predicate atom)
+(cl--define-built-in-type tree-sitter-compiled-query atom)
+(cl--define-built-in-type tree-sitter-node atom)
+(cl--define-built-in-type tree-sitter-parser atom)
+(when (fboundp 'user-ptrp)
+  (cl--define-built-in-type user-ptr atom nil
+                            :predicate user-ptrp))
+(cl--define-built-in-type font-object atom)
+(cl--define-built-in-type font-entity atom)
+(cl--define-built-in-type font-spec atom)
+(cl--define-built-in-type condvar atom)
+(cl--define-built-in-type mutex atom)
+(cl--define-built-in-type thread atom)
+(cl--define-built-in-type terminal atom)
+(cl--define-built-in-type hash-table atom)
+(cl--define-built-in-type frame atom)
+(cl--define-built-in-type buffer atom)
+(cl--define-built-in-type window atom)
+(cl--define-built-in-type process atom)
+(cl--define-built-in-type finalizer atom)
+(cl--define-built-in-type window-configuration atom)
+(cl--define-built-in-type overlay atom)
+(cl--define-built-in-type number-or-marker atom
+  "Abstract supertype of both `number's and `marker's.")
+(cl--define-built-in-type symbol atom
+  "Type of symbols."
+  (name     symbol-name)
+  (value    symbol-value)
+  (function symbol-function)
+  (plist    symbol-plist))
+(cl--define-built-in-type obarray atom)
+(cl--define-built-in-type native-comp-unit atom)
+(cl--define-built-in-type sequence t "Abstract supertype of sequences.")
+(cl--define-built-in-type list sequence)
+(cl--define-built-in-type array (sequence atom) "Abstract supertype of arrays.")
+(cl--define-built-in-type number (number-or-marker)
+  "Abstract supertype of numbers.")
+(cl--define-built-in-type float (number))
+(cl--define-built-in-type integer-or-marker (number-or-marker)
+  "Abstract supertype of both `integer's and `marker's.")
+(cl--define-built-in-type integer (number integer-or-marker))
+(cl--define-built-in-type marker (integer-or-marker))
+(cl--define-built-in-type bignum (integer)
+  "Type of those integers too large to fit in a `fixnum'.")
+(cl--define-built-in-type fixnum (integer)
+  "Type of small (fixed-size) integers.")
+(cl--define-built-in-type boolean (symbol)
+  "Type of the canonical boolean values, i.e. either nil or t.")
+(cl--define-built-in-type symbol-with-pos (symbol)
+  "Type of symbols augmented with source-position information.")
+(cl--define-built-in-type vector (array))
+(cl--define-built-in-type record (atom)
+  "Abstract type of objects with slots.")
+(cl--define-built-in-type bool-vector (array) "Type of bitvectors.")
+(cl--define-built-in-type char-table (array)
+  "Type of special arrays that are indexed by characters.")
+(cl--define-built-in-type string (array))
+(cl--define-built-in-type null (boolean list)
+  "Type of the nil value."
+  :predicate null)
+(cl--define-built-in-type cons (list)
+  "Type of cons cells."
+  (car car) (cdr cdr))
+(cl--define-built-in-type function (atom)
+  "Abstract supertype of function values.")
+(cl--define-built-in-type compiled-function (function)
+  "Abstract type of functions that have been compiled.")
+(cl--define-built-in-type closure (function)
+  "Abstract type of functions represented by a vector-like object.")
+(cl--define-built-in-type byte-code-function (compiled-function closure)
+  "Type of functions that have been byte-compiled.")
+(cl--define-built-in-type subr (atom)
+  "Abstract type of functions compiled to machine code.")
+(cl--define-built-in-type module-function (function)
+  "Type of functions provided via the module API.")
+(cl--define-built-in-type interpreted-function (closure)
+  "Type of functions that have not been compiled.")
+(cl--define-built-in-type special-form (subr)
+  "Type of the core syntactic elements of the Emacs Lisp language.")
+(cl--define-built-in-type native-comp-function (subr compiled-function)
+  "Type of functions that have been compiled by the native compiler.")
+(cl--define-built-in-type primitive-function (subr compiled-function)
+  "Type of functions hand written in C.")
+
+;; -- cl-defstruct class registry (faithful subset of cl-preloaded.el) --
+;; cl-generic's typeof generalizer also dispatches on cl-defstruct types: it
+;; needs `cl--find-class NAME' to return a `cl-structure-class' object.  Every
+;; `cl-defstruct' now registers one (see the guarded form emitted by the macro);
+;; the two metaclasses below and their parent chain (record → cl-structure-object
+;; → cl--class → cl-structure-class) are bootstrapped by hand, matching the DAG
+;; `cl--class-allparents' walks (binary-verified against GNU Emacs 30.2).
+
+;; cl-preloaded.el:207 — the type of CL struct descriptors.  Extra slots beyond
+;; those inherited from cl--class are kept for layout fidelity though the
+;; cluster's load path only reads name/parents.
+(cl-defstruct (cl-structure-class
+               (:include cl--class)
+               (:conc-name cl--struct-class-)
+               (:predicate cl--struct-class-p)
+               (:constructor nil)
+               (:constructor cl--struct-new-class
+                (name docstring parents type named slots index-table
+                      children-sym tag print))
+               (:copier nil))
+  "The type of CL structs descriptors."
+  (tag nil) (type nil) (named nil) (print nil) (children-sym nil))
+
+;; cl-preloaded.el:232 — the root parent of all "normal" CL structs.
+(cl-defstruct (cl-structure-object
+               (:predicate cl-struct-p)
+               (:constructor nil)
+               (:copier nil))
+  "The root parent of all \"normal\" CL structs")
+
+;; Bootstrap the metaclass chain by hand (the `cl-defstruct' auto-registration
+;; above short-circuits until cl-structure-object is registered).
+(put 'cl-structure-object 'cl--class
+     (cl--struct-new-class 'cl-structure-object nil (list (cl--find-class 'record))
+                           nil nil nil nil nil nil nil))
+(put 'cl--class 'cl--class
+     (cl--struct-new-class 'cl--class nil (list (cl--find-class 'cl-structure-object))
+                           nil nil nil nil nil nil nil))
+(put 'cl-structure-class 'cl--class
+     (cl--struct-new-class 'cl-structure-class nil (list (cl--find-class 'cl--class))
+                           nil nil nil nil nil nil nil))
 
 (defun oclosure--index-table (slotdescs)
   (let ((i -1)
