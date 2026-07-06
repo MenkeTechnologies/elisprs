@@ -3177,6 +3177,132 @@ remote, otherwise search locally."
       count)))
 ;;; ---- misc small subr.el helpers ----
 (defun ngettext (singular plural n) (if (= n 1) singular plural))
+
+;;; ---- version comparison (faithful port of lisp/subr.el, Emacs 30.2) ----
+;; version-to-list parses a version string into a list of integers; the
+;; version-list-* comparators do the significant-trailing-zero comparison; and
+;; version< / version<= / version= wrap them over two version strings. The
+;; version-regexp-alist data is copied value-for-value from subr.el so that
+;; non-numeric qualifiers (snapshot/alpha/beta/pre/rc) sort exactly as Emacs.
+(defconst version-separator "."
+  "Specify the string used to separate the version elements.")
+
+(defconst version-regexp-alist
+  '(("^[-._+ ]?snapshot$"                                 . -4)
+    ("^[-._+]$"                                           . -4)
+    ("^[-._+ ]?\\(cvs\\|git\\|bzr\\|svn\\|hg\\|darcs\\)$" . -4)
+    ("^[-._+ ]?unknown$"                                  . -4)
+    ("^[-._+ ]?alpha$"                                    . -3)
+    ("^[-._+ ]?beta$"                                     . -2)
+    ("^[-._+ ]?\\(pre\\|rc\\)$"                           . -1))
+  "Specify association between non-numeric version and its priority.")
+
+(defun version-to-list (ver)
+  "Convert version string VER into a list of integers."
+  (declare (side-effect-free t))
+  (unless (stringp ver)
+    (error "Version must be a string"))
+  ;; Change .x.y to 0.x.y
+  (if (and (>= (length ver) (length version-separator))
+	   (string-equal (substring ver 0 (length version-separator))
+			 version-separator))
+      (setq ver (concat "0" ver)))
+  (unless (string-match-p "^[0-9]" ver)
+    (error "Invalid version syntax: `%s' (must start with a number)" ver))
+  (save-match-data
+    (let ((i 0)
+	  (case-fold-search t)		; ignore case in matching
+	  lst s al)
+      ;; Parse the version-string up to a separator until there are none left
+      (while (and (setq s (string-match "[0-9]+" ver i))
+		  (= s i))
+        ;; Add the numeric part to the beginning of the version list;
+        ;; lst gets reversed at the end
+	(setq lst (cons (string-to-number (substring ver i (match-end 0)))
+			lst)
+	      i   (match-end 0))
+	;; handle non-numeric part
+	(when (and (setq s (string-match "[^0-9]+" ver i))
+		   (= s i))
+	  (setq s (substring ver i (match-end 0))
+		i (match-end 0))
+	  ;; handle alpha, beta, pre, etc. separator
+	  (unless (string= s version-separator)
+	    (setq al version-regexp-alist)
+	    (while (and al (not (string-match (caar al) s)))
+	      (setq al (cdr al)))
+	    (cond (al
+		   (push (cdar al) lst))
+        ;; Convert 22.3a to 22.3.1, 22.3b to 22.3.2, etc., but only if
+        ;; the letter is the end of the version-string, to avoid
+        ;; 22.8X3 being valid
+        ((and (string-match "^[-._+ ]?\\([a-zA-Z]\\)$" s)
+           (= i (length ver)))
+		   (push (- (aref (downcase (match-string 1 s)) 0) ?a -1)
+			 lst))
+		  (t (error "Invalid version syntax: `%s'" ver))))))
+    (nreverse lst))))
+
+(defun version-list-< (l1 l2)
+  "Return t if L1, a list specification of a version, is lower than L2."
+  (declare (pure t) (side-effect-free t))
+  (while (and l1 l2 (= (car l1) (car l2)))
+    (setq l1 (cdr l1)
+	  l2 (cdr l2)))
+  (cond
+   ((and l1 l2) (< (car l1) (car l2)))
+   ((and (null l1) (null l2)) nil)
+   (l1 (< (version-list-not-zero l1) 0))
+   (t  (< 0 (version-list-not-zero l2)))))
+
+(defun version-list-= (l1 l2)
+  "Return t if L1, a list specification of a version, is equal to L2."
+  (declare (pure t) (side-effect-free t))
+  (while (and l1 l2 (= (car l1) (car l2)))
+    (setq l1 (cdr l1)
+	  l2 (cdr l2)))
+  (cond
+   ((and l1 l2) nil)
+   ((and (null l1) (null l2)))
+   (l1 (zerop (version-list-not-zero l1)))
+   (t  (zerop (version-list-not-zero l2)))))
+
+(defun version-list-<= (l1 l2)
+  "Return t if L1, a list specification of a version, is lower or equal to L2."
+  (declare (pure t) (side-effect-free t))
+  (while (and l1 l2 (= (car l1) (car l2)))
+    (setq l1 (cdr l1)
+	  l2 (cdr l2)))
+  (cond
+   ((and l1 l2) (< (car l1) (car l2)))
+   ((and (null l1) (null l2)))
+   (l1 (<= (version-list-not-zero l1) 0))
+   (t  (<= 0 (version-list-not-zero l2)))))
+
+(defun version-list-not-zero (lst)
+  "Return the first non-zero element of LST, which is a list of integers.
+If all LST elements are zeros or LST is nil, return zero."
+  (declare (pure t) (side-effect-free t))
+  (while (and lst (zerop (car lst)))
+    (setq lst (cdr lst)))
+  (if lst
+      (car lst)
+    0))
+
+(defun version< (v1 v2)
+  "Return t if version V1 is lower (older) than V2."
+  (declare (side-effect-free t))
+  (version-list-< (version-to-list v1) (version-to-list v2)))
+
+(defun version<= (v1 v2)
+  "Return t if version V1 is lower (older) than or equal to V2."
+  (declare (side-effect-free t))
+  (version-list-<= (version-to-list v1) (version-to-list v2)))
+
+(defun version= (v1 v2)
+  "Return t if version V1 is equal to V2."
+  (declare (side-effect-free t))
+  (version-list-= (version-to-list v1) (version-to-list v2)))
 ;; format-seconds: ported from time-date.el. %y/%d/%h/%m/%s units (upper-case adds
 ;; ---- time arithmetic (seconds-based) ----
 ;; elisprs represents time values as plain seconds (integer or float) — a valid
