@@ -7873,4 +7873,140 @@ regardless if `funcall' would accept to call them."
            fun args)))
 
 (provide 'oclosure)
+
+;;; ---- coding systems (predicate/registry subset) ----
+;; Faithful to GNU Emacs 30.2's built-in coding-system registry. Only the
+;; registration/predicate surface is ported: `coding-system-p', `coding-system-base',
+;; `coding-system-list', `check-coding-system'.  The actual encode/decode machinery
+;; (define-coding-system-internal and the charset codecs) is not implemented here.
+;; Registry data captured value-for-value from `emacs -Q --batch' via
+;; (coding-system-list) and (coding-system-list t).
+(define-error 'coding-system-error "Invalid coding system")
+
+(defconst coding-system--all
+  '(
+    binary no-conversion undecided prefer-utf-8 raw-text no-conversion-multibyte latin-1 iso-8859-1
+    iso-latin-1 emacs-mule cp65001 mule-utf-8 utf-8 utf-8-with-signature utf-8-auto utf-8-emacs
+    utf-16le utf-16be utf-16-le utf-16le-with-signature utf-16-be utf-16be-with-signature utf-16 iso-2022-7bit
+    iso-2022-7bit-ss2 iso-2022-int-1 iso-2022-7bit-lock iso-2022-cjk iso-2022-7bit-lock-ss2 iso-2022-8bit-ss2 ctext x-ctext
+    compound-text ctext-no-compositions ctext-with-extensions x-ctext-with-extensions compound-text-with-extensions ascii iso-safe us-ascii
+    utf-7 utf-7-imap chinese-iso-7bit iso-2022-cn iso-2022-cn-ext gb2312 cn-gb euc-cn
+    euc-china cn-gb-2312 chinese-iso-8bit hz hz-gb-2312 chinese-hz cp950 cn-big5
+    big5 chinese-big5 cn-big5-hkscs big5-hkscs chinese-big5-hkscs euc-taiwan euc-tw windows-936
+    cp936 gbk chinese-gbk gb18030 chinese-gb18030 iso-8859-5 cyrillic-iso-8bit cp878
+    koi8 koi8-r cyrillic-koi8 koi8-u alternativnyj cyrillic-alternativnyj cp866 koi8-t
+    cp1251 windows-1251 cp866u ruscii cp1125 ibm855 cp855 mik
+    pt154 devanagari in-is13194-devanagari ebcdic-us ebcdic-uk cp1047 ibm1047 cp038
+    ebcdic-int ibm038 latin-2 iso-8859-2 iso-latin-2 latin-3 iso-8859-3 iso-latin-3
+    latin-4 iso-8859-4 iso-latin-4 latin-5 iso-8859-9 iso-latin-5 latin-6 iso-8859-10
+    iso-latin-6 latin-7 iso-8859-13 iso-latin-7 latin-8 iso-8859-14 iso-latin-8 latin-0
+    latin-9 iso-8859-15 iso-latin-9 cp1250 windows-1250 cp1252 windows-1252 cp1254
+    windows-1254 cp1257 windows-1257 cp256 ebcdic-int1 ibm256 cp273 ibm273
+    cp274 ebcdic-be ibm274 cp275 ebcdic-br ibm275 cp277 ebcdic-cp-no
+    ebcdic-cp-dk ibm277 cp278 ebcdic-cp-se ebcdic-cp-fi ibm278 cp280 ebcdic-cp-it
+    ibm280 cp284 ebcdic-cp-es ibm284 cp285 ebcdic-cp-gb ibm285 cp297
+    ebcdic-cp-fr ibm297 ibm775 cp775 ibm850 cp850 ibm852 cp852
+    ibm857 cp857 cp858 ibm860 cp860 ibm861 cp861 ibm863
+    cp863 ibm865 cp865 ibm437 cp437 macintosh mac-roman next
+    roman8 hp-roman8 adobe-standard-encoding latin-10 iso-8859-16 iso-latin-10 iso-8859-7 greek-iso-8bit
+    cp1253 windows-1253 cp737 ibm851 cp851 ibm869 cp869 iso-8859-8-i
+    iso-8859-8-e iso-8859-8 hebrew-iso-8bit cp1255 windows-1255 ibm862 cp862 junet
+    iso-2022-jp iso-2022-jp-2 sjis shift_jis japanese-shift-jis cp932 japanese-cp932 old-jis
+    iso-2022-jp-1978-irv japanese-iso-7bit-1978-irv euc-jp euc-japan euc-japan-1990 japanese-iso-8bit eucjp-ms iso-2022-jp-3
+    iso-2022-jp-2004 euc-jisx0213 euc-jis-2004 shift_jis-2004 japanese-shift-jis-2004 cp281 ebcdic-jp-e ibm281
+    cp290 ebcdic-jp-kana ibm290 ks_c_5601-1987 euc-korea euc-kr korean-iso-8bit korean-iso-7bit-lock
+    iso-2022-kr cp949 korean-cp949 lao tis-620 tis620 th-tis620 thai-tis620
+    ibm874 cp874 iso-8859-11 tibetan tibetan-iso-8bit viscii vietnamese-viscii tcvn-5712
+    tcvn vietnamese-tcvn vscii vietnamese-vscii viqr vietnamese-viqr cp1258 windows-1258
+    iso-8859-6 cp1256 windows-1256 georgian-ps georgian-academy
+    )
+  "All built-in coding-system names (base systems and aliases), GNU Emacs 30.2.")
+
+(defconst coding-system--alias-alist
+  '(
+    (binary . no-conversion) (latin-1 . iso-latin-1) (iso-8859-1 . iso-latin-1) (cp65001 . utf-8)
+    (mule-utf-8 . utf-8) (utf-16-le . utf-16le-with-signature) (utf-16-be . utf-16be-with-signature) (iso-2022-int-1 . iso-2022-7bit-lock)
+    (iso-2022-cjk . iso-2022-7bit-lock-ss2) (ctext . compound-text) (x-ctext . compound-text) (ctext-with-extensions . compound-text-with-extensions)
+    (x-ctext-with-extensions . compound-text-with-extensions) (ascii . us-ascii) (iso-safe . us-ascii) (chinese-iso-7bit . iso-2022-cn)
+    (gb2312 . chinese-iso-8bit) (cn-gb . chinese-iso-8bit) (euc-cn . chinese-iso-8bit) (euc-china . chinese-iso-8bit)
+    (cn-gb-2312 . chinese-iso-8bit) (hz . chinese-hz) (hz-gb-2312 . chinese-hz) (cp950 . chinese-big5)
+    (cn-big5 . chinese-big5) (big5 . chinese-big5) (cn-big5-hkscs . chinese-big5-hkscs) (big5-hkscs . chinese-big5-hkscs)
+    (euc-taiwan . euc-tw) (windows-936 . chinese-gbk) (cp936 . chinese-gbk) (gbk . chinese-gbk)
+    (gb18030 . chinese-gb18030) (iso-8859-5 . cyrillic-iso-8bit) (cp878 . cyrillic-koi8) (koi8 . cyrillic-koi8)
+    (koi8-r . cyrillic-koi8) (alternativnyj . cyrillic-alternativnyj) (cp1251 . windows-1251) (cp866u . cp1125)
+    (ruscii . cp1125) (ibm855 . cp855) (devanagari . in-is13194-devanagari) (cp1047 . ibm1047)
+    (cp038 . ibm038) (ebcdic-int . ibm038) (latin-2 . iso-latin-2) (iso-8859-2 . iso-latin-2)
+    (latin-3 . iso-latin-3) (iso-8859-3 . iso-latin-3) (latin-4 . iso-latin-4) (iso-8859-4 . iso-latin-4)
+    (latin-5 . iso-latin-5) (iso-8859-9 . iso-latin-5) (latin-6 . iso-latin-6) (iso-8859-10 . iso-latin-6)
+    (latin-7 . iso-latin-7) (iso-8859-13 . iso-latin-7) (latin-8 . iso-latin-8) (iso-8859-14 . iso-latin-8)
+    (latin-0 . iso-latin-9) (latin-9 . iso-latin-9) (iso-8859-15 . iso-latin-9) (cp1250 . windows-1250)
+    (cp1252 . windows-1252) (cp1254 . windows-1254) (cp1257 . windows-1257) (cp256 . ibm256)
+    (ebcdic-int1 . ibm256) (cp273 . ibm273) (cp274 . ibm274) (ebcdic-be . ibm274)
+    (cp275 . ibm275) (ebcdic-br . ibm275) (cp277 . ibm277) (ebcdic-cp-no . ibm277)
+    (ebcdic-cp-dk . ibm277) (cp278 . ibm278) (ebcdic-cp-se . ibm278) (ebcdic-cp-fi . ibm278)
+    (cp280 . ibm280) (ebcdic-cp-it . ibm280) (cp284 . ibm284) (ebcdic-cp-es . ibm284)
+    (cp285 . ibm285) (ebcdic-cp-gb . ibm285) (cp297 . ibm297) (ebcdic-cp-fr . ibm297)
+    (ibm775 . cp775) (ibm850 . cp850) (ibm852 . cp852) (ibm857 . cp857)
+    (ibm860 . cp860) (ibm861 . cp861) (ibm863 . cp863) (ibm865 . cp865)
+    (ibm437 . cp437) (macintosh . mac-roman) (roman8 . hp-roman8) (latin-10 . iso-latin-10)
+    (iso-8859-16 . iso-latin-10) (iso-8859-7 . greek-iso-8bit) (cp1253 . windows-1253) (ibm851 . cp851)
+    (ibm869 . cp869) (iso-8859-8-i . hebrew-iso-8bit) (iso-8859-8-e . hebrew-iso-8bit) (iso-8859-8 . hebrew-iso-8bit)
+    (cp1255 . windows-1255) (ibm862 . cp862) (junet . iso-2022-jp) (sjis . japanese-shift-jis)
+    (shift_jis . japanese-shift-jis) (cp932 . japanese-cp932) (old-jis . japanese-iso-7bit-1978-irv) (iso-2022-jp-1978-irv . japanese-iso-7bit-1978-irv)
+    (euc-jp . japanese-iso-8bit) (euc-japan . japanese-iso-8bit) (euc-japan-1990 . japanese-iso-8bit) (iso-2022-jp-3 . iso-2022-jp-2004)
+    (euc-jisx0213 . euc-jis-2004) (shift_jis-2004 . japanese-shift-jis-2004) (cp281 . ibm281) (ebcdic-jp-e . ibm281)
+    (cp290 . ibm290) (ebcdic-jp-kana . ibm290) (ks_c_5601-1987 . korean-iso-8bit) (euc-korea . korean-iso-8bit)
+    (euc-kr . korean-iso-8bit) (korean-iso-7bit-lock . iso-2022-kr) (cp949 . korean-cp949) (tis-620 . thai-tis620)
+    (tis620 . thai-tis620) (th-tis620 . thai-tis620) (ibm874 . cp874) (tibetan . tibetan-iso-8bit)
+    (viscii . vietnamese-viscii) (tcvn-5712 . vietnamese-vscii) (tcvn . vietnamese-vscii) (vietnamese-tcvn . vietnamese-vscii)
+    (vscii . vietnamese-vscii) (viqr . vietnamese-viqr) (cp1258 . windows-1258) (cp1256 . windows-1256)
+    )
+  "Alist mapping each alias coding-system to its base coding-system, GNU Emacs 30.2.")
+
+(defun coding-system--strip-eol (name)
+  "Strip one trailing -unix/-dos/-mac EOL suffix from string NAME."
+  (cond ((string-suffix-p "-unix" name) (substring name 0 -5))
+        ((string-suffix-p "-dos" name) (substring name 0 -4))
+        ((string-suffix-p "-mac" name) (substring name 0 -4))
+        (t name)))
+
+(defun coding-system-p (object)
+  "Return t if OBJECT is nil or a coding system.
+See the documentation of `define-coding-system' for information
+about coding-system objects."
+  (or (null object)
+      (and (symbolp object)
+           (and (memq (intern (coding-system--strip-eol (symbol-name object)))
+                      coding-system--all)
+                t))))
+
+(defun coding-system-base (coding-system)
+  "Return the base of CODING-SYSTEM.
+Any alias or end-of-line variant resolves to its base coding system.
+If CODING-SYSTEM is invalid, signal a `coding-system-error'."
+  (if (null coding-system)
+      'no-conversion
+    (progn
+      (check-coding-system coding-system)
+      (let* ((base (intern (coding-system--strip-eol (symbol-name coding-system))))
+             (resolved (assq base coding-system--alias-alist)))
+        (if resolved (cdr resolved) base)))))
+
+(defun coding-system-list (&optional base-only)
+  "Return a list of all existing non-subsidiary coding systems.
+If optional arg BASE-ONLY is non-nil, only base coding systems are listed."
+  (if base-only
+      (let ((result nil))
+        (dolist (cs coding-system--all)
+          (unless (assq cs coding-system--alias-alist)
+            (push cs result)))
+        (nreverse result))
+    (copy-sequence coding-system--all)))
+
+(defun check-coding-system (coding-system)
+  "Check validity of CODING-SYSTEM.
+If valid, return CODING-SYSTEM, else signal a `coding-system-error'."
+  (if (coding-system-p coding-system)
+      coding-system
+    (signal 'coding-system-error (list coding-system))))
 "#;
