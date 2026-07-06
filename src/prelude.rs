@@ -5952,6 +5952,123 @@ Mode-specific keymaps may want to use this as their parent keymap."
   "ESC TAB" #'backward-button
   "<backtab>" #'backward-button)
 
+;;; ---- button types (button.el) ----
+;; Faithful port of button.el's button-type system (define-button-type and the
+;; button-type-{put,get,subtype-p} accessors).  Button types hold default
+;; properties for buttons; each type NAME stores them on a separate uninterned
+;; `-button' symbol (its `button-category-symbol'), so `category' text/overlay
+;; properties can point at it without name clashes.  Overlay/text-property
+;; button placement (make-button, insert-button, push-button navigation) is not
+;; modeled here — only the type registry, which is what init files exercise at
+;; load time.  Value-for-value against Emacs 30.2 button.el.
+
+(defface button '((t :inherit link))
+  "Default face used for buttons."
+  :group 'basic-faces)
+
+(defvar-keymap button-map
+  :doc "Keymap used by buttons."
+  :parent button-buffer-map
+  "RET" #'push-button
+  "<mouse-2>" #'push-button
+  "<follow-link>" 'mouse-face
+  ;; FIXME: You'd think that for keymaps coming from text-properties on the
+  ;; mode-line or header-line, the `mode-line' or `header-line' prefix
+  ;; shouldn't be necessary!
+  "<mode-line> <mouse-2>" #'push-button
+  "<header-line> <mouse-2>" #'push-button
+  ;; `push-button' will automatically dispatch to
+  ;; `touch-screen-track-tap'.
+  "<mode-line> <touchscreen-down>" #'push-button
+  "<header-line> <touchscreen-down>" #'push-button
+  "<touchscreen-down>" #'push-button)
+
+;; `button-mode' (the TAB-navigation minor mode) is intentionally omitted: it is
+;; button UI, not part of the type registry, and the prelude already omits it
+;; while keeping button-buffer-map.  The type machinery below is self-contained.
+
+;; Default properties for buttons.
+(put 'default-button 'face 'button)
+(put 'default-button 'mouse-face 'highlight)
+(put 'default-button 'keymap button-map)
+(put 'default-button 'type 'button)
+;; `action' may be either a function to call, or a marker to go to.
+(put 'default-button 'action #'ignore)
+(put 'default-button 'help-echo (purecopy "mouse-2, RET: Push this button"))
+;; Make overlay buttons go away if their underlying text is deleted.
+(put 'default-button 'evaporate t)
+;; Prevent insertions adjacent to text-property buttons from
+;; inheriting their properties.
+(put 'default-button 'rear-nonsticky t)
+
+;; A `category-symbol' property for the default button type.
+(put 'button 'button-category-symbol 'default-button)
+
+;; [this is an internal function]
+(defsubst button-category-symbol (type)
+  "Return the symbol used by `button-type' TYPE to store properties.
+Buttons inherit them by setting their `category' property to that symbol."
+  (or (get type 'button-category-symbol)
+      (error "Unknown button type `%s'" type)))
+
+(defun define-button-type (name &rest properties)
+  "Define a `button type' called NAME (a symbol).
+The remaining PROPERTIES arguments form a plist of PROPERTY VALUE
+pairs, specifying properties to use as defaults for buttons with
+this type (a button's type may be set by giving it a `type'
+property when creating the button, using the :type keyword
+argument).
+
+In addition, the keyword argument :supertype may be used to specify a
+`button-type' from which NAME inherits its default property values
+\(however, the inheritance happens only when NAME is defined; subsequent
+changes to a supertype are not reflected in its subtypes)."
+  (declare (indent defun))
+  (let ((catsym (make-symbol (concat (symbol-name name) "-button")))
+	(super-catsym
+	 (button-category-symbol
+	  (or (plist-get properties 'supertype)
+	      (plist-get properties :supertype)
+	      'button))))
+    ;; Provide a link so that it's easy to find the real symbol.
+    (put name 'button-category-symbol catsym)
+    ;; Initialize NAME's properties using the global defaults.
+    (let ((default-props (symbol-plist super-catsym)))
+      (while default-props
+	(put catsym (pop default-props) (pop default-props))))
+    ;; Add NAME as the `type' property, which will then be returned as
+    ;; the type property of individual buttons.
+    (put catsym 'type name)
+    ;; Add the properties in PROPERTIES to the real symbol.
+    (while properties
+      (let ((prop (pop properties)))
+	(when (eq prop :supertype)
+	  (setq prop 'supertype))
+	(put catsym prop (pop properties))))
+    ;; Make sure there's a `supertype' property.
+    (unless (get catsym 'supertype)
+      (put catsym 'supertype 'button))
+    name))
+
+(defun button-type-put (type prop val)
+  "Set the `button-type' TYPE's PROP property to VAL."
+  (put (button-category-symbol type) prop val))
+
+(defun button-type-get (type prop)
+  "Get the property of `button-type' TYPE named PROP."
+  (get (button-category-symbol type) prop))
+
+(defun button-type-subtype-p (type supertype)
+  "Return non-nil if `button-type' TYPE is a subtype of SUPERTYPE."
+  (or (eq type supertype)
+      (and type
+	   (button-type-subtype-p (button-type-get type 'supertype)
+				  supertype))))
+
+;; Mark `button' as provided so `(require 'button)' in init files no-ops onto
+;; the preloaded type machinery instead of trying to open a file (button.el:672).
+(provide 'button)
+
 (defvar-keymap special-mode-map
   :suppress t
   "q" #'quit-window
