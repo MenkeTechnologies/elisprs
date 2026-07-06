@@ -19,18 +19,25 @@ fn is_nil(v: &Value) -> bool {
 }
 
 // ── numeric helpers ──
-fn as_num(v: &Value) -> Result<(i64, f64, bool), String> {
+fn as_num(h: &ElispHost, v: &Value) -> Result<(i64, f64, bool), String> {
     match v {
         Value::Int(n) => Ok((*n, *n as f64, false)),
         Value::Float(f) => Ok((*f as i64, *f, true)),
-        _ => Err(format!("wrong-type-argument: numberp {}", v.as_str_cow())),
+        // A marker coerces to its (integer) buffer position in arithmetic.
+        _ => match h.marker_position(v) {
+            Some(p) => Ok((p as i64, p as f64, false)),
+            None => Err(format!("wrong-type-argument: numberp {}", v.as_str_cow())),
+        },
     }
 }
-fn as_int(v: &Value) -> Result<i64, String> {
+fn as_int(h: &ElispHost, v: &Value) -> Result<i64, String> {
     match v {
         Value::Int(n) => Ok(*n),
         Value::Float(f) => Ok(*f as i64),
-        _ => Err(format!("wrong-type-argument: integerp {}", v.as_str_cow())),
+        _ => match h.marker_position(v) {
+            Some(p) => Ok(p as i64),
+            None => Err(format!("wrong-type-argument: integerp {}", v.as_str_cow())),
+        },
     }
 }
 fn as_string(v: &Value) -> Result<String, String> {
@@ -81,31 +88,31 @@ fn num_result(i: i64, f: f64, isf: bool) -> Value {
     }
 }
 
-fn add(_h: &mut ElispHost, a: &[Value]) -> R {
+fn add(h: &mut ElispHost, a: &[Value]) -> R {
     let (mut i, mut f, mut isf) = (0i64, 0f64, false);
     for v in a {
-        let (vi, vf, vfl) = as_num(v)?;
+        let (vi, vf, vfl) = as_num(h, v)?;
         isf |= vfl;
         i += vi;
         f += vf;
     }
     Ok(num_result(i, f, isf))
 }
-fn mul(_h: &mut ElispHost, a: &[Value]) -> R {
+fn mul(h: &mut ElispHost, a: &[Value]) -> R {
     let (mut i, mut f, mut isf) = (1i64, 1f64, false);
     for v in a {
-        let (vi, vf, vfl) = as_num(v)?;
+        let (vi, vf, vfl) = as_num(h, v)?;
         isf |= vfl;
         i *= vi;
         f *= vf;
     }
     Ok(num_result(i, f, isf))
 }
-fn sub(_h: &mut ElispHost, a: &[Value]) -> R {
+fn sub(h: &mut ElispHost, a: &[Value]) -> R {
     if a.is_empty() {
         return Ok(Value::Int(0));
     }
-    let (i0, f0, mut isf) = as_num(&a[0])?;
+    let (i0, f0, mut isf) = as_num(h, &a[0])?;
     if a.len() == 1 {
         return Ok(if isf {
             Value::Float(-f0)
@@ -115,18 +122,18 @@ fn sub(_h: &mut ElispHost, a: &[Value]) -> R {
     }
     let (mut i, mut f) = (i0, f0);
     for v in &a[1..] {
-        let (vi, vf, vfl) = as_num(v)?;
+        let (vi, vf, vfl) = as_num(h, v)?;
         isf |= vfl;
         i -= vi;
         f -= vf;
     }
     Ok(num_result(i, f, isf))
 }
-fn div(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (i0, f0, mut isf) = as_num(&a[0])?;
+fn div(h: &mut ElispHost, a: &[Value]) -> R {
+    let (i0, f0, mut isf) = as_num(h, &a[0])?;
     let (mut i, mut f) = (i0, f0);
     for v in &a[1..] {
-        let (vi, vf, vfl) = as_num(v)?;
+        let (vi, vf, vfl) = as_num(h, v)?;
         isf |= vfl;
         if !isf && vi == 0 {
             return Err("arith-error: division by zero".to_string());
@@ -155,9 +162,9 @@ fn modulo(h: &mut ElispHost, a: &[Value]) -> R {
 }
 // `mod` (vs `%`): the result takes the sign of the divisor, and either operand
 // may be a float — (mod 13.5 4) => 1.5, (mod -1 3) => 2.
-fn mod_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (xi, xf, xisf) = as_num(&a[0])?;
-    let (yi, yf, yisf) = as_num(&a[1])?;
+fn mod_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let (xi, xf, xisf) = as_num(h, &a[0])?;
+    let (yi, yf, yisf) = as_num(h, &a[1])?;
     if xisf || yisf {
         // Faithful port of Emacs `Fmod` (data.c): fmod, then fix the sign so the
         // result matches the divisor. `%` on f64 is fmod (the remainder keeps the
@@ -184,16 +191,16 @@ fn mod_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(Value::Int(r))
 }
-fn one_plus(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (i, f, isf) = as_num(&a[0])?;
+fn one_plus(h: &mut ElispHost, a: &[Value]) -> R {
+    let (i, f, isf) = as_num(h, &a[0])?;
     Ok(if isf {
         Value::Float(f + 1.0)
     } else {
         Value::Int(i + 1)
     })
 }
-fn one_minus(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (i, f, isf) = as_num(&a[0])?;
+fn one_minus(h: &mut ElispHost, a: &[Value]) -> R {
+    let (i, f, isf) = as_num(h, &a[0])?;
     Ok(if isf {
         Value::Float(f - 1.0)
     } else {
@@ -201,28 +208,28 @@ fn one_minus(_h: &mut ElispHost, a: &[Value]) -> R {
     })
 }
 
-fn cmp(a: &[Value], pred: fn(f64, f64) -> bool) -> R {
+fn cmp(h: &ElispHost, a: &[Value], pred: fn(f64, f64) -> bool) -> R {
     for w in a.windows(2) {
-        if !pred(as_num(&w[0])?.1, as_num(&w[1])?.1) {
+        if !pred(as_num(h, &w[0])?.1, as_num(h, &w[1])?.1) {
             return Ok(Value::Undef);
         }
     }
     Ok(Value::Bool(true))
 }
-fn num_eq(_h: &mut ElispHost, a: &[Value]) -> R {
-    cmp(a, |x, y| x == y)
+fn num_eq(h: &mut ElispHost, a: &[Value]) -> R {
+    cmp(h, a, |x, y| x == y)
 }
-fn lt(_h: &mut ElispHost, a: &[Value]) -> R {
-    cmp(a, |x, y| x < y)
+fn lt(h: &mut ElispHost, a: &[Value]) -> R {
+    cmp(h, a, |x, y| x < y)
 }
-fn gt(_h: &mut ElispHost, a: &[Value]) -> R {
-    cmp(a, |x, y| x > y)
+fn gt(h: &mut ElispHost, a: &[Value]) -> R {
+    cmp(h, a, |x, y| x > y)
 }
-fn le(_h: &mut ElispHost, a: &[Value]) -> R {
-    cmp(a, |x, y| x <= y)
+fn le(h: &mut ElispHost, a: &[Value]) -> R {
+    cmp(h, a, |x, y| x <= y)
 }
-fn ge(_h: &mut ElispHost, a: &[Value]) -> R {
-    cmp(a, |x, y| x >= y)
+fn ge(h: &mut ElispHost, a: &[Value]) -> R {
+    cmp(h, a, |x, y| x >= y)
 }
 
 // ── equality ──
@@ -262,6 +269,8 @@ fn el_equal(h: &ElispHost, a: &Value, b: &Value) -> bool {
             (Some(Obj::Vector(va)), Some(Obj::Vector(vb))) => {
                 va.len() == vb.len() && va.iter().zip(vb).all(|(x, y)| el_equal(h, x, y))
             }
+            // Two markers are `equal` when they share a buffer and position.
+            (Some(Obj::Marker(_)), Some(Obj::Marker(_))) => h.markers_equal(a, b),
             _ => false,
         },
         _ => false,
@@ -614,7 +623,7 @@ fn vector_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.alloc(Obj::Vector(a.to_vec())))
 }
 fn make_vector(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_num(&a[0])?.0;
+    let n = as_num(h, &a[0])?.0;
     if n < 0 {
         return Err(format!("wrong-type-argument: wholenump {n}"));
     }
@@ -627,7 +636,7 @@ fn aref(h: &mut ElispHost, a: &[Value]) -> R {
         let c = as_char(h, &a[1])?;
         return Ok(h.char_table_ref(&a[0], c));
     }
-    let idx = as_num(&a[1])?.0;
+    let idx = as_num(h, &a[1])?.0;
     let oor = |h: &ElispHost| format!("args-out-of-range: {} {idx}", h.print(&a[0], true));
     if idx < 0 {
         return Err(oor(h));
@@ -659,7 +668,7 @@ fn aset(h: &mut ElispHost, a: &[Value]) -> R {
         }
         return Ok(a[2].clone());
     }
-    let idx = as_num(&a[1])?.0;
+    let idx = as_num(h, &a[1])?.0;
     if idx < 0 {
         return Err(format!("args-out-of-range: {} {idx}", h.print(&a[0], true)));
     }
@@ -698,7 +707,7 @@ fn fillarray(h: &mut ElispHost, a: &[Value]) -> R {
 /// `char-table-extra-slots' property before calling this. INIT fills every char
 /// slot; the `default` slot starts nil (Emacs `Fmake_char_table`).
 fn make_char_table_new(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_num(&a[2])?.0;
+    let n = as_num(h, &a[2])?.0;
     let n = if n < 0 { 0 } else { n as usize };
     Ok(h.alloc(Obj::CharTable(CharTable::new(
         a[0].clone(),
@@ -731,7 +740,7 @@ fn set_char_table_parent(h: &mut ElispHost, a: &[Value]) -> R {
     Err(wrong_char_table(h, &a[0]))
 }
 fn char_table_extra_slot(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_num(&a[1])?.0;
+    let n = as_num(h, &a[1])?.0;
     match h.obj(&a[0]) {
         Some(Obj::CharTable(t)) => t
             .extra
@@ -743,7 +752,7 @@ fn char_table_extra_slot(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 fn set_char_table_extra_slot(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_num(&a[1])?.0;
+    let n = as_num(h, &a[1])?.0;
     if let Value::Obj(id) = &a[0] {
         if let Some(Obj::CharTable(t)) = h.arena.get_mut(*id as usize) {
             if n >= 0 && (n as usize) < t.extra.len() {
@@ -1251,7 +1260,7 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
         // one is "Not enough arguments", a non-number is a type mismatch.
         let numf = |idx: usize| -> Result<(i64, f64, bool), String> {
             let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
-            as_num(arg).map_err(|_| BAD_TYPE.to_string())
+            as_num(h, arg).map_err(|_| BAD_TYPE.to_string())
         };
         let body = match conv {
             's' => {
@@ -1481,11 +1490,11 @@ fn substring(h: &mut ElispHost, a: &[Value]) -> R {
         }
     };
     let start = match a.get(1) {
-        Some(v) if !is_nil(v) => adj(as_int(v)?),
+        Some(v) if !is_nil(v) => adj(as_int(h, v)?),
         _ => 0,
     };
     let end = match a.get(2) {
-        Some(v) if !is_nil(v) => adj(as_int(v)?),
+        Some(v) if !is_nil(v) => adj(as_int(h, v)?),
         _ => len,
     };
     if start < 0 || end > len || start > end {
@@ -1583,17 +1592,17 @@ fn string_to_char(_h: &mut ElispHost, a: &[Value]) -> R {
     ))
 }
 fn make_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_int(&a[0])?;
+    let n = as_int(h, &a[0])?;
     if n < 0 {
         return Err(format!("wrong-type-argument: wholenump {n}"));
     }
     let c = char::from_u32(as_char(h, &a[1])?).unwrap_or(' ');
     Ok(Value::str(c.to_string().repeat(n as usize)))
 }
-fn string_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+fn string_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let mut s = String::new();
     for v in a {
-        if let Some(c) = char::from_u32(as_int(v)? as u32) {
+        if let Some(c) = char::from_u32(as_int(h, v)? as u32) {
             s.push(c);
         }
     }
@@ -1606,7 +1615,7 @@ fn string_to_list(h: &mut ElispHost, a: &[Value]) -> R {
         .collect();
     Ok(h.list_from(items))
 }
-fn string_search(_h: &mut ElispHost, a: &[Value]) -> R {
+fn string_search(h: &mut ElispHost, a: &[Value]) -> R {
     let needle = as_string(&a[0])?;
     let hay = as_string(&a[1])?;
     // Optional START is a char index; search only the tail from there, then map
@@ -1615,7 +1624,7 @@ fn string_search(_h: &mut ElispHost, a: &[Value]) -> R {
     let hay_len = hay.chars().count() as i64;
     let start_char = match a.get(2) {
         Some(v) if !is_nil(v) => {
-            let n = as_int(v)?;
+            let n = as_int(h, v)?;
             if n < 0 || n > hay_len {
                 return Err(format!("args-out-of-range: {n}"));
             }
@@ -1705,7 +1714,7 @@ fn string_match(h: &mut ElispHost, a: &[Value]) -> R {
             // Emacs: a negative START counts from the end (`len + START`); any
             // START outside `[0, len]` after that adjustment is args-out-of-range,
             // whose DATA is `(STRING RAW-START)`.
-            let raw = as_int(v)?;
+            let raw = as_int(h, v)?;
             let len = subject.chars().count() as i64;
             let pos = if raw < 0 { len + raw } else { raw };
             if pos < 0 || pos > len {
@@ -1741,7 +1750,7 @@ fn string_match_p(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(match-beginning N)` / `(match-end N)` — the char position of the start/end
 /// of the Nth subexpression of the last match, or nil.
 fn match_edge(h: &mut ElispHost, a: &[Value], end: bool) -> R {
-    let n = as_int(&a[0])?.max(0) as usize;
+    let n = as_int(h, &a[0])?.max(0) as usize;
     let edge = h
         .match_data
         .as_ref()
@@ -1762,7 +1771,7 @@ fn match_end(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(match-string N &optional STRING)` — the text matched by the Nth
 /// subexpression. STRING defaults to the subject of the last `string-match`.
 fn match_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_int(&a[0])?.max(0) as usize;
+    let n = as_int(h, &a[0])?.max(0) as usize;
     let Some(md) = h.match_data.as_ref() else {
         return Ok(Value::Undef);
     };
@@ -1993,11 +2002,11 @@ enum Rm {
 /// `(OP NUMBER &optional DIVISOR)` — round NUMBER (or NUMBER/DIVISOR) to an
 /// integer under `rm`. Integer operands use exact integer division so large
 /// magnitudes don't lose precision; a float operand routes through `f64`.
-fn quotient(a: &[Value], rm: Rm) -> R {
-    let (xi, xf, xisf) = as_num(&a[0])?;
+fn quotient(h: &ElispHost, a: &[Value], rm: Rm) -> R {
+    let (xi, xf, xisf) = as_num(h, &a[0])?;
     match a.get(1) {
         Some(d) if !is_nil(d) => {
-            let (di, df, disf) = as_num(d)?;
+            let (di, df, disf) = as_num(h, d)?;
             if !xisf && !disf {
                 if di == 0 {
                     return Err("arith-error: division by zero".to_string());
@@ -2048,21 +2057,21 @@ fn int_div(x: i64, y: i64, rm: Rm) -> i64 {
         _ => q,
     }
 }
-fn floor_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    quotient(a, Rm::Floor)
+fn floor_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    quotient(h, a, Rm::Floor)
 }
-fn ceiling_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    quotient(a, Rm::Ceil)
+fn ceiling_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    quotient(h, a, Rm::Ceil)
 }
-fn round_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+fn round_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // Emacs rounds half to even (banker's rounding): (round 2.5) => 2, (round 0.5) => 0.
-    quotient(a, Rm::Round)
+    quotient(h, a, Rm::Round)
 }
-fn truncate_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    quotient(a, Rm::Trunc)
+fn truncate_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    quotient(h, a, Rm::Trunc)
 }
-fn float_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (_i, f, _isf) = as_num(&a[0])?;
+fn float_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let (_i, f, _isf) = as_num(h, &a[0])?;
     Ok(Value::Float(f))
 }
 fn logand_fn(h: &mut ElispHost, a: &[Value]) -> R {
@@ -2140,28 +2149,28 @@ fn lsh_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(expt BASE EXP)` — integer power when BASE is an integer and EXP a
 /// non-negative integer; otherwise float `BASE**EXP` (covers negative and
 /// fractional exponents). `(expt 2 10)`=>1024, `(expt 2 -1)`=>0.5, `(expt 2.0 0.5)`.
-fn expt_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (bi, bf, bisf) = as_num(&a[0])?;
-    let (ei, ef, eisf) = as_num(&a[1])?;
+fn expt_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let (bi, bf, bisf) = as_num(h, &a[0])?;
+    let (ei, ef, eisf) = as_num(h, &a[1])?;
     if !bisf && !eisf && ei >= 0 {
         Ok(Value::Int(bi.wrapping_pow(ei as u32)))
     } else {
         Ok(Value::Float(bf.powf(ef)))
     }
 }
-fn sqrt_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(&a[0])?.1.sqrt()))
+fn sqrt_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(h, &a[0])?.1.sqrt()))
 }
-fn exp_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(&a[0])?.1.exp()))
+fn exp_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(h, &a[0])?.1.exp()))
 }
-fn log_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let x = as_num(&a[0])?.1;
+fn log_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let x = as_num(h, &a[0])?.1;
     Ok(Value::Float(match a.get(1) {
         // Emacs uses `log10`/`log2` for base 10/2 (exact for powers of the base:
         // (log 1000 10) => 3.0), falling back to ln(x)/ln(base) otherwise.
         Some(b) => {
-            let base = as_num(b)?.1;
+            let base = as_num(h, b)?.1;
             if base == 10.0 {
                 x.log10()
             } else if base == 2.0 {
@@ -2173,25 +2182,25 @@ fn log_fn(_h: &mut ElispHost, a: &[Value]) -> R {
         None => x.ln(),
     }))
 }
-fn sin_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(&a[0])?.1.sin()))
+fn sin_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(h, &a[0])?.1.sin()))
 }
-fn cos_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(&a[0])?.1.cos()))
+fn cos_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(h, &a[0])?.1.cos()))
 }
-fn tan_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(&a[0])?.1.tan()))
+fn tan_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(h, &a[0])?.1.tan()))
 }
-fn asin_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(&a[0])?.1.asin()))
+fn asin_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(h, &a[0])?.1.asin()))
 }
-fn acos_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(&a[0])?.1.acos()))
+fn acos_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(h, &a[0])?.1.acos()))
 }
-fn atan_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let y = as_num(&a[0])?.1;
+fn atan_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let y = as_num(h, &a[0])?.1;
     Ok(Value::Float(match a.get(1) {
-        Some(x) => y.atan2(as_num(x)?.1),
+        Some(x) => y.atan2(as_num(h, x)?.1),
         None => y.atan(),
     }))
 }
@@ -2229,13 +2238,15 @@ fn scalbn(x: f64, mut n: i64) -> f64 {
     }
     y * f64::from_bits(((0x3ff + n) as u64) << 52)
 }
-fn ldexp_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let m = as_num(&a[0])?.1;
-    let e = as_num(&a[1])?.0;
+fn ldexp_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let m = as_num(h, &a[0])?.1;
+    let e = as_num(h, &a[1])?.0;
     Ok(Value::Float(scalbn(m, e)))
 }
-fn copysign_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(&a[0])?.1.copysign(as_num(&a[1])?.1)))
+fn copysign_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(
+        as_num(h, &a[0])?.1.copysign(as_num(h, &a[1])?.1),
+    ))
 }
 /// Decompose V into (SIGNIFICAND . EXPONENT) with the significand in [0.5,1).
 /// Bit-level port of C `frexp` (musl): exact for all values including subnormals
@@ -2263,36 +2274,36 @@ fn frexp_parts(x: f64) -> (f64, i64) {
     }
 }
 fn frexp_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let (m, e) = frexp_parts(as_num(&a[0])?.1);
+    let (m, e) = frexp_parts(as_num(h, &a[0])?.1);
     Ok(h.cons(Value::Float(m), Value::Int(e)))
 }
 fn isnan_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(a[0], Value::Float(f) if f.is_nan())))
 }
-fn fround_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(&a[0])?.1.round_ties_even()))
+fn fround_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(h, &a[0])?.1.round_ties_even()))
 }
-fn ffloor_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(&a[0])?.1.floor()))
+fn ffloor_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(h, &a[0])?.1.floor()))
 }
-fn fceiling_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(&a[0])?.1.ceil()))
+fn fceiling_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(h, &a[0])?.1.ceil()))
 }
-fn ftruncate_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(&a[0])?.1.trunc()))
+fn ftruncate_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Float(as_num(h, &a[0])?.1.trunc()))
 }
 
 /// `(string-to-number STRING &optional BASE)` — parse a leading number. With
 /// BASE (2–16) parse an integer in that radix; otherwise parse an int, or a
 /// float when a `.` or exponent is present. Non-numeric input yields 0.
-fn string_to_number(_h: &mut ElispHost, a: &[Value]) -> R {
+fn string_to_number(h: &mut ElispHost, a: &[Value]) -> R {
     let raw = as_string(&a[0])?;
     let s = raw.trim_start();
     if let Some(bv) = a.get(1) {
         // Base 10 (and nil) use the float-capable default parser below; only a
         // non-decimal base forces integer-only parsing.
         if !is_nil(bv) {
-            let base_i = as_int(bv)?;
+            let base_i = as_int(h, bv)?;
             // Emacs restricts BASE to 2..16 and signals args-out-of-range
             // otherwise (checked before the base==10 fast path).
             if !(2..=16).contains(&base_i) {
@@ -2484,6 +2495,7 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
             Some(Obj::HashTable { .. }) => "hash-table",
             Some(Obj::CharTable(_)) => "char-table",
             Some(Obj::Buffer(_)) => "buffer",
+            Some(Obj::Marker(_)) => "marker",
             None => "symbol",
         },
         _ => "symbol",
@@ -2517,7 +2529,7 @@ fn char_or_string_p(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(ok))
 }
 fn char_equal(h: &mut ElispHost, a: &[Value]) -> R {
-    let (c1, c2) = (as_int(&a[0])?, as_int(&a[1])?);
+    let (c1, c2) = (as_int(h, &a[0])?, as_int(h, &a[1])?);
     if c1 == c2 {
         return Ok(Value::Bool(true));
     }
@@ -2606,8 +2618,8 @@ fn special_form_p(h: &mut ElispHost, a: &[Value]) -> R {
         .unwrap_or(false);
     Ok(nil_or(ok))
 }
-fn char_uppercase_p(_h: &mut ElispHost, a: &[Value]) -> R {
-    let c = char::from_u32(as_int(&a[0])? as u32);
+fn char_uppercase_p(h: &mut ElispHost, a: &[Value]) -> R {
+    let c = char::from_u32(as_int(h, &a[0])? as u32);
     Ok(nil_or(c.is_some_and(|c| c.is_uppercase())))
 }
 /// `(string-distance S1 S2 &optional BYTECOMPARE)` — Levenshtein edit distance.
@@ -2881,25 +2893,25 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 /// The string argument's bytes between optional char START/END.
-fn hash_input(a: &[Value], obj_idx: usize) -> Result<Vec<u8>, String> {
+fn hash_input(h: &ElispHost, a: &[Value], obj_idx: usize) -> Result<Vec<u8>, String> {
     let s = as_string(&a[obj_idx])?;
     let chars: Vec<char> = s.chars().collect();
     let start = match a.get(obj_idx + 1) {
-        Some(v) if !is_nil(v) => as_int(v)?.max(0) as usize,
+        Some(v) if !is_nil(v) => as_int(h, v)?.max(0) as usize,
         _ => 0,
     };
     let end = match a.get(obj_idx + 2) {
-        Some(v) if !is_nil(v) => (as_int(v)?.max(0) as usize).min(chars.len()),
+        Some(v) if !is_nil(v) => (as_int(h, v)?.max(0) as usize).min(chars.len()),
         _ => chars.len(),
     };
     let sub: String = chars[start.min(end)..end].iter().collect();
     Ok(sub.into_bytes())
 }
-fn sha1_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::str(to_hex(&sha1_bytes(&hash_input(a, 0)?))))
+fn sha1_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::str(to_hex(&sha1_bytes(&hash_input(h, a, 0)?))))
 }
-fn md5_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::str(to_hex(&md5_bytes(&hash_input(a, 0)?))))
+fn md5_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::str(to_hex(&md5_bytes(&hash_input(h, a, 0)?))))
 }
 /// `(secure-hash ALGORITHM OBJECT &optional START END BINARY)`.
 fn secure_hash(h: &mut ElispHost, a: &[Value]) -> R {
@@ -2908,7 +2920,7 @@ fn secure_hash(h: &mut ElispHost, a: &[Value]) -> R {
         .sym_name(&a[0])
         .or_else(|| as_string(&a[0]).ok())
         .unwrap_or_default();
-    let bytes = hash_input(a, 1)?;
+    let bytes = hash_input(h, a, 1)?;
     let digest = match algo.as_str() {
         "md5" => md5_bytes(&bytes),
         "sha1" => sha1_bytes(&bytes),
@@ -3058,8 +3070,8 @@ fn string_to_vector(h: &mut ElispHost, a: &[Value]) -> R {
 /// the integer `frexp` exponent minus one; every other case (zero, ±infinity,
 /// NaN) falls through to C `logb`, which returns a *float* — `-inf` for zero,
 /// `+inf` for either infinity, and NaN for NaN.
-fn logb_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let f = as_num(&a[0])?.1;
+fn logb_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let f = as_num(h, &a[0])?.1;
     if f.is_finite() && f != 0.0 {
         return Ok(Value::Int(f.abs().log2().floor() as i64));
     }
@@ -3105,8 +3117,8 @@ fn ascii_char_p(c: i64) -> bool {
     (0..0x80).contains(&c)
 }
 /// `CHECK_CHARACTER`: a character is a fixnum in `0..=MAX_CHAR` (`0x3FFFFF`).
-fn check_character(v: &Value) -> Result<i64, String> {
-    let c = as_int(v)?;
+fn check_character(h: &ElispHost, v: &Value) -> Result<i64, String> {
+    let c = as_int(h, v)?;
     if (0..=MAX_CHAR).contains(&c) {
         Ok(c)
     } else {
@@ -3118,8 +3130,8 @@ fn check_character(v: &Value) -> Result<i64, String> {
 /// (src/character.c). Fold the Shift and Control modifier bits of an ASCII base
 /// character into the code; Meta and other modifiers are left in place. CHAR is
 /// any integer (`CHECK_FIXNUM`), not just a valid character.
-fn char_resolve_modifiers(_h: &mut ElispHost, a: &[Value]) -> R {
-    let mut c = as_int(&a[0])?;
+fn char_resolve_modifiers(h: &mut ElispHost, a: &[Value]) -> R {
+    let mut c = as_int(h, &a[0])?;
     // A non-ASCII base character can't reflect modifier bits into the code.
     if !ascii_char_p(c & !CHAR_MODIFIER_MASK) {
         return Ok(Value::Int(c));
@@ -3156,8 +3168,8 @@ fn char_resolve_modifiers(_h: &mut ElispHost, a: &[Value]) -> R {
 /// (Meta etc.) fail the `characterp` check. Characters outside Unicode
 /// (eight-bit / raw internal codes) can't be held in a UTF-8 string here, so
 /// they yield the empty string.
-fn text_char_description(_h: &mut ElispHost, a: &[Value]) -> R {
-    let c = check_character(&a[0])?;
+fn text_char_description(h: &mut ElispHost, a: &[Value]) -> R {
+    let c = check_character(h, &a[0])?;
     if ascii_char_p(c) {
         let s = if c < 0o40 {
             format!("^{}", (c as u8 + 64) as char)
@@ -3179,8 +3191,8 @@ fn text_char_description(_h: &mut ElispHost, a: &[Value]) -> R {
 /// `(unibyte-char-to-multibyte BYTE)` — port of `Funibyte_char_to_multibyte`
 /// (src/charset.c). ASCII bytes map to themselves; bytes `0x80..=0xFF` become
 /// the eight-bit character `0x3FFF00 + byte`. BYTE above 255 is not unibyte.
-fn unibyte_char_to_multibyte(_h: &mut ElispHost, a: &[Value]) -> R {
-    let c = check_character(&a[0])?;
+fn unibyte_char_to_multibyte(h: &mut ElispHost, a: &[Value]) -> R {
+    let c = check_character(h, &a[0])?;
     if c >= 256 {
         return Err(format!("error: Not a unibyte character: {c}"));
     }
@@ -3190,8 +3202,8 @@ fn unibyte_char_to_multibyte(_h: &mut ElispHost, a: &[Value]) -> R {
 /// `(multibyte-char-to-unibyte CHAR)` — port of `Fmultibyte_char_to_unibyte`
 /// (src/charset.c). Characters below 256 map to themselves, eight-bit chars
 /// (above `MAX_5_BYTE_CHAR`) map to their raw byte, all others map to -1.
-fn multibyte_char_to_unibyte(_h: &mut ElispHost, a: &[Value]) -> R {
-    let c = check_character(&a[0])?;
+fn multibyte_char_to_unibyte(h: &mut ElispHost, a: &[Value]) -> R {
+    let c = check_character(h, &a[0])?;
     let byte = if c < 256 {
         c
     } else if c > MAX_5_BYTE_CHAR {
@@ -3251,7 +3263,7 @@ fn car_less_than_car(h: &mut ElispHost, a: &[Value]) -> R {
     };
     let a0 = car_of(h, &a[0])?;
     let b0 = car_of(h, &a[1])?;
-    Ok(nil_or(as_num(&a0)?.1 < as_num(&b0)?.1))
+    Ok(nil_or(as_num(h, &a0)?.1 < as_num(h, &b0)?.1))
 }
 /// `(subr-name SUBR)` — the name of a primitive SUBR as a string. Signals
 /// `wrong-type-argument` when SUBR is not a subr (e.g. a plain symbol).
@@ -3447,14 +3459,14 @@ fn rng_next() -> u64 {
 /// `(random &optional LIMIT)`. With a positive integer LIMIT, return an integer in
 /// [0, LIMIT); with t, reseed and return a random integer; otherwise a random
 /// fixnum (may be negative).
-fn random_fn(_h: &mut ElispHost, a: &[Value]) -> R {
+fn random_fn(h: &mut ElispHost, a: &[Value]) -> R {
     match a.first() {
         Some(Value::Bool(true)) => {
             RNG_STATE.with(|s| s.set(rng_seed()));
             Ok(Value::Int((rng_next() >> 1) as i64))
         }
         Some(v) if !is_nil(v) => {
-            let n = as_int(v)?;
+            let n = as_int(h, v)?;
             if n <= 0 {
                 return Err("args-out-of-range: random limit must be positive".to_string());
             }
@@ -3477,12 +3489,12 @@ fn time_arg_secs(h: &ElispHost, v: Option<&Value>) -> Result<f64, String> {
             // (TICKS . HZ): a cons whose cdr is a number.
             if let Some(Obj::Cons(car, Value::Int(hz))) = h.obj(t) {
                 if *hz != 0 {
-                    return Ok(as_num(car)?.1 / (*hz as f64));
+                    return Ok(as_num(h, car)?.1 / (*hz as f64));
                 }
             }
             // (HIGH LOW [USEC [PSEC]]).
             let parts = h.list_vec(t).ok_or("invalid time value")?;
-            let get = |i: usize| parts.get(i).and_then(|v| as_num(v).ok()).map(|x| x.1);
+            let get = |i: usize| parts.get(i).and_then(|v| as_num(h, v).ok()).map(|x| x.1);
             let high = get(0).unwrap_or(0.0);
             let low = get(1).unwrap_or(0.0);
             let usec = get(2).unwrap_or(0.0);
@@ -3745,7 +3757,7 @@ fn encode_time(h: &mut ElispHost, a: &[Value]) -> R {
     let g = |i: usize| {
         parts
             .get(i)
-            .and_then(|v| as_num(v).ok())
+            .and_then(|v| as_num(h, v).ok())
             .map(|x| x.0)
             .unwrap_or(0)
     };
@@ -3969,11 +3981,11 @@ fn buffer_list(h: &mut ElispHost, _a: &[Value]) -> R {
 
 // ── mark (a bare position; active-region / mark-ring not modeled) ──
 fn set_mark_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let buf = h.cur_buf();
-    buf.mark = match a.first() {
-        Some(v) if !is_nil(v) => Some(as_int(v)?.max(1) as usize),
+    let mark = match a.first() {
+        Some(v) if !is_nil(v) => Some(as_int(h, v)?.max(1) as usize),
         _ => None,
     };
+    h.cur_buf().mark = mark;
     Ok(a.first().cloned().unwrap_or(Value::Undef))
 }
 fn mark_fn(h: &mut ElispHost, _a: &[Value]) -> R {
@@ -4001,8 +4013,8 @@ fn region_end(h: &mut ElispHost, _a: &[Value]) -> R {
 
 // ── narrowing ──
 fn narrow_to_region(h: &mut ElispHost, a: &[Value]) -> R {
-    let beg = as_int(&a[0])?.max(1) as usize;
-    let end = as_int(&a[1])?.max(1) as usize;
+    let beg = as_int(h, &a[0])?.max(1) as usize;
+    let end = as_int(h, &a[1])?.max(1) as usize;
     h.narrow(beg, end);
     Ok(Value::Undef)
 }
@@ -4099,21 +4111,55 @@ fn insert_chars(v: &Value) -> Result<Vec<char>, String> {
     }
 }
 fn insert_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let mut chunks = Vec::new();
     for v in a {
-        chunks.extend(insert_chars(v)?);
+        let start = h.cur_buf_ref().point; // 1-based insertion position
+        let chars = insert_chars(v)?;
+        let n = chars.len();
+        h.cur_insert(chars, true);
+        // A propertized string carries its text properties into the buffer.
+        if let Value::Str(arc) = v {
+            if let Some(plists) = h.string_props_vec(arc) {
+                for (i, pl) in plists.into_iter().enumerate().take(n) {
+                    if !is_nil(&pl) {
+                        h.buffer_set_plist_at(start - 1 + i, pl);
+                    }
+                }
+            }
+        }
     }
-    h.cur_insert(chunks, true);
+    Ok(Value::Undef)
+}
+/// `--insert-before-markers--`: insert one string/char, relocating markers at the
+/// insertion point past the new text (the `insert-before-markers` primitive).
+fn insert_before_markers_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let chunks = insert_chars(&a[0])?;
+    h.cur_insert_before_markers(chunks);
     Ok(Value::Undef)
 }
 fn buffer_string(h: &mut ElispHost, _a: &[Value]) -> R {
-    // Only the accessible (narrowed) portion `[begv, zv)`.
-    let buf = h.cur_buf_ref();
-    Ok(Value::str(
-        buf.text[(buf.begv - 1)..(buf.zv - 1)]
-            .iter()
-            .collect::<String>(),
-    ))
+    // Only the accessible (narrowed) portion `[begv, zv)`, carrying its text
+    // properties (like Emacs `buffer-string`).
+    let (begv, zv) = {
+        let b = h.cur_buf_ref();
+        (b.begv, b.zv)
+    };
+    let text: String = h.cur_buf_ref().text[(begv - 1)..(zv - 1)].iter().collect();
+    let out = Value::str(text);
+    let plists: Vec<Value> = (begv - 1..zv - 1)
+        .map(|i| {
+            h.cur_buf_ref()
+                .props
+                .get(i)
+                .cloned()
+                .unwrap_or(Value::Undef)
+        })
+        .collect();
+    if plists.iter().any(|p| !is_nil(p)) {
+        if let Value::Str(arc) = &out {
+            h.string_set_props_vec(arc, plists);
+        }
+    }
+    Ok(out)
 }
 fn buffer_size(h: &mut ElispHost, _a: &[Value]) -> R {
     // The full buffer size, ignoring any narrowing (like Emacs `buffer-size`).
@@ -4129,7 +4175,7 @@ fn point_max(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(Value::Int(h.cur_buf().zv as i64))
 }
 fn goto_char(h: &mut ElispHost, a: &[Value]) -> R {
-    let arg = as_int(&a[0])?;
+    let arg = as_int(h, &a[0])?;
     let buf = h.cur_buf();
     // Point is clamped to the accessible region, but `goto-char` returns its
     // POSITION argument unchanged (verified against the binary).
@@ -4145,11 +4191,12 @@ fn erase_buffer(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(Value::Undef)
 }
 fn char_after(h: &mut ElispHost, a: &[Value]) -> R {
-    let buf = h.cur_buf();
-    let pos = match a.first() {
-        Some(v) if !is_nil(v) => as_int(v)? as usize,
-        _ => buf.point,
+    let arg = match a.first() {
+        Some(v) if !is_nil(v) => Some(as_int(h, v)? as usize),
+        _ => None,
     };
+    let buf = h.cur_buf();
+    let pos = arg.unwrap_or(buf.point);
     // Only positions inside the accessible region `[begv, zv)` hold a char.
     Ok(if pos >= buf.begv && pos < buf.zv {
         Value::Int(buf.text[pos - 1] as i64)
@@ -4157,22 +4204,300 @@ fn char_after(h: &mut ElispHost, a: &[Value]) -> R {
         Value::Undef
     })
 }
-fn buffer_substring(h: &mut ElispHost, a: &[Value]) -> R {
-    let buf = h.cur_buf();
+/// Shared core of `buffer-substring` (WITH-props) and `-no-properties`. Returns
+/// the accessible-region-clamped `[lo, hi)` character range as a fresh string;
+/// when `with_props`, the source characters' text properties are copied onto the
+/// returned string (registered in the string-property side table).
+fn buffer_substring_core(h: &mut ElispHost, a: &[Value], with_props: bool) -> R {
+    let s0 = as_int(h, &a[0])?;
+    let e0 = as_int(h, &a[1])?;
+    let buf = h.cur_buf_ref();
     let (lo0, hi0) = (buf.begv as i64, buf.zv as i64);
-    let s = as_int(&a[0])?.clamp(lo0, hi0);
-    let e = as_int(&a[1])?.clamp(lo0, hi0);
+    let s = s0.clamp(lo0, hi0);
+    let e = e0.clamp(lo0, hi0);
     let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
-    Ok(Value::str(
-        buf.text[(lo - 1) as usize..(hi - 1) as usize]
-            .iter()
-            .collect::<String>(),
-    ))
+    let text: String = buf.text[(lo - 1) as usize..(hi - 1) as usize]
+        .iter()
+        .collect();
+    let out = Value::str(text);
+    if with_props {
+        // Copy the covered per-char plists (offset to the substring's indices).
+        let plists: Vec<Value> = ((lo - 1) as usize..(hi - 1) as usize)
+            .map(|i| {
+                h.cur_buf_ref()
+                    .props
+                    .get(i)
+                    .cloned()
+                    .unwrap_or(Value::Undef)
+            })
+            .collect();
+        if plists.iter().any(|p| !is_nil(p)) {
+            if let Value::Str(arc) = &out {
+                h.string_set_props_vec(arc, plists);
+            }
+        }
+    }
+    Ok(out)
+}
+fn buffer_substring(h: &mut ElispHost, a: &[Value]) -> R {
+    buffer_substring_core(h, a, true)
+}
+fn buffer_substring_no_properties(h: &mut ElispHost, a: &[Value]) -> R {
+    buffer_substring_core(h, a, false)
+}
+
+// ── markers ──────────────────────────────────────────────────────────────
+fn make_marker(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(h.alloc_marker(None, 0, false))
+}
+fn point_marker(h: &mut ElispHost, _a: &[Value]) -> R {
+    let p = h.cur_buf_ref().point;
+    let bi = h.current;
+    Ok(h.alloc_marker(Some(bi), p, false))
+}
+fn markerp_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(h.is_marker(&a[0])))
+}
+fn require_marker(h: &ElispHost, v: &Value) -> Result<(), String> {
+    if h.is_marker(v) {
+        Ok(())
+    } else {
+        Err(format!("wrong-type-argument: markerp {}", h.print(v, true)))
+    }
+}
+fn marker_position_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    require_marker(h, &a[0])?;
+    Ok(match h.marker_position(&a[0]) {
+        Some(p) => Value::Int(p as i64),
+        None => Value::Undef,
+    })
+}
+fn marker_buffer_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    require_marker(h, &a[0])?;
+    Ok(h.marker_buffer(&a[0]).unwrap_or(Value::Undef))
+}
+fn marker_insertion_type_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    require_marker(h, &a[0])?;
+    Ok(nil_or(h.marker_insertion_type(&a[0]).unwrap_or(false)))
+}
+fn set_marker_insertion_type_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    require_marker(h, &a[0])?;
+    h.set_marker_insertion_type(&a[0], !is_nil(&a[1]));
+    Ok(a[1].clone())
+}
+/// `(set-marker MARKER POSITION &optional BUFFER)` / `move-marker`.
+fn set_marker_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    require_marker(h, &a[0])?;
+    let pos_arg = a.get(1).cloned().unwrap_or(Value::Undef);
+    if is_nil(&pos_arg) {
+        h.set_marker_to(&a[0], None, 0)?;
+        return Ok(a[0].clone());
+    }
+    let pos = as_int(h, &pos_arg)?;
+    let bi = match a.get(2) {
+        Some(v) if !is_nil(v) => h
+            .resolve_buffer(v)
+            .ok_or("error: Marker does not point anywhere")?,
+        _ => h.current,
+    };
+    h.set_marker_to(&a[0], Some(bi), pos.max(1) as usize)?;
+    Ok(a[0].clone())
+}
+/// `(copy-marker &optional POSITION TYPE)`.
+fn copy_marker_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let itype = a.get(1).is_some_and(|v| !is_nil(v));
+    let arg = a.first().cloned().unwrap_or(Value::Undef);
+    if is_nil(&arg) {
+        return Ok(h.alloc_marker(None, 0, itype));
+    }
+    if h.is_marker(&arg) {
+        // Copy the source marker's buffer + position (detached when it is).
+        if let (Some(p), Some(bufv)) = (h.marker_position(&arg), h.marker_buffer(&arg)) {
+            let bi = h.resolve_buffer(&bufv).unwrap_or(h.current);
+            return Ok(h.alloc_marker(Some(bi), p, itype));
+        }
+        return Ok(h.alloc_marker(None, 0, itype));
+    }
+    let pos = as_int(h, &arg)?;
+    let bi = h.current;
+    let size = h.cur_buf_ref().text.len();
+    let p = (pos.max(1) as usize).min(size + 1);
+    Ok(h.alloc_marker(Some(bi), p, itype))
+}
+
+// ── text properties ────────────────────────────────────────────────────────
+/// A text-property OBJECT arg: a string (its Arc) or a buffer slot index.
+/// `nil`/absent is the current buffer.
+enum PropObj {
+    Str(std::sync::Arc<String>),
+    Buf(usize),
+}
+fn prop_object(h: &ElispHost, obj: Option<&Value>) -> Result<PropObj, String> {
+    match obj {
+        Some(Value::Str(s)) => Ok(PropObj::Str(s.clone())),
+        None | Some(Value::Undef) | Some(Value::Bool(false)) => Ok(PropObj::Buf(h.current)),
+        Some(v) => match h.resolve_buffer(v) {
+            Some(bi) => Ok(PropObj::Buf(bi)),
+            None => Err(format!("wrong-type-argument: bufferp {}", h.print(v, true))),
+        },
+    }
+}
+/// The plist at POS in OBJECT, validating range like Emacs (string idx `[0,len]`,
+/// buffer pos `[begv,zv]`; the upper bound yields nil, past it errors).
+fn plist_at_pos(h: &ElispHost, obj: &PropObj, pos: i64) -> Result<Value, String> {
+    match obj {
+        PropObj::Str(s) => {
+            let len = s.chars().count() as i64;
+            if pos < 0 || pos > len {
+                return Err(format!("args-out-of-range: {pos} {pos}"));
+            }
+            if pos == len {
+                return Ok(Value::Undef);
+            }
+            Ok(h.string_plist_at(s, pos as usize))
+        }
+        PropObj::Buf(bi) => {
+            let (begv, zv) = h.buffer_begv_zv(*bi);
+            if pos < begv as i64 || pos > zv as i64 {
+                return Err(format!("args-out-of-range: {pos} {pos}"));
+            }
+            if pos == zv as i64 {
+                return Ok(Value::Undef);
+            }
+            Ok(h.buffer_plist_at_idx(*bi, (pos - 1) as usize))
+        }
+    }
+}
+fn get_text_property_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let pos = as_int(h, &a[0])?;
+    let obj = prop_object(h, a.get(2))?;
+    let plist = plist_at_pos(h, &obj, pos)?;
+    Ok(h.plist_get_eq(&plist, &a[1]))
+}
+fn text_properties_at_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let pos = as_int(h, &a[0])?;
+    let obj = prop_object(h, a.get(1))?;
+    plist_at_pos(h, &obj, pos)
+}
+/// Convert a text-property START/END pair to `(lo0, hi0)` character indices
+/// (0-based, half-open) for OBJECT: strings index from 0, buffers from `begv`.
+fn prop_range(obj: &PropObj, start: i64, end: i64, h: &ElispHost) -> (usize, usize) {
+    let base = match obj {
+        PropObj::Str(_) => 0,
+        PropObj::Buf(_) => 1,
+    };
+    let s = (start - base).max(0);
+    let e = (end - base).max(0);
+    let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+    let _ = h;
+    (lo as usize, hi as usize)
+}
+/// Run `f` with the current buffer temporarily set to `bi` (restored after).
+fn with_buffer<T>(h: &mut ElispHost, bi: usize, f: impl FnOnce(&mut ElispHost) -> T) -> T {
+    let saved = h.current;
+    h.current = bi;
+    let r = f(h);
+    h.current = saved;
+    r
+}
+fn put_text_property_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let start = as_int(h, &a[0])?;
+    let end = as_int(h, &a[1])?;
+    let (prop, val) = (a[2].clone(), a[3].clone());
+    let obj = prop_object(h, a.get(4))?;
+    let (lo, hi) = prop_range(&obj, start, end, h);
+    match obj {
+        PropObj::Str(s) => h.string_put_prop(&s, lo, hi, &prop, &val),
+        PropObj::Buf(bi) => with_buffer(h, bi, |h| h.buffer_put_prop(lo, hi, &prop, &val)),
+    }
+    Ok(Value::Undef)
+}
+fn set_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let start = as_int(h, &a[0])?;
+    let end = as_int(h, &a[1])?;
+    let plist = a[2].clone();
+    let obj = prop_object(h, a.get(3))?;
+    let (lo, hi) = prop_range(&obj, start, end, h);
+    match obj {
+        PropObj::Str(s) => h.string_set_props(&s, lo, hi, &plist),
+        PropObj::Buf(bi) => with_buffer(h, bi, |h| h.buffer_set_props(lo, hi, &plist)),
+    }
+    Ok(Value::Undef)
+}
+/// Apply each `(prop val)` pair of PROPS via `f` (for add/remove).
+fn each_prop_pair(h: &ElispHost, props: &Value) -> Vec<(Value, Value)> {
+    let mut out = Vec::new();
+    let mut cur = props.clone();
+    while let Some(Obj::Cons(k, d)) = h.obj(&cur) {
+        let k = k.clone();
+        let rest = d.clone();
+        match h.obj(&rest) {
+            Some(Obj::Cons(v, d2)) => {
+                out.push((k, v.clone()));
+                cur = d2.clone();
+            }
+            _ => break,
+        }
+    }
+    out
+}
+fn add_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let start = as_int(h, &a[0])?;
+    let end = as_int(h, &a[1])?;
+    let obj = prop_object(h, a.get(3))?;
+    let (lo, hi) = prop_range(&obj, start, end, h);
+    for (prop, val) in each_prop_pair(h, &a[2]) {
+        match &obj {
+            PropObj::Str(s) => h.string_put_prop(s, lo, hi, &prop, &val),
+            PropObj::Buf(bi) => {
+                let bi = *bi;
+                with_buffer(h, bi, |h| h.buffer_put_prop(lo, hi, &prop, &val));
+            }
+        }
+    }
+    Ok(Value::Undef)
+}
+fn remove_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let start = as_int(h, &a[0])?;
+    let end = as_int(h, &a[1])?;
+    let obj = prop_object(h, a.get(3))?;
+    let (lo, hi) = prop_range(&obj, start, end, h);
+    for (prop, _) in each_prop_pair(h, &a[2]) {
+        match &obj {
+            PropObj::Str(s) => h.string_remove_prop(s, lo, hi, &prop),
+            PropObj::Buf(bi) => {
+                let bi = *bi;
+                with_buffer(h, bi, |h| h.buffer_remove_prop(lo, hi, &prop));
+            }
+        }
+    }
+    Ok(Value::Undef)
+}
+/// `(propertize STRING &rest PROPS)` — a fresh copy of STRING carrying PROPS.
+fn propertize_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let base = as_string(&a[0])?;
+    let len = base.chars().count();
+    let out = Value::str(base);
+    // Build the plist from the trailing PROP VALUE pairs (in given order).
+    let mut flat: Vec<Value> = Vec::new();
+    let mut i = 1;
+    while i + 1 < a.len() {
+        flat.push(a[i].clone());
+        flat.push(a[i + 1].clone());
+        i += 2;
+    }
+    if !flat.is_empty() {
+        let plist = h.list_from(flat);
+        if let Value::Str(arc) = &out {
+            h.string_set_props(arc, 0, len, &plist);
+        }
+    }
+    Ok(out)
 }
 fn delete_region(h: &mut ElispHost, a: &[Value]) -> R {
     let len = h.cur_buf().text.len() as i64;
-    let s = as_int(&a[0])?.clamp(1, len + 1);
-    let e = as_int(&a[1])?.clamp(1, len + 1);
+    let s = as_int(h, &a[0])?.clamp(1, len + 1);
+    let e = as_int(h, &a[1])?.clamp(1, len + 1);
     let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
     h.cur_delete(lo as usize, hi as usize);
     Ok(Value::Undef)
@@ -4207,14 +4532,14 @@ fn move_point_by(h: &mut ElispHost, delta: i64) -> R {
 }
 fn forward_char(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(v)?,
+        Some(v) if !is_nil(v) => as_int(h, v)?,
         _ => 1,
     };
     move_point_by(h, n)
 }
 fn backward_char(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(v)?,
+        Some(v) if !is_nil(v) => as_int(h, v)?,
         _ => 1,
     };
     move_point_by(h, -n)
@@ -4268,7 +4593,7 @@ fn bol_after_lines(t: &[char], point: usize, n: i64, begv: usize, zv: usize) -> 
 }
 fn line_beginning_position(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(v)?,
+        Some(v) if !is_nil(v) => as_int(h, v)?,
         _ => 1,
     };
     let buf = h.cur_buf();
@@ -4278,7 +4603,7 @@ fn line_beginning_position(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn line_end_position(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(v)?,
+        Some(v) if !is_nil(v) => as_int(h, v)?,
         _ => 1,
     };
     let buf = h.cur_buf();
@@ -4307,7 +4632,7 @@ fn eobp(h: &mut ElispHost, _a: &[Value]) -> R {
 }
 fn forward_line(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(v)?,
+        Some(v) if !is_nil(v) => as_int(h, v)?,
         _ => 1,
     };
     let buf = h.cur_buf();
@@ -4363,7 +4688,7 @@ fn search_forward(h: &mut ElispHost, a: &[Value]) -> R {
     let needle: Vec<char> = as_string(&a[0])?.chars().collect();
     let len = h.cur_buf().text.len();
     let bound = match a.get(1) {
-        Some(v) if !is_nil(v) => (as_int(v)?.max(0) as usize).min(len + 1),
+        Some(v) if !is_nil(v) => (as_int(h, v)?.max(0) as usize).min(len + 1),
         _ => len + 1,
     };
     let noerror = a.get(2).is_some_and(|v| !is_nil(v));
@@ -4403,7 +4728,7 @@ fn re_search_forward(h: &mut ElispHost, a: &[Value]) -> R {
     let pat = as_string(&a[0])?;
     let re = compile_cf(&pat, case_fold_search(h))?;
     let bound = match a.get(1) {
-        Some(v) if !is_nil(v) => Some(as_int(v)?.max(0) as usize),
+        Some(v) if !is_nil(v) => Some(as_int(h, v)?.max(0) as usize),
         _ => None,
     };
     let noerror = a.get(2).is_some_and(|v| !is_nil(v));
@@ -4483,7 +4808,7 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
         Some(Value::Undef) | Some(Value::Bool(false)) | None
     );
     let subexp = match a.get(4) {
-        Some(v) if !is_nil(v) => as_int(v)?.max(0) as usize,
+        Some(v) if !is_nil(v) => as_int(h, v)?.max(0) as usize,
         _ => 0,
     };
     let spans = {
@@ -4566,13 +4891,13 @@ fn write_region(h: &mut ElispHost, a: &[Value]) -> R {
     let content: String = match &a[0] {
         Value::Str(s) => s.to_string(),
         _ => {
-            let buf = h.cur_buf();
-            let len = buf.text.len() as i64;
-            let s = as_int(&a[0])?.clamp(1, len + 1);
+            let len = h.cur_buf_ref().text.len() as i64;
+            let s = as_int(h, &a[0])?.clamp(1, len + 1);
             let e = match a.get(1) {
-                Some(v) if !is_nil(v) => as_int(v)?.clamp(1, len + 1),
+                Some(v) if !is_nil(v) => as_int(h, v)?.clamp(1, len + 1),
                 _ => len + 1,
             };
+            let buf = h.cur_buf();
             let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
             buf.text[(lo - 1) as usize..(hi - 1) as usize]
                 .iter()
@@ -4680,11 +5005,12 @@ fn process_lines(h: &mut ElispHost, a: &[Value]) -> R {
 
 // ── more buffer editing/motion ──
 fn char_before(h: &mut ElispHost, a: &[Value]) -> R {
-    let buf = h.cur_buf();
-    let pos = match a.first() {
-        Some(v) if !is_nil(v) => as_int(v)? as usize,
-        _ => buf.point,
+    let arg = match a.first() {
+        Some(v) if !is_nil(v) => Some(as_int(h, v)? as usize),
+        _ => None,
     };
+    let buf = h.cur_buf();
+    let pos = arg.unwrap_or(buf.point);
     // The char at pos-1, only when pos-1 is inside the accessible region.
     Ok(if pos > buf.begv && pos <= buf.zv {
         Value::Int(buf.text[pos - 2] as i64)
@@ -4693,7 +5019,7 @@ fn char_before(h: &mut ElispHost, a: &[Value]) -> R {
     })
 }
 fn delete_char(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_int(&a[0])?;
+    let n = as_int(h, &a[0])?;
     let point = h.cur_buf().point;
     let zv = h.cur_buf().zv;
     let begv = h.cur_buf().begv;
@@ -4707,19 +5033,19 @@ fn delete_char(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Undef)
 }
 fn insert_char(h: &mut ElispHost, a: &[Value]) -> R {
-    let c = char::from_u32(as_int(&a[0])? as u32).unwrap_or('\u{fffd}');
+    let c = char::from_u32(as_int(h, &a[0])? as u32).unwrap_or('\u{fffd}');
     let count = match a.get(1) {
-        Some(v) if !is_nil(v) => as_int(v)?.max(0) as usize,
+        Some(v) if !is_nil(v) => as_int(h, v)?.max(0) as usize,
         _ => 1,
     };
     h.cur_insert(vec![c; count], true);
     Ok(Value::Undef)
 }
 fn count_lines(h: &mut ElispHost, a: &[Value]) -> R {
+    let len = h.cur_buf_ref().text.len() as i64;
+    let s = as_int(h, &a[0])?.clamp(1, len + 1);
+    let e = as_int(h, &a[1])?.clamp(1, len + 1);
     let buf = h.cur_buf();
-    let len = buf.text.len() as i64;
-    let s = as_int(&a[0])?.clamp(1, len + 1);
-    let e = as_int(&a[1])?.clamp(1, len + 1);
     let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
     let region = &buf.text[(lo - 1) as usize..(hi - 1) as usize];
     let nl = region.iter().filter(|&&c| c == '\n').count();
@@ -4732,11 +5058,12 @@ fn count_lines(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Int((nl + extra) as i64))
 }
 fn line_number_at_pos(h: &mut ElispHost, a: &[Value]) -> R {
-    let buf = h.cur_buf();
-    let pos = match a.first() {
-        Some(v) if !is_nil(v) => as_int(v)? as usize,
-        _ => buf.point,
+    let arg = match a.first() {
+        Some(v) if !is_nil(v) => Some(as_int(h, v)? as usize),
+        _ => None,
     };
+    let buf = h.cur_buf();
+    let pos = arg.unwrap_or(buf.point);
     let upto = (pos.saturating_sub(1)).min(buf.text.len());
     let n = buf.text[..upto].iter().filter(|&&c| c == '\n').count();
     Ok(Value::Int(n as i64 + 1))
@@ -4758,7 +5085,7 @@ fn current_column(h: &mut ElispHost, _a: &[Value]) -> R {
 fn search_backward(h: &mut ElispHost, a: &[Value]) -> R {
     let needle: Vec<char> = as_string(&a[0])?.chars().collect();
     let bound = match a.get(1) {
-        Some(v) if !is_nil(v) => (as_int(v)?.max(1) as usize) - 1,
+        Some(v) if !is_nil(v) => (as_int(h, v)?.max(1) as usize) - 1,
         _ => 0,
     };
     let noerror = a.get(2).is_some_and(|v| !is_nil(v));
@@ -4867,7 +5194,7 @@ fn skip_chars_backward(h: &mut ElispHost, a: &[Value]) -> R {
 fn forward_word(h: &mut ElispHost, a: &[Value]) -> R {
     // Word = run of alphanumerics (no syntax tables).
     let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(v)?,
+        Some(v) if !is_nil(v) => as_int(h, v)?,
         _ => 1,
     };
     let buf = h.cur_buf();
@@ -4884,7 +5211,7 @@ fn forward_word(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn backward_word(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(v)?,
+        Some(v) if !is_nil(v) => as_int(h, v)?,
         _ => 1,
     };
     let buf = h.cur_buf();
@@ -5116,9 +5443,49 @@ pub fn install(h: &mut ElispHost) {
         "buffer-substring-no-properties",
         2,
         Some(2),
-        buffer_substring,
+        buffer_substring_no_properties,
     );
     s("delete-region", 2, Some(2), delete_region);
+    // markers
+    s("make-marker", 0, Some(0), make_marker);
+    s("point-marker", 0, Some(0), point_marker);
+    s("markerp", 1, Some(1), markerp_fn);
+    s("marker-position", 1, Some(1), marker_position_fn);
+    s("marker-buffer", 1, Some(1), marker_buffer_fn);
+    s(
+        "marker-insertion-type",
+        1,
+        Some(1),
+        marker_insertion_type_fn,
+    );
+    s(
+        "set-marker-insertion-type",
+        2,
+        Some(2),
+        set_marker_insertion_type_fn,
+    );
+    s("set-marker", 2, Some(3), set_marker_fn);
+    s("move-marker", 2, Some(3), set_marker_fn);
+    s("copy-marker", 0, Some(2), copy_marker_fn);
+    // text properties
+    s("get-text-property", 2, Some(3), get_text_property_fn);
+    s("text-properties-at", 1, Some(2), text_properties_at_fn);
+    s("put-text-property", 4, Some(5), put_text_property_fn);
+    s("set-text-properties", 3, Some(4), set_text_properties_fn);
+    s("add-text-properties", 3, Some(4), add_text_properties_fn);
+    s(
+        "remove-text-properties",
+        3,
+        Some(4),
+        remove_text_properties_fn,
+    );
+    s("propertize", 1, None, propertize_fn);
+    s(
+        "--insert-before-markers--",
+        1,
+        Some(1),
+        insert_before_markers_fn,
+    );
     s("insert-file-contents", 1, None, insert_file_contents);
     s("forward-char", 0, Some(1), forward_char);
     s("backward-char", 0, Some(1), backward_char);

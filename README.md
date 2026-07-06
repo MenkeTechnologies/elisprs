@@ -111,6 +111,8 @@ elisp --version
 | IO/format | `format message princ prin1 prin1-to-string print terpri` |
 | Functional | `funcall apply mapcar mapc sort identity` |
 | Regexp | `string-match string-match-p match-beginning match-end match-string match-data set-match-data replace-regexp-in-string regexp-quote` (+ `save-match-data`) |
+| Markers | `make-marker point-marker copy-marker set-marker move-marker marker-position marker-buffer markerp marker-insertion-type set-marker-insertion-type` |
+| Text properties | `propertize put-text-property get-text-property set-text-properties add-text-properties remove-text-properties text-properties-at next-single-property-change next-property-change previous-single-property-change get-char-property` |
 
 `defun`/`defmacro`/`lambda` support `&optional` and `&rest`; macros expand and re-evaluate; `condition-case` matches the `error` umbrella and specific error symbols.
 
@@ -146,7 +148,9 @@ elisp --version
 
 **Buffers & text editing.** A global registry of named live buffers, each with its own text, 1-based point, mark, and narrowing bounds. `current-buffer` / `set-buffer` / `get-buffer-create` / `generate-new-buffer` / `kill-buffer` / `rename-buffer` / `buffer-list` manage the registry; `insert` / `delete-region` / `delete-char` / point motion (`forward-char`, `forward-line`, `beginning-of-line`, …) / `narrow-to-region` / `widen` edit the current buffer. `save-excursion` restores point via a marker that tracks intervening edits; `save-restriction` / `with-temp-buffer` / `with-current-buffer` scope the buffer and its restriction. Buffer-local variables key off the current buffer.
 
-**Not in scope** — surfaced loudly rather than silently misread: this is a useful elisp core, **not** the ~1000-subr GNU Emacs surface. Within the editor layer, **text properties** (`propertize` / interval trees), **general marker objects** (`make-marker` / `point-marker`), and **redisplay** (windows, header lines, faces) are not modeled — buffer text, point, insertion, and narrowing are.
+**Markers & text properties.** First-class markers (`make-marker` / `point-marker` / `copy-marker` / `set-marker` / `marker-position` / `marker-buffer` / `marker-insertion-type`) auto-adjust when text is inserted or deleted, honoring insertion type, and serve as buffer positions. String and buffer text carry property intervals: `propertize` / `put-text-property` / `get-text-property` / `set-text-properties` / `add-text-properties` / `remove-text-properties` / `text-properties-at` / `next-single-property-change` / `next-property-change` / `previous-single-property-change` / `get-char-property`; `buffer-substring` and `buffer-string` carry properties (the `-no-properties` variant drops them). This is enough that `tabulated-list-print` produces byte-identical propertized output to GNU Emacs.
+
+**Not in scope** — surfaced loudly rather than silently misread: this is a useful elisp core, **not** the ~1000-subr GNU Emacs surface. Within the editor layer, **overlays**, a real **interval tree** (properties use a per-character plist vector, observably identical for get/put/next-change but O(n) in storage), and **redisplay** (windows, header lines, faces) are not modeled.
 
 ---
 

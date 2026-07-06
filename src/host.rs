@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, Weak};
 
 /// Sentinel prefix marking the AOT heap image stashed in `chunk.names`.
 pub const HEAP_IMAGE_TAG: &str = "\u{0}ELHEAP\u{0}";
@@ -181,6 +182,24 @@ pub enum Obj {
     /// buffer's whole lifetime (killed buffers keep their slot, marked dead by a
     /// `None` name). Buffer objects are runtime-only and never serialized.
     Buffer(usize),
+    /// A general marker object (`make-marker`/`point-marker`/`copy-marker`). The
+    /// payload is shared (`Rc<RefCell<..>>`) with the buffer's live-marker registry
+    /// so a single edit updates every reference; see [`MarkerData`]. Runtime-only,
+    /// never serialized.
+    Marker(Rc<RefCell<MarkerData>>),
+}
+
+/// The mutable state of an Emacs marker. A marker points into a buffer at a
+/// 1-based `pos`; `buffer` is the buffer's slot index, or `None` for a detached
+/// marker (`make-marker`, or `set-marker … nil`) whose `pos` is meaningless.
+/// `insertion_type` t means text inserted exactly at the marker moves the marker
+/// past it (nil = the marker stays before the inserted text). The `Rc<RefCell>`
+/// is shared between the `Obj::Marker` and the owning buffer's `markers` list, so
+/// [`ElispHost::cur_insert`]/[`ElispHost::cur_delete`] adjust every live marker.
+pub struct MarkerData {
+    pub buffer: Option<usize>,
+    pub pos: usize,
+    pub insertion_type: bool,
 }
 
 /// An Emacs char-table's payload. Per-char values use efficient range storage:
@@ -323,6 +342,15 @@ pub struct ElispHost {
     pub(crate) buffers: Vec<EditBuffer>,
     /// Index into `buffers` of the current buffer (`current-buffer`/`set-buffer`).
     pub(crate) current: usize,
+    /// Text properties for strings. `Value::Str` is an `Arc<String>` value with no
+    /// room for interval storage, so a propertized string's per-char plists live in
+    /// this side table keyed by the `Arc`'s pointer identity. The stored `Weak`
+    /// guards against pointer reuse: a lookup only trusts the entry when the weak
+    /// still upgrades to the same allocation (a freed-then-reused address fails to
+    /// upgrade → treated as unpropertized). Properties therefore travel with cheap
+    /// `Arc` clones (`eq` strings) exactly like Emacs, but are lost across `concat`/
+    /// `substring` (which mint fresh allocations) unless re-registered explicitly.
+    pub(crate) string_props: HashMap<usize, (Weak<String>, Vec<Value>)>,
 }
 
 /// An editing buffer: a char vector, a 1-based point, narrowing bounds, the mark,
@@ -339,6 +367,15 @@ pub struct EditBuffer {
     /// are `eq`-stable. `Value::Undef` only during initial construction.
     pub self_obj: Value,
     pub text: Vec<char>,
+    /// Text-property plists, one per character (parallel to `text`, same length).
+    /// Each entry is a plist `Value` (`Value::Undef` = no properties). Kept in sync
+    /// with every `cur_insert`/`cur_delete` (inserted chars get nil props — plain
+    /// `insert` does not inherit, matching Emacs).
+    pub props: Vec<Value>,
+    /// Live markers pointing into this buffer, adjusted on every edit. Shared
+    /// (`Rc`) with the corresponding `Obj::Marker`; a marker is removed here when
+    /// it is re-pointed (`set-marker`) elsewhere or detached.
+    pub markers: Vec<Rc<RefCell<MarkerData>>>,
     /// Point: 1-based, always kept within `[begv, zv]`.
     pub point: usize,
     /// Narrowing lower bound (`point-min`); 1 when un-narrowed. Marker-like with
@@ -422,6 +459,8 @@ impl ElispHost {
                 name: Some("*scratch*".to_string()),
                 self_obj: Value::Undef,
                 text: Vec::new(),
+                props: Vec::new(),
+                markers: Vec::new(),
                 point: 1,
                 begv: 1,
                 zv: 1,
@@ -432,6 +471,7 @@ impl ElispHost {
                 local_map: Value::Undef,
             }],
             current: 0,
+            string_props: HashMap::new(),
         };
         crate::builtins::install(&mut h);
         // The default buffer's own object handle (allocated after the arena
@@ -936,11 +976,11 @@ impl ElispHost {
                     extra: t.extra.clone(),
                     ranges: t.ranges.clone(),
                 },
-                // Buffer objects are runtime-only (created after prelude load) and
-                // never appear in a compiled/AOT heap image; emit a harmless
-                // placeholder so the match stays exhaustive.
-                Obj::Buffer(_) => SerObj::Symbol {
-                    name: "--unexpected-buffer--".to_string(),
+                // Buffer/marker objects are runtime-only (created after prelude
+                // load) and never appear in a compiled/AOT heap image; emit a
+                // harmless placeholder so the match stays exhaustive.
+                Obj::Buffer(_) | Obj::Marker(_) => SerObj::Symbol {
+                    name: "--unexpected-runtime-obj--".to_string(),
                     value: None,
                     function: None,
                     special: false,
@@ -1058,8 +1098,8 @@ impl ElispHost {
                         ranges: t.ranges.clone(),
                     },
                     // Runtime-only; never legitimately serialized (see above).
-                    Obj::Buffer(_) => SerObj::Symbol {
-                        name: "--unexpected-buffer--".to_string(),
+                    Obj::Buffer(_) | Obj::Marker(_) => SerObj::Symbol {
+                        name: "--unexpected-runtime-obj--".to_string(),
                         value: None,
                         function: None,
                         special: false,
@@ -1324,7 +1364,13 @@ impl ElispHost {
                     if self.print_flag("print-escape-newlines") {
                         t = t.replace('\n', "\\n").replace('\u{c}', "\\f");
                     }
-                    format!("\"{t}\"")
+                    // A propertized string prints as `#("text" START END (plist) …)`.
+                    let intervals = self.string_prop_intervals(s, depth);
+                    if intervals.is_empty() {
+                        format!("\"{t}\"")
+                    } else {
+                        format!("#(\"{t}\"{intervals})")
+                    }
                 } else {
                     s.to_string()
                 }
@@ -1375,6 +1421,16 @@ impl ElispHost {
                     match self.buffers.get(*idx).and_then(|b| b.name.as_ref()) {
                         Some(name) => format!("#<buffer {name}>"),
                         None => "#<killed buffer>".to_string(),
+                    }
+                }
+                Some(Obj::Marker(m)) => {
+                    let md = m.borrow();
+                    match md
+                        .buffer
+                        .and_then(|bi| self.buffers.get(bi).and_then(|b| b.name.as_ref()))
+                    {
+                        Some(name) => format!("#<marker at {} in {}>", md.pos, name),
+                        None => "#<marker in no buffer>".to_string(),
                     }
                 }
                 Some(Obj::Subr { name, .. }) => format!("#<subr {name}>"),
@@ -1541,6 +1597,8 @@ impl ElispHost {
             name: Some(name),
             self_obj: Value::Undef,
             text: Vec::new(),
+            props: Vec::new(),
+            markers: Vec::new(),
             point: 1,
             begv: 1,
             zv: 1,
@@ -1605,9 +1663,16 @@ impl ElispHost {
         let b = &mut self.buffers[idx];
         b.name = None;
         b.text.clear();
+        b.props.clear();
         b.locals.clear();
         b.se_markers.clear();
         b.restrict_stack.clear();
+        // Detach every marker that pointed into the killed buffer.
+        for mk in b.markers.drain(..) {
+            let mut md = mk.borrow_mut();
+            md.buffer = None;
+            md.pos = 0;
+        }
         if self.current == idx {
             self.current = self
                 .buffers
@@ -1656,6 +1721,11 @@ impl ElispHost {
             adj_ins(lo, pos, len, false);
             adj_ins(hi, pos, len, true);
         }
+        for mk in b.markers.iter() {
+            let mut md = mk.borrow_mut();
+            let ins_type = md.insertion_type;
+            adj_ins(&mut md.pos, pos, len, ins_type);
+        }
     }
     /// Apply a deletion of `[from, to)` in the current buffer to every marker-like
     /// position, including point.
@@ -1674,6 +1744,9 @@ impl ElispHost {
             adj_del(lo, from, to);
             adj_del(hi, from, to);
         }
+        for mk in b.markers.iter() {
+            adj_del(&mut mk.borrow_mut().pos, from, to);
+        }
     }
     /// Insert `chars` at point in the current buffer. `leave_after` puts point
     /// after the inserted text (the `insert` default); otherwise point is left at
@@ -1684,11 +1757,36 @@ impl ElispHost {
         if len == 0 {
             return;
         }
-        self.buffers[self.current]
-            .text
-            .splice((pos - 1)..(pos - 1), chars);
+        let b = &mut self.buffers[self.current];
+        b.text.splice((pos - 1)..(pos - 1), chars);
+        // Plain insert gives the new characters nil properties (no inheritance).
+        b.props
+            .splice((pos - 1)..(pos - 1), std::iter::repeat_n(Value::Undef, len));
         self.adjust_for_insert(pos, len);
         self.buffers[self.current].point = if leave_after { pos + len } else { pos };
+    }
+    /// `insert-before-markers`: like `cur_insert` (leaving point after), but every
+    /// marker sitting exactly at the insertion point is relocated *after* the new
+    /// text regardless of its insertion type (Emacs `insert_before_markers`).
+    pub fn cur_insert_before_markers(&mut self, chars: Vec<char>) {
+        let pos = self.buffers[self.current].point;
+        let len = chars.len();
+        if len == 0 {
+            return;
+        }
+        let b = &mut self.buffers[self.current];
+        b.text.splice((pos - 1)..(pos - 1), chars);
+        b.props
+            .splice((pos - 1)..(pos - 1), std::iter::repeat_n(Value::Undef, len));
+        self.adjust_for_insert(pos, len);
+        // Bump any live marker that ended up exactly at the insertion point.
+        for mk in self.buffers[self.current].markers.iter() {
+            let mut md = mk.borrow_mut();
+            if md.pos == pos {
+                md.pos = pos + len;
+            }
+        }
+        self.buffers[self.current].point = pos + len;
     }
     /// Delete the region `[from, to)` (1-based, `from <= to`) from the current
     /// buffer, adjusting point and all markers.
@@ -1696,7 +1794,9 @@ impl ElispHost {
         if from >= to {
             return;
         }
-        self.buffers[self.current].text.drain((from - 1)..(to - 1));
+        let b = &mut self.buffers[self.current];
+        b.text.drain((from - 1)..(to - 1));
+        b.props.drain((from - 1)..(to - 1));
         self.adjust_for_delete(from, to);
     }
     /// `(narrow-to-region BEG END)` on the current buffer: clamp `begv`/`zv` to the
@@ -1714,6 +1814,350 @@ impl ElispHost {
         let b = &mut self.buffers[self.current];
         b.begv = 1;
         b.zv = b.text.len() + 1;
+    }
+
+    // ── markers ──────────────────────────────────────────────────────────────
+    /// Allocate an `Obj::Marker`; when it points into a buffer, register it in
+    /// that buffer's live-marker list so edits keep it up to date.
+    pub fn alloc_marker(&mut self, buffer: Option<usize>, pos: usize, itype: bool) -> Value {
+        let md = Rc::new(RefCell::new(MarkerData {
+            buffer,
+            pos,
+            insertion_type: itype,
+        }));
+        if let Some(bi) = buffer {
+            self.buffers[bi].markers.push(md.clone());
+        }
+        self.alloc(Obj::Marker(md))
+    }
+    /// The shared marker cell behind V, if V is a marker.
+    fn marker_rc(&self, v: &Value) -> Option<Rc<RefCell<MarkerData>>> {
+        match self.obj(v) {
+            Some(Obj::Marker(m)) => Some(m.clone()),
+            _ => None,
+        }
+    }
+    /// `(markerp V)`.
+    pub fn is_marker(&self, v: &Value) -> bool {
+        matches!(self.obj(v), Some(Obj::Marker(_)))
+    }
+    /// `(marker-position M)` — 1-based position, or `None` for a detached marker.
+    pub fn marker_position(&self, v: &Value) -> Option<usize> {
+        let m = self.marker_rc(v)?;
+        let md = m.borrow();
+        md.buffer.map(|_| md.pos)
+    }
+    /// `(marker-buffer M)` — the buffer's object handle, or `None` when detached.
+    pub fn marker_buffer(&self, v: &Value) -> Option<Value> {
+        let m = self.marker_rc(v)?;
+        let bi = m.borrow().buffer?;
+        Some(self.buffers[bi].self_obj.clone())
+    }
+    /// `(marker-insertion-type M)`.
+    pub fn marker_insertion_type(&self, v: &Value) -> Option<bool> {
+        Some(self.marker_rc(v)?.borrow().insertion_type)
+    }
+    /// `(set-marker-insertion-type M TYPE)`.
+    pub fn set_marker_insertion_type(&mut self, v: &Value, itype: bool) {
+        if let Some(m) = self.marker_rc(v) {
+            m.borrow_mut().insertion_type = itype;
+        }
+    }
+    /// Coerce a value to a buffer position: an integer/float is itself; a marker
+    /// yields its position (`None` when detached); anything else `None`.
+    pub fn as_position(&self, v: &Value) -> Option<i64> {
+        match v {
+            Value::Int(n) => Some(*n),
+            Value::Float(f) => Some(*f as i64),
+            _ => self.marker_position(v).map(|p| p as i64),
+        }
+    }
+    /// Point MARKER at `(buffer, pos)` — or detach it when `buffer` is `None` —
+    /// moving it between buffer registries. `pos` is clamped to `[1, size+1]`.
+    pub fn set_marker_to(
+        &mut self,
+        marker: &Value,
+        buffer: Option<usize>,
+        pos: usize,
+    ) -> Result<(), String> {
+        let m = self.marker_rc(marker).ok_or("set-marker: not a marker")?;
+        let old_buf = m.borrow().buffer;
+        if let Some(ob) = old_buf {
+            if let Some(b) = self.buffers.get_mut(ob) {
+                b.markers.retain(|x| !Rc::ptr_eq(x, &m));
+            }
+        }
+        match buffer {
+            None => {
+                let mut md = m.borrow_mut();
+                md.buffer = None;
+                md.pos = 0;
+            }
+            Some(bi) => {
+                let size = self.buffers[bi].text.len();
+                let p = pos.clamp(1, size + 1);
+                {
+                    let mut md = m.borrow_mut();
+                    md.buffer = Some(bi);
+                    md.pos = p;
+                }
+                self.buffers[bi].markers.push(m.clone());
+            }
+        }
+        Ok(())
+    }
+    /// Two markers are `equal` when they share a buffer and position (Emacs
+    /// `Fequal` on markers).
+    pub fn markers_equal(&self, a: &Value, b: &Value) -> bool {
+        match (self.marker_rc(a), self.marker_rc(b)) {
+            (Some(x), Some(y)) => {
+                let (xa, xb) = (x.borrow(), y.borrow());
+                xa.buffer == xb.buffer && xa.pos == xb.pos
+            }
+            _ => false,
+        }
+    }
+
+    // ── text properties ──────────────────────────────────────────────────────
+    /// `plist-get` with `eq` key comparison (the `get-text-property` default).
+    pub fn plist_get_eq(&self, plist: &Value, prop: &Value) -> Value {
+        let mut cur = plist.clone();
+        while let Some(Obj::Cons(k, d)) = self.obj(&cur) {
+            let k = k.clone();
+            let rest = d.clone();
+            let (val, rest2) = match self.obj(&rest) {
+                Some(Obj::Cons(v, d2)) => (v.clone(), d2.clone()),
+                _ => return Value::Undef,
+            };
+            if self.values_eq(&k, prop) {
+                return val;
+            }
+            cur = rest2;
+        }
+        Value::Undef
+    }
+    /// A fresh plist equal to PLIST but with PROP → VAL (`eq` key match; appended
+    /// if absent). Never mutates the input.
+    fn plist_put_copy(&mut self, plist: &Value, prop: &Value, val: &Value) -> Value {
+        let mut flat: Vec<Value> = Vec::new();
+        let mut replaced = false;
+        let mut cur = plist.clone();
+        while let Some(Obj::Cons(k, d)) = self.obj(&cur) {
+            let k = k.clone();
+            let rest = d.clone();
+            let (v, rest2) = match self.obj(&rest) {
+                Some(Obj::Cons(v, d2)) => (v.clone(), d2.clone()),
+                _ => break,
+            };
+            if self.values_eq(&k, prop) {
+                flat.push(k);
+                flat.push(val.clone());
+                replaced = true;
+            } else {
+                flat.push(k);
+                flat.push(v);
+            }
+            cur = rest2;
+        }
+        if !replaced {
+            // Emacs prepends a newly-added property (existing keys keep their
+            // position); `text-properties-at` returns most-recently-added first.
+            let mut prepended = vec![prop.clone(), val.clone()];
+            prepended.extend(flat);
+            flat = prepended;
+        }
+        self.list_from(flat)
+    }
+    /// A fresh plist equal to PLIST with PROP removed (`eq` key match).
+    fn plist_remove_copy(&mut self, plist: &Value, prop: &Value) -> Value {
+        let mut flat: Vec<Value> = Vec::new();
+        let mut cur = plist.clone();
+        while let Some(Obj::Cons(k, d)) = self.obj(&cur) {
+            let k = k.clone();
+            let rest = d.clone();
+            let (v, rest2) = match self.obj(&rest) {
+                Some(Obj::Cons(v, d2)) => (v.clone(), d2.clone()),
+                _ => break,
+            };
+            if !self.values_eq(&k, prop) {
+                flat.push(k);
+                flat.push(v);
+            }
+            cur = rest2;
+        }
+        self.list_from(flat)
+    }
+    /// The property plist at absolute char index `idx0` in the current buffer.
+    pub fn buffer_plist_at(&self, idx0: usize) -> Value {
+        self.cur_buf_ref()
+            .props
+            .get(idx0)
+            .cloned()
+            .unwrap_or(Value::Undef)
+    }
+    /// Overwrite the property plist at absolute char index `idx0` in the current
+    /// buffer (used by `insert` to carry an inserted string's text properties).
+    pub fn buffer_set_plist_at(&mut self, idx0: usize, plist: Value) {
+        if let Some(slot) = self.buffers[self.current].props.get_mut(idx0) {
+            *slot = plist;
+        }
+    }
+    /// The property plist at absolute char index `idx0` in buffer `bi`.
+    pub fn buffer_plist_at_idx(&self, bi: usize, idx0: usize) -> Value {
+        self.buffers[bi]
+            .props
+            .get(idx0)
+            .cloned()
+            .unwrap_or(Value::Undef)
+    }
+    /// The `(point-min, point-max)` bounds of buffer `bi`.
+    pub fn buffer_begv_zv(&self, bi: usize) -> (usize, usize) {
+        let b = &self.buffers[bi];
+        (b.begv, b.zv)
+    }
+    /// `put-text-property` on the current buffer over char indices `[s0, e0)`.
+    pub fn buffer_put_prop(&mut self, s0: usize, e0: usize, prop: &Value, val: &Value) {
+        let n = self.cur_buf_ref().props.len();
+        for idx in s0..e0.min(n) {
+            let cur = self.buffers[self.current].props[idx].clone();
+            let np = self.plist_put_copy(&cur, prop, val);
+            self.buffers[self.current].props[idx] = np;
+        }
+    }
+    /// `set-text-properties` on the current buffer: replace each char's plist over
+    /// `[s0, e0)` with PLIST (shared — the slots are never mutated in place).
+    pub fn buffer_set_props(&mut self, s0: usize, e0: usize, plist: &Value) {
+        let n = self.cur_buf_ref().props.len();
+        for idx in s0..e0.min(n) {
+            self.buffers[self.current].props[idx] = plist.clone();
+        }
+    }
+    /// `remove-text-properties` on the current buffer: drop PROP from each plist.
+    pub fn buffer_remove_prop(&mut self, s0: usize, e0: usize, prop: &Value) {
+        let n = self.cur_buf_ref().props.len();
+        for idx in s0..e0.min(n) {
+            let cur = self.buffers[self.current].props[idx].clone();
+            let np = self.plist_remove_copy(&cur, prop);
+            self.buffers[self.current].props[idx] = np;
+        }
+    }
+
+    /// The per-char property plists registered for string S, or `None` when it has
+    /// none (or a stale/reused pointer — the `Weak` guard rejects that).
+    pub fn string_props_vec(&self, s: &Arc<String>) -> Option<Vec<Value>> {
+        let key = Arc::as_ptr(s) as usize;
+        let (weak, props) = self.string_props.get(&key)?;
+        weak.upgrade().filter(|a| Arc::as_ptr(a) as usize == key)?;
+        Some(props.clone())
+    }
+    /// The property plist at char index `idx0` of string S.
+    pub fn string_plist_at(&self, s: &Arc<String>, idx0: usize) -> Value {
+        self.string_props_vec(s)
+            .and_then(|v| v.get(idx0).cloned())
+            .unwrap_or(Value::Undef)
+    }
+    /// Install (replacing any existing) the per-char plists for string S.
+    pub fn string_set_props_vec(&mut self, s: &Arc<String>, vec: Vec<Value>) {
+        let key = Arc::as_ptr(s) as usize;
+        self.string_props.insert(key, (Arc::downgrade(s), vec));
+    }
+    /// The property vec for S, creating an all-nil one of the right length if the
+    /// string has none registered yet.
+    fn string_props_or_new(&self, s: &Arc<String>) -> Vec<Value> {
+        self.string_props_vec(s)
+            .unwrap_or_else(|| vec![Value::Undef; s.chars().count()])
+    }
+    /// `put-text-property` on string S over char indices `[s0, e0)`.
+    pub fn string_put_prop(
+        &mut self,
+        s: &Arc<String>,
+        s0: usize,
+        e0: usize,
+        prop: &Value,
+        val: &Value,
+    ) {
+        let mut vec = self.string_props_or_new(s);
+        for idx in s0..e0.min(vec.len()) {
+            let cur = vec[idx].clone();
+            vec[idx] = self.plist_put_copy(&cur, prop, val);
+        }
+        self.string_set_props_vec(s, vec);
+    }
+    /// `set-text-properties` on string S over `[s0, e0)` (shared PLIST slots).
+    pub fn string_set_props(&mut self, s: &Arc<String>, s0: usize, e0: usize, plist: &Value) {
+        let mut vec = self.string_props_or_new(s);
+        for idx in s0..e0.min(vec.len()) {
+            vec[idx] = plist.clone();
+        }
+        self.string_set_props_vec(s, vec);
+    }
+    /// `remove-text-properties` on string S over `[s0, e0)`.
+    pub fn string_remove_prop(&mut self, s: &Arc<String>, s0: usize, e0: usize, prop: &Value) {
+        let mut vec = self.string_props_or_new(s);
+        for idx in s0..e0.min(vec.len()) {
+            let cur = vec[idx].clone();
+            vec[idx] = self.plist_remove_copy(&cur, prop);
+        }
+        self.string_set_props_vec(s, vec);
+    }
+    /// Value comparison for merging text-property intervals: `eq` semantics, but
+    /// strings also compare by content (adjacent cells that were given an
+    /// `equal`-string property merge, matching Emacs's shared-string intervals).
+    fn merge_val_eq(&self, a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Str(x), Value::Str(y)) => x == y,
+            _ => self.values_eq(a, b),
+        }
+    }
+    /// True if PLIST A ⊆ PLIST B: every `(key value)` of A has an equal value in B
+    /// (a nil value counts as absent). Used only for interval merging on print.
+    fn plist_subset(&self, a: &Value, b: &Value) -> bool {
+        let mut cur = a.clone();
+        while let Some(Obj::Cons(k, d)) = self.obj(&cur) {
+            let k = k.clone();
+            let (v, rest2) = match self.obj(d) {
+                Some(Obj::Cons(v, d2)) => (v.clone(), d2.clone()),
+                _ => break,
+            };
+            let bv = self.plist_get_eq(b, &k);
+            if !self.merge_val_eq(&bv, &v) {
+                return false;
+            }
+            cur = rest2;
+        }
+        true
+    }
+    /// Structural plist equality (same key→value set, `eq` on values) — used to
+    /// merge adjacent text-property intervals when printing a propertized string.
+    fn plist_struct_eq(&self, a: &Value, b: &Value) -> bool {
+        self.plist_subset(a, b) && self.plist_subset(b, a)
+    }
+    /// The `#(...)` interval tail for a propertized string: maximal runs of chars
+    /// sharing a (non-nil) property list, as ` START END (plist)` segments. Empty
+    /// when the string carries no properties.
+    fn string_prop_intervals(&self, s: &Arc<String>, depth: usize) -> String {
+        let Some(props) = self.string_props_vec(s) else {
+            return String::new();
+        };
+        let mut out = String::new();
+        let n = props.len();
+        let mut i = 0;
+        while i < n {
+            let mut j = i + 1;
+            while j < n && self.plist_struct_eq(&props[i], &props[j]) {
+                j += 1;
+            }
+            if el_truthy(&props[i]) {
+                out.push_str(&format!(
+                    " {} {} {}",
+                    i,
+                    j,
+                    self.print_inner(&props[i], true, depth + 1)
+                ));
+            }
+            i = j;
+        }
+        out
     }
 
     /// Resolve char `c` in char-table `ct` with Emacs `char_table_ref` fallback:

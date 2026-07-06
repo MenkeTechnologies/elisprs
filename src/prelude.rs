@@ -961,9 +961,6 @@ autoload.  Returns FUNCTION when it installs the autoload, else nil."
          (t (setq out (cons (upcase c) out))))
         (setq in-word wordc)))
     (apply (function string) (reverse out)))))
-;; Text properties aren't stored (fusevm strings can't carry them), so this
-;; returns the bare string — display-string code runs; property reads still error.
-(defun propertize (string &rest _props) string)
 (defun string-trim-left (s &optional regexp)
   ;; Strip a leading match of REGEXP (default whitespace).
   (let ((re (concat "\\`\\(?:" (or regexp "[ \t\n\r]+") "\\)")))
@@ -2113,8 +2110,63 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
     (dolist (x cur) (when (funcall test elt x) (setq found t)))
     (if found cur
       (set var (if append (append cur (list elt)) (cons elt cur))))))
-;; No text-property model, so this collapses to plain `equal'.
-(defun equal-including-properties (a b) (equal a b))
+;; equal-including-properties compares text as `equal' does, and additionally
+;; requires matching text properties on strings.
+(defun equal-including-properties (a b)
+  (and (equal a b)
+       (or (not (stringp a))
+           (let ((i 0) (n (length a)) (ok t))
+             (while (and ok (< i n))
+               (unless (--plists-equal (text-properties-at i a)
+                                       (text-properties-at i b))
+                 (setq ok nil))
+               (setq i (1+ i)))
+             ok))))
+
+;; ── text-property scanning (built on the primitive get/put/at) ──
+;; Structural plist equality: same key -> `eq' value set (a nil value = absent).
+(defun --plist-subset (a b)
+  (let ((ok t) (p a))
+    (while (and ok p)
+      (unless (eq (cadr p) (plist-get b (car p))) (setq ok nil))
+      (setq p (cddr p)))
+    ok))
+(defun --plists-equal (a b) (and (--plist-subset a b) (--plist-subset b a)))
+;; Overlays are not modeled, so get-char-property falls straight through to the
+;; text properties (NAMED boundary: no overlay lookup layer).
+(defun get-char-property (pos prop &optional object)
+  (get-text-property pos prop object))
+(defun next-single-property-change (pos prop &optional object limit)
+  (let* ((end (if (stringp object) (length object) (point-max)))
+         (lim (if limit (min limit end) end))
+         (val (get-text-property pos prop object))
+         (p (1+ pos)) (res nil))
+    (while (and (null res) (< p lim))
+      (if (not (eq val (get-text-property p prop object)))
+          (setq res p)
+        (setq p (1+ p))))
+    (or res (if limit lim nil))))
+(defun next-property-change (pos &optional object limit)
+  (let* ((end (if (stringp object) (length object) (point-max)))
+         (lim (if limit (min limit end) end))
+         (val (text-properties-at pos object))
+         (p (1+ pos)) (res nil))
+    (while (and (null res) (< p lim))
+      (if (not (--plists-equal val (text-properties-at p object)))
+          (setq res p)
+        (setq p (1+ p))))
+    (or res (if limit lim nil))))
+(defun previous-single-property-change (pos prop &optional object limit)
+  (let ((start (if (stringp object) 0 (point-min))))
+    (if (<= pos start) nil
+      (let* ((lim (if limit (max limit start) start))
+             (val (get-text-property (1- pos) prop object))
+             (p (1- pos)) (res nil))
+        (while (and (null res) (> p lim))
+          (if (not (eq val (get-text-property (1- p) prop object)))
+              (setq res p)
+            (setq p (1- p))))
+        (or res (if limit lim nil))))))
 
 (defun apply-partially (fn &rest args) (lambda (&rest more) (apply fn (append args more))))
 (defun complement (fn) (lambda (&rest args) (not (apply fn args))))
@@ -2210,8 +2262,8 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
         ((stringp obj) 'string)
         ((consp obj) 'cons)
         (t (type-of obj))))
-(defun number-or-marker-p (x) (numberp x))
-(defun integer-or-marker-p (x) (integerp x))
+(defun number-or-marker-p (x) (or (numberp x) (markerp x)))
+(defun integer-or-marker-p (x) (or (integerp x) (markerp x)))
 (defun string-pad (s len &optional padding start)
   ;; Pad S to LENGTH chars with PADDING (default space); pad on the left when
   ;; START is non-nil, otherwise on the right.
@@ -2221,7 +2273,7 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
       (let ((fill (make-string (- len cur) pad)))
         (if start (concat fill s) (concat s fill))))))
 ;; A horizontal rule: LENGTH dashes (default 79, the batch text width) + newline.
-;; (Emacs returns a face-propertized string; elisprs can't store props.)
+;; (Emacs returns a string with a face applied; the plain text is returned here.)
 (defun make-separator-line (&optional length)
   (concat (make-string (or length 79) ?-) "\n"))
 (defun string-lines (string &optional omit-nulls keep-newlines)
@@ -2659,8 +2711,11 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (defun newline (&optional n _interactive) (insert (make-string (or n 1) ?\n)) nil)
 ;; Insert N newlines after point, leaving point before them.
 (defun open-line (n) (save-excursion (insert (make-string n ?\n))) nil)
-;; No real markers, so this is plain insert.
-(defun insert-before-markers (&rest args) (apply #'insert args))
+;; insert-before-markers: like insert, but markers exactly at point advance past
+;; the new text (handled by the primitive --insert-before-markers--).
+(defun insert-before-markers (&rest args)
+  (dolist (a args) (--insert-before-markers-- a))
+  nil)
 (defun count-words (start end)
   (length (split-string (buffer-substring start end) "[^[:alnum:]]+" t)))
 (defun how-many (regexp &optional start end)
@@ -5076,10 +5131,11 @@ Mode-specific keymaps may want to use this as their parent keymap."
   "g" #'revert-buffer)
 
 ;;; ---- major/minor mode machinery (derived.el, easy-mmode.el, subr.el) ----
-;; Real text editing (point/insert, multiple named live buffers, narrowing, and
-;; marker-based save-excursion) is modeled by the text-editing subsystem
-;; (builtins.rs). Text properties, general marker objects, and redisplay are not.
-;; Syntax tables and abbrev tables are separate subsystems: the constructors below
+;; Real text editing (point/insert, multiple named live buffers, narrowing,
+;; marker-based save-excursion, first-class markers, and string/buffer text
+;; properties) is modeled by the text-editing subsystem (builtins.rs). Overlays
+;; and redisplay are not. Syntax tables and abbrev tables are separate subsystems:
+;; the constructors below
 ;; are placeholders sufficient for `define-derived-mode' to expand and load; they
 ;; do not model syntax/abbrev semantics.
 
