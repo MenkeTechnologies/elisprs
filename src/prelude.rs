@@ -2903,13 +2903,17 @@ and the returned string should both be non-magic."
 ;; `load-file-name'/`load-true-file-name' are nil and `load-in-progress' is nil,
 ;; matching Emacs. `load-path' is searched for a bare (directory-less) FILE;
 ;; `load-suffixes' are the extensions tried (elisprs has no bytecode, so `.elc'
-;; is never found — only `.el' and the exact name resolve).
+;; is never found); crossed with `load-file-rep-suffixes' = `("" ".gz")', so
+;; `.el', `.el.gz', the exact name, and its `.gz' variant all resolve.
 (defvar load-path nil)
 (defvar load-file-name nil)
 (defvar load-true-file-name nil)
 (defvar load-in-progress nil)
 (defvar load-suffixes '(".elc" ".el"))
-(defvar load-file-rep-suffixes '(""))
+;; jka-compr (auto-compression-mode, on by default) sets this to `("" ".gz")' so
+;; `load' transparently finds and gunzips compressed libraries — the stock Emacs
+;; lisp tree ships as `*.el.gz'. The `load' builtin honors the `.gz' rep-suffix.
+(defvar load-file-rep-suffixes '("" ".gz"))
 ;; get-load-suffixes (C `Fget_load_suffixes', lread.c): the cross product of
 ;; `load-suffixes' with `load-file-rep-suffixes', in the same order the C loop
 ;; conses then nreverses — suffix0+rep0, suffix0+rep1, suffix1+rep0, ...

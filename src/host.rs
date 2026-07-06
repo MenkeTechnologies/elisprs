@@ -3323,9 +3323,11 @@ pub(crate) fn load_abspath(candidate: &str) -> std::path::PathBuf {
 /// Resolution: if FILE has a directory component (or is absolute/`~`), it is
 /// used as-is; otherwise each directory in `load-path` is tried (falling back to
 /// cwd when `load-path` is empty). For each base, suffixes are tried in order:
-/// `.el` then the exact name (Emacs would try `.elc` first, but elisprs emits no
-/// bytecode so no `.elc` ever exists). NOSUFFIX limits the search to the exact
-/// name; MUST-SUFFIX requires a `load-suffixes` extension (only `.el` here).
+/// `.el`, `.el.gz`, the exact name, then its `.gz` variant (Emacs would try `.elc`
+/// first, but elisprs emits no bytecode so no `.elc` ever exists). The `.gz`
+/// variants are jka-compr's `load-file-rep-suffixes`; a resolved `.gz` file is
+/// gunzipped in memory. NOSUFFIX limits the search to the exact name (and its
+/// `.gz`); MUST-SUFFIX requires a `load-suffixes` extension (`.el`/`.el.gz` here).
 ///
 /// While the file's forms run, `load-file-name`, `load-true-file-name` and
 /// `load-in-progress` are dynamically bound and restored afterward — even if a
@@ -3345,13 +3347,18 @@ fn intrinsic_load(args: &[Value]) -> Result<Value, String> {
     let nosuffix = args.get(3).is_some_and(el_truthy);
     let must_suffix = args.get(4).is_some_and(el_truthy);
 
-    // Suffixes to append (`.elc` skipped — elisprs writes no bytecode files).
+    // Suffixes to append, in Emacs's search order. Each `load-suffixes` entry is
+    // crossed with `load-file-rep-suffixes` = `("" ".gz")` (jka-compr's compressed
+    // variant — the stock Emacs lisp tree ships as `*.el.gz`), then the bare
+    // rep-suffixes are appended for the exact-name pass. `.elc` is skipped —
+    // elisprs writes no bytecode files. NOSUFFIX drops the load-suffixes; MUST-SUFFIX
+    // drops the bare exact-name pass. Mirrors `Fget_load_suffixes` + `openp` order.
     let suffixes: &[&str] = if nosuffix {
-        &[""]
+        &["", ".gz"]
     } else if must_suffix {
-        &[".el"]
+        &[".el", ".el.gz"]
     } else {
-        &[".el", ""]
+        &[".el", ".el.gz", "", ".gz"]
     };
 
     // Base names: FILE alone if it carries a directory component, else each
@@ -3412,8 +3419,21 @@ fn intrinsic_load(args: &[Value]) -> Result<Value, String> {
         }
     };
 
-    let src = std::fs::read_to_string(&path)
-        .map_err(|e| format!("file-error: Cannot open load file: {}: {e}", path.display()))?;
+    // Read the resolved file. A `.gz` target is decompressed in memory (jka-compr
+    // does the same via `load` -> `insert-file-contents` -> `jka-compr-insert`),
+    // so a stock `*.el.gz` library evaluates identically to its `.el` form.
+    let src = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| format!("file-error: Cannot open load file: {}: {e}", path.display()))?;
+        let mut dec = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut dec, &mut s)
+            .map_err(|e| format!("file-error: uncompressing {}: {e}", path.display()))?;
+        s
+    } else {
+        std::fs::read_to_string(&path)
+            .map_err(|e| format!("file-error: Cannot open load file: {}: {e}", path.display()))?
+    };
     let abs = Value::str(path.to_string_lossy().into_owned());
 
     // Dynamically bind the load vars, remembering the pre-load specstack depth

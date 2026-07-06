@@ -69,3 +69,8 @@ fancy-regex = "0.14"
 # unbounded, and Lisp recursion is bounded by `max-lisp-eval-depth`, not a
 # crash. rust-lang maintained, vendorable, durable.
 stacker = "0.1"
+# The Emacs 30.2 lisp tree ships as `*.el.gz`; `load' transparently gunzips them
+# (jka-compr's `load-file-rep-suffixes' = `("" ".gz")'). flate2's default
+# `rust_backend' is pure-Rust miniz_oxide (no C toolchain, vendorable, durable),
+# so `(load "lib")' resolves and decompresses a `.gz`-only library in memory.
+flate2 = "1"

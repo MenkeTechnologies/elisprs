@@ -9,8 +9,11 @@
 (message "== locate-library demo ==")
 
 (ert-deftest get-load-suffixes-default ()
-  "Default suffixes are the load × rep cross product (rep = (\"\"))."
-  (should (equal (get-load-suffixes) '(".elc" ".el"))))
+  "Default suffixes are the load × rep cross product; jka-compr's default
+rep = (\"\" \".gz\") adds a `.gz' variant after each entry, so a stock `*.el.gz'
+library resolves. (Emacs also prepends `.so'/`.dylib' module variants, which
+elisprs omits — it loads no native modules.)"
+  (should (equal (get-load-suffixes) '(".elc" ".elc.gz" ".el" ".el.gz"))))
 
 (ert-deftest get-load-suffixes-cross-product-order ()
   "Order matches the C loop: suffix0+rep0, suffix0+rep1, suffix1+rep0, ..."
