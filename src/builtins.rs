@@ -4028,6 +4028,23 @@ fn current_directory(_h: &mut ElispHost, _a: &[Value]) -> R {
     ))
 }
 
+/// Emacs C `Vsystem_type` (emacs.c), computed at build/configure time. We derive
+/// the same symbol from the running platform so a `.el` file gets the value it
+/// would see under a native Emacs on this host. Mapping matches Emacs's
+/// `s/*.h` `SYSTEM_TYPE` conventions: macOS -> `darwin`, Linux -> `gnu/linux`,
+/// the BSDs -> `berkeley-unix`, Windows -> `windows-nt`.
+fn system_type(h: &mut ElispHost, _a: &[Value]) -> R {
+    let sym = match std::env::consts::OS {
+        "macos" => "darwin",
+        "linux" => "gnu/linux",
+        "windows" => "windows-nt",
+        "freebsd" | "openbsd" | "netbsd" | "dragonfly" => "berkeley-unix",
+        "android" => "android",
+        _ => "gnu/linux",
+    };
+    Ok(h.intern(sym))
+}
+
 // ── filesystem (read-only queries) ──
 /// Expand a leading `~/` against $HOME; relative paths resolve against the
 /// process cwd (= `default-directory`), as elisp expects.
@@ -5564,6 +5581,7 @@ pub fn install(h: &mut ElispHost) {
     s("subr-arity", 1, Some(1), func_arity);
     s("subr-name", 1, Some(1), subr_name);
     s("--current-directory--", 0, Some(0), current_directory);
+    s("--system-type--", 0, Some(0), system_type);
     s("file-exists-p", 1, Some(1), file_exists_p);
     s("file-directory-p", 1, Some(1), file_directory_p);
     s("file-regular-p", 1, Some(1), file_regular_p);

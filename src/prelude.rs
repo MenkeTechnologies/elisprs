@@ -22,6 +22,26 @@ pub const PRELUDE: &str = r#"
 ;; Regexp matching folds case unless this is let-bound to nil (Emacs default t).
 (defvar case-fold-search t)
 
+;;; ---- build/system identity (C-level vars from emacs.c, verified against
+;;; ---- GNU Emacs 30.2) ----
+;; `emacs-version' is a C variable (Vemacs_version). We track the emulated
+;; Emacs release the prelude is faithful to.
+(defconst emacs-version "30.2")
+;; `emacs-major-version'/`emacs-minor-version' are derived in lisp/version.el
+;; exactly like this; kept here because version.el is not preloaded.
+(defconst emacs-major-version
+  (progn (string-match "^[0-9]+" emacs-version)
+         (string-to-number (match-string 0 emacs-version))))
+(defconst emacs-minor-version
+  (progn (string-match "^[0-9]+\\.\\([0-9]+\\)" emacs-version)
+         (string-to-number (match-string 1 emacs-version))))
+;; `system-type' (Vsystem_type) is platform-derived; the Rust primitive maps the
+;; running OS to Emacs's symbol (darwin/gnu-linux/berkeley-unix/windows-nt).
+(defvar system-type (--system-type--))
+;; No GUI and non-interactive batch execution, matching `emacs -Q --batch'.
+(defvar window-system nil)
+(defvar noninteractive t)
+
 ;;; ---- numeric helpers ----
 ;; Fixnum bounds match GNU Emacs on a 64-bit build (62-bit tagged integers).
 (defconst most-positive-fixnum 2305843009213693951)
