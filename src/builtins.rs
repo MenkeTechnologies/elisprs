@@ -957,7 +957,7 @@ fn terpri(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(Value::Bool(true))
 }
 fn print_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let s = h.print(&a[0], true);
+    let s = h.print_checked(&a[0], true)?;
     h.emit(&s);
     h.emit("\n");
     Ok(a[0].clone())
@@ -970,7 +970,7 @@ fn pop_output_capture(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(Value::str(h.output_capture.pop().unwrap_or_default()))
 }
 fn prin1_to_string(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::str(h.print(&a[0], true)))
+    Ok(Value::str(h.print_checked(&a[0], true)?))
 }
 
 // ── nonlocal exits ──
@@ -1351,7 +1351,7 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
         let body = match conv {
             's' => {
                 let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
-                let s = h.print(arg, false);
+                let s = h.print_checked(arg, false)?;
                 match spec.prec {
                     Some(p) => s.chars().take(p).collect(),
                     None => s,
@@ -1359,7 +1359,7 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             }
             'S' => {
                 let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
-                h.print(arg, true)
+                h.print_checked(arg, true)?
             }
             // The `+`/space sign flags apply to the signed conversions (d/e/f/g).
             // `%i` is an accepted alias for `%d` (as in C printf).
@@ -1424,12 +1424,12 @@ fn message_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::str(s))
 }
 fn princ_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let s = h.print(&a[0], false);
+    let s = h.print_checked(&a[0], false)?;
     h.emit(&s);
     Ok(a[0].clone())
 }
 fn prin1_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let s = h.print(&a[0], true);
+    let s = h.print_checked(&a[0], true)?;
     h.emit(&s);
     Ok(a[0].clone())
 }

@@ -311,6 +311,11 @@ pub enum Resolved {
     },
 }
 
+/// print.c `PRINT_CIRCLE`: the max print nesting depth. With `print-circle`
+/// nil, an object nested this deep signals "Apparently circular structure being
+/// printed" instead of printing (Emacs errors at exactly this depth).
+const PRINT_CIRCLE: usize = 200;
+
 pub struct ElispHost {
     pub(crate) arena: Vec<Obj>,
     obarray: HashMap<String, u32>,
@@ -342,6 +347,11 @@ pub struct ElispHost {
     /// Output-capture stack for `with-output-to-string`: when non-empty,
     /// `princ`/`prin1`/`print`/`terpri` append to the top buffer instead of stdout.
     pub(crate) output_capture: Vec<String>,
+    /// Set by `print_inner` when nesting reaches `PRINT_CIRCLE`; the print entry
+    /// points (`prin1`/`print`/`princ`/`format`) read it to signal Emacs's
+    /// `error "Apparently circular structure being printed"`. `Cell` so the
+    /// `&self` printer can record it. Reset at the top of every `print` call.
+    pub(crate) print_overflow: Cell<bool>,
     /// The global buffer registry. Index 0 is the default buffer (`*scratch*`).
     /// Slots are never removed — `kill-buffer` marks a buffer dead (`name: None`)
     /// so its index (and any live buffer object referencing it) stays valid.
@@ -479,6 +489,7 @@ impl ElispHost {
             pending_error: None,
             match_data: None,
             output_capture: Vec::new(),
+            print_overflow: Cell::new(false),
             buffers: vec![EditBuffer {
                 name: Some("*scratch*".to_string()),
                 self_obj: Value::Undef,
@@ -1546,7 +1557,19 @@ impl ElispHost {
 
     // ── printing ──
     pub fn print(&self, v: &Value, readable: bool) -> String {
+        self.print_overflow.set(false);
         self.print_inner(v, readable, 0)
+    }
+
+    /// Like `print`, but returns Emacs's `error "Apparently circular structure
+    /// being printed"` when the value nested `PRINT_CIRCLE` deep (matching
+    /// print.c: with `print-circle` nil, that depth signals rather than prints).
+    pub fn print_checked(&self, v: &Value, readable: bool) -> Result<String, String> {
+        let s = self.print(v, readable);
+        if self.print_overflow.get() {
+            return Err("Apparently circular structure being printed".to_string());
+        }
+        Ok(s)
     }
 
     /// Read a non-negative integer dynamic var (`print-length`/`print-level`) for
@@ -1595,6 +1618,14 @@ impl ElispHost {
     }
 
     fn print_inner(&self, v: &Value, readable: bool, depth: usize) -> String {
+        // Faithful to print.c `PRINT_CIRCLE` = 200: with `print-circle` nil,
+        // any object nested this deep aborts printing with "Apparently circular
+        // structure being printed". Stop recursing here (both to match Emacs and
+        // to keep the Rust call stack bounded) and flag it for `print_checked`.
+        if depth >= PRINT_CIRCLE {
+            self.print_overflow.set(true);
+            return String::new();
+        }
         match v {
             Value::Undef => "nil".to_string(),
             Value::Bool(true) => "t".to_string(),
