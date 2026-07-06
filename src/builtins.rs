@@ -2509,6 +2509,91 @@ fn recordp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(ok))
 }
 
+// ── OClosure C primitives (oclosure.el) ──
+// These implement the host-specific seam `oclosure.el` builds on. The rest of
+// oclosure.el is ported faithfully into the prelude. Because elisprs closures
+// are compiled (not aref-indexable interpreted-functions), the type + slot
+// layout is attached via a side table and slot values live in the closure's
+// captured env — see `ElispHost::oclosure_*`.
+
+/// `(closurep OBJECT)` — t if OBJECT is a closure.
+fn closurep_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(h.is_closure(&a[0])))
+}
+
+/// `(oclosure--fix-type TYPE SLOTS MUTABLES CLOSURE)` — mark CLOSURE as an
+/// OClosure of TYPE with the given ordered SLOTS; returns CLOSURE. In Emacs this
+/// is a 2-arg cconv marker whose type rides in the lambda's `:documentation`;
+/// elisprs passes the type + slot names explicitly (its closures have no
+/// aref-addressable docstring slot) — a NAMED divergence of the internal seam,
+/// not of the observable API.
+fn oclosure_fix_type(h: &mut ElispHost, a: &[Value]) -> R {
+    let closure = a[3].clone();
+    if !h.is_closure(&closure) {
+        return Err("Wrong type argument: closurep".to_string());
+    }
+    let ty = h
+        .as_sym_handle(&a[0])
+        .ok_or("oclosure--fix-type: type is not a symbol")?;
+    let slot_vals = h
+        .list_vec(&a[1])
+        .ok_or("oclosure--fix-type: slots is not a proper list")?;
+    let mut slots = Vec::with_capacity(slot_vals.len());
+    for s in &slot_vals {
+        slots.push(
+            h.as_sym_handle(s)
+                .ok_or("oclosure--fix-type: slot name is not a symbol")?,
+        );
+    }
+    h.oclosure_set_meta(&closure, ty, slots);
+    Ok(closure)
+}
+
+/// `(oclosure-type OCLOSURE)` — the type symbol of OCLOSURE, or nil.
+fn oclosure_type_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    match h.oclosure_type_of(&a[0]) {
+        Some(id) => Ok(Value::Obj(id)),
+        None => Ok(Value::Undef),
+    }
+}
+
+/// `(oclosure--get OCLOSURE INDEX MUTABLE)` — value of slot INDEX. MUTABLE is
+/// accepted for signature compatibility but unused (slot values always live in a
+/// mutable env cell; mutability is enforced by the class in `oclosure--set-slot-value`).
+fn oclosure_get_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    if !h.is_closure(&a[0]) {
+        return Err("Wrong type argument: closurep".to_string());
+    }
+    let idx = as_int(h, &a[1])? as usize;
+    h.oclosure_get(&a[0], idx)
+        .ok_or_else(|| "oclosure--get: slot index out of range".to_string())
+}
+
+/// `(oclosure--set V OCLOSURE INDEX)` — set slot INDEX to V; returns V.
+fn oclosure_set_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    if !h.is_closure(&a[1]) {
+        return Err("Wrong type argument: closurep".to_string());
+    }
+    let idx = as_int(h, &a[2])? as usize;
+    if h.oclosure_set(&a[1], idx, &a[0]) {
+        Ok(a[0].clone())
+    } else {
+        Err("oclosure--set: slot index out of range".to_string())
+    }
+}
+
+/// `(oclosure--copy OCLOSURE MUTLIST &rest ARGS)` — functional copy of OCLOSURE
+/// with the first `(length ARGS)` slots replaced. MUTLIST (bytecode mutable-cell
+/// wrapping) is irrelevant to elisprs's env-cell slots and ignored.
+fn oclosure_copy_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    if !h.is_closure(&a[0]) {
+        return Err("Wrong type argument: closurep".to_string());
+    }
+    let args: Vec<Value> = a[2..].to_vec();
+    h.oclosure_copy(&a[0], &args)
+        .ok_or_else(|| "oclosure--copy: not an OClosure".to_string())
+}
+
 /// `(functionp OBJECT)` — non-nil if OBJECT can be called as a function (a subr,
 /// a non-macro closure, or a symbol whose function cell resolves to one).
 fn functionp(h: &mut ElispHost, a: &[Value]) -> R {
@@ -5616,6 +5701,12 @@ pub fn install(h: &mut ElispHost) {
     s("upcase", 1, Some(1), upcase_fn);
     s("type-of", 1, Some(1), type_of);
     s("recordp", 1, Some(1), recordp);
+    s("closurep", 1, Some(1), closurep_fn);
+    s("oclosure--fix-type", 4, Some(4), oclosure_fix_type);
+    s("oclosure-type", 1, Some(1), oclosure_type_fn);
+    s("oclosure--get", 3, Some(3), oclosure_get_fn);
+    s("oclosure--set", 3, Some(3), oclosure_set_fn);
+    s("oclosure--copy", 2, None, oclosure_copy_fn);
     s("sxhash-equal", 1, Some(1), sxhash_equal_fn);
     s("sxhash", 1, Some(1), sxhash_equal_fn);
     s("sxhash-eq", 1, Some(1), sxhash_eq_fn);

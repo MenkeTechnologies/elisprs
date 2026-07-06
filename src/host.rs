@@ -351,6 +351,24 @@ pub struct ElispHost {
     /// `Arc` clones (`eq` strings) exactly like Emacs, but are lost across `concat`/
     /// `substring` (which mint fresh allocations) unless re-registered explicitly.
     pub(crate) string_props: HashMap<usize, (Weak<String>, Vec<Value>)>,
+    /// OClosure metadata, keyed by the closure object's arena handle. An OClosure
+    /// (`oclosure.el`) is an ordinary [`Obj::Closure`] that also carries a *type*
+    /// symbol and an ordered list of *slot* symbol handles. The slot *values* are
+    /// not stored here — they live in the closure's captured lexical env (the same
+    /// storage the closure body reads), so `oclosure--set` and a body `setq` stay
+    /// mutually visible, exactly as Emacs stores oclosure slots in the closure's
+    /// env alist. This side table (rather than a field on `Obj::Closure`) keeps the
+    /// compiler's closure-template construction untouched. Session-local: not part
+    /// of the AOT heap image (oclosure-heavy libraries load at runtime).
+    pub(crate) oclosure_meta: HashMap<u32, OClosureMeta>,
+}
+
+/// Type + slot layout attached to an [`Obj::Closure`] to make it an OClosure.
+/// `ty` is the type symbol's handle; `slots` are the slot symbols' handles in
+/// declaration order (index 0 = first slot). Values live in the closure's env.
+pub struct OClosureMeta {
+    pub ty: u32,
+    pub slots: Vec<u32>,
 }
 
 /// An editing buffer: a char vector, a 1-based point, narrowing bounds, the mark,
@@ -472,6 +490,7 @@ impl ElispHost {
             }],
             current: 0,
             string_props: HashMap::new(),
+            oclosure_meta: HashMap::new(),
         };
         crate::builtins::install(&mut h);
         // The default buffer's own object handle (allocated after the arena
@@ -520,6 +539,11 @@ impl ElispHost {
             Value::Obj(id) => self.arena.get(*id as usize),
             _ => None,
         }
+    }
+    /// Public form of [`Self::sym_handle`]: the arena handle of `v` if it is a
+    /// symbol object, else `None`. Used by the OClosure builtins.
+    pub fn as_sym_handle(&self, v: &Value) -> Option<u32> {
+        self.sym_handle(v)
     }
     fn sym_handle(&self, v: &Value) -> Option<u32> {
         match v {
@@ -948,6 +972,130 @@ impl ElispHost {
         }
         template.clone()
     }
+
+    // ── OClosure seam (oclosure.el's C primitives) ──
+    // These implement the host-specific primitives `oclosure.el` builds on. In
+    // Emacs they poke at an interpreted-function's `aref` slots; elisprs closures
+    // are compiled (a `Chunk` + captured env), so the seam instead attaches a
+    // type + slot-name list (side table) and reads/writes slot values in the
+    // closure's captured lexical env by symbol. The observable oclosure API
+    // (define / lambda / accessors / `oclosure-type`) matches Emacs exactly.
+
+    /// True if `v` is a closure (`closurep`).
+    pub fn is_closure(&self, v: &Value) -> bool {
+        matches!(self.obj(v), Some(Obj::Closure { .. }))
+    }
+
+    /// Mark closure `v` as an OClosure of type `ty` with the given ordered slot
+    /// symbols (`oclosure--fix-type`). No-op if `v` is not a closure.
+    pub fn oclosure_set_meta(&mut self, v: &Value, ty: u32, slots: Vec<u32>) {
+        if let Value::Obj(id) = v {
+            if matches!(self.arena.get(*id as usize), Some(Obj::Closure { .. })) {
+                self.oclosure_meta.insert(*id, OClosureMeta { ty, slots });
+            }
+        }
+    }
+
+    /// The type symbol handle of OClosure `v`, or `None` (`oclosure-type`).
+    pub fn oclosure_type_of(&self, v: &Value) -> Option<u32> {
+        match v {
+            Value::Obj(id) if self.is_closure(v) => self.oclosure_meta.get(id).map(|m| m.ty),
+            _ => None,
+        }
+    }
+
+    /// Clone a closure's captured env (for slot access), or `None`.
+    fn closure_env(&self, v: &Value) -> Option<Lex> {
+        match self.obj(v) {
+            Some(Obj::Closure { env, .. }) => Some(env.clone()),
+            _ => None,
+        }
+    }
+
+    /// Read slot `index` of OClosure `v` (`oclosure--get`): look up the slot
+    /// symbol in the closure's captured env.
+    pub fn oclosure_get(&self, v: &Value, index: usize) -> Option<Value> {
+        let id = match v {
+            Value::Obj(id) => *id,
+            _ => return None,
+        };
+        let sym = *self.oclosure_meta.get(&id)?.slots.get(index)?;
+        let env = self.closure_env(v)?;
+        env.as_ref().and_then(|h| h.lookup(sym))
+    }
+
+    /// Write slot `index` of OClosure `v` (`oclosure--set`): mutate the slot
+    /// symbol's cell in the closure's captured env. Returns false if not found.
+    pub fn oclosure_set(&self, v: &Value, index: usize, val: &Value) -> bool {
+        let id = match v {
+            Value::Obj(id) => *id,
+            _ => return false,
+        };
+        let sym = match self.oclosure_meta.get(&id).and_then(|m| m.slots.get(index)) {
+            Some(s) => *s,
+            None => return false,
+        };
+        match self.closure_env(v).flatten() {
+            Some(head) => head.set(sym, val),
+            None => false,
+        }
+    }
+
+    /// Functional copy of OClosure `src` (`oclosure--copy`): a new closure with the
+    /// same code + type, whose first `args.len()` slots take the new values and
+    /// whose remaining slots keep `src`'s values. Fresh slot bindings are prepended
+    /// to `src`'s env so they shadow the originals (the copy's body reads the new
+    /// values). Returns `None` if `src` is not an OClosure closure.
+    pub fn oclosure_copy(&mut self, src: &Value, args: &[Value]) -> Option<Value> {
+        let id = match src {
+            Value::Obj(id) => *id,
+            _ => return None,
+        };
+        let slots = self.oclosure_meta.get(&id)?.slots.clone();
+        let ty = self.oclosure_meta.get(&id)?.ty;
+        let (params, body, is_macro, base_env) = match self.obj(src) {
+            Some(Obj::Closure {
+                params,
+                body,
+                is_macro,
+                env,
+            }) => (params.clone(), body.clone(), *is_macro, env.clone()),
+            _ => return None,
+        };
+        // New value for each slot: the passed arg, else the original slot value.
+        let mut vals: Vec<Value> = Vec::with_capacity(slots.len());
+        for (k, &sym) in slots.iter().enumerate() {
+            let v = if k < args.len() {
+                args[k].clone()
+            } else {
+                base_env
+                    .as_ref()
+                    .and_then(|h| h.lookup(sym))
+                    .unwrap_or(Value::Undef)
+            };
+            vals.push(v);
+        }
+        // Prepend in reverse so slot[0] ends up frontmost (found first on lookup).
+        let mut env = base_env;
+        for (k, &sym) in slots.iter().enumerate().rev() {
+            env = Some(Rc::new(Scope {
+                sym,
+                val: RefCell::new(vals[k].clone()),
+                parent: env.take(),
+            }));
+        }
+        let newv = self.alloc(Obj::Closure {
+            params,
+            body,
+            is_macro,
+            env,
+        });
+        if let Value::Obj(nid) = newv {
+            self.oclosure_meta.insert(nid, OClosureMeta { ty, slots });
+        }
+        Some(newv)
+    }
+
     // ── AOT heap image ──
     /// Serialize the user/prelude heap (arena ≥ `builtin_count`) for embedding
     /// into an AOT object. Builtins are excluded — they are re-created by

@@ -3671,6 +3671,11 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
        ((eq head 'symbol-function) (list 'fset (car args) val))
        ;; (setf (get SYM PROP) V) -> (put SYM PROP V).
        ((eq head 'get) (list 'put (car args) (car (cdr args)) val))
+       ;; (setf (cl--find-class NAME) CLASS) -> (put NAME 'cl--class CLASS).
+       ;; `cl--find-class' stores class descriptors on the symbol's plist, exactly
+       ;; as cl-preloaded.el does; this is its gv setter.
+       ((eq head 'cl--find-class)
+        (list 'put (car args) (list 'quote 'cl--class) val))
        ;; cl-first..cl-tenth name list positions; cl-rest is the cdr.
        ((eq head 'cl-rest) (list 'setcdr (car args) val))
        ((memq head '(cl-first cl-second cl-third cl-fourth cl-fifth
@@ -3765,7 +3770,14 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
        ;; `(cl--generic name)' -> `(get name 'cl--generic)' (gv.el:103).
        (t (let ((me (macroexpand-1 place)))
             (if (eq me place)
-                (error "setf: unsupported place %S" place)
+                ;; gv.el function-setter fallback: if `(setf HEAD)' names a
+                ;; function (e.g. an oclosure mutable-slot setter installed via
+                ;; `(defalias (gv-setter aname) ...)'), call it as
+                ;; `(funcall #'(setf HEAD) VAL ARGS...)'.
+                (let ((setter (intern (format "(setf %s)" head))))
+                  (if (fboundp setter)
+                      (cons 'funcall (cons (list 'function setter) (cons val args)))
+                    (error "setf: unsupported place %S" place)))
               (setf--expand me val))))))))
 (defmacro setf (&rest pairs)
   (let ((forms nil))
@@ -6226,4 +6238,359 @@ No problems result if this variable is not bound.
   "Run all tests; raise an error (→ non-zero exit) on any unexpected result."
   (let ((bad (ert-run-tests-batch)))
     (if (> bad 0) (error "%d unexpected ERT result(s)" bad) t)))
+
+;;; ---- oclosure (Open Closures) ----
+;; Faithful port of emacs-lisp/oclosure.el (Emacs 30.2).  An OClosure is a
+;; closure that also carries a type (for cl-generic dispatch) and named,
+;; optionally-mutable slots reachable from outside via generated accessors.
+;;
+;; elisprs divergences from oclosure.el (NAMED — the observable API matches the
+;; Emacs binary exactly; only the host-specific internals differ):
+;;  * The C primitives `oclosure--get/--set/--copy/--fix-type', `oclosure-type'
+;;    and `closurep' are Rust builtins (src/builtins.rs), because elisprs closures
+;;    are compiled (a fusevm Chunk + captured env), not aref-indexable
+;;    interpreted-functions.  Slot values live in the closure's captured lexical
+;;    env (the same storage the body reads), so `oclosure--set' and an in-body
+;;    `setq' stay mutually visible — exactly as Emacs stores slots in the env.
+;;  * `oclosure-define' installs the class AND the accessors/copiers in one
+;;    runtime call (`oclosure--define'); Emacs splits this across an
+;;    eval-and-compile class registration and a compile-time
+;;    `oclosure--define-functions' macro.  Merging is safe because top-level forms
+;;    are evaluated in order, so the class is registered before the next form's
+;;    macroexpansion (which `oclosure-lambda' needs).
+;;  * The cl--class / cl-slot-descriptor substrate (from cl-preloaded.el) is
+;;    provided here minimally: the `closure' parent is a plain class object rather
+;;    than the full built-in-type hierarchy.
+;;  * The cl-print pretty-printer methods for accessors are omitted (cosmetic).
+
+;; -- helpers not yet in the prelude --
+(defun macroexp-parse-body (body)
+  "Parse a function BODY into (DECLARATIONS . EXPS)."
+  (let ((decls ()))
+    (while
+        (and body
+             (let ((e (car body)))
+               (or (and (stringp e) (cdr body))
+                   (memq (car-safe e)
+                         '(:documentation declare interactive cl-declare)))))
+      (push (pop body) decls))
+    (cons (nreverse decls) body)))
+
+(defconst cl--lambda-list-keywords
+  '(&optional &rest &key &allow-other-keys &aux &whole &body &environment))
+
+(defun cl--arglist-args (args)
+  (if (not (listp args)) (list args)
+    (let ((res nil) (kind nil) arg)
+      (while (consp args)
+        (setq arg (pop args))
+        (if (memq arg cl--lambda-list-keywords) (setq kind arg)
+          (if (eq arg '&cl-defs) (pop args)
+            (and (consp arg) kind (setq arg (car arg)))
+            (and (consp arg) (cdr arg) (eq kind '&key) (setq arg (cadr arg)))
+            (setq res (nconc res (cl--arglist-args arg))))))
+      (nconc res (and args (list args))))))
+
+(defun gv-setter (name)
+  "Return the symbol where the (setf NAME) function should be placed."
+  (intern (format "(setf %s)" name)))
+
+;; -- cl--class / cl-slot-descriptor substrate (subset of cl-preloaded.el) --
+(defun cl--find-class (name) (get name 'cl--class))
+
+(cl-defstruct (cl-slot-descriptor
+               (:conc-name cl--slot-descriptor-)
+               (:constructor nil)
+               (:constructor cl--make-slot-descriptor (name &optional initform type props)))
+  name initform type props)
+
+(cl-defstruct (cl--class (:constructor nil))
+  name docstring parents slots index-table)
+
+(cl-defstruct (oclosure--class (:include cl--class))
+  allparents)
+
+(defun oclosure--index-table (slotdescs)
+  (let ((i -1)
+        (it (make-hash-table :test 'eq)))
+    (dolist (desc slotdescs)
+      (let ((slot (cl--slot-descriptor-name desc)))
+        (cl-incf i)
+        (when (gethash slot it)
+          (error "Duplicate slot name: %S" slot))
+        (setf (gethash slot it) i)))
+    it))
+
+(defun oclosure--class-make (name docstring slots parents allparents)
+  (make-oclosure--class :name name :docstring docstring :parents parents
+                        :slots slots :index-table (oclosure--index-table slots)
+                        :allparents allparents))
+
+;; The `closure' parent class (minimal), then the `oclosure' root.
+(setf (cl--find-class 'closure)
+      (make-oclosure--class :name 'closure :allparents '(closure)))
+(setf (cl--find-class 'oclosure)
+      (oclosure--class-make 'oclosure
+                            "The root parent of all OClosure types"
+                            nil (list (cl--find-class 'closure))
+                            '(oclosure)))
+
+(defun oclosure--p (oclosure)
+  (not (not (oclosure-type oclosure))))
+(cl-deftype oclosure () '(satisfies oclosure--p))
+
+(defun oclosure--slot-mutable-p (slotdesc)
+  (not (alist-get :read-only (cl--slot-descriptor-props slotdesc))))
+
+(defun oclosure--build-class (name docstring parent-names slots)
+  (cl-assert (null (cdr parent-names)))
+  (let* ((parent-class (let ((pname (or (car parent-names) 'oclosure)))
+                         (or (cl--find-class pname)
+                             (error "Unknown class: %S" pname))))
+         (slotdescs
+          (append
+           (oclosure--class-slots parent-class)
+           (mapcar (lambda (field)
+                     (if (not (consp field))
+                         (cl--make-slot-descriptor field nil nil
+                                                   '((:read-only . t)))
+                       (let ((sname (pop field))
+                             (type nil)
+                             (read-only t)
+                             (props '()))
+                         (while field
+                           (pcase (pop field)
+                             (:mutable (setq read-only (not (car field))))
+                             (:type (setq type (car field)))
+                             (p (message "Unknown property: %S" p)
+                                (push (cons p (car field)) props)))
+                           (setq field (cdr field)))
+                         (cl--make-slot-descriptor sname nil type
+                                                   `((:read-only . ,read-only)
+                                                     ,@props)))))
+                   slots))))
+    (oclosure--class-make name docstring slotdescs
+                          (if (cdr parent-names)
+                              (oclosure--class-parents parent-class)
+                            (list parent-class))
+                          (cons name (oclosure--class-allparents
+                                      parent-class)))))
+
+(defun oclosure--defstruct-make-copiers (copiers slotdescs name)
+  (let* ((mutables '())
+         (slots (mapcar
+                 (lambda (desc)
+                   (let ((sname (cl--slot-descriptor-name desc)))
+                     (when (oclosure--slot-mutable-p desc)
+                       (push sname mutables))
+                     sname))
+                 slotdescs)))
+    (mapcar
+     (lambda (copier)
+       (pcase-let*
+           ((cname (pop copier))
+            (args (or (pop copier) `(&key ,@slots)))
+            (inline (and (eq :inline (car copier)) (pop copier)))
+            (doc (or (pop copier)
+                     (format "Copier for objects of type `%s'." name)))
+            (obj (make-symbol "obj"))
+            (absent (make-symbol "absent"))
+            (anames (cl--arglist-args args))
+            (mnames
+             (let ((res '()) (tmp args))
+               (while (and tmp (not (memq (car tmp) cl--lambda-list-keywords)))
+                 (push (pop tmp) res))
+               res))
+            (has-kw (let ((k nil))
+                      (dolist (a args)
+                        (when (memq a cl--lambda-list-keywords) (setq k t)))
+                      k))
+            (index -1)
+            (mutlist '())
+            (argvals
+             (mapcar
+              (lambda (slot)
+                (setq index (1+ index))
+                (let* ((mutable (memq slot mutables))
+                       (get `(oclosure--get ,obj ,index ,(not (not mutable)))))
+                  (push mutable mutlist)
+                  (cond
+                   ((not (memq slot anames)) get)
+                   ((memq slot mnames) slot)
+                   (t `(if (eq ',absent ,slot) ,get ,slot)))))
+              slots)))
+         `(,(if inline 'cl-defsubst 'cl-defun) ,cname
+           ,(if has-kw `(&cl-defs (',absent) ,obj ,@args) `(,obj ,@args))
+           ,doc
+           (oclosure--copy ,obj ',(if (remq nil mutlist) (nreverse mutlist))
+                           ,@argvals))))
+     copiers)))
+
+(defun oclosure--install-functions (name copiers)
+  (let* ((class (cl--find-class name))
+         (slotdescs (oclosure--class-slots class))
+         (i -1))
+    (dolist (desc slotdescs)
+      (setq i (1+ i))
+      (let* ((slot (cl--slot-descriptor-name desc))
+             (mutable (oclosure--slot-mutable-p desc))
+             (aname (intern (format "%S--%S" name slot))))
+        (if (not mutable)
+            (defalias aname
+              (oclosure--copy oclosure--accessor-prototype nil name slot i))
+          (defalias aname
+            (oclosure--accessor-copy oclosure--mut-getter-prototype name slot i))
+          (defalias (gv-setter aname)
+            (oclosure--accessor-copy oclosure--mut-setter-prototype name slot i)))))
+    (dolist (form (oclosure--defstruct-make-copiers copiers slotdescs name))
+      (eval form t))))
+
+(defun oclosure--define (name docstring parent-names slots &rest props)
+  (let* ((class (oclosure--build-class name docstring parent-names slots))
+         (pred (lambda (oclosure)
+                 (let ((type (oclosure-type oclosure)))
+                   (when type
+                     (memq name (oclosure--class-allparents
+                                 (cl--find-class type)))))))
+         (predname (or (plist-get props :predicate)
+                       (intern (format "%s--internal-p" name)))))
+    (setf (cl--find-class name) class)
+    (dolist (slot (oclosure--class-slots class))
+      (put (cl--slot-descriptor-name slot) 'slot-name t))
+    (defalias predname pred)
+    (put name 'cl-deftype-satisfies predname)
+    (oclosure--install-functions name (plist-get props :copiers))
+    name))
+
+(defmacro oclosure-define (name &optional docstring &rest slots)
+  "Define a new OClosure type."
+  (declare (doc-string 2) (indent 1))
+  (unless (or (stringp docstring) (null docstring))
+    (push docstring slots)
+    (setq docstring nil))
+  (let* ((options (when (consp name)
+                    (prog1 (copy-sequence (cdr name))
+                      (setq name (car name)))))
+         (get-opt (lambda (opt &optional all)
+                    (let ((val (assq opt options))
+                          tmp)
+                      (when val (setq options (delq val options)))
+                      (if (not all)
+                          (cdr val)
+                        (when val
+                          (setq val (list (cdr val)))
+                          (while (setq tmp (assq opt options))
+                            (push (cdr tmp) val)
+                            (setq options (delq tmp options)))
+                          (nreverse val))))))
+         (predicate (car (funcall get-opt :predicate)))
+         (parent-names (or (funcall get-opt :parent)
+                           (funcall get-opt :include)))
+         (copiers (funcall get-opt :copier 'all)))
+    `(oclosure--define ',name ,docstring ',parent-names ',slots
+                       ,@(when predicate `(:predicate ',predicate))
+                       :copiers ',copiers)))
+
+(defmacro oclosure--lambda (type bindings mutables args &rest body)
+  "Low level construction of an OClosure object."
+  (let* ((parsed (macroexp-parse-body body))
+         (prebody (car parsed))
+         (realbody (cdr parsed))
+         (slotnames (mapcar #'car bindings)))
+    `(let ,(mapcar (lambda (bind)
+                     (if (cdr bind) bind
+                       `(,(car bind) (progn nil))))
+                   (reverse bindings))
+       (oclosure--fix-type ,type ',slotnames ',mutables
+         (lambda ,args
+           ,@prebody
+           (if t nil ,@slotnames
+               ,@(mapcar (lambda (m) `(setq ,m ,m)) mutables))
+           ,@realbody)))))
+
+(defmacro oclosure-lambda (type-and-slots args &rest body)
+  "Define anonymous OClosure function."
+  (declare (indent 2))
+  (let* ((type (car type-and-slots))
+         (fields (cdr type-and-slots))
+         (class (or (cl--find-class type)
+                    (error "Unknown class: %S" type)))
+         (slots (oclosure--class-slots class))
+         (mutables '())
+         (slotbinds (mapcar (lambda (slot)
+                              (let ((sname (cl--slot-descriptor-name slot)))
+                                (when (oclosure--slot-mutable-p slot)
+                                  (push sname mutables))
+                                (list sname)))
+                            slots))
+         (tempbinds (mapcar
+                     (lambda (field)
+                       (let* ((fname (car field))
+                              (bind (assq fname slotbinds)))
+                         (cond
+                          ((not bind) (error "Unknown slot: %S" fname))
+                          ((cdr bind) (error "Duplicate slot: %S" fname))
+                          (t (let ((temp (gensym "temp")))
+                               (setcdr bind (list temp))
+                               (cons temp (cdr field)))))))
+                     fields)))
+    `(let ,tempbinds
+       (oclosure--lambda ',type ,slotbinds ,mutables ,args ,@body))))
+
+(defun oclosure--slot-index (oclosure slotname)
+  (gethash slotname
+           (oclosure--class-index-table
+            (cl--find-class (oclosure-type oclosure)))))
+
+(defun oclosure--slot-value (oclosure slotname)
+  (let ((class (cl--find-class (oclosure-type oclosure)))
+        (index (oclosure--slot-index oclosure slotname)))
+    (oclosure--get oclosure index
+                   (oclosure--slot-mutable-p
+                    (nth index (oclosure--class-slots class))))))
+
+(defun oclosure--set-slot-value (oclosure slotname value)
+  (let ((class (cl--find-class (oclosure-type oclosure)))
+        (index (oclosure--slot-index oclosure slotname)))
+    (unless (oclosure--slot-mutable-p
+             (nth index (oclosure--class-slots class)))
+      (signal 'setting-constant (list oclosure slotname)))
+    (oclosure--set value oclosure index)))
+
+;; Accessor prototype + the `accessor'/`oclosure-accessor' types (bootstrapped
+;; exactly like oclosure.el).
+(defconst oclosure--accessor-prototype
+  (oclosure--lambda 'oclosure-accessor ((type) (slot) (index)) nil
+    (oclosure) (oclosure--get oclosure index nil)))
+
+(oclosure-define accessor
+  "OClosure function to access a specific slot of an object."
+  type slot)
+
+(oclosure-define (oclosure-accessor
+                  (:parent accessor)
+                  (:copier oclosure--accessor-copy (type slot index)))
+  "OClosure function to access a specific slot of an OClosure function."
+  index)
+
+(defconst oclosure--mut-getter-prototype
+  (oclosure-lambda (oclosure-accessor (type) (slot) (index)) (oclosure)
+    (oclosure--get oclosure index t)))
+(defconst oclosure--mut-setter-prototype
+  (oclosure-lambda (oclosure-accessor (type) (slot) (index)) (val oclosure)
+    (oclosure--set val oclosure index)))
+
+(oclosure-define (save-some-buffers-function
+                  (:predicate save-some-buffers-function--p)))
+
+(oclosure-define (cconv--interactive-helper) fun if)
+(defun cconv--interactive-helper (fun if)
+  "Add interactive \"form\" IF to FUN."
+  (oclosure-lambda (cconv--interactive-helper (fun fun) (if if))
+      (&rest args)
+    (apply (if (called-interactively-p 'any)
+               #'funcall-interactively #'funcall)
+           fun args)))
+
+(provide 'oclosure)
 "#;

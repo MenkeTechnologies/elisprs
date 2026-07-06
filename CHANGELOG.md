@@ -227,6 +227,28 @@ All notable changes to elisprs are documented here. The format follows
   applicable) keyword arguments, and preserve the input sequence's type.
 
 ### Added
+- **OClosures (`emacs-lisp/oclosure.el`)** — a faithful port of the Open Closure
+  subsystem: `oclosure-define` (a callable type with named, typed, optionally
+  `:mutable` slots and single-parent inheritance), `oclosure-lambda` (an instance
+  — a closure that also carries its type and slot values), the generated per-slot
+  accessors (`TYPE--SLOT`, with `setf` support for mutable slots via the gv
+  function-setter), the type predicates (`TYPE--internal-p`), `oclosure-type`,
+  `oclosure--slot-value` / `oclosure--set-slot-value`, and the `accessor` /
+  `oclosure-accessor` bootstrap types. Verified value-for-value against the Emacs
+  30.2 binary. The host-specific primitives — `closurep`, `oclosure--fix-type`,
+  `oclosure-type`, `oclosure--get`, `oclosure--set`, `oclosure--copy` — are C
+  (`src/builtins.rs`): because elisprs closures are compiled (a fusevm `Chunk` +
+  captured env) rather than aref-indexable interpreted-functions, a closure's
+  OClosure type + slot layout is attached via a side table and its slot values
+  live in the closure's captured lexical env (the same storage the body reads, so
+  `oclosure--set` and an in-body `setq` stay mutually visible — exactly as Emacs
+  stores slots in the env). A minimal cl--class / cl-slot-descriptor substrate
+  (from `cl-preloaded.el`) backs the type hierarchy. This clears the `oclosure`
+  wall that blocked the cl-generic cluster: `cl-generic.el`'s `cl--generic-nnm`
+  OClosure and its `oclosure-type`-based method-dispatch touchpoints now load and
+  evaluate; the remaining cl-generic gaps are outside oclosure (`help-fns`'s
+  `help-add-fundoc-usage`, and cl-macs `cl-defstruct` slot-option / `:type`
+  handling for the `cl--generic` struct).
 - **Text buffers, point, narrowing & marker-based `save-excursion`** — the
   buffer.c/editfns.c/insdel.c editing core, verified value-for-value against the
   Emacs 30.2 binary. A global registry of **named live buffers**, each with its
