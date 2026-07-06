@@ -5439,6 +5439,75 @@ This is like the `&' operator of the C language."
 (defmacro defface (face spec doc &rest args)
   (nconc (list 'custom-declare-face (list 'quote face) spec doc) args))
 
+;;; ---- per-user Emacs file location (files.el / startup.el) ----
+;; startup.el:597 sets `user-emacs-directory' at startup; the defvar itself is
+;; nil ("The value does not matter since Emacs sets this at startup").  elisprs
+;; does not run the C/startup init path, so we seed the documented runtime value
+;; "~/.emacs.d/" -- oracle-confirmed against emacs -Q --batch (30.2).
+;; startup.el
+(defvar init-file-user nil
+  "Identity of user whose init file is or was read.")
+;; startup.el (effective runtime value; Emacs sets this at startup)
+(defvar user-emacs-directory "~/.emacs.d/"
+  "Directory beneath which additional per-user Emacs-specific files are placed.")
+;; emacs.c C variable (nil outside the dump/pdump build path)
+(defvar dump-mode nil
+  "Non-nil means Emacs is dumping or bootstrapping.")
+;; files.el
+(defcustom user-emacs-directory-warning t
+  "Non-nil means warn if unable to access or create `user-emacs-directory'."
+  :type 'boolean
+  :group 'initialization
+  :version "24.4")
+
+;; files.el: faithful port of `locate-user-emacs-file'.
+(defun locate-user-emacs-file (new-name &optional old-name)
+  "Return an absolute per-user Emacs-specific file name.
+If NEW-NAME exists in `user-emacs-directory', return it.
+Else if OLD-NAME is non-nil and ~/OLD-NAME exists, return ~/OLD-NAME.
+Else return NEW-NAME in `user-emacs-directory', creating the
+directory if it does not exist."
+  (convert-standard-filename
+   (let* ((home (concat "~" (or init-file-user "")))
+	  (at-home (and old-name (expand-file-name old-name home)))
+          (bestname (abbreviate-file-name
+                     (expand-file-name new-name user-emacs-directory))))
+     (if (and at-home (not (file-readable-p bestname))
+              (file-readable-p at-home))
+	 at-home
+       ;; Make sure `user-emacs-directory' exists,
+       ;; unless we're in batch mode or dumping Emacs.
+       (or noninteractive
+           dump-mode
+	   (let (errtype)
+	     (if (file-directory-p user-emacs-directory)
+		 (or (file-accessible-directory-p user-emacs-directory)
+		     (setq errtype "access"))
+               ;; We don't want to create HOME if it doesn't exist.
+               (if (and (not (file-exists-p "~"))
+                        (string-prefix-p
+                         (expand-file-name "~")
+                         (expand-file-name user-emacs-directory)))
+                   (setq errtype "create")
+                 ;; Create `user-emacs-directory'.
+	         (with-file-modes ?\700
+		   (condition-case nil
+		       (make-directory user-emacs-directory t)
+		     (error (setq errtype "create"))))))
+	     (when (and errtype
+			user-emacs-directory-warning
+			(not (get 'user-emacs-directory-warning 'this-session)))
+	       ;; Warn only once per Emacs session.
+	       (put 'user-emacs-directory-warning 'this-session t)
+	       (display-warning 'initialization
+				(format "\
+Unable to %s `user-emacs-directory' (%s).
+Any data that would normally be written there may be lost!
+If you never want to see this message again,
+customize the variable `user-emacs-directory-warning'."
+					errtype user-emacs-directory)))))
+       bestname))))
+
 ;;; ---- keymaps (data subsystem: keymap.c primitives + keymap.el string API) ----
 ;; A keymap is a list whose car is the symbol `keymap'.  Bindings follow as
 ;; (EVENT . DEFINITION) conses; a bare `keymap' element in the tail begins the
