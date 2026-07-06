@@ -6,6 +6,28 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed (Emacs parity — see BUGS.md)
+- `assq` / `assoc` / `rassq` now skip non-cons list elements instead of signalling
+  `wrong-type-argument listp` (Emacs C `FOR_EACH_TAIL` + a `CONSP` guard), so e.g.
+  `(assq 'interactive '("doc" (…)))` returns nil — the lookup `cl-defmethod`
+  expansion performs over a method body that starts with a docstring.
+- `cl-defstruct` slots accept per-slot `:type` / `:read-only` / `:documentation`
+  options (`(name nil :type symbol :read-only t)`): `:type`/`:documentation` are
+  parsed and dropped (Emacs does not enforce `:type` at runtime), and setf on a
+  `:read-only` slot signals `"SLOT is a read-only slot"` (cl-macs.el). A docstring
+  preceding the slot specs is dropped rather than mistaken for a slot.
+- `cl-flet` / `cl-labels` support the `(FUNC EXP)` binding form (bind a local
+  function to the value of an expression), not just `(FUNC ARGLIST BODY…)`
+  (cl-macs.el) — used by cl-generic's `(cl-flet ((cl-call-next-method CNM)) …)`.
+- Ported the help.el usage/docstring helpers `help-add-fundoc-usage`,
+  `help-split-fundoc`, `help--make-usage`, `help--make-usage-docstring` and
+  `help--docstring-quote` (they append/split the `"(fn ARGS)"` usage line on a
+  docstring during `cl-defgeneric`/`cl-defmethod` expansion); the macroexp
+  predicates `macroexp-const-p` / `macroexp-copyable-p` / `macroexp--fgrep`; and
+  the byte-run advertised-calling-convention table
+  (`get-advertised-calling-convention` / `set-advertised-calling-convention`).
+  Together these let the upstream `emacs-lisp/cl-generic.el` load through its full
+  generic/method machinery (up to the built-in-type generalizer prefill, which
+  needs cl-preloaded.el's `cl--class` registry).
 - `condition-case` now binds the handler variable to the real `(ERROR-SYMBOL .
   DATA)` object, preserving `signal`'s data list — `(signal 'wrong-type-argument
   '(integerp 5))` caught binds `(wrong-type-argument integerp 5)`, so `(cadr e)` =>

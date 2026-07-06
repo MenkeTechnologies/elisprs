@@ -134,15 +134,32 @@ pub const PRELUDE: &str = r#"
             (setq r el)
           (setq alist (cdr alist)))))
     r))
-(defun assq (k l) (let ((r nil)) (while (and l (not r)) (if (eq (caar l) k) (setq r (car l)) (setq l (cdr l)))) r))
-(defun assoc (k l &optional testfn)
+;; assq/assoc/rassq skip non-cons list elements (Emacs C `FOR_EACH_TAIL' + a
+;; `CONSP' guard), so e.g. a docstring string in a body list is ignored rather
+;; than signalling `wrong-type-argument listp' — cl-generic relies on this via
+;; `(assq 'interactive BODY)'.
+(defun assq (k l)
   (let ((r nil))
     (while (and l (not r))
-      (if (if testfn (funcall testfn (caar l) k) (equal (caar l) k))
+      (if (and (consp (car l)) (eq (car (car l)) k))
           (setq r (car l))
         (setq l (cdr l))))
     r))
-(defun rassq (v l) (let ((r nil)) (while (and l (not r)) (if (eq (cdar l) v) (setq r (car l)) (setq l (cdr l)))) r))
+(defun assoc (k l &optional testfn)
+  (let ((r nil))
+    (while (and l (not r))
+      (if (and (consp (car l))
+               (if testfn (funcall testfn (car (car l)) k) (equal (car (car l)) k)))
+          (setq r (car l))
+        (setq l (cdr l))))
+    r))
+(defun rassq (v l)
+  (let ((r nil))
+    (while (and l (not r))
+      (if (and (consp (car l)) (eq (cdr (car l)) v))
+          (setq r (car l))
+        (setq l (cdr l))))
+    r))
 (defun alist-get (k al &optional default _remove testfn)
   ;; Value associated with K in alist AL (DEFAULT if absent); TESTFN overrides eq.
   (let ((p (if testfn (assoc k al testfn) (assq k al))))
@@ -600,6 +617,31 @@ interpreter; expands to nil."
   (if (and (not (consp v)) (or (not (symbolp v)) (null v) (eq v t) (keywordp v)))
       v
     (list 'quote v)))
+;; macroexp const-ness predicates (macroexp.el:682).  Used by cl-macs/cl-generic
+;; to decide when a subform may be duplicated or optimized away.
+(defvar byte-compile-const-variables nil)
+(defun macroexp--const-symbol-p (symbol &optional any-value)
+  "Non-nil if SYMBOL is constant.
+If ANY-VALUE is nil, only return non-nil if the value of the symbol is the
+symbol itself."
+  (or (memq symbol '(nil t))
+      (keywordp symbol)
+      (if any-value
+          (or (memq symbol byte-compile-const-variables)
+              (and (boundp symbol)
+                   (condition-case nil
+                       (progn (set symbol (symbol-value symbol)) nil)
+                     (setting-constant t)))))))
+(defun macroexp-const-p (exp)
+  "Return non-nil if EXP will always evaluate to the same value."
+  (cond ((consp exp) (or (eq (car exp) 'quote)
+                         (and (eq (car exp) 'function)
+                              (symbolp (cadr exp)))))
+        ((symbolp exp) (macroexp--const-symbol-p exp))
+        (t t)))
+(defun macroexp-copyable-p (exp)
+  "Return non-nil if EXP can be copied without extra cost."
+  (or (symbolp exp) (macroexp-const-p exp)))
 ;; defsubst: define an inline function.  In the interpreter this is exactly a
 ;; `defun'; the `byte-optimizer' property is what the byte-compiler consults to
 ;; inline calls (byte-run.el:481).  elisprs has no byte-compiler, so the
@@ -630,6 +672,18 @@ autoload.  Returns FUNCTION when it installs the autoload, else nil."
       nil
     (fset function (list 'autoload file docstring interactive type))
     function))
+;; Advertised calling convention (byte-run.el:498).  Records the SIGNATURE a
+;; function advertises to the byte-compiler; cl-generic's `cl-generic-define-method'
+;; preserves a generic's advertised signature across redefinition.
+(defvar advertised-signature-table (make-hash-table :test 'eq :weakness 'key))
+(defun set-advertised-calling-convention (function signature _when)
+  "Set the advertised SIGNATURE of FUNCTION."
+  (puthash (indirect-function function) signature
+           advertised-signature-table))
+(defun get-advertised-calling-convention (function)
+  "Get the advertised SIGNATURE of FUNCTION.
+Return t if there isn't any."
+  (gethash function advertised-signature-table t))
 ;; make-obsolete family (byte-run.el).  These only record properties the
 ;; byte-compiler reads to emit warnings; in the interpreter they are inert but
 ;; ported so obsolete declarations in real libraries load cleanly.
@@ -1379,6 +1433,59 @@ TYPE nil maps for side effects only and returns nil."
 (defmacro cl-pushnew (x place &rest _keys)
   ;; Add X to the front of PLACE unless already present (by eql).
   `(if (memql ,x ,place) ,place (setf ,place (cons ,x ,place))))
+;;; ---- help.el usage/docstring helpers (help-add-fundoc-usage &c) ----
+;; Faithful ports from lisp/help.el (30.2). cl-defgeneric/cl-defmethod expansion
+;; in cl-generic.el calls `help-add-fundoc-usage' to append the "(fn ARGS)" line
+;; to a method's docstring; these are the (formerly help-fns.el) helpers it needs.
+(defun help--docstring-quote (string)
+  "Return a doc string that represents STRING.
+The result, when formatted by `substitute-command-keys', should equal STRING."
+  (replace-regexp-in-string "['\\`‘’]" "\\\\=\\&" string))
+(defun help--make-usage (function arglist)
+  (cons (if (symbolp function) function 'anonymous)
+        (mapcar (lambda (arg)
+                  (cond
+                   ;; Parameter name.
+                   ((symbolp arg)
+                    (let ((name (symbol-name arg)))
+                      (cond
+                       ((string-match "\\`&" name) (bare-symbol arg))
+                       ((string-match "\\`_." name)
+                        (intern (upcase (substring name 1))))
+                       (t (intern (upcase name))))))
+                   ;; Parameter with a default value (from cl-defgeneric etc).
+                   ((and (consp arg)
+                         (symbolp (car arg)))
+                    (cons (intern (upcase (symbol-name (car arg)))) (cdr arg)))
+                   ;; Something else.
+                   (t arg)))
+                arglist)))
+;; (define-obsolete-function-alias 'help-make-usage ...) lives after `defalias'
+;; is defined below — the alias body calls `defalias' at load time.
+(defun help--make-usage-docstring (fn arglist)
+  (let ((print-escape-newlines t))
+    (help--docstring-quote (format "%S" (help--make-usage fn arglist)))))
+;; `help-split-fundoc' is defined after `pcase' (below) since its body uses it
+;; and elisprs expands macros at `defun'-definition time.
+(defun help-add-fundoc-usage (docstring arglist)
+  "Add the usage info to DOCSTRING.
+If DOCSTRING already has a usage info, then just return it unchanged.
+The usage info is built from ARGLIST.  DOCSTRING can be nil.
+ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
+  (unless (stringp docstring) (setq docstring ""))
+  (if (or (string-match "\n\n(fn\\(\\( .*\\)?)\\)\\'" docstring)
+          (eq arglist t))
+      docstring
+    (concat docstring
+            (if (string-match "\n?\n\\'" docstring)
+                (if (< (- (match-end 0) (match-beginning 0)) 2) "\n" "")
+              "\n\n")
+            (if (stringp arglist)
+                (if (string-match "\\`[^ ]+\\(.*\\))\\'" arglist)
+                    (concat "(fn" (match-string 1 arglist) ")")
+                  (error "Unrecognized usage format"))
+              (help--make-usage-docstring 'fn arglist)))))
+
 ;; cl-defstruct registries: --slots maps NAME -> full slot specs (read at
 ;; macroexpansion to inherit via :include); --parent maps child-tag -> parent-tag
 ;; (walked at runtime so a subtype satisfies a parent's predicate).
@@ -1394,7 +1501,12 @@ TYPE nil maps for side effects only and returns nil."
 ;; predicate, `NAME-SLOT' accessors (setf-able), and `copy-NAME' copier. (Printing
 ;; and `type-of' differ from Emacs records — these are plain vectors.)
 (defmacro cl-defstruct (name-spec &rest slots)
-  (let* ((name (if (consp name-spec) (car name-spec) name-spec))
+  ;; An optional docstring may precede the slot specs (cl-macs.el pops it via
+  ;; `(if (stringp (car descs)) (pop descs))').  Record it on the struct's plist
+  ;; and drop it so it is not mistaken for a slot.
+  (let* ((--doc-- (and (stringp (car slots)) (car slots)))
+         (slots (if --doc-- (cdr slots) slots))
+         (name (if (consp name-spec) (car name-spec) name-spec))
          (sname (symbol-name name))
          (tag (intern (concat "cl-struct-" sname)))
          ;; Options: (:constructor NAME) renames the make-NAME constructor;
@@ -1446,6 +1558,12 @@ TYPE nil maps for side effects only and returns nil."
          (all-slots (append parent-slots slots))
          (snames (mapcar (lambda (s) (if (consp s) (car s) s)) all-slots))
          (defaults (mapcar (lambda (s) (if (consp s) (car (cdr s)) nil)) all-slots))
+         ;; Per-slot options plist is (cddr SLOT): (:type T :read-only R :documentation D).
+         ;; `:type'/`:documentation' are parsed and ignored for storage (Emacs does
+         ;; not enforce :type at runtime); `:read-only' non-nil makes the slot's
+         ;; setf-expander error, matching cl-macs.el:3257.
+         (readonly (mapcar (lambda (s) (and (consp s) (plist-get (cdr (cdr s)) :read-only)))
+                           all-slots))
          (forms nil)
          ;; constructor: vector of defaults, then apply :keyword overrides.
          (kw-clauses (let ((j 1) (cs nil))
@@ -1499,13 +1617,18 @@ TYPE nil maps for side effects only and returns nil."
                         forms)))
     (when copier
       (setq forms (cons `(defun ,(intern copier) (--s--) (vconcat --s--)) forms)))
-    (let ((j 1))
+    (let ((j 1) (ros readonly))
       (dolist (sn snames)
         (let ((acc (intern (concat conc (symbol-name sn)))))
           (setq forms (cons `(defun ,acc (--s--) (aref --s-- ,j)) forms))
           (setq forms (cons `(setq cl-struct--slot-index
                                    (cons (cons ',acc ,j) cl-struct--slot-index))
-                            forms)))
+                            forms))
+          (when (car ros)
+            (setq forms (cons `(setq cl-struct--slot-readonly
+                                     (cons ',acc cl-struct--slot-readonly))
+                              forms))))
+        (setq ros (cdr ros))
         (setq j (1+ j))))
     `(progn ,@(reverse forms) ',name)))
 ;; Generic struct-slot introspection. Slots are stored as bare symbols (no
@@ -1582,10 +1705,18 @@ TYPE nil maps for side effects only and returns nil."
             (cons 'cl-destructuring-bind
                   (cons (car spec) (cons '--cl-flet-args-- (cdr spec)))))
     (cons 'lambda spec)))
+(defun cl-flet--binding-value (spec)
+  ;; SPEC is (cdr BINDING).  Per cl-macs.el:2098, a length-1 SPEC is the
+  ;; `(FUNC EXP)' form: EXP is an expression returning the function value to
+  ;; bind (used by cl-generic's `(cl-flet ((cl-call-next-method CNM)) ...)').
+  ;; Otherwise SPEC is `(ARGLIST BODY...)', shorthand for a local lambda.
+  (if (= (length spec) 1)
+      (car spec)
+    (cl-flet--lambda spec)))
 (defmacro cl-flet (bindings &rest body)
   (let* ((gs (mapcar (lambda (b) (make-symbol (symbol-name (car b)))) bindings))
          (alist (cl-mapcar (lambda (b g) (cons (car b) g)) bindings gs)))
-    `(let ,(cl-mapcar (lambda (b g) (list g (cl-flet--lambda (cdr b)))) bindings gs)
+    `(let ,(cl-mapcar (lambda (b g) (list g (cl-flet--binding-value (cdr b)))) bindings gs)
        ,@(cl-flet--walk body alist))))
 (defmacro cl-flet* (bindings &rest body)
   ;; Sequential cl-flet: each local function sees the earlier ones.
@@ -1596,7 +1727,7 @@ TYPE nil maps for side effects only and returns nil."
   (let* ((gs (mapcar (lambda (b) (make-symbol (symbol-name (car b)))) bindings))
          (alist (cl-mapcar (lambda (b g) (cons (car b) g)) bindings gs)))
     `(let ,(mapcar (lambda (g) (list g nil)) gs)
-       ,@(cl-mapcar (lambda (b g) (list 'setq g (cl-flet--lambda (cl-flet--walk (cdr b) alist)))) bindings gs)
+       ,@(cl-mapcar (lambda (b g) (list 'setq g (cl-flet--binding-value (cl-flet--walk (cdr b) alist)))) bindings gs)
        ,@(cl-flet--walk body alist))))
 ;; cl-macrolet: local macros. Expand calls to them throughout BODY at expansion
 ;; time (re-walking each expansion), then leave the rest for the normal pass.
@@ -2882,6 +3013,8 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (defun set-default-toplevel-value (sym val) (set-default sym val))
 (defun defalias (symbol definition &optional _docstring) (fset symbol definition) symbol)
 (defalias 'string-split 'split-string)
+;; help.el: obsolete alias for `help--make-usage' (help usage helpers ported above).
+(define-obsolete-function-alias 'help-make-usage #'help--make-usage "25.1")
 ;; with-memoization: cache BODY's value in PLACE; reuse it on later calls.
 (defmacro with-memoization (place &rest body) `(or ,place (setf ,place (progn ,@body))))
 ;; regexp-opt: a regexp matching any of STRINGS (sorted, regexp-quoted alternation).
@@ -3630,6 +3763,9 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 ;; `cl-defstruct' when it runs, consulted by `setf--expand' when expanding later
 ;; top-level forms — which works because forms are processed in order).
 (defvar cl-struct--slot-index nil)
+;; Accessors of `:read-only' cl-defstruct slots. `setf--expand' signals the same
+;; "ACCESSOR is a read-only slot" error cl-macs.el:3260 raises via gv-define-expander.
+(defvar cl-struct--slot-readonly nil)
 (defun setf--expand (place val)
   (if (symbolp place)
       (list 'setq place val)
@@ -3731,6 +3867,9 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
                     (list 'setcar (list 'cdr '--pg-m--) val)
                     (setf--expand (car args)
                                   (list 'cons (car (cdr args)) (list 'cons val (car args)))))))
+       ;; A read-only cl-defstruct slot: setf is an error (cl-macs.el:3260).
+       ((memq head cl-struct--slot-readonly)
+        (error "%s is a read-only slot" head))
        ;; A cl-defstruct accessor: (setf (NAME-SLOT s) v) -> (aset s INDEX v).
        ((assq head cl-struct--slot-index)
         (list 'aset (car args) (cdr (assq head cl-struct--slot-index)) val))
@@ -4154,6 +4293,36 @@ or the result is already atomic/grouped."
   (let ((ev (make-symbol "e")))
     (list 'dolist (list ev (car (cdr spec)))
           (cons 'pcase-let (cons (list (list (car spec) ev)) body)))))
+;; help.el:2302 — defined here (after `pcase') because its body uses `pcase' and
+;; elisprs expands macros when the `defun' is read, not when it is called.
+(defun help-split-fundoc (docstring def &optional section)
+  "Split a function DOCSTRING into the actual doc and the usage info.
+Return (USAGE . DOC), where USAGE is a string describing the argument
+list of DEF, such as \"(apply FUNCTION &rest ARGUMENTS)\".
+DEF is the function whose usage we're looking for in DOCSTRING.
+With SECTION nil, return nil if there is no usage info; conversely,
+SECTION t means to return (USAGE . DOC) even if there's no usage info.
+When SECTION is \\='usage or \\='doc, return only that part."
+  (let* ((found (and docstring
+                     (string-match "\n\n(fn\\(\\( .*\\)?)\\)\\'" docstring)))
+         (doc (if found
+                  (and (memq section '(t nil doc))
+                       (not (zerop (match-beginning 0)))
+                       (substring docstring 0 (match-beginning 0)))
+                docstring))
+         (usage (and found
+                     (memq section '(t nil usage))
+                     (let ((tail (match-string 1 docstring)))
+                       (format "(%s%s"
+                               (if (and (symbolp def) def)
+                                   (help--docstring-quote (format "%S" def))
+                                 'anonymous)
+                               tail)))))
+    (pcase section
+      (`nil (and usage (cons usage doc)))
+      (`t (cons usage doc))
+      (`usage usage)
+      (`doc doc))))
 (defmacro seq-let (args seq &rest body)
   ;; Positionally bind ARGS to the elements of SEQ for BODY; `&rest` binds the
   ;; tail. ARGS may be a list or a vector pattern.
@@ -6275,6 +6444,38 @@ No problems result if this variable is not bound.
                          '(:documentation declare interactive cl-declare)))))
       (push (pop body) decls))
     (cons (nreverse decls) body)))
+
+;; macroexp--fgrep (macroexp.el:724): return those of BINDINGS whose var/func
+;; symbol appears anywhere in SEXP — a poor-man's free-variable test used by
+;; cl-generic to decide whether a method body references `cl-call-next-method'.
+;; Faithful port, including the tortoise/hare cycle guard for cyclic data.
+(defun macroexp--fgrep (bindings sexp)
+  (let ((res '())
+        (seen (make-hash-table :test #'eq))
+        (sexpss (list (list sexp))))
+    (while (and sexpss bindings)
+      (let ((sexps (pop sexpss)))
+        (unless (gethash sexps seen)
+          (puthash sexps t seen)
+          (if (vectorp sexps) (setq sexps (mapcar #'identity sexps)))
+          (let ((tortoise sexps) (skip t))
+            (while sexps
+              (let ((sexp (if (consp sexps) (pop sexps)
+                            (prog1 sexps (setq sexps nil)))))
+                (if skip
+                    (setq skip nil)
+                  (setq tortoise (cdr tortoise))
+                  (if (eq tortoise sexps)
+                      (setq sexps nil)
+                    (setq skip t)))
+                (cond
+                 ((or (consp sexp) (vectorp sexp)) (push sexp sexpss))
+                 (t
+                  (let ((tmp (assq sexp bindings)))
+                    (when tmp
+                      (push tmp res)
+                      (setq bindings (remove tmp bindings))))))))))))
+    res))
 
 (defconst cl--lambda-list-keywords
   '(&optional &rest &key &allow-other-keys &aux &whole &body &environment))
