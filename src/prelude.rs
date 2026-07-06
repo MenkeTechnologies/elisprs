@@ -2886,6 +2886,18 @@ and the returned string should both be non-magic."
 ;; POSIX: standard file names need no conversion.
 (defun convert-standard-filename (filename) filename)
 (defvar default-directory (file-name-as-directory (--current-directory--)))
+;; `file-name-handler-alist' (C `Vfile_name_handler_alist', fileio.c): alist of
+;; (REGEXP . HANDLER) pairs consulted by file-name operations to dispatch magic
+;; file names. The C variable is initialized to nil; the batch default below is
+;; the post-loadup set Emacs 30.2 reports under `emacs -Q --batch' — the epa,
+;; jka-compr, tramp, and `file-name-non-special' handlers installed at startup.
+;; elisprs handles compressed loads in Rust (no dispatch through this alist), so
+;; this is data other code reads/rebinds, matching the oracle value-for-value.
+(defvar file-name-handler-alist
+  '(("\\.gpg\\(~\\|\\.~[0-9]+~\\)?\\'" . epa-file-handler)
+    ("\\(?:\\.tzst\\|\\.zst\\|\\.dz\\|\\.txz\\|\\.xz\\|\\.lzma\\|\\.lz\\|\\.g?z\\|\\.\\(?:tgz\\|svgz\\|sifz\\)\\|\\.tbz2?\\|\\.bz2\\|\\.Z\\)\\(?:~\\|\\.~[-[:alnum:]:#@^._]+\\(?:~[[:digit:]]+\\)?~\\)?\\'" . jka-compr-handler)
+    ("\\`/\\(?:-\\|[^/:|]\\{2,\\}\\):" . tramp-autoload-file-name-handler)
+    ("\\`/:" . file-name-non-special)))
 ;; `load' machinery. These are dynamic (special) variables the `load' builtin
 ;; rebinds around a file's evaluation and restores afterward. At top level
 ;; `load-file-name'/`load-true-file-name' are nil and `load-in-progress' is nil,
