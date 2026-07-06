@@ -157,5 +157,56 @@
   (should (= 5 (default-value 'brd-dv)))
   (should (= 5 brd-dv)))
 
+;; ---- `declare' spec processing (byte-run.el defun/defmacro): specs with a
+;; runtime effect are applied at macroexpansion time via `defun-declarations-alist'
+;; (and the gv.el additions).  Values verified against `emacs -Q --batch'. ----
+;; The gv-setter defuns are defined at top level (as `emacs -Q' requires) so the
+;; expander they register is installed before the tests' `setf' is macroexpanded;
+;; a defun-with-gv-setter *inside* a deftest fails in Emacs too (setf can't see
+;; the not-yet-registered expander at macroexpansion time).
+(defun brd-gs (x)
+  ;; A `(declare (gv-setter (lambda ...)))' registers a gv-expander so `setf' on
+  ;; the place works — the fn's arglist is appended after the setter's value.
+  (declare (gv-setter (lambda (v) (list 'setcar x v))))
+  (car x))
+(defun brd-sset (cell val) (setcar cell val) val)
+(defun brd-sym-gs (x)
+  ;; The symbol form `(declare (gv-setter SYMBOL))' installs a simple setter that
+  ;; forwards to SYMBOL — the `advice--buffer-local' pattern nadvice uses for
+  ;; buffer-local advice via `(local VAR)' places.
+  (declare (gv-setter brd-sset))
+  (car x))
+
+(ert-deftest byte-run-declare-gv-setter-lambda ()
+  ;; emacs -Q: (functionp (function-get 'brd-gs 'gv-expander)) => t
+  (should (functionp (function-get 'brd-gs 'gv-expander)))
+  (let ((c (cons 1 2)))
+    (setf (brd-gs c) 40)
+    ;; emacs -Q: c => (40 . 2)
+    (should (equal '(40 . 2) c)))
+  ;; The function itself still works.
+  (should (= 7 (brd-gs (cons 7 8)))))
+
+(ert-deftest byte-run-declare-gv-setter-symbol ()
+  (let ((c (cons 3 4)))
+    (setf (brd-sym-gs c) 41)
+    ;; emacs -Q: c => (41 . 4)
+    (should (equal '(41 . 4) c))))
+
+(ert-deftest byte-run-declare-obsolete-and-props ()
+  ;; `(declare (obsolete NEW WHEN))' sets `byte-obsolete-info'; `(indent N)' and
+  ;; `(doc-string N)' set the corresponding function properties.
+  (defun brd-multi (a b)
+    (declare (indent 2) (doc-string 3) (obsolete brd-new "31.1"))
+    (+ a b))
+  ;; emacs -Q: (get 'brd-multi 'byte-obsolete-info) => (brd-new nil "31.1")
+  (should (equal '(brd-new nil "31.1") (get 'brd-multi 'byte-obsolete-info)))
+  ;; emacs -Q: (function-get 'brd-multi 'lisp-indent-function) => 2
+  (should (eql 2 (function-get 'brd-multi 'lisp-indent-function)))
+  ;; emacs -Q: (function-get 'brd-multi 'doc-string-elt) => 3
+  (should (eql 3 (function-get 'brd-multi 'doc-string-elt)))
+  ;; The declaration does not disturb the body.
+  (should (= 5 (brd-multi 2 3))))
+
 (ert-run-tests-batch-and-exit)
 ;;; byte-run-defs.el ends here

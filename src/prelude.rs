@@ -753,9 +753,10 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
   (unless (consp spec)
     (error "Edebug spec has to be a list: %S" spec))
   (put name 'edebug-elem-spec spec))
-;; Declaration handler alists (byte-run.el).  elisprs's `declare' is a no-op, so
-;; these are not consulted for defun/defmacro expansion; they exist only because
-;; libraries (e.g. gv) push their own gv-expander/gv-setter handlers onto them.
+;; Declaration handler alists (byte-run.el).  Declared nil here (before the
+;; handler functions exist) and populated further below; the host's defun/defmacro
+;; expander consults them via `elisprs--expand-defun-declarations' to process
+;; `(declare ...)' specs with runtime effect (gv-setter, obsolete, indent, …).
 (defvar defun-declarations-alist nil)
 (defvar macro-declarations-alist nil)
 (defmacro defvar-local (var val &optional doc)
@@ -6473,6 +6474,250 @@ rather than files.  These modes usually use read-only buffers."
 (defun force-mode-line-update (&optional _all) nil)
 ;; Warnings are not modeled; return the form unchanged.
 (defun macroexp-warn-and-return (_msg form &rest _) form)
+
+;;; ---- declaration handlers (byte-run.el) -----------------------------------
+;; `declare' specs that have a *runtime* effect (register a gv-setter, set the
+;; obsolete/indent/doc-string properties, …) are processed at defun/defmacro
+;; macroexpansion time.  In Emacs `defun'/`defmacro' are themselves macros that
+;; do this; in elisprs they are compiler special forms, so the host's
+;; defun/defmacro expander (macroexpand_all) delegates to
+;; `elisprs--expand-defun-declarations' below once these handlers are defined.
+;; Each `defun-declarations-alist' entry is (PROP FUN [DOC]); FUN is applied to
+;; (NAME ARGLIST . VALUES) and returns a form to eval after the definition.
+;; Ported faithfully from byte-run.el.
+(defalias 'byte-run--set-advertised-calling-convention
+  (lambda (f _args arglist when)
+    (list 'set-advertised-calling-convention
+          (list 'quote f) (list 'quote arglist) (list 'quote when))))
+(defalias 'byte-run--set-obsolete
+  (lambda (f _args new-name when)
+    (list 'make-obsolete
+          (list 'quote f) (list 'quote new-name) when)))
+(defalias 'byte-run--set-interactive-only
+  (lambda (f _args instead)
+    (list 'function-put (list 'quote f)
+          ''interactive-only (list 'quote instead))))
+(defalias 'byte-run--set-pure
+  (lambda (f _args val)
+    (list 'function-put (list 'quote f)
+          ''pure (list 'quote val))))
+(defalias 'byte-run--set-side-effect-free
+  (lambda (f _args val)
+    (list 'function-put (list 'quote f)
+          ''side-effect-free (list 'quote val))))
+(defalias 'byte-run--set-important-return-value
+  (lambda (f _args val)
+    (list 'function-put (list 'quote f)
+          ''important-return-value (list 'quote val))))
+(defalias 'byte-run--set-compiler-macro
+  (lambda (f args compiler-function)
+    (if (not (eq (car-safe compiler-function) 'lambda))
+        `(eval-and-compile
+           (function-put ',f 'compiler-macro #',compiler-function))
+      (let ((cfname (intern (concat (symbol-name f) "--anon-cmacro")))
+            (data (cdr compiler-function)))
+        `(progn
+           (eval-and-compile
+             (function-put ',f 'compiler-macro #',cfname))
+           :autoload-end
+           (eval-and-compile
+             (defun ,cfname (,@(car data) ,@args)
+               (ignore ,@(delq '&rest (delq '&optional (copy-sequence args))))
+               ,@(cdr data))))))))
+(defalias 'byte-run--set-doc-string
+  (lambda (f _args pos)
+    (list 'function-put (list 'quote f)
+          ''doc-string-elt (if (numberp pos) pos (list 'quote pos)))))
+(defalias 'byte-run--set-indent
+  (lambda (f _args val)
+    (list 'function-put (list 'quote f)
+          ''lisp-indent-function (if (numberp val) val (list 'quote val)))))
+(defalias 'byte-run--set-speed
+  (lambda (f _args val)
+    (list 'function-put (list 'quote f) ''speed (list 'quote val))))
+(defalias 'byte-run--set-safety
+  (lambda (f _args val)
+    (list 'function-put (list 'quote f) ''safety (list 'quote val))))
+(defalias 'byte-run--set-completion
+  (lambda (f _args val)
+    (list 'function-put (list 'quote f)
+          ''completion-predicate (list 'function val))))
+(defalias 'byte-run--set-modes
+  (lambda (f _args &rest val)
+    (list 'function-put (list 'quote f) ''command-modes (list 'quote val))))
+(defalias 'byte-run--set-interactive-args
+  (lambda (f args &rest val)
+    (setq args (remove '&optional (remove '&rest args)))
+    (list 'function-put (list 'quote f)
+          ''interactive-args
+          (list 'quote
+                (mapcar (lambda (elem)
+                          (cons (seq-position args (car elem)) (cadr elem)))
+                        val)))))
+(defalias 'byte-run--set-function-type
+  (lambda (f _args val &optional f2)
+    (when (and f2 (not (eq f2 f)))
+      (error "`%s' does not match top level function `%s' inside function type declaration"
+             f2 f))
+    (list 'function-put (list 'quote f) ''function-type (list 'quote val))))
+(defalias 'byte-run--set-debug
+  (lambda (name _args spec)
+    (list 'progn :autoload-end
+          (list 'put (list 'quote name) ''edebug-form-spec (list 'quote spec)))))
+(defalias 'byte-run--set-no-font-lock-keyword
+  (lambda (name _args val)
+    (list 'function-put (list 'quote name) ''no-font-lock-keyword (list 'quote val))))
+
+;; Populate the alists declared earlier as nil (byte-run.el:235,349).
+(setq defun-declarations-alist
+      (list
+       (list 'advertised-calling-convention
+             #'byte-run--set-advertised-calling-convention)
+       (list 'obsolete #'byte-run--set-obsolete)
+       (list 'interactive-only #'byte-run--set-interactive-only)
+       (list 'pure #'byte-run--set-pure)
+       (list 'side-effect-free #'byte-run--set-side-effect-free)
+       (list 'important-return-value #'byte-run--set-important-return-value)
+       (list 'compiler-macro #'byte-run--set-compiler-macro)
+       (list 'doc-string #'byte-run--set-doc-string)
+       (list 'indent #'byte-run--set-indent)
+       (list 'speed #'byte-run--set-speed)
+       (list 'safety #'byte-run--set-safety)
+       (list 'completion #'byte-run--set-completion)
+       (list 'modes #'byte-run--set-modes)
+       (list 'interactive-args #'byte-run--set-interactive-args)
+       (list 'ftype #'byte-run--set-function-type)))
+(setq macro-declarations-alist
+      (cons (list 'debug #'byte-run--set-debug)
+            (cons (list 'no-font-lock-keyword #'byte-run--set-no-font-lock-keyword)
+                  defun-declarations-alist)))
+
+;; byte-run.el:279 — split BODY into (DOCSTRING DECLARE INTERACTIVE REST WARNINGS).
+(defun byte-run--parse-body (body allow-interactive)
+  "Decompose BODY into (DOCSTRING DECLARE INTERACTIVE BODY-REST WARNINGS)."
+  (let* ((top body)
+         (docstring nil)
+         (declare-form nil)
+         (interactive-form nil)
+         (warnings nil)
+         (warn (lambda (msg form)
+                 (push (macroexp-warn-and-return
+                        (format-message msg) nil nil t form)
+                       warnings))))
+    (while
+        (and body
+             (let* ((form (car body))
+                    (head (car-safe form)))
+               (cond
+                ((or (and (stringp form) (cdr body))
+                     (eq head :documentation))
+                 (cond
+                  (docstring (funcall warn "More than one doc string" top))
+                  (declare-form
+                   (funcall warn "Doc string after `declare'" declare-form))
+                  (interactive-form
+                   (funcall warn "Doc string after `interactive'" interactive-form))
+                  (t (setq docstring form)))
+                 t)
+                ((eq head 'declare)
+                 (cond
+                  (declare-form
+                   (funcall warn "More than one `declare' form" form))
+                  (interactive-form
+                   (funcall warn "`declare' after `interactive'" form))
+                  (t (setq declare-form form)))
+                 t)
+                ((eq head 'interactive)
+                 (cond
+                  ((not allow-interactive)
+                   (funcall warn "No `interactive' form allowed here" form))
+                  (interactive-form
+                   (funcall warn "More than one `interactive' form" form))
+                  (t (setq interactive-form form)))
+                 t))))
+      (setq body (cdr body)))
+    (list docstring declare-form interactive-form body warnings)))
+
+;; byte-run.el:326 — map each declaration clause through DECLARATIONS-ALIST.
+(defun byte-run--parse-declarations (name arglist clauses construct declarations-alist)
+  (let* ((cl-decls nil)
+         (actions
+          (mapcar
+           (lambda (x)
+             (let ((f (cdr (assq (car x) declarations-alist))))
+               (cond
+                (f (apply (car f) name arglist (cdr x)))
+                ((and (featurep 'cl)
+                      (memq (car x)
+                            '(special inline notinline optimize warn)))
+                 (push (list 'declare x) cl-decls)
+                 nil)
+                (t
+                 (macroexp-warn-and-return
+                  (format-message "Unknown %s property `%S'"
+                                  construct (car x))
+                  nil nil nil (car x))))))
+           clauses)))
+    (cons actions cl-decls)))
+
+;; gv.el:159 — turn a (gv-setter …)/(gv-expander …) declaration into the form
+;; that registers the corresponding generalized-variable handler.
+(defun gv--defun-declaration (symbol name args handler &optional fix)
+  `(progn
+     :autoload-end
+     ,(pcase (cons symbol handler)
+        (`(gv-expander . (lambda (,do) . ,body))
+         `(gv-define-expander ,name (lambda (,do ,@args) ,@body)))
+        (`(gv-expander . ,(pred symbolp))
+         `(gv-define-expander ,name #',handler))
+        (`(gv-setter . (lambda (,store) . ,body))
+         `(gv-define-setter ,name (,store ,@args) ,@body))
+        (`(gv-setter . ,(pred symbolp))
+         `(gv-define-simple-setter ,name ,handler ,fix))
+        (_ (message "Unknown %s declaration %S" symbol handler) nil))))
+(defsubst gv--expander-defun-declaration (&rest args)
+  (apply #'gv--defun-declaration 'gv-expander args))
+(defsubst gv--setter-defun-declaration (&rest args)
+  (apply #'gv--defun-declaration 'gv-setter args))
+(or (assq 'gv-expander defun-declarations-alist)
+    (let ((x (list 'gv-expander #'gv--expander-defun-declaration)))
+      (push x macro-declarations-alist)
+      (push x defun-declarations-alist)))
+(or (assq 'gv-setter defun-declarations-alist)
+    (push (list 'gv-setter #'gv--setter-defun-declaration)
+          defun-declarations-alist))
+
+;; Bridge invoked by the host's defun/defmacro expander (macroexpand_all).
+;; CONSTRUCT is `defun' or `defmacro'; NAME/ARGLIST/BODY are the raw pieces.
+;; Returns the replacement form threading each declaration's runtime side-effect
+;; form after the (unchanged-shape) definition, mirroring byte-run.el's `defun'
+;; and `defmacro' macros — or nil when BODY has no `declare' (host falls through
+;; to plain body expansion).
+(defun elisprs--expand-defun-declarations (construct name arglist body)
+  (let* ((allow-interactive (eq construct 'defun))
+         (parse (byte-run--parse-body body allow-interactive))
+         (docstring (nth 0 parse))
+         (declare-form (nth 1 parse))
+         (interactive-form (nth 2 parse))
+         (rest (nth 3 parse))
+         (warnings (nth 4 parse))
+         (alist (if (eq construct 'defmacro)
+                    macro-declarations-alist
+                  defun-declarations-alist))
+         (declarations
+          (and declare-form
+               (byte-run--parse-declarations
+                name arglist (cdr declare-form) construct alist))))
+    (when declare-form
+      (setq rest (nconc warnings rest))
+      (setq rest (nconc (cdr declarations) rest))
+      (when interactive-form (setq rest (cons interactive-form rest)))
+      (when docstring (setq rest (cons docstring rest)))
+      (when (null rest) (setq rest '(nil)))
+      (let ((def (cons construct (cons name (cons arglist rest)))))
+        (if declarations
+            (cons 'prog1 (cons def (car declarations)))
+          def)))))
 ;; custom-set-minor-mode (custom.el): a defcustom :set that toggles the mode.
 ;; (Reached only via Customize, which is out of the mode-run path.)
 (defun custom-set-minor-mode (variable value)

@@ -3063,7 +3063,39 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
         }
         // `(defun|defmacro NAME ARGLIST . BODY)`: same protection for the ARGLIST
         // (and NAME); only the body forms are expression positions.
-        Some("defun" | "defmacro") if elems.len() >= 3 => {
+        Some(construct @ ("defun" | "defmacro")) if elems.len() >= 3 => {
+            // Faithful byte-run.el `declare' handling: `defun'/`defmacro' are
+            // macros in Emacs that process the `(declare ...)' specs (registering
+            // gv-setters, obsolete/indent/doc-string props, …).  elisprs keeps
+            // them as compiler special forms, so we delegate to the prelude bridge
+            // `elisprs--expand-defun-declarations', which returns a rewritten
+            // definition threading each spec's runtime side-effect form after it.
+            // Guarded on fboundp so early-prelude defuns (compiled before the
+            // bridge is defined) keep the pre-bridge behavior — no bootstrap cycle.
+            let bridge_ready = with_host(|h| {
+                let s = h.intern("elisprs--expand-defun-declarations");
+                h.is_fbound(&s)
+            });
+            if bridge_ready {
+                let (bridge, cons_sym, name, arglist, body_list) = with_host(|h| {
+                    let bridge = h.intern("elisprs--expand-defun-declarations");
+                    let cons_sym = h.intern(construct);
+                    let body_list = h.list_from(elems[3..].to_vec());
+                    (
+                        bridge,
+                        cons_sym,
+                        elems[1].clone(),
+                        elems[2].clone(),
+                        body_list,
+                    )
+                });
+                let replaced = call_function(&bridge, &[cons_sym, name, arglist, body_list])?;
+                // Non-nil ⇒ BODY had a `declare'; expand the rewritten form (its
+                // inner defun has the `declare' stripped, so this does not recurse).
+                if el_truthy(&replaced) {
+                    return macroexpand_all(&replaced);
+                }
+            }
             let mut out = Vec::with_capacity(elems.len());
             out.push(elems[0].clone());
             out.push(elems[1].clone()); // NAME, untouched
