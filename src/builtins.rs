@@ -68,6 +68,26 @@ fn as_integer(h: &ElispHost, v: &Value) -> Result<i64, String> {
         )),
     }
 }
+/// Emacs `most-positive-fixnum` (2^61-1). Integers above this are bignums in
+/// Emacs, and the fixed-size allocators (`make-vector`, `make-string`,
+/// `make-record`) reject a bignum length as a non-wholenum.
+const MOST_POSITIVE_FIXNUM: i64 = 2305843009213693951;
+/// Rendered form of `Vmemory_signal_data`: the plain `error` Emacs signals when
+/// an allocation request cannot be satisfied. `make_error_object` splits this
+/// into `(error "Memory exhausted--use C-x s then exit and restart Emacs")`.
+const MEMORY_EXHAUSTED: &str = "error: Memory exhausted--use C-x s then exit and restart Emacs";
+
+/// Validate a requested array/string length the way Emacs's `CHECK_FIXNAT`
+/// does: a negative value or one above `most-positive-fixnum` (a bignum) is not
+/// a wholenum, so signal `wrong-type-argument wholenump N` rather than
+/// attempting an allocation that would panic or abort the process.
+fn check_array_len(n: i64) -> Result<usize, String> {
+    if !(0..=MOST_POSITIVE_FIXNUM).contains(&n) {
+        return Err(format!("wrong-type-argument: wholenump {n}"));
+    }
+    Ok(n as usize)
+}
+
 /// Character-code accessor: a valid character is an integer in [0, #x3FFFFF];
 /// anything else signals `wrong-type-argument characterp VALUE` (a negative code
 /// or one past the upper bound, as `char-to-string`/`make-string` do).
@@ -623,11 +643,16 @@ fn vector_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.alloc(Obj::Vector(a.to_vec())))
 }
 fn make_vector(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_num(h, &a[0])?.0;
-    if n < 0 {
-        return Err(format!("wrong-type-argument: wholenump {n}"));
-    }
-    Ok(h.alloc(Obj::Vector(vec![a[1].clone(); n as usize])))
+    let n = check_array_len(as_num(h, &a[0])?.0)?;
+    // Fallible allocation: a length that fits `most-positive-fixnum` can still
+    // exceed available memory (or `isize::MAX` bytes). Emacs signals a plain
+    // `error` there instead of aborting, so `try_reserve_exact` maps both the
+    // capacity-overflow and out-of-memory cases to `MEMORY_EXHAUSTED`.
+    let mut v: Vec<Value> = Vec::new();
+    v.try_reserve_exact(n)
+        .map_err(|_| MEMORY_EXHAUSTED.to_string())?;
+    v.resize(n, a[1].clone());
+    Ok(h.alloc(Obj::Vector(v)))
 }
 fn aref(h: &mut ElispHost, a: &[Value]) -> R {
     // A char-table indexes by character (0..=MAX_CHAR) with parent/default
@@ -1610,12 +1635,21 @@ fn string_to_char(_h: &mut ElispHost, a: &[Value]) -> R {
     ))
 }
 fn make_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_int(h, &a[0])?;
-    if n < 0 {
-        return Err(format!("wrong-type-argument: wholenump {n}"));
-    }
+    let n = check_array_len(as_int(h, &a[0])?)?;
     let c = char::from_u32(as_char(h, &a[1])?).unwrap_or(' ');
-    Ok(Value::str(c.to_string().repeat(n as usize)))
+    // Fallible allocation, as in `make_vector`: `n * len_utf8` may overflow
+    // `usize` or exceed available memory. Emacs signals a plain `error` rather
+    // than aborting the process, so reserve up front and map failure to it.
+    let bytes = n
+        .checked_mul(c.len_utf8())
+        .ok_or_else(|| MEMORY_EXHAUSTED.to_string())?;
+    let mut s = String::new();
+    s.try_reserve_exact(bytes)
+        .map_err(|_| MEMORY_EXHAUSTED.to_string())?;
+    for _ in 0..n {
+        s.push(c);
+    }
+    Ok(Value::str(s))
 }
 fn string_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let mut s = String::new();

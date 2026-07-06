@@ -72,7 +72,10 @@ pub const PRELUDE: &str = r#"
   (if (or (null n) (= n 1))
       (progn (while (consp (cdr l)) (setq l (cdr l))) l)
     (nthcdr (max 0 (- (length l) n)) l)))
-(defun make-list (n x) (let ((r nil)) (while (> n 0) (setq r (cons x r)) (setq n (1- n))) r))
+(defun make-list (n x)
+  (unless (and (integerp n) (>= n 0) (<= n most-positive-fixnum))
+    (signal 'wrong-type-argument (list 'wholenump n)))
+  (let ((r nil)) (while (> n 0) (setq r (cons x r)) (setq n (1- n))) r))
 (defun number-sequence (from &optional to inc)
   ;; With only FROM, or FROM=TO, the sequence is (FROM); INC defaults to 1.
   (if (or (null to) (= from to))
@@ -2230,6 +2233,13 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (defun record (type &rest slots)
   (apply #'vector (intern (concat "cl-struct-" (symbol-name type))) slots))
 (defun make-record (type slots init)
+  ;; Emacs's `Fmake_record' checks SLOTS is a wholenum, then caps the record at
+  ;; PSEUDOVECTOR_SIZE_MASK (4095) slots; anything larger signals a plain error
+  ;; rather than attempting an impossible allocation.
+  (unless (and (integerp slots) (>= slots 0) (<= slots most-positive-fixnum))
+    (signal 'wrong-type-argument (list 'wholenump slots)))
+  (when (> (1+ slots) 4095)
+    (error "Attempt to allocate a record of %d slots; max is %d" (1+ slots) 4095))
   (let ((v (make-vector (1+ slots) init)))
     (aset v 0 (intern (concat "cl-struct-" (symbol-name type))))
     v))
