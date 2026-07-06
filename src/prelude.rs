@@ -3452,7 +3452,9 @@ If all LST elements are zeros or LST is nil, return zero."
 ;; `make-local-variable', `make-variable-buffer-local', `local-variable-p',
 ;; `local-variable-if-set-p', `kill-local-variable' and `buffer-local-value' are
 ;; C primitives (builtins.rs) backed by the current buffer's local-binding table.
-(defun set-default-toplevel-value (sym val) (set-default sym val))
+;; Faithful to the C subr `Fset_default_toplevel_value' (data.c): it runs
+;; `set_default_internal' and returns nil, NOT the value.
+(defun set-default-toplevel-value (sym val) (set-default sym val) nil)
 (defun defalias (symbol definition &optional _docstring) (fset symbol definition) symbol)
 (defalias 'string-split 'split-string)
 ;; help.el: obsolete alias for `help--make-usage' (help usage helpers ported above).
@@ -7238,6 +7240,30 @@ rather than files.  These modes usually use read-only buffers."
         (if declarations
             (cons 'prog1 (cons def (car declarations)))
           def)))))
+;; custom-local-buffer (custom.el): when non-nil in a Customization buffer,
+;; :set functions target that buffer's local binding instead of the default.
+(defvar custom-local-buffer nil
+  "Non-nil, in a Customization buffer, means customize a specific buffer.
+If this variable is non-nil, it should be a buffer,
+and it means customize the local bindings of that buffer.
+This variable is a permanent local, and it normally has a local binding
+in every Customization buffer.")
+(put 'custom-local-buffer 'permanent-local t)
+
+;; custom-set-default (custom.el): the default :set function for a customizable
+;; variable.  Sets the default value of VARIABLE to VALUE, unless a
+;; `custom-local-buffer' is active (Customize buffer), in which case the local
+;; binding in that buffer is set instead.
+(defun custom-set-default (variable value)
+  "Default :set function for a customizable variable.
+Normally, this sets the default value of VARIABLE to VALUE,
+but if `custom-local-buffer' is non-nil,
+this sets the local binding in that buffer instead."
+  (if custom-local-buffer
+      (with-current-buffer custom-local-buffer
+	(set variable value))
+    (set-default-toplevel-value variable value)))
+
 ;; custom-set-minor-mode (custom.el): a defcustom :set that toggles the mode.
 ;; (Reached only via Customize, which is out of the mode-run path.)
 (defun custom-set-minor-mode (variable value)
