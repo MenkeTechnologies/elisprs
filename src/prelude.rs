@@ -6076,6 +6076,49 @@ changes to a supertype are not reflected in its subtypes)."
 ;; the preloaded type machinery instead of trying to open a file (button.el:672).
 (provide 'button)
 
+;;; ---- widget types (widget.el) ----
+;; Faithful port of widget.el, the bootstrap half of the widget system that only
+;; defines new widget types (everything else is autoloaded from wid-edit.el).
+;; `define-widget' registers a type by storing (CLASS . ARGS) on the NAME
+;; symbol's `widget-type' property and the doc string on `widget-documentation';
+;; that registry is what init files touch at load time. The widget UI itself
+;; (widget-create/widget-convert/widget-apply, the wid-edit.el layer) is not
+;; modeled here. Value-for-value against Emacs 30.2 widget.el.
+
+;; `define-widget-keywords' is a dummy kept only so external libraries that still
+;; call it don't error; it expands to nil (obsolete since 27.1).
+(defmacro define-widget-keywords (&rest _keys)
+  (declare (obsolete nil "27.1") (indent defun))
+  nil)
+
+(defun define-widget (name class doc &rest args)
+  "Define a new widget type named NAME from CLASS.
+
+NAME and CLASS should both be symbols, CLASS should be one of the
+existing widget types, or nil to create the widget from scratch.
+
+After the new widget has been defined, the following two calls will
+create identical widgets:
+
+* (widget-create NAME)
+
+* (apply #\\='widget-create CLASS ARGS)
+
+The third argument DOC is a documentation string for the widget."
+  (declare (doc-string 3) (indent defun))
+  ;;
+  (unless (or (null doc) (stringp doc))
+    (error "Widget documentation must be nil or a string"))
+  (put name 'widget-type (cons class args))
+  (put name 'widget-documentation (purecopy doc))
+  name)
+
+(define-obsolete-function-alias 'widget-plist-member #'plist-member "26.1")
+
+;; Mark `widget' as provided so `(require 'widget)' no-ops onto the preloaded
+;; type registry instead of trying to open a file (widget.el:139).
+(provide 'widget)
+
 (defvar-keymap special-mode-map
   :suppress t
   "q" #'quit-window
