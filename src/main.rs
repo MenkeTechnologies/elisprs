@@ -7,9 +7,11 @@
 //!   elisp --aot FILE -o OUT  lower to a fusevm chunk / native object
 //!   elisp --version
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+mod repl;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -64,6 +66,9 @@ fn main() -> ExitCode {
             }
         };
     }
+    if args.iter().any(|a| a == "--repl") {
+        return repl::run();
+    }
     if let Some(pos) = args.iter().position(|a| a == "-e" || a == "--eval") {
         let Some(expr) = args.get(pos + 1) else {
             eprintln!("elisp: -e requires an expression");
@@ -91,7 +96,14 @@ fn main() -> ExitCode {
         };
     }
 
-    repl()
+    // No flag, no file: launch the reedline REPL on an interactive terminal;
+    // fall back to the plain line-buffered reader when stdin is piped (so
+    // `echo '(+ 1 2)' | elisp` still evaluates without a TTY line editor).
+    if io::stdin().is_terminal() {
+        repl::run()
+    } else {
+        repl_stdin()
+    }
 }
 
 fn run_aot(args: &[String], exe: bool) -> ExitCode {
@@ -130,7 +142,10 @@ fn run_aot(args: &[String], exe: bool) -> ExitCode {
     }
 }
 
-fn repl() -> ExitCode {
+/// Plain line-buffered REPL used when stdin is not a terminal (piped input).
+/// Accumulates lines until parens balance, then evaluates. The interactive TTY
+/// path uses the reedline editor in `repl::run`.
+fn repl_stdin() -> ExitCode {
     let stdin = io::stdin();
     let mut buf = String::new();
     println!(
@@ -209,16 +224,12 @@ fn print_help() {
     let status = format!(" STATUS: ONLINE  // SIGNAL: ████████░░ // v{ver}");
     let space = " ".repeat(BOX_W.saturating_sub(status.chars().count()));
     let rule = "─".repeat(BOX_W);
+    // Logo glyphs live in exactly one place — `banner::LOGO_ROWS` — so the
+    // `--help` header and the REPL banner never drift.
+    print!("\n{}", elisprs::banner::logo_colored(true));
     print!(
         concat!(
-            "\n",
-            "\x1b[36m ███████╗██╗     ██╗███████╗██████╗ ██████╗ ███████╗\x1b[0m\n",
-                "\x1b[36m ██╔════╝██║     ██║██╔════╝██╔══██╗██╔══██╗██╔════╝\x1b[0m\n",
-                "\x1b[35m █████╗  ██║     ██║███████╗██████╔╝██████╔╝███████╗\x1b[0m\n",
-                "\x1b[35m ██╔══╝  ██║     ██║╚════██║██╔═══╝ ██╔══██╗╚════██║\x1b[0m\n",
-                "\x1b[31m ███████╗███████╗██║███████║██║     ██║  ██║███████║\x1b[0m\n",
-                "\x1b[31m ╚══════╝╚══════╝╚═╝╚══════╝╚═╝     ╚═╝  ╚═╝╚══════╝\x1b[0m\n",
-                " \x1b[36m┌{rule}┐\x1b[0m\n",
+            " \x1b[36m┌{rule}┐\x1b[0m\n",
                 " \x1b[36m│\x1b[0m{status}{space}\x1b[36m│\x1b[0m\n",
                 " \x1b[36m└{rule}┘\x1b[0m\n",
                 "\x1b[35m  >> EMACS LISP ON FUSEVM // FULL SPECTRUM <<\x1b[0m\n",
@@ -231,6 +242,7 @@ fn print_help() {
                 "  elisp FILE.el            \x1b[32m//\x1b[0m evaluate a file\n",
                 "  elisp -e EXPR            \x1b[32m//\x1b[0m evaluate an expression and print its value\n",
                 "  elisp                    \x1b[32m//\x1b[0m start a REPL\n",
+                "  elisp --repl             \x1b[32m//\x1b[0m start the reedline REPL (Tab-completion + stats banner)\n",
                 "  elisp --lsp              \x1b[32m//\x1b[0m language server over stdio (stub)\n",
                 "  elisp --dap              \x1b[32m//\x1b[0m debug adapter over stdio (stub)\n",
                 "  elisp --aot FILE -o OUT  \x1b[32m//\x1b[0m lower to a fusevm chunk / native object\n",

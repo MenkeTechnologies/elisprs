@@ -74,3 +74,13 @@ stacker = "0.1"
 # `rust_backend' is pure-Rust miniz_oxide (no C toolchain, vendorable, durable),
 # so `(load "lib")' resolves and decompresses a `.gz`-only library in memory.
 flate2 = "1"
+# `elisp --repl` (and the bare-tty fallthrough) is a utop-style line editor
+# backed by reedline: Tab completion over the LSP wordlist, a live stats
+# banner, and a `~/.elisprs/history` file. nu-ansi-term paints the status
+# bar; sysinfo (system feature only) feeds the banner memory row; toml parses
+# `~/.elisprs/config.toml` for the emacs/vi edit-mode selector. libc (already a
+# dependency above) supplies localtime_r + TIOCGWINSZ for the status bar.
+reedline = "0.47.0"
+nu-ansi-term = "0.50"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+toml = "0.8"

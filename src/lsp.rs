@@ -1947,10 +1947,26 @@ fn offset_of(text: &str, pos: Position) -> usize {
 
 // ── feature handlers ─────────────────────────────────────────────────────────
 
+/// Every metadata entry the language knows: the special forms the compiler
+/// recognizes followed by the installed subrs. Single source of truth for both
+/// the LSP completion list (which keeps the full sig/doc detail) and the REPL
+/// wordlist (`completion_words`, bare names only).
+pub fn all_entries() -> impl Iterator<Item = &'static Entry> {
+    SPECIAL_FORMS.iter().chain(SUBRS)
+}
+
+/// The merged, sorted, de-duplicated bare names of every special form + subr —
+/// the wordlist the reedline REPL feeds its Tab completer. Shares `all_entries`
+/// with the LSP `completion()` path so the two never drift.
+pub fn completion_words() -> Vec<String> {
+    let mut v: Vec<String> = all_entries().map(|e| e.name.to_string()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 fn completion() -> CompletionResponse {
-    let items = SPECIAL_FORMS
-        .iter()
-        .chain(SUBRS)
+    let items = all_entries()
         .map(|e| CompletionItem {
             label: e.name.to_string(),
             kind: Some(match e.kind {

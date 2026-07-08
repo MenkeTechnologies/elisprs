@@ -79,7 +79,8 @@ The build produces the `elisp` binary:
 ```sh
 elisp FILE.el            # evaluate a file
 elisp -e "(+ 1 2)"       # evaluate an expression, print its value
-elisp                    # REPL (balanced-paren continuation, Ctrl-D to exit)
+elisp                    # REPL — reedline editor on a TTY, plain line reader when piped
+elisp --repl             # force the reedline REPL: Tab-completion, live stats banner, ~/.elisprs/history
 elisp --lsp              # language server over stdio        (completion/hover/diagnostics/signature help)
 elisp --dap              # debug adapter over stdio          (breakpoints/stepping/variables)
 elisp --aot FILE -o a.o  # AOT-compile to a native object via fusevm::aot

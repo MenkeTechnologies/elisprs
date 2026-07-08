@@ -42,6 +42,14 @@ Evaluate the forms in \fIFILE\fR (typically a \fB.el\fR file) in order.
 .BR \-e ", " \-\-eval " " \fIPROGRAM\fR
 Evaluate \fIPROGRAM\fR and print the value of the last form.
 .TP
+.B \-\-repl
+Start the interactive reedline REPL: a utop-style line editor with Tab
+completion over the special-form and subr wordlist, a live ASCII stats banner,
+emacs/vi edit modes (\fBELISPRS_REPL_MODE\fR or \fI~/.elisprs/config.toml\fR),
+and history at \fI~/.elisprs/history\fR. With no arguments on an interactive
+terminal, \fBelisp\fR launches this REPL automatically; piped input falls back
+to a plain line-buffered reader.
+.TP
 .B \-\-lsp
 Run the language server over stdio. Stub at milestone 1.
 .TP

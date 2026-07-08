@@ -7,6 +7,7 @@
 
 pub mod aot;
 pub mod aot_runtime;
+pub mod banner;
 pub mod builtins;
 pub mod cache;
 pub mod compiler;
