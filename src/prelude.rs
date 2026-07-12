@@ -1723,11 +1723,18 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
                          (and (vectorp --o--) (> (length --o--) 0)
                               (cl-struct--is-a (aref --o-- 0) ',tag)))
                       forms))
-    (when parent
-      (setq forms (cons `(setq cl-struct--parent
-                               (cons (cons ',tag ',(intern (concat "cl-struct-" (symbol-name parent))))
-                                     cl-struct--parent))
-                        forms)))
+    ;; Record the tag's parent so the predicate accepts subtypes.  With an
+    ;; explicit `:include' the parent is that struct; otherwise every "normal"
+    ;; struct implicitly roots at `cl-structure-object' (cl-macs.el defaults
+    ;; `parent-type' to it), which is what makes `cl-struct-p' — the predicate
+    ;; for `cl-structure-object' — accept any struct.  The root itself is skipped
+    ;; so it has no self-parent.
+    (let ((ptag (cond (parent (intern (concat "cl-struct-" (symbol-name parent))))
+                      ((not (eq name 'cl-structure-object)) 'cl-struct-cl-structure-object))))
+      (when ptag
+        (setq forms (cons `(setq cl-struct--parent
+                                 (cons (cons ',tag ',ptag) cl-struct--parent))
+                          forms))))
     (when copier
       (setq forms (cons `(defun ,(intern copier) (--s--) (vconcat --s--)) forms)))
     ;; Register a `cl-structure-class' so cl-generic's typeof generalizer can

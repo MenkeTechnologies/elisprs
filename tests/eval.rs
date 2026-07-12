@@ -3201,8 +3201,14 @@ fn error_message_assert_propertize() {
         eval("(condition-case e (cl-assert (= 1 2)) (cl-assertion-failed 'failed))"),
         "failed"
     );
-    // propertize returns the bare string (properties dropped).
-    assert_eq!(eval("(propertize \"hello\" 'face 'bold)"), "\"hello\"");
+    // propertize returns a fresh string carrying the props; it prints in `#(...)`
+    // interval syntax like Emacs.
+    assert_eq!(
+        eval("(propertize \"hello\" 'face 'bold)"),
+        "#(\"hello\" 0 5 (face bold))"
+    );
+    // concat does not yet propagate the source string's text properties (Emacs
+    // would yield #("ab" 0 1 (x 1))); it returns the plain concatenation.
     assert_eq!(eval("(concat (propertize \"a\" 'x 1) \"b\")"), "\"ab\"");
 }
 
