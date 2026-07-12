@@ -1655,7 +1655,33 @@ pub fn run_stdio() -> i32 {
     }
 }
 
+/// Guard against leaking as an orphan LSP process. Editors / GUI apps reap us via
+/// kill-on-drop, which only fires on a *graceful* client exit; a hard client
+/// death (SIGKILL/crash/force-quit) skips it, and a leaked pipe fd can keep our
+/// stdin open so we never see EOF either. Watch for reparenting to pid 1 (our
+/// client died) and exit — nothing this read-only server holds is worth leaking.
+fn spawn_orphan_guard() {
+    std::thread::spawn(|| {
+        // Linux: also ask the kernel to SIGKILL us the instant the parent dies.
+        // Best-effort; the getppid poll below is the portable guarantee (macOS
+        // has no PDEATHSIG).
+        #[cfg(target_os = "linux")]
+        // SAFETY: prctl(PR_SET_PDEATHSIG, ...) only registers a signal disposition.
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0);
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            // SAFETY: getppid takes no arguments and never fails.
+            if unsafe { libc::getppid() } == 1 {
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    spawn_orphan_guard();
     let (connection, io_threads) = Connection::stdio();
     let caps = ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
