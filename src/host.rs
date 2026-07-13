@@ -184,7 +184,7 @@ pub enum Obj {
     /// char-table for lookup fallback, and `extra` slots. See [`CharTable`].
     CharTable(CharTable),
     /// An editing buffer object (`get-buffer-create`/`generate-new-buffer`). The
-    /// payload is the index into [`ElispHost::buffers`], which is stable for the
+    /// payload is the index into `ElispHost::buffers`, which is stable for the
     /// buffer's whole lifetime (killed buffers keep their slot, marked dead by a
     /// `None` name). Buffer objects are runtime-only and never serialized.
     Buffer(usize),
@@ -198,13 +198,13 @@ pub enum Obj {
     /// [`ElispHost::make_symbol`], so a private obarray's symbols never collide
     /// with the global ones. The single global obarray (the value of the
     /// `obarray` variable) is the one with `global == true`; its symbol set is
-    /// [`ElispHost::obarray`], not `symbols`. See [`ObarrayData`].
+    /// `ElispHost::obarray`, not `symbols`. See [`ObarrayData`].
     Obarray(ObarrayData),
 }
 
 /// An `Obj::Obarray` payload. A private obarray owns its `symbols` map
 /// (name → symbol arena id); the global obarray (`global == true`) leaves
-/// `symbols` empty and routes every operation to [`ElispHost::obarray`].
+/// `symbols` empty and routes every operation to `ElispHost::obarray`.
 pub struct ObarrayData {
     pub symbols: HashMap<String, u32>,
     pub global: bool,
@@ -644,7 +644,7 @@ impl ElispHost {
             _ => Vec::new(),
         }
     }
-    /// Public form of [`Self::sym_handle`]: the arena handle of `v` if it is a
+    /// Public form of `Self::sym_handle`: the arena handle of `v` if it is a
     /// symbol object, else `None`. Used by the OClosure builtins.
     pub fn as_sym_handle(&self, v: &Value) -> Option<u32> {
         self.sym_handle(v)

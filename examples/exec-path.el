@@ -3,8 +3,10 @@
 ;; Differential-tested against real `emacs -Q --batch' 30.2. Pins the port of
 ;; `executable-find', `locate-file' (+ `locate-file-internal', the `openp'
 ;; search), `file-executable-p', and the `exec-path'/`exec-suffixes'/
-;; `path-separator' variables. Values that are deterministic across machines use
-;; `sh'/`ls' (present under /bin on every unix) and /etc/hosts (never +x).
+;; `path-separator' variables. `sh'/`ls' are present on every unix but their
+;; directory is not (/bin on macOS, /usr/bin on a merged-/usr Linux), so search
+;; results are compared against a hand-rolled scan (`exec-path--scan') instead of
+;; a hardcoded path; only /bin/sh (+x) and /etc/hosts (never +x) are literal.
 (require 'cl-lib)
 (message "== exec-path / file-location subsystem ==")
 
@@ -29,15 +31,35 @@ followed by `exec-directory' with its trailing slash stripped."
   (should-not (file-executable-p "/etc/hosts"))
   (should-not (file-executable-p "/no/such/path/xyz")))
 
+(defun exec-path--scan (name pred)
+  "First NAME under `exec-path' satisfying PRED, scanned by hand.
+Which directory owns `sh'/`ls' is machine-dependent -- /bin on macOS, /usr/bin
+on a merged-/usr Linux -- so the expected value is re-derived from PRED and
+`exec-path' rather than hardcoded. The scan uses only `concat' and the file
+predicates, so it stays an independent check of the `executable-find' /
+`locate-file' search order."
+  (let ((dirs exec-path) (hit nil))
+    (while (and dirs (not hit))
+      (let ((cand (concat (car dirs) "/" name)))
+        (when (and (funcall pred cand) (not (file-directory-p cand)))
+          (setq hit cand)))
+      (setq dirs (cdr dirs)))
+    hit))
+
 (ert-deftest executable-find-real-and-missing ()
   "Finds real binaries by absolute path; nil for a name in no directory."
-  (should (equal (executable-find "sh") "/bin/sh"))
-  (should (equal (executable-find "ls") "/bin/ls"))
+  (let ((sh (executable-find "sh")))
+    (should (equal sh (exec-path--scan "sh" #'file-executable-p)))
+    (should (file-executable-p sh)))
+  (should (equal (executable-find "ls") (exec-path--scan "ls" #'file-executable-p)))
+  (should (file-executable-p (executable-find "ls")))
   (should-not (executable-find "definitely-not-a-real-binary-xyz")))
 
 (ert-deftest locate-file-search-and-suffixes ()
   "PATH + SUFFIXES search; dir-major order; the empty suffix matches the bare name."
-  (should (equal (locate-file "sh" exec-path) "/bin/sh"))
+  ;; No PREDICATE: the default is `file-readable-p', not the executable bit.
+  (should (equal (locate-file "sh" exec-path) (exec-path--scan "sh" #'file-readable-p)))
+  (should (file-readable-p (locate-file "sh" exec-path)))
   (should (equal (locate-file "ls" '("/bin" "/usr/bin") '(".foo" "")) "/bin/ls"))
   ;; An absolute FILENAME is tried once regardless of PATH.
   (should (equal (locate-file "/bin/sh" nil) "/bin/sh"))
