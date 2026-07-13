@@ -194,6 +194,7 @@ pub const PRELUDE: &str = r#"
       (if (funcall test (car pl) k) (progn (setq r (cadr pl)) (setq pl nil)) (setq pl (cddr pl))))
     r))
 (defun plist-member (pl k &optional predicate)
+  (unless (listp pl) (signal 'wrong-type-argument (list 'plistp pl)))
   (let ((test (or predicate #'eq)) (r nil))
     (while (consp pl)
       (if (funcall test (car pl) k) (progn (setq r pl) (setq pl nil)) (setq pl (cddr pl))))
@@ -2348,6 +2349,8 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (defun plist-put (plist prop val &optional predicate)
   ;; Mutate PLIST in place: overwrite an existing PROP, or append (PROP VAL) to
   ;; the tail via setcdr. Only a nil PLIST yields a fresh list (can't mutate nil).
+  ;; A non-list PLIST is `plistp' -- its own predicate, not `listp'.
+  (unless (listp plist) (signal 'wrong-type-argument (list 'plistp plist)))
   (let ((test (or predicate #'eq)))
    (if (null plist)
       (list prop val)

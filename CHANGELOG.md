@@ -43,6 +43,29 @@ All notable changes to elisprs are documented here. The format follows
   the second and later `(eval 2.5 t)` in a process answered `2`. Fixed in fusevm
   0.14.6.
 
+### Fixed (Emacs parity — round 5, widened fuzz grammar)
+The fuzz generator now also covers hash tables, Emacs regexp syntax (valid *and*
+malformed), text properties, cl-lib, the printer's dynamic variables, and `format`
+directives with widths/flags. On that new surface it found:
+
+- **`(length 'car)` answered 0** instead of signalling `sequencep` — so
+  `(ash (length 'car) 5)` was a silent 0 rather than an error. (`safe-length` is
+  the one that answers 0.)
+- The bit-logic ops name a predicate that depends on the argument's **position**:
+  Emacs's `bit_op` checks the first with a direct `CHECK_INTEGER`
+  (`integer-or-marker-p`) and each later one for number-ness first, so
+  `(logand "x" 2)` and `(logand 2 "x")` report *different* predicates for the same
+  value.
+- An array index must be a fixnum: `(elt "abc" <bignum>)` is `fixnump`, and a
+  bignum index used to be coerced and reported back as a different number in the
+  `args-out-of-range` data.
+- `prin1-to-string` takes NOESCAPE (`(prin1-to-string "a" t)` → `a`).
+- `isnan` signals `floatp` on a non-float rather than answering nil; `plist-put` /
+  `plist-member` signal `plistp` (while `plist-get` stays lenient).
+- The higher-order primitives (`sort`, `mapcar`, `mapc`) resolve their function
+  designator before calling, so an arity error names the resolved function
+  (`#<subr abs>`), and an improper list argument names its tail.
+
 ### Fixed (correctness — the warm script cache)
 A cache hit skips the reader, the compiler AND the prelude, replaying cached chunks
 onto a restored heap image. That is a different code path from a cold run — and the

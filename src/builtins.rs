@@ -527,15 +527,7 @@ fn append_fn(h: &mut ElispHost, a: &[Value]) -> R {
             Some(Obj::Vector(items)) => out.extend(items.clone()),
             _ => match v {
                 Value::Str(s) => out.extend(s.chars().map(|c| Value::Int(c as i64))),
-                _ => match h.list_vec(v) {
-                    Some(items) => out.extend(items),
-                    None => {
-                        return Err(format!(
-                            "wrong-type-argument: sequencep {}",
-                            h.print(v, true)
-                        ))
-                    }
-                },
+                _ => out.extend(h.seq_vec_checked(v)?),
             },
         }
     }
@@ -637,6 +629,12 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
     match &a[0] {
         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
         Value::Undef => Ok(Value::Int(0)),
+        // A symbol, a number, t … are not sequences: Emacs signals rather than
+        // answering 0. (`safe-length` is the one that answers 0.)
+        Value::Bool(_) | Value::Int(_) | Value::Float(_) => Err(format!(
+            "wrong-type-argument: sequencep {}",
+            h.print(&a[0], true)
+        )),
         Value::Obj(_) => match h.obj(&a[0]) {
             Some(Obj::Vector(items)) => Ok(Value::Int(items.len() as i64)),
             Some(Obj::Cons(..)) => {
@@ -674,7 +672,13 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
                     }
                 }
             }
-            _ => Ok(Value::Int(0)),
+            // A bool-vector/char-table/record has a length; a symbol, a subr, a
+            // buffer … do not — Emacs signals rather than answering 0.
+            Some(Obj::CharTable(_)) | Some(Obj::HashTable { .. }) => Ok(Value::Int(0)),
+            _ => Err(format!(
+                "wrong-type-argument: sequencep {}",
+                h.print(&a[0], true)
+            )),
         },
         _ => Err(format!(
             "wrong-type-argument: sequencep {}",
@@ -843,7 +847,10 @@ fn aref(h: &mut ElispHost, a: &[Value]) -> R {
         let c = as_char(h, &a[1])?;
         return Ok(h.char_table_ref(&a[0], c));
     }
-    let idx = as_num(h, &a[1])?.0;
+    let idx = match &a[1] {
+        Value::Int(n) => *n,
+        v => return Err(format!("wrong-type-argument: fixnump {}", h.print(v, true))),
+    };
     let oor = |h: &ElispHost| format!("args-out-of-range: {} {idx}", h.print(&a[0], true));
     if idx < 0 {
         return Err(oor(h));
@@ -1215,7 +1222,10 @@ fn pop_output_capture(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(Value::str(h.output_capture.pop().unwrap_or_default()))
 }
 fn prin1_to_string(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::str(h.print_checked(&a[0], true)?))
+    // `(prin1-to-string OBJECT &optional NOESCAPE)` — a non-nil NOESCAPE prints
+    // the way `princ` does (no quotes, no escapes).
+    let readable = a.get(1).is_none_or(is_nil);
+    Ok(Value::str(h.print_checked(&a[0], readable)?))
 }
 
 // ── nonlocal exits ──
@@ -2582,6 +2592,29 @@ fn as_int_exact(h: &ElispHost, v: &Value) -> Result<BigInt, String> {
 /// ops (`logand`/`logior`/`logxor`/`%`) take a marker and signal
 /// `integer-or-marker-p`, while the shifts and `lognot`/`logcount` take strictly
 /// an integer and signal `integerp`.
+/// The exact integer of a bit-logic argument (`logand`/`logior`/`logxor`), with
+/// the predicate Emacs names for that *position*.
+///
+/// Emacs's `bit_op` checks the FIRST argument with a direct `CHECK_INTEGER`, so a
+/// bad one there is always `integer-or-marker-p`. Each *later* argument is checked
+/// for number-ness first, so a non-number there is `number-or-marker-p` while a
+/// float is still `integer-or-marker-p`:
+///
+/// ```text
+/// (logand "x" 2)  => (wrong-type-argument integer-or-marker-p "x")   ; first
+/// (logand 2 "x")  => (wrong-type-argument number-or-marker-p  "x")   ; later
+/// (logand 2 1.0)  => (wrong-type-argument integer-or-marker-p 1.0)   ; a number
+/// ```
+fn as_int_bitop(h: &ElispHost, v: &Value, first: bool) -> Result<BigInt, String> {
+    if !first && !h.is_number(v) && h.marker_position(v).is_none() {
+        return Err(format!(
+            "wrong-type-argument: number-or-marker-p {}",
+            h.print(v, true)
+        ));
+    }
+    as_int_exact(h, v)
+}
+
 fn as_int_exact_p(h: &ElispHost, v: &Value, markers_ok: bool) -> Result<BigInt, String> {
     match v {
         Value::Int(n) => Ok(BigInt::from(*n)),
@@ -2609,22 +2642,22 @@ fn as_int_exact_p(h: &ElispHost, v: &Value, markers_ok: bool) -> Result<BigInt, 
 
 fn logand_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let mut r = BigInt::from(-1);
-    for v in a {
-        r &= as_int_exact(h, v)?;
+    for (i, v) in a.iter().enumerate() {
+        r &= as_int_bitop(h, v, i == 0)?;
     }
     Ok(h.make_integer(r))
 }
 fn logior_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let mut r = BigInt::from(0);
-    for v in a {
-        r |= as_int_exact(h, v)?;
+    for (i, v) in a.iter().enumerate() {
+        r |= as_int_bitop(h, v, i == 0)?;
     }
     Ok(h.make_integer(r))
 }
 fn logxor_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let mut r = BigInt::from(0);
-    for v in a {
-        r ^= as_int_exact(h, v)?;
+    for (i, v) in a.iter().enumerate() {
+        r ^= as_int_bitop(h, v, i == 0)?;
     }
     Ok(h.make_integer(r))
 }
@@ -2852,8 +2885,14 @@ fn frexp_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let (m, e) = frexp_parts(as_num(h, &a[0])?.1);
     Ok(h.cons(Value::Float(m), Value::Int(e)))
 }
-fn isnan_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(matches!(a[0], Value::Float(f) if f.is_nan())))
+fn isnan_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    match a[0] {
+        Value::Float(f) => Ok(nil_or(f.is_nan())),
+        _ => Err(format!(
+            "wrong-type-argument: floatp {}",
+            h.print(&a[0], true)
+        )),
+    }
 }
 fn fround_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Float(as_num(h, &a[0])?.1.round_ties_even()))
@@ -6395,7 +6434,7 @@ pub fn install(h: &mut ElispHost) {
     s("identity", 1, Some(1), identity);
     s("terpri", 0, Some(1), terpri);
     s("print", 1, Some(2), print_fn);
-    s("prin1-to-string", 1, Some(1), prin1_to_string);
+    s("prin1-to-string", 1, Some(3), prin1_to_string);
     // nonlocal exits (catch/unwind-protect/condition-case are compiler intrinsics)
     s("throw", 2, Some(2), throw_fn);
     s("error", 1, None, error_fn);

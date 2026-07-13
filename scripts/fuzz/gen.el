@@ -58,6 +58,21 @@
   '("" "a" "ab" "abc" "Hello, World" "hello world" "  padded  " "a,b,,c" "line\nbreak"
     "tab\there" "quote\"d" "back\\slash" "123" "-4.5" "ÜñîçøðÉ" "αβγ" "aAbB"))
 (defvar fz-symbols '(foo bar baz nil t car - + a))
+;; Emacs regexp syntax, not the `regex`-crate dialect: grouping and alternation
+;; are backslashed. A few are deliberately malformed — an invalid regexp is a
+;; parity case of its own (`invalid-regexp` and its message text).
+(defvar fz-regexps
+  '("a" "a+" "a*b" "[a-z]+" "[^a-z]" "\\(a\\)\\1" "\\(a+\\)\\(b\\)?" "^a" "b$" "\\`a" "a\\'"
+    "\\<a\\>" "\\_<a\\_>" "\\w+" "\\W" "\\s-" "[[:alpha:]]+" "[[:digit:]]" "a\\{2,3\\}"
+    "\\(?:ab\\|cd\\)" "a\\|b" "." "\\." "" "[" "\\(" "a\\{" "*a" "[z-a]"))
+
+;; `format' control strings: each pairs with the argument kinds it consumes.
+(defvar fz-formats
+  '(("%s" any) ("%S" any) ("%d" num) ("%d%%" num) ("%x" int) ("%X" int) ("%o" int)
+    ("%c" char) ("%e" num) ("%f" num) ("%g" num) ("%5d" num) ("%-8s" any) ("%+d" num)
+    ("%#x" int) ("%#o" int) ("%.3s" str) ("%5.2f" num) ("%08.3f" num) ("%2$s %1$s" any any)
+    ("[%s]" any) ("%s-%s" any any) ("%d/%d" num num)))
+
 (defvar fz-fns
   '(car cdr 1+ 1- abs identity not null length upcase downcase symbol-name
     number-to-string string-to-number integerp stringp consp listp nlistp
@@ -79,6 +94,15 @@
    ((eq kind 'sym) (list 'quote (fz-pick fz-symbols)))
    ((eq kind 'bool) (fz-pick '(t nil)))
    ((eq kind 'char) (fz-pick '(?a ?z ?A ?0 ?\s ?\n ?\t ?é)))
+   ((eq kind 're) (fz-pick fz-regexps))
+   ((eq kind 'ht)
+    ;; A hash table built inline: `(let ((h (make-hash-table …))) (puthash …) h)`.
+    (let ((test (fz-pick '(eq eql equal)))
+          (k (fz-atom (fz-pick '(int str sym))))
+          (v (fz-atom (fz-pick '(int str bool)))))
+      (list 'let (list (list 'h (list 'make-hash-table :test (list 'quote test))))
+            (list 'puthash k v 'h)
+            'h)))
    ((eq kind 'fn) (let ((f (fz-pick fz-fns)))
                     (if (fz-chance 20)
                         (list 'lambda '(x) (list (fz-pick '(list cons)) 'x 'x))
@@ -144,6 +168,35 @@
     (prin1-to-string any) (intern str) (symbol-name sym) (type-of any)
     ;; vectors / sequences
     (aref vec int) (vconcat seq seq) (vector any any) (append vec list)
+    ;; regexp
+    (string-match re str) (string-match-p re str) (string-match re str small)
+    (replace-regexp-in-string re str str) (replace-regexp-in-string re str str bool)
+    (regexp-quote str) (split-string str re) (split-string str re bool)
+    (string-trim str re re)
+    ;; hash tables (built and read in one form so the corpus stays pure)
+    (hash-table-count ht) (hash-table-test ht) (hash-table-p any) (hash-table-keys ht)
+    (hash-table-values ht) (gethash any ht) (gethash any ht any)
+    ;; plists / alists
+    (plist-get list any) (plist-member list any) (plist-put freshlist any any)
+    (alist-get any list) (alist-get any list any) (assoc-default any list)
+    (assq-delete-all any list) (rassq-delete-all any list) (assoc-string any list)
+    ;; text properties
+    (propertize str sym any) (substring-no-properties str)
+    (get-text-property small sym str) (text-properties-at small str)
+    (equal-including-properties any any)
+    ;; symbols / obarray
+    (intern str) (intern-soft str) (make-symbol str) (symbol-name sym) (symbolp any)
+    (type-of any) (subrp any) (functionp any) (macrop any) (special-form-p any)
+    ;; cl-lib
+    (cl-remove-duplicates list) (cl-position any list) (cl-count any list)
+    (cl-find any list) (cl-some fn list) (cl-every fn list) (cl-remove-if fn list)
+    (cl-subseq list small) (cl-reduce fn list) (cl-sort freshlist fn)
+    (cl-evenp int) (cl-oddp int) (cl-plusp num) (cl-minusp num)
+    ;; case / chars
+    (capitalize any) (upcase-initials str) (char-equal char char) (string-to-char str)
+    (char-to-string char) (string-width str) (string-reverse str)
+    ;; printing
+    (prin1-to-string any) (prin1-to-string any bool) (format-message str any)
     ;; predicates
     (consp any) (listp any) (atom any) (null any) (not any) (stringp any) (symbolp any)
     (vectorp any) (arrayp any) (sequencep any) (functionp any) (booleanp any)
@@ -151,7 +204,7 @@
 
 ;; Slots whose value must stay small for the form to stay bounded, no matter what
 ;; the table says: a chaos int in `make-string' would allocate gigabytes.
-(defvar fz-bounded '(small char))
+(defvar fz-bounded '(small char re ht))
 
 (defvar fz-chaos-rate 12
   "Percent of argument slots filled with a deliberately wrong-typed value.")
@@ -187,6 +240,7 @@
    ((fz-chance fz-chaos-rate) (fz-pick fz-chaos))
    ((<= depth 0) (fz-leaf kind))
    ((eq kind 'any) (fz-expr depth))
+   ((eq kind 'freshlist) (fz-leaf 'list))
    ((eq kind 'seq)
     (fz-of-kind (fz-pick '(list str vec)) depth))
    ((fz-chance 45)
@@ -223,6 +277,14 @@
   (cons (car spec)
         (mapcar (lambda (k) (fz-of-kind k depth)) (cdr spec))))
 
+(defun fz-format-form (depth)
+  "A `format' call whose control string matches its argument kinds."
+  (let* ((spec (fz-pick fz-formats))
+         (ctl (car spec))
+         (kinds (cdr spec))
+         (args (mapcar (lambda (k) (fz-of-kind k (1- depth))) kinds)))
+    (cons 'format (cons ctl args))))
+
 (defun fz-control (depth)
   "A random control-flow / binding form."
   (let ((d (1- depth)))
@@ -239,6 +301,18 @@
      ((fz-chance 12) (list 'catch (list 'quote 'tag)
                            (list 'throw (list 'quote 'tag) (fz-expr d))))
      ((fz-chance 20) (list 'ignore-errors (fz-expr d)))
+     ;; The printer's dynamic variables change what `prin1' emits, which is a
+     ;; parity surface of its own.
+     ((fz-chance 14)
+      (list 'let (list (list (fz-pick '(print-length print-level))
+                            (fz-atom 'small)))
+            (list 'prin1-to-string (fz-expr d))))
+     ((fz-chance 14)
+      (list 'let (list (list (fz-pick '(print-escape-newlines
+                                        print-escape-control-characters
+                                        print-quoted))
+                            t))
+            (list 'prin1-to-string (fz-expr d))))
      ((fz-chance 30) (list 'dotimes (list 'i (fz-atom 'small)) (fz-expr d)))
      (t (list 'progn (fz-expr d) (fz-expr d))))))
 
@@ -248,6 +322,7 @@
    ((<= depth 0) (fz-leaf 'any))
    ((fz-chance 22) (fz-leaf (fz-pick '(any any list vec str))))
    ((fz-chance 12) (fz-control depth))
+   ((fz-chance 8) (fz-format-form depth))
    (t (fz-build (fz-pick fz-calls) (1- depth)))))
 
 ;;; ── main ─────────────────────────────────────────────────────────────────────

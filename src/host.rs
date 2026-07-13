@@ -3268,15 +3268,12 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 if args.len() < 2 {
                     return Err(format!("wrong-number-of-arguments: mapcar {}", args.len()));
                 }
-                let seq = with_host(|h| h.seq_vec(&args[1])).ok_or_else(|| {
-                    format!(
-                        "wrong-type-argument: sequencep {}",
-                        with_host(|h| h.print(&args[1], true))
-                    )
-                })?;
+                // An improper list names its tail; a non-sequence names itself.
+                let seq = with_host(|h| h.seq_vec_checked(&args[1]))?;
+                let f = with_host(|h| h.function_designator(&args[0]));
                 let mut out = Vec::with_capacity(seq.len());
                 for e in seq {
-                    out.push(call_function(&args[0], &[e])?);
+                    out.push(call_function(&f, &[e])?);
                 }
                 return Ok(with_host(|h| h.list_from(out)));
             }
@@ -3284,14 +3281,10 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 if args.len() < 2 {
                     return Err(format!("wrong-number-of-arguments: mapc {}", args.len()));
                 }
-                let seq = with_host(|h| h.seq_vec(&args[1])).ok_or_else(|| {
-                    format!(
-                        "wrong-type-argument: sequencep {}",
-                        with_host(|h| h.print(&args[1], true))
-                    )
-                })?;
+                let seq = with_host(|h| h.seq_vec_checked(&args[1]))?;
+                let f = with_host(|h| h.function_designator(&args[0]));
                 for e in seq {
-                    call_function(&args[0], &[e])?;
+                    call_function(&f, &[e])?;
                 }
                 return Ok(args[1].clone());
             }
@@ -3325,7 +3318,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 // keyword form is non-destructive unless `:in-place t`.
                 let mut in_place;
                 if args.len() == 2 && !is_kw(&args[1]) {
-                    pred = Some(args[1].clone());
+                    pred = Some(with_host(|h| h.function_designator(&args[1])));
                     in_place = true;
                 } else {
                     in_place = false;
@@ -3335,7 +3328,9 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                         let val = args.get(idx + 1).cloned().unwrap_or(Value::Undef);
                         let truthy = !matches!(val, Value::Undef | Value::Bool(false));
                         match kw.as_str() {
-                            ":lessp" | ":predicate" => pred = Some(val),
+                            ":lessp" | ":predicate" => {
+                                pred = Some(with_host(|h| h.function_designator(&val)))
+                            }
                             ":key" => {
                                 if truthy {
                                     key = Some(val)
