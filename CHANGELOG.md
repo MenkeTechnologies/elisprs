@@ -43,6 +43,33 @@ All notable changes to elisprs are documented here. The format follows
   the second and later `(eval 2.5 t)` in a process answered `2`. Fixed in fusevm
   0.14.6.
 
+### Fixed (correctness — the warm script cache)
+A cache hit skips the reader, the compiler AND the prelude, replaying cached chunks
+onto a restored heap image. That is a different code path from a cold run — and the
+one every user hits on the *second* run of any script. It was wrong in four ways,
+all of which made a script behave differently the second time it ran:
+
+- **The image double-applied the file's own effects.** It was captured *after* the
+  file ran, so a prelude object the file mutated came back already mutated and the
+  replayed chunks mutated it again — `(get 'g 'custom-group)` returned the previous
+  run's entries. An order-dependent flag changed the result outright: a
+  `make-variable-buffer-local` left `buffer_local_auto` set, so replaying the file's
+  own `(defvar bl-y nil)` created a buffer-local binding the cold run never had and
+  `local-variable-p` answered `t` instead of `nil`. The image is now the heap as it
+  stood *before* the file ran; only `special` (which the compiler sets, and a hit
+  does not compile) is carried forward.
+- **The OClosure side table was lost.** It is built when the prelude runs, so every
+  prelude OClosure came back a plain closure: `oclosure--copy: "not an OClosure"`.
+- **A closure's captured environment was not serialized.** Restored closures had
+  captured nothing, so the prelude's OClosure accessors signalled
+  `void-variable index`.
+- `scripts/run_examples.sh` now runs every example **twice** — cold, then warm.
+  Running each once is what let all of this hide: `oclosure`, `mode-buffer-local`,
+  `language-info-alist`, `custom-autoload` and `defcustom-decl` each passed cold and
+  failed warm. All 71 now pass on both runs.
+
+Cache format → v4.
+
 ### Fixed (correctness — round 3, from the same fuzz harness)
 - **A handled error poisoned the next one.** An error travels on two channels: the
   message returns as a `Result::Err` string, while the structured object

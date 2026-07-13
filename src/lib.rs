@@ -162,12 +162,18 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
     };
 
     let debug = std::env::var_os("ELISPRS_CACHE_DEBUG").is_some();
-    if let Some((chunks, heap)) = cache::get(path, mtime_ns, &schema_key) {
+    if let Some((chunks, heap, oclosure_meta)) = cache::get(path, mtime_ns, &schema_key) {
         if debug {
             eprintln!("elisprs: cache HIT  {path} ({} chunks)", chunks.len());
         }
         host::reset_host();
-        host::with_host(|h| h.import_heap_image(heap));
+        host::with_host(|h| {
+            h.import_heap_image(heap);
+            // The OClosure table is built when the prelude runs, which this hit
+            // skips — restore it or every prelude OClosure comes back as a plain
+            // closure.
+            h.import_oclosure_meta(oclosure_meta);
+        });
         return with_load_file_name(path, || {
             let mut last = Value::Undef;
             for chunk in chunks {
@@ -187,12 +193,15 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
     load_prelude();
     let builtin_count = host::with_host(|h| h.builtin_count());
     let prelude_end = host::with_host(|h| h.arena_len());
-    let baseline = host::with_host(|h| h.snapshot_values(builtin_count, prelude_end));
+    // The clean prelude heap, captured BEFORE the file runs: this is the state the
+    // cached chunks replay onto, so it must not contain any of their effects.
+    let clean_prelude = host::with_host(|h| h.export_heap_range(builtin_count, prelude_end));
 
     // Bind load-file-name only while the forms run; unbind before the clean heap
     // image is captured so the cached image carries no transient load binding.
     let (chunks, last) = with_load_file_name(path, || run_top_forms(&src))?;
-    let heap = host::with_host(|h| h.export_heap_image_clean(prelude_end, &baseline));
-    cache::put(path, mtime_ns, &schema_key, &chunks, &heap);
+    let heap = host::with_host(|h| h.export_heap_image_clean(prelude_end, &clean_prelude));
+    let oclosure_meta = host::with_host(|h| h.export_oclosure_meta());
+    cache::put(path, mtime_ns, &schema_key, &chunks, &heap, &oclosure_meta);
     Ok(last)
 }

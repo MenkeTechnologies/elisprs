@@ -46,9 +46,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Magic header bytes — fail fast if a wrong-format file is read. ("ELSP")
 pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// Bumped on incompatible rkyv schema changes. v2 adds the header + binary-mtime;
-/// v3 adds `SerObj::Symbol::interned`, without which a cache hit re-interned every
+/// v3 adds `SerObj::Symbol::interned`; v4 rolls every runtime-mutated symbol cell
+/// (function, buffer-local-auto, alias) back to its pre-run state, not just the value.
 /// symbol in the heap image and an uninterned prelude local could shadow a builtin.
-pub const SHARD_FORMAT_VERSION: u32 = 3;
+pub const SHARD_FORMAT_VERSION: u32 = 4;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next
@@ -87,6 +88,10 @@ struct Entry {
     forms: Vec<Vec<u8>>,
     /// bincode `Vec<SerObj>` — the clean (pre-user-run) heap image.
     heap: Vec<u8>,
+    /// bincode `Vec<(u32, u32, Vec<u32>)>` — the OClosure side table
+    /// (`closure-handle, type, slots`). Not derivable from `heap`: it is built
+    /// when the prelude runs, which a cache hit skips.
+    oclosure_meta: Vec<u8>,
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize)]
@@ -238,7 +243,12 @@ fn write_shard(shard: &Shard) -> std::io::Result<()> {
 /// `schema_key` must match the key the entry was written under (see `schema_key`).
 /// Misses on: cache disabled, format/schema drift, mtime mismatch, or a binary
 /// newer than the cached entry.
-pub fn get(path: &str, mtime_ns: i64, schema_key: &str) -> Option<(Vec<Chunk>, Vec<SerObj>)> {
+#[allow(clippy::type_complexity)]
+pub fn get(
+    path: &str,
+    mtime_ns: i64,
+    schema_key: &str,
+) -> Option<(Vec<Chunk>, Vec<SerObj>, Vec<(u32, u32, Vec<u32>)>)> {
     if !cache_enabled() {
         return None;
     }
@@ -265,12 +275,21 @@ pub fn get(path: &str, mtime_ns: i64, schema_key: &str) -> Option<(Vec<Chunk>, V
         .collect::<Result<_, _>>()
         .ok()?;
     let heap: Vec<SerObj> = bincode::deserialize(&entry.heap).ok()?;
-    Some((chunks, heap))
+    let oclosure_meta: Vec<(u32, u32, Vec<u32>)> =
+        bincode::deserialize(&entry.oclosure_meta).ok()?;
+    Some((chunks, heap, oclosure_meta))
 }
 
 /// Store a compiled script. Best-effort — any failure just skips caching. Takes
 /// an exclusive `flock` so concurrent writers can't clobber each other's shard.
-pub fn put(path: &str, mtime_ns: i64, schema_key: &str, chunks: &[Chunk], heap: &[SerObj]) {
+pub fn put(
+    path: &str,
+    mtime_ns: i64,
+    schema_key: &str,
+    chunks: &[Chunk],
+    heap: &[SerObj],
+    oclosure_meta: &[(u32, u32, Vec<u32>)],
+) {
     if !cache_enabled() {
         return;
     }
@@ -282,6 +301,9 @@ pub fn put(path: &str, mtime_ns: i64, schema_key: &str, chunks: &[Chunk], heap: 
         return;
     };
     let Ok(heap_blob) = bincode::serialize(heap) else {
+        return;
+    };
+    let Ok(oclosure_blob) = bincode::serialize(oclosure_meta) else {
         return;
     };
 
@@ -305,6 +327,7 @@ pub fn put(path: &str, mtime_ns: i64, schema_key: &str, chunks: &[Chunk], heap: 
             cached_at_secs: now_secs(),
             forms,
             heap: heap_blob,
+            oclosure_meta: oclosure_blob,
         },
     );
     shard.header.built_at_secs = now_secs() as u64;
@@ -374,6 +397,7 @@ mod tests {
                 cached_at_secs: 4,
                 forms: vec![vec![9, 9, 9]],
                 heap: vec![1, 2],
+                oclosure_meta: vec![3, 4],
             },
         );
         let bytes = rkyv::to_bytes::<_, 4096>(&shard).unwrap();

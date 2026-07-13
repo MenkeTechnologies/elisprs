@@ -88,3 +88,49 @@ fn warm_cache_preserves_prelude_definitions() {
     assert_eq!(cold, "(1 2) t 2305843009213693951\n", "cold run");
     assert_eq!(warm, cold, "warm cache diverged from cold");
 }
+
+/// A cache hit replays the file's chunks onto the restored image, so the image has
+/// to be the heap as it stood BEFORE the file ran. Exporting the *post-run* heap
+/// double-applied every effect the file had:
+///
+///   - `make-variable-buffer-local` left `buffer_local_auto` set, so replaying the
+///     file's own `(defvar bl-y nil)` created a buffer-local binding the cold run
+///     never had, and `local-variable-p` answered t instead of nil;
+///   - a prelude object the file mutated came back already mutated — the
+///     symbol-plist table returned the previous run's entries and the replay
+///     appended to them again.
+#[test]
+fn warm_cache_does_not_double_apply_the_files_own_effects() {
+    let script = r#"
+(defvar bl-y nil)
+(make-variable-buffer-local 'bl-y)
+(put 'pg 'custom-group '(one))
+(princ (format "%S %S %S\n"
+               (local-variable-p 'bl-y)
+               (local-variable-if-set-p 'bl-y)
+               (get 'pg 'custom-group)))
+"#;
+    let (cold, warm) = run_cold_then_warm("effects", script);
+    assert_eq!(cold, "nil t (one)\n", "cold run");
+    assert_eq!(warm, cold, "a warm cache re-applied the file's own effects");
+}
+
+/// The OClosure side table and a closure's captured environment are built when the
+/// PRELUDE runs — which a cache hit skips — so both must ride in the image. Without
+/// the table every prelude OClosure came back a plain closure
+/// (`oclosure--copy: "not an OClosure"`); without the captured env its accessors
+/// signalled `void-variable index`.
+#[test]
+fn warm_cache_restores_oclosures_and_captured_environments() {
+    let script = r#"
+(oclosure-define oc-pt x y)
+(let ((o (oclosure-lambda (oc-pt (x 3) (y 4)) () (+ x y))))
+  (princ (format "%S %S %S\n" (funcall o) (oc-pt--x o) (oclosure-type o))))
+"#;
+    let (cold, warm) = run_cold_then_warm("oclosure", script);
+    assert_eq!(cold, "7 3 oc-pt\n", "cold run");
+    assert_eq!(
+        warm, cold,
+        "warm cache lost the OClosure metadata or its captures"
+    );
+}

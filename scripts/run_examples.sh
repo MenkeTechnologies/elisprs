@@ -25,20 +25,32 @@ if [ -z "$BIN" ]; then
 fi
 echo "running examples with: $BIN"
 
+# Each example runs TWICE: once with a cold rkyv script cache, then once warm.
+# A warm run skips the reader, the compiler AND the prelude, replaying cached
+# chunks onto a restored heap image — a completely different code path, and the
+# one real users hit on every run after the first. Running each example once left
+# it untested: `oclosure`, `mode-buffer-local`, `language-info-alist`,
+# `custom-autoload` and `defcustom-decl` all passed cold and failed warm.
 fail=0
 total=0
 for f in examples/*.el; do
   total=$((total + 1))
   stem="$(basename "$f" .el)"
-  if "$BIN" "$f" >/dev/null 2>&1; then
-    echo "ok   $stem"
-  else
+  if ! "$BIN" "$f" >/dev/null 2>&1; then
     code=$?
-    echo "FAIL $stem (exit $code)"
-    # Re-run showing output so the CI log captures the failure detail.
-    "$BIN" "$f" 2>&1 | sed 's/^/     | /'
+    echo "FAIL $stem (cold, exit $code)"
+    "$BIN" "$f" 2>&1 | perl -pe 's/^/     | /'
     fail=$((fail + 1))
+    continue
   fi
+  if ! "$BIN" "$f" >/dev/null 2>&1; then
+    code=$?
+    echo "FAIL $stem (WARM CACHE, exit $code) -- passed cold, failed on re-run"
+    "$BIN" "$f" 2>&1 | perl -pe 's/^/     | /'
+    fail=$((fail + 1))
+    continue
+  fi
+  echo "ok   $stem (cold + warm)"
 done
 
 echo "---"

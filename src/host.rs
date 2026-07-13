@@ -32,7 +32,7 @@ pub const MAX_CHAR: u32 = 0x3F_FFFF;
 /// A serializable mirror of a heap object — everything except `Subr` (a native
 /// fn pointer, re-installed by `install`). Used to ship the user/prelude heap
 /// into an AOT object so `Value::Obj` handles resolve in the AOT-runtime host.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum SerObj {
     Cons(Value, Value),
     Symbol {
@@ -75,6 +75,11 @@ pub enum SerObj {
         rest: Option<u32>,
         body: Chunk,
         is_macro: bool,
+        /// The captured lexical environment, innermost binding first, as
+        /// `(symbol-handle, value)`. A closure without its captures is a closure
+        /// whose body cannot run.
+        #[serde(default)]
+        env: Vec<(u32, Value)>,
     },
     Bignum(BigInt),
 }
@@ -128,6 +133,15 @@ pub struct Scope {
 pub type Lex = Option<Rc<Scope>>;
 
 impl Scope {
+    /// A single binding, linked in front of `parent`.
+    pub(crate) fn new(sym: u32, val: Value, parent: Lex) -> Self {
+        Scope {
+            sym,
+            val: RefCell::new(val),
+            parent,
+        }
+    }
+
     /// The bound symbol's arena handle.
     pub(crate) fn sym_handle(&self) -> u32 {
         self.sym
@@ -445,6 +459,18 @@ pub struct ElispHost {
 pub struct ClosureSrc {
     pub arglist: Value,
     pub body: Vec<Value>,
+}
+
+/// The cells of a symbol that the *running* file may mutate, snapshotted before
+/// it runs so a cached heap image can roll them back (the cached chunks replay
+/// every one of them on a hit). `special` is absent on purpose: the compiler sets
+/// it, and a cache hit does not compile.
+#[derive(Clone, Default)]
+pub struct SymbolBaseline {
+    pub value: Option<Value>,
+    pub function: Option<Value>,
+    pub buffer_local_auto: bool,
+    pub alias_of: Option<u32>,
 }
 
 /// Type + slot layout attached to an [`Obj::Closure`] to make it an OClosure.
@@ -1515,6 +1541,7 @@ impl ElispHost {
                     params,
                     body,
                     is_macro,
+                    env,
                     ..
                 } => SerObj::Closure {
                     required: params.required.clone(),
@@ -1522,6 +1549,7 @@ impl ElispHost {
                     rest: params.rest,
                     body: (**body).clone(),
                     is_macro: *is_macro,
+                    env: self.flatten_lex(env),
                 },
                 // No Subr ever lives in the user range (only `install` makes them).
                 Obj::Subr { .. } => SerObj::Symbol {
@@ -1603,10 +1631,103 @@ impl ElispHost {
     }
     /// Snapshot the value cells of symbols in `[start, end)` (used to capture the
     /// post-prelude baseline before running a user script for the cache).
-    pub fn snapshot_values(&self, start: usize, end: usize) -> Vec<Option<Value>> {
+    /// A scope chain as `(symbol-handle, value)` pairs, innermost first.
+    pub fn flatten_lex(&self, env: &Lex) -> Vec<(u32, Value)> {
+        let mut out = Vec::new();
+        let mut cur = env.clone();
+        while let Some(scope) = cur {
+            out.push((scope.sym_handle(), scope.value()));
+            cur = scope.parent_lex();
+        }
+        out
+    }
+
+    /// Rebuild a scope chain from [`Self::flatten_lex`]'s output.
+    pub fn rebuild_lex(&self, pairs: Vec<(u32, Value)>) -> Lex {
+        let mut env: Lex = None;
+        // Innermost first on the way out, so re-link from the outermost in.
+        for (sym, val) in pairs.into_iter().rev() {
+            env = Some(Rc::new(Scope::new(sym, val, env)));
+        }
+        env
+    }
+
+    /// One heap object in its serializable form. `id` is its arena handle (needed
+    /// to decide whether a symbol owns its name in the obarray).
+    fn ser_obj(&self, o: &Obj, id: u32) -> SerObj {
+        match o {
+            Obj::Bignum(b) => SerObj::Bignum(b.clone()),
+            Obj::Symbol(s) => SerObj::Symbol {
+                name: s.name.clone(),
+                value: s.value.clone(),
+                function: s.function.clone(),
+                special: s.special,
+                buffer_local_auto: s.buffer_local_auto,
+                alias_of: s.alias_of,
+                interned: self.symbol_is_interned(s, id),
+            },
+            Obj::Cons(a, b) => SerObj::Cons(a.clone(), b.clone()),
+            Obj::Vector(v) => SerObj::Vector(v.clone()),
+            Obj::HashTable { test, entries } => SerObj::HashTable {
+                test: *test,
+                entries: entries.clone(),
+            },
+            Obj::CharTable(t) => SerObj::CharTable {
+                subtype: t.subtype.clone(),
+                default: t.default.clone(),
+                parent: t.parent.clone(),
+                extra: t.extra.clone(),
+                ranges: t.ranges.clone(),
+            },
+            Obj::Closure {
+                params,
+                body,
+                is_macro,
+                env,
+                ..
+            } => SerObj::Closure {
+                required: params.required.clone(),
+                optional: params.optional.clone(),
+                rest: params.rest,
+                body: (**body).clone(),
+                is_macro: *is_macro,
+                env: self.flatten_lex(env),
+            },
+            // Runtime-only objects (and subrs, which `install` recreates): a
+            // placeholder keeps the arena indices aligned.
+            Obj::Subr { .. } | Obj::Buffer(_) | Obj::Marker(_) | Obj::Obarray(_) => {
+                SerObj::Symbol {
+                    name: "--unexpected-runtime-obj--".to_string(),
+                    value: None,
+                    function: None,
+                    special: false,
+                    buffer_local_auto: false,
+                    alias_of: None,
+                    interned: false,
+                }
+            }
+        }
+    }
+
+    /// Serialize an arena range exactly as it stands. Taken right after the
+    /// prelude, this is the clean state the cached chunks expect to replay onto.
+    pub fn export_heap_range(&self, start: usize, end: usize) -> Vec<SerObj> {
+        self.arena[start..end]
+            .iter()
+            .enumerate()
+            .map(|(off, o)| self.ser_obj(o, (start + off) as u32))
+            .collect()
+    }
+
+    pub fn snapshot_values(&self, start: usize, end: usize) -> Vec<Option<SymbolBaseline>> {
         (start..end)
             .map(|i| match self.arena.get(i) {
-                Some(Obj::Symbol(s)) => s.value.clone(),
+                Some(Obj::Symbol(s)) => Some(SymbolBaseline {
+                    value: s.value.clone(),
+                    function: s.function.clone(),
+                    buffer_local_auto: s.buffer_local_auto,
+                    alias_of: s.alias_of,
+                }),
                 _ => None,
             })
             .collect()
@@ -1618,78 +1739,43 @@ impl ElispHost {
     pub fn export_heap_image_clean(
         &self,
         prelude_end: usize,
-        baseline: &[Option<Value>],
+        clean_prelude: &[SerObj],
     ) -> Vec<SerObj> {
-        self.arena[self.builtin_count..]
-            .iter()
-            .enumerate()
-            .map(|(off, o)| {
-                let idx = self.builtin_count + off;
-                match o {
-                    Obj::Bignum(b) => SerObj::Bignum(b.clone()),
-                    Obj::Symbol(s) => {
-                        let value = if idx < prelude_end {
-                            baseline.get(idx - self.builtin_count).cloned().flatten()
-                        } else {
-                            None
-                        };
-                        SerObj::Symbol {
-                            name: s.name.clone(),
-                            value,
-                            function: s.function.clone(),
-                            special: s.special,
-                            buffer_local_auto: s.buffer_local_auto,
-                            alias_of: s.alias_of,
-                            interned: self.symbol_is_interned(s, idx as u32),
-                        }
-                    }
-                    Obj::Cons(a, b) => SerObj::Cons(a.clone(), b.clone()),
-                    Obj::Vector(v) => SerObj::Vector(v.clone()),
-                    Obj::HashTable { test, entries } => SerObj::HashTable {
-                        test: *test,
-                        entries: entries.clone(),
-                    },
-                    Obj::CharTable(t) => SerObj::CharTable {
-                        subtype: t.subtype.clone(),
-                        default: t.default.clone(),
-                        parent: t.parent.clone(),
-                        extra: t.extra.clone(),
-                        ranges: t.ranges.clone(),
-                    },
-                    // Runtime-only; never legitimately serialized (see above).
-                    Obj::Buffer(_) | Obj::Marker(_) | Obj::Obarray(_) => SerObj::Symbol {
-                        name: "--unexpected-runtime-obj--".to_string(),
-                        value: None,
-                        function: None,
-                        special: false,
-                        buffer_local_auto: false,
-                        alias_of: None,
-                        interned: false,
-                    },
-                    Obj::Closure {
-                        params,
-                        body,
-                        is_macro,
-                        ..
-                    } => SerObj::Closure {
-                        required: params.required.clone(),
-                        optional: params.optional.clone(),
-                        rest: params.rest,
-                        body: (**body).clone(),
-                        is_macro: *is_macro,
-                    },
-                    Obj::Subr { .. } => SerObj::Symbol {
-                        name: "--unexpected-subr--".to_string(),
-                        value: None,
-                        function: None,
-                        special: false,
-                        buffer_local_auto: false,
-                        alias_of: None,
-                        interned: false,
-                    },
-                }
-            })
-            .collect()
+        // The image a cache hit replays onto must be the heap as it stood BEFORE
+        // this file ran, because the cached chunks re-apply every effect the file
+        // had. Exporting the post-run heap double-applies them:
+        //
+        //   - a prelude object the file mutated comes back already mutated. The
+        //     symbol-plist table is the visible case — `(get 'g 'custom-group)`
+        //     returned the previous run's entries, and the replay appended to
+        //     them again.
+        //   - an order-dependent symbol flag changes the result outright: a
+        //     `make-variable-buffer-local` left `buffer_local_auto` set, so
+        //     replaying the file's own `(defvar bl-y nil)` created a buffer-local
+        //     binding the cold run never had.
+        //
+        // So: prelude objects come from the snapshot taken before the run, and
+        // objects the file itself created keep only what the COMPILER gave them
+        // (`special` — a cache hit does not compile, so nothing would set it
+        // again); everything the chunks set at run time is cleared.
+        let mut out: Vec<SerObj> = clean_prelude.to_vec();
+        for (off, o) in self.arena[prelude_end..].iter().enumerate() {
+            let id = (prelude_end + off) as u32;
+            let ser = match o {
+                Obj::Symbol(s) => SerObj::Symbol {
+                    name: s.name.clone(),
+                    value: None,
+                    function: None,
+                    special: s.special,
+                    buffer_local_auto: false,
+                    alias_of: None,
+                    interned: self.symbol_is_interned(s, id),
+                },
+                other => self.ser_obj(other, id),
+            };
+            out.push(ser);
+        }
+        out
     }
     /// Rebuild the user/prelude heap from an image. Must be called on a fresh
     /// host (arena == builtins only) so handles line up with compile time.
@@ -1745,6 +1831,7 @@ impl ElispHost {
                     rest,
                     body,
                     is_macro,
+                    env,
                 } => Obj::Closure {
                     params: Rc::new(Params {
                         required,
@@ -1754,7 +1841,7 @@ impl ElispHost {
                     src: Rc::new(ClosureSrc::default()),
                     body: Rc::new(body),
                     is_macro,
-                    env: None,
+                    env: self.rebuild_lex(env),
                 },
             };
             self.arena.push(obj);
@@ -2849,6 +2936,30 @@ impl ElispHost {
     /// Restore a scope chain taken by [`Self::take_lex`].
     pub fn restore_lex(&mut self, lex: Lex) {
         self.lex = lex;
+    }
+
+    /// The OClosure side table, flattened for the cache: `(closure-handle, type,
+    /// slot-handles)`.
+    ///
+    /// It is NOT reconstructible from the heap image: `oclosure--fix-type` runs
+    /// when the *prelude* runs (`oclosure--accessor-prototype` is a prelude
+    /// `defconst`), and a cache hit skips the prelude. Without it, every prelude
+    /// OClosure came back as a plain closure and `oclosure--copy` answered
+    /// "not an OClosure" on the second run of any script.
+    pub fn export_oclosure_meta(&self) -> Vec<(u32, u32, Vec<u32>)> {
+        self.oclosure_meta
+            .iter()
+            .map(|(id, m)| (*id, m.ty, m.slots.clone()))
+            .collect()
+    }
+
+    /// Restore the table exported by [`Self::export_oclosure_meta`]. Handles line
+    /// up because the image is imported into a host whose arena is at exactly the
+    /// length it had when the image was taken.
+    pub fn import_oclosure_meta(&mut self, meta: Vec<(u32, u32, Vec<u32>)>) {
+        for (id, ty, slots) in meta {
+            self.oclosure_meta.insert(id, OClosureMeta { ty, slots });
+        }
     }
 
     /// A sequence's elements, or Emacs's error for what it actually is.
