@@ -40,7 +40,7 @@ crate-type = ["rlib", "staticlib"]
 # persistent on-disk cache of compiled native code (keyed by chunk hash), so
 # hot elisp loops trace-compile and warm runs skip recompilation. The cache
 # directory defaults to fusevm's own, or `FUSEVM_JIT_CACHE_DIR` if set.
-fusevm = { version = "0.14.5", features = ["jit-disk-cache", "aot"] }
+fusevm = { version = "0.14.6", features = ["jit-disk-cache", "aot"] }
 
 # `elisp --lsp` speaks LSP over stdio (src/lsp.rs); `elisp --dap` speaks the
 # Debug Adapter Protocol over stdio (src/dap.rs). libc gives the DAP server a
@@ -56,6 +56,15 @@ serde_json = "1"
 rkyv = { version = "0.7", features = ["validation", "archive_le", "size_32"] }
 bincode = "1"
 libc = "0.2"
+# Emacs promotes an integer that leaves fixnum range to a bignum, so parity needs
+# arbitrary-precision integers: `(expt 2 70)`, `(* 1e12 1e12)`, `(1+ most-positive-fixnum)`.
+# num-bigint is the rust-num implementation — pure Rust (no GMP to link, unlike
+# Emacs itself), vendorable, and stable since 2015. The `serde` feature lets a
+# bignum ride through `SerObj` into the AOT heap image like every other heap object.
+num-bigint = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+num-integer = "0.1"
+
 # Emacs-Lisp regexps (string-match / replace-regexp-in-string / match-string).
 # elisp regexp syntax is translated to the `regex`-dialect in src/regexp.rs;
 # `fancy-regex` is the matching engine — it adds a backtracking fallback for

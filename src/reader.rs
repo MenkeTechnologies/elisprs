@@ -8,6 +8,7 @@
 
 use crate::host::{ElispHost, Obj};
 use fusevm::Value;
+use num_bigint::BigInt;
 
 pub fn read_all(h: &mut ElispHost, src: &str) -> Result<Vec<Value>, String> {
     let mut r = Reader {
@@ -728,13 +729,22 @@ fn classify(h: &mut ElispHost, tok: &str) -> Value {
     }
     if !tok.starts_with(':') {
         if let Ok(i) = tok.parse::<i64>() {
-            return Value::Int(i);
+            return h.make_integer(BigInt::from(i));
+        }
+        // Too big for an i64 but still all digits: a bignum, exactly as in Emacs.
+        // Reading it as an f64 (the `looks_numeric` fallback below) would both
+        // lose precision and change the type from integer to float.
+        if let Ok(b) = tok.parse::<BigInt>() {
+            return h.make_integer(b);
         }
         // A trailing decimal point with no fractional digits is an integer in
         // elisp: `1.` => 1, `-3.` => -3 (but `1.5`/`1.e3` are floats).
         if let Some(intpart) = tok.strip_suffix('.') {
             if let Ok(i) = intpart.parse::<i64>() {
                 return Value::Int(i);
+            }
+            if let Ok(b) = intpart.parse::<BigInt>() {
+                return h.make_integer(b);
             }
         }
         if looks_numeric(tok) {

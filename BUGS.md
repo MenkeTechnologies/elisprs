@@ -13,6 +13,52 @@ elref() { emacs -Q --batch --eval "(prin1 $1)" 2>&1; }   # ground truth
 
 ---
 
+## Differential fuzzing vs Emacs 30.2 — ✅ FIXED
+
+`scripts/fuzz_parity.sh` generates a seeded corpus of random elisp forms and runs
+every one under both `emacs -Q --batch` (ground truth) and `elisp`, comparing the
+value *and* the signalled error. It reduced a 2,000-form corpus from 334 diverging
+forms to 119, and the residue is error-data shape in corners (a closure's printed
+form inside `wrong-number-of-arguments`, `invalid-function` data, `args-out-of-range`
+on some `seq-*` paths). What it found and what was fixed:
+
+- **Integer overflow wrapped instead of promoting.** Emacs's integers are
+  unbounded; `(expt 2 70)` answered `0`, `(* 1000000000000 1000000000000)` wrapped.
+  elisprs now has bignums (`Obj::Bignum`), and integers promote everywhere: the
+  arithmetic ops, `expt`/`ash`/`lsh`/`abs`/bitwise, `/` `%` `mod`, rounding, the
+  reader (a literal too big for an `i64` silently became a *float*), the printer,
+  `eq`/`eql`/`equal`, `sxhash`, `format`, `number-to-string`, `string-to-number`.
+- **Arithmetic coerced non-numbers.** `(+ 1 "a")` answered `1.0` and
+  `(min "str" 1)` answered `"str"` — fusevm's ops are awk-flavoured, and the
+  compiler lowers elisp's `+`/`-`/`*`/comparisons straight to them. fusevm 0.14.6
+  added a numeric hook so those ops delegate the cases they cannot compute; elisp
+  now signals `(wrong-type-argument number-or-marker-p "a")`.
+- **`(eval 2.5 t)` answered `2` the second time.** fusevm's block JIT returned its
+  result register as `Value::Int` unconditionally, truncating any float chunk
+  result once the cache was warm.
+- **A warm script cache shadowed the `exp` builtin.** The heap image re-interned
+  uninterned symbols; the prelude binds a local named `exp`. Cold run: `0.367…`.
+  Warm run: `void-function exp`.
+- **Comparison was lossy** above 2^53 (`=` compared `f64`s).
+- **Float printing** did not follow Emacs's shortest-round-trip `%g`.
+- **Error data** leaked raw heap handles (`(obj:154357)`), omitted the offending
+  value, and used one predicate where Emacs uses four (`numberp` /
+  `number-or-marker-p` / `integerp` / `integer-or-marker-p`).
+- **Regexp errors** leaked `fancy-regex`'s parser text; Emacs's own messages and
+  tolerances (`"*x"`, `[z-a]`) are reproduced now.
+- `match-data` trailing unmatched groups, `print-escape-control-characters`,
+  `seq-union` dedup, and the `string-suffix-p` / `nconc` / `string-to-vector` /
+  `concat` / `remq` / `delq` / `string=` tolerances.
+
+Reproduce any of it:
+
+```sh
+bash scripts/fuzz_parity.sh -n 2000 -s 1      # seeded: same corpus every run
+bash scripts/fuzz_parity.sh -c corpus.el      # re-check a saved corpus
+```
+
+---
+
 ## Additional parity gaps found via sweep — ✅ FIXED
 
 Beyond the numbered entries below, fresh `elisp` vs `emacs -Q` sweeps surfaced

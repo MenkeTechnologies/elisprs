@@ -238,6 +238,17 @@ Coverage spans `reader.rs` unit tests (number-vs-symbol tokenization, `#'` desug
 
 The [`examples/*.el`](examples) scripts are self-testing: each uses the prelude's ERT surface (`ert-deftest` / `should` / `should-error`) and `ert-run-tests-batch-and-exit`, which exits non-zero on any failure. [`tests/examples.rs`](tests/examples.rs) runs every example through the built `elisp` binary as a `cargo test` gate, and the CI `examples` job runs them through the release binary on Linux + macOS.
 
+### Differential fuzzing against GNU Emacs
+
+```bash
+bash scripts/fuzz_parity.sh              # 500 random forms, seed 1
+bash scripts/fuzz_parity.sh -n 5000 -s 42
+```
+
+[`scripts/fuzz_parity.sh`](scripts/fuzz_parity.sh) generates a corpus of random elisp forms from a seeded grammar ([`scripts/fuzz/gen.el`](scripts/fuzz/gen.el)), evaluates every form under **both** `emacs -Q --batch` (ground truth) and `elisp` through one shared driver ([`scripts/fuzz/drive.el`](scripts/fuzz/drive.el)), and reports every form whose value — or whose signalled error — differs. Errors are compared too: Emacs's error symbol and error data are as much of the contract as the return value.
+
+The seed makes a divergence reproduce exactly on any machine, and a crash or hang in one form is isolated rather than losing the rest of the corpus. It needs a real `emacs` on `PATH`; the parity gaps it has already closed are recorded in [BUGS.md](BUGS.md).
+
 ---
 
 ## [0x09] DOCUMENTATION // RENDERED HTML + MARKDOWN

@@ -85,8 +85,6 @@ pub const PRELUDE: &str = r#"
 (defun evenp (x) (zerop (% x 2)))
 (defun oddp (x) (not (zerop (% x 2))))
 (defun natnump (x) (and (integerp x) (>= x 0)))
-(defun fixnump (x) (integerp x))
-(defun bignump (_x) nil)
 (defun wholenump (x) (natnump x))
 
 ;;; ---- list construction / access ----
@@ -243,7 +241,11 @@ pub const PRELUDE: &str = r#"
 (defun remove (x l)
   (let ((r (seq-filter (lambda (e) (not (equal e x))) (append l nil))))
     (if (vectorp l) (vconcat r) r)))
-(defun remq (x l) (seq-filter (lambda (e) (not (eq e x))) l))
+(defun remq (x l)
+  ;; Emacs: (delq X (copy-sequence LIST)) -- a non-list signals `listp', where
+  ;; the seq-filter form this used to be signalled `sequencep'.
+  (unless (listp l) (signal 'wrong-type-argument (list 'listp l)))
+  (seq-filter (lambda (e) (not (eq e x))) l))
 (defun string-to-multibyte (s) s)
 (defun string-as-multibyte (s) s)
 (defun string-to-unibyte (s &rest _) s)
@@ -264,6 +266,8 @@ pub const PRELUDE: &str = r#"
           (setq tail (cdr tail)))))
     l))
 (defun delq (x l)
+  (unless (or (null l) (proper-list-p l))
+    (signal 'wrong-type-argument (list 'listp l)))
   (if (not (listp l)) (remq x l)
     (while (and (consp l) (eq (car l) x)) (setq l (cdr l)))
     (let ((tail l))
@@ -281,13 +285,20 @@ pub const PRELUDE: &str = r#"
 (defun nconc (&rest lists)
   ;; Destructively concatenate LISTS by splicing each onto the previous tail.
   ;; (Uses `while`, not `dolist`, which is defined later in this prelude.)
+  ;; Only the arguments BEFORE the last must be lists; the last may be any object
+  ;; and becomes the final cdr: (nconc (list 1) (cons 2 "s")) => (1 2 . "s").
   (let ((result nil) (tail nil))
     (while lists
-      (let ((seg (car lists)))
+      (let ((seg (car lists)) (last (null (cdr lists))))
+        (unless (or last (listp seg))
+          (signal 'wrong-type-argument (list 'listp seg)))
         (when seg
           (if result (setcdr tail seg) (setq result seg))
-          (setq tail seg)
-          (while (cdr tail) (setq tail (cdr tail)))))
+          ;; Walk to the last cons; a non-cons segment (only possible as the last
+          ;; argument) has no tail to walk.
+          (when (consp seg)
+            (setq tail seg)
+            (while (consp (cdr tail)) (setq tail (cdr tail))))))
       (setq lists (cdr lists)))
     result))
 (defun rassq-delete-all (value alist)
@@ -536,6 +547,7 @@ pub const PRELUDE: &str = r#"
 (defvar print-length nil)
 (defvar print-level nil)
 (defvar print-escape-newlines nil)
+(defvar print-escape-control-characters nil)
 (defvar print-quoted t)
 (defvar gensym-counter 0)
 (defun gensym (&optional prefix)
@@ -1087,7 +1099,12 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 ;;; ---- strings (ASCII) ----
 ;; Emacs's string comparators accept symbols too, using their print names.
 (defun string--name (x) (if (symbolp x) (symbol-name x) x))
-(defun string= (a b) (equal (string--name a) (string--name b)))
+(defun string= (a b)
+  ;; Emacs accepts a string or a symbol on either side and signals `stringp' on
+  ;; anything else -- it does not quietly answer nil for, say, a float.
+  (unless (or (stringp a) (symbolp a)) (signal 'wrong-type-argument (list 'stringp a)))
+  (unless (or (stringp b) (symbolp b)) (signal 'wrong-type-argument (list 'stringp b)))
+  (equal (string--name a) (string--name b)))
 (defun string-equal (a b) (string= a b))
 (defun string< (a b)
   (let ((la (string-to-list (string--name a))) (lb (string-to-list (string--name b)))
@@ -1317,7 +1334,15 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 (defun seq-intersection (a b &optional testfn)
   (seq-filter (lambda (x) (seq-contains-p b x testfn)) a))
 (defun seq-union (a b &optional testfn)
-  (append (append a nil) (seq-difference b a testfn)))
+  ;; Emacs reduces an accumulator over both sequences, skipping an element it
+  ;; already holds -- so duplicates *within* A are dropped too:
+  ;; (seq-union '(1 1 2) '(2 3)) => (1 2 3), not (1 1 2 3).
+  (let ((acc nil))
+    (dolist (e (append a nil))
+      (unless (seq-contains-p acc e testfn) (setq acc (cons e acc))))
+    (dolist (e (append b nil))
+      (unless (seq-contains-p acc e testfn) (setq acc (cons e acc))))
+    (nreverse acc)))
 (defun seq-sort (pred seq) (seq-into (sort (append seq nil) pred) (seq--type-of seq)))
 (defun seq-partition (seq n)
   ;; Each chunk keeps SEQ's type (string→strings, vector→vectors, list→lists).

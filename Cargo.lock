@@ -486,6 +486,9 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "nu-ansi-term",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
  "reedline",
  "rkyv",
  "serde",
@@ -578,9 +581,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusevm"
-version = "0.14.5"
+version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86de6aa60cded919cb9ae214e4522e4f6c7becbb67603f360da54c8c7f752468"
+checksum = "769410bb540396287ad8f4bc0fa22fee92492b00fb8091eafa5670e4001ca924"
 dependencies = [
  "bincode",
  "chrono",
@@ -857,6 +860,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "num-bigint"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+dependencies = [
+ "num-integer",
+ "num-traits",
+ "serde",
+]
+
+[[package]]
+name = "num-integer"
+version = "0.1.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]

@@ -2,8 +2,9 @@
 //! ~irreducible core; the large derived surface (caar.., seq-*, cl-*, alist
 //! helpers) will be defined in an elisp prelude on top of these.
 
-use crate::host::{CharTable, ElispHost, MatchData, Obj, Resolved};
+use crate::host::{bigint_to_f64, CharTable, ElispHost, MatchData, Num, Obj, Resolved};
 use fusevm::Value;
+use num_bigint::BigInt;
 
 type R = Result<Value, String>;
 
@@ -19,15 +20,33 @@ fn is_nil(v: &Value) -> bool {
 }
 
 // ── numeric helpers ──
+/// Approximate numeric accessor: `(fixnum, as-f64, is-float)`.
+///
+/// Kept for the float-valued builtins (`sqrt`, `sin`, `log`, `ffloor`, the `%e`/
+/// `%f`/`%g` format directives …), which read only the `f64`. Anything whose
+/// result must be *exact* — arithmetic, comparison, the bit ops — uses
+/// [`as_number`] instead: a bignum cannot fit the `i64` field, and above 2^53 the
+/// `f64` field is lossy.
 fn as_num(h: &ElispHost, v: &Value) -> Result<(i64, f64, bool), String> {
     match v {
         Value::Int(n) => Ok((*n, *n as f64, false)),
         Value::Float(f) => Ok((*f as i64, *f, true)),
-        // A marker coerces to its (integer) buffer position in arithmetic.
-        _ => match h.marker_position(v) {
-            Some(p) => Ok((p as i64, p as f64, false)),
-            None => Err(format!("wrong-type-argument: numberp {}", v.as_str_cow())),
-        },
+        _ => {
+            // A bignum is exact only in `f64` here — every caller of this
+            // accessor produces a float anyway.
+            if let Some(b) = h.as_bigint(v) {
+                let f = bigint_to_f64(&b);
+                return Ok((f as i64, f, false));
+            }
+            // A marker coerces to its (integer) buffer position in arithmetic.
+            match h.marker_position(v) {
+                Some(p) => Ok((p as i64, p as f64, false)),
+                None => Err(format!(
+                    "wrong-type-argument: number-or-marker-p {}",
+                    h.print(v, true)
+                )),
+            }
+        }
     }
 }
 fn as_int(h: &ElispHost, v: &Value) -> Result<i64, String> {
@@ -36,26 +55,19 @@ fn as_int(h: &ElispHost, v: &Value) -> Result<i64, String> {
         Value::Float(f) => Ok(*f as i64),
         _ => match h.marker_position(v) {
             Some(p) => Ok(p as i64),
-            None => Err(format!("wrong-type-argument: integerp {}", v.as_str_cow())),
+            None => Err(format!(
+                "wrong-type-argument: integerp {}",
+                h.print(v, true)
+            )),
         },
     }
 }
-fn as_string(v: &Value) -> Result<String, String> {
+/// The string value of `v`, or Emacs's `(wrong-type-argument stringp X)` — with
+/// X printed as `prin1` would, never as the raw heap handle the value carries.
+fn as_string(h: &ElispHost, v: &Value) -> Result<String, String> {
     match v {
         Value::Str(s) => Ok(s.to_string()),
-        _ => Err(format!("wrong-type-argument: stringp {}", v.as_str_cow())),
-    }
-}
-/// Strict integer accessor signalling `integer-or-marker-p` on non-integers —
-/// Emacs's bitwise (`logand`/`logior`/`logxor`) and `%` argument checks reject
-/// floats rather than truncating them.
-fn as_int_om(h: &ElispHost, v: &Value) -> Result<i64, String> {
-    match v {
-        Value::Int(n) => Ok(*n),
-        _ => Err(format!(
-            "wrong-type-argument: integer-or-marker-p {}",
-            h.print(v, true)
-        )),
+        _ => Err(format!("wrong-type-argument: stringp {}", h.print(v, true))),
     }
 }
 /// Strict integer accessor signalling `integerp` (for `ash`/`lsh`/`lognot`/`logcount`).
@@ -76,6 +88,18 @@ const MOST_POSITIVE_FIXNUM: i64 = 2305843009213693951;
 /// an allocation request cannot be satisfied. `make_error_object` splits this
 /// into `(error "Memory exhausted--use C-x s then exit and restart Emacs")`.
 const MEMORY_EXHAUSTED: &str = "error: Memory exhausted--use C-x s then exit and restart Emacs";
+
+/// [`check_array_len`] on an elisp value: a bignum length is out of fixnum range
+/// by construction, so it is the `wholenump` rejection rather than a type error.
+fn check_array_len_val(h: &ElispHost, v: &Value) -> Result<usize, String> {
+    if h.is_bignum(v) {
+        return Err(format!(
+            "wrong-type-argument: wholenump {}",
+            h.print(v, true)
+        ));
+    }
+    check_array_len(as_num(h, v)?.0)
+}
 
 /// Validate a requested array/string length the way Emacs's `CHECK_FIXNAT`
 /// does: a negative value or one above `most-positive-fixnum` (a bignum) is not
@@ -100,92 +124,161 @@ fn as_char(h: &ElispHost, v: &Value) -> Result<u32, String> {
         )),
     }
 }
-fn num_result(i: i64, f: f64, isf: bool) -> Value {
-    if isf {
-        Value::Float(f)
-    } else {
-        Value::Int(i)
+
+/// The exact value of an elisp number: an integer of any size, or a float.
+///
+/// This is the accessor every builtin whose result must be *exact* uses —
+/// `+`, `*`, `-`, `/`, `expt`, `abs`, the comparisons. `as_num`'s `(i64, f64,
+/// bool)` triple cannot represent a bignum, and comparing large integers as
+/// `f64` (which it forces) calls 2^62 and 2^62+1 equal.
+///
+/// A marker coerces to its buffer position, as in Emacs. Anything that is not a
+/// number signals with Emacs's predicate and its `prin1` form (never the raw
+/// heap handle).
+fn as_number(h: &ElispHost, v: &Value) -> Result<Num, String> {
+    as_number_p(h, v, true)
+}
+
+/// [`as_number`], but choosing Emacs's predicate for the calling builtin.
+///
+/// `markers_ok` distinguishes the two families: the arithmetic ops accept a
+/// marker (as its buffer position) and signal `number-or-marker-p`, while
+/// `abs`/`floor`/`ceiling`/`round`/`truncate`/`float`/`expt`/`sqrt`/
+/// `number-to-string` take strictly a number and signal `numberp`.
+fn as_number_p(h: &ElispHost, v: &Value, markers_ok: bool) -> Result<Num, String> {
+    match v {
+        Value::Int(n) => Ok(Num::Int(BigInt::from(*n))),
+        Value::Float(f) => Ok(Num::Float(*f)),
+        _ => {
+            if let Some(b) = h.as_bigint(v) {
+                return Ok(Num::Int(b));
+            }
+            if markers_ok {
+                if let Some(p) = h.marker_position(v) {
+                    return Ok(Num::Int(BigInt::from(p)));
+                }
+            }
+            Err(format!(
+                "wrong-type-argument: {} {}",
+                if markers_ok {
+                    "number-or-marker-p"
+                } else {
+                    "numberp"
+                },
+                h.print(v, true)
+            ))
+        }
     }
 }
 
-fn add(h: &mut ElispHost, a: &[Value]) -> R {
-    let (mut i, mut f, mut isf) = (0i64, 0f64, false);
+/// Fold an n-ary exact arithmetic op (`+`, `*`, `-`) over its arguments.
+/// Integer arithmetic stays exact and promotes to a bignum; a single float
+/// operand makes the whole result a float, as in Emacs.
+fn fold_arith(
+    h: &mut ElispHost,
+    a: &[Value],
+    init: i64,
+    int_op: fn(BigInt, BigInt) -> BigInt,
+    float_op: fn(f64, f64) -> f64,
+) -> R {
+    let mut acc = Num::Int(BigInt::from(init));
     for v in a {
-        let (vi, vf, vfl) = as_num(h, v)?;
-        isf |= vfl;
-        i += vi;
-        f += vf;
+        let n = as_number(h, v)?;
+        acc = match (acc, n) {
+            (Num::Int(x), Num::Int(y)) => Num::Int(int_op(x, y)),
+            (x, y) => Num::Float(float_op(x.to_f64(), y.to_f64())),
+        };
     }
-    Ok(num_result(i, f, isf))
+    Ok(match acc {
+        Num::Int(i) => h.make_integer(i),
+        Num::Float(f) => Value::Float(f),
+    })
+}
+
+fn add(h: &mut ElispHost, a: &[Value]) -> R {
+    fold_arith(h, a, 0, |x, y| x + y, |x, y| x + y)
 }
 fn mul(h: &mut ElispHost, a: &[Value]) -> R {
-    let (mut i, mut f, mut isf) = (1i64, 1f64, false);
-    for v in a {
-        let (vi, vf, vfl) = as_num(h, v)?;
-        isf |= vfl;
-        i *= vi;
-        f *= vf;
-    }
-    Ok(num_result(i, f, isf))
+    fold_arith(h, a, 1, |x, y| x * y, |x, y| x * y)
 }
 fn sub(h: &mut ElispHost, a: &[Value]) -> R {
     if a.is_empty() {
         return Ok(Value::Int(0));
     }
-    let (i0, f0, mut isf) = as_num(h, &a[0])?;
+    // Unary `-` negates; n-ary subtracts the rest from the first.
     if a.len() == 1 {
-        return Ok(if isf {
-            Value::Float(-f0)
-        } else {
-            Value::Int(-i0)
+        return Ok(match as_number(h, &a[0])? {
+            Num::Int(x) => h.make_integer(-x),
+            Num::Float(f) => Value::Float(-f),
         });
     }
-    let (mut i, mut f) = (i0, f0);
+    let mut acc = as_number(h, &a[0])?;
     for v in &a[1..] {
-        let (vi, vf, vfl) = as_num(h, v)?;
-        isf |= vfl;
-        i -= vi;
-        f -= vf;
+        let n = as_number(h, v)?;
+        acc = match (acc, n) {
+            (Num::Int(x), Num::Int(y)) => Num::Int(x - y),
+            (x, y) => Num::Float(x.to_f64() - y.to_f64()),
+        };
     }
-    Ok(num_result(i, f, isf))
+    Ok(match acc {
+        Num::Int(i) => h.make_integer(i),
+        Num::Float(f) => Value::Float(f),
+    })
 }
 fn div(h: &mut ElispHost, a: &[Value]) -> R {
-    let (i0, f0, mut isf) = as_num(h, &a[0])?;
-    let (mut i, mut f) = (i0, f0);
-    for v in &a[1..] {
-        let (vi, vf, vfl) = as_num(h, v)?;
-        isf |= vfl;
-        if !isf && vi == 0 {
-            return Err("arith-error: division by zero".to_string());
-        }
-        if vi != 0 {
-            i /= vi;
-        }
-        f /= vf;
+    // Integer division truncates toward zero and stays exact (a bignum quotient is
+    // a bignum); the first float operand makes the rest float division.
+    let first = as_number(h, &a[0])?;
+    // Unary `/` is `1/x` in Emacs — `(/ 4)` is 0 (integer division), `(/ 4.0)` is
+    // 0.25 — not the argument itself.
+    let (mut acc, rest): (Num, &[Value]) = if a.len() == 1 {
+        (Num::Int(BigInt::from(1)), &a[0..1])
+    } else {
+        (first, &a[1..])
+    };
+    for v in rest {
+        let n = as_number(h, v)?;
+        acc = match (acc, n) {
+            (Num::Int(x), Num::Int(y)) => {
+                if y == BigInt::from(0) {
+                    return Err("arith-error: division by zero".to_string());
+                }
+                Num::Int(x / y)
+            }
+            (x, y) => Num::Float(x.to_f64() / y.to_f64()),
+        };
     }
-    // A float division that yields NaN (e.g. (/ 0.0 0.0)) gets a hardware-dependent
-    // sign bit: x86-64 produces a sign-negative NaN, ARM a positive one. Emacs prints
-    // such a result as "0.0e+NaN" (positive), so canonicalize the sign here to keep
-    // output platform-independent. A later negation still flips it to "-0.0e+NaN".
-    if isf && f.is_nan() {
-        f = f.abs();
-    }
-    Ok(num_result(i, f, isf))
+    Ok(match acc {
+        Num::Int(i) => h.make_integer(i),
+        Num::Float(mut f) => {
+            // A float division that yields NaN (e.g. `(/ 0.0 0.0)`) gets a
+            // hardware-dependent sign bit: x86-64 produces a sign-negative NaN,
+            // ARM a positive one. Emacs prints such a result as "0.0e+NaN"
+            // (positive), so canonicalize the sign to keep output
+            // platform-independent. A later negation still flips it to "-0.0e+NaN".
+            if f.is_nan() {
+                f = f.abs();
+            }
+            Value::Float(f)
+        }
+    })
 }
 fn modulo(h: &mut ElispHost, a: &[Value]) -> R {
-    let x = as_int_om(h, &a[0])?;
-    let y = as_int_om(h, &a[1])?;
-    if y == 0 {
+    let x = as_int_exact(h, &a[0])?;
+    let y = as_int_exact(h, &a[1])?;
+    if y == BigInt::from(0) {
         return Err("arith-error: division by zero".to_string());
     }
-    Ok(Value::Int(x % y))
+    let r = x % y;
+    Ok(h.make_integer(r))
 }
 // `mod` (vs `%`): the result takes the sign of the divisor, and either operand
 // may be a float — (mod 13.5 4) => 1.5, (mod -1 3) => 2.
 fn mod_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let (xi, xf, xisf) = as_num(h, &a[0])?;
-    let (yi, yf, yisf) = as_num(h, &a[1])?;
-    if xisf || yisf {
+    let xn = as_number(h, &a[0])?;
+    let yn = as_number(h, &a[1])?;
+    if matches!(xn, Num::Float(_)) || matches!(yn, Num::Float(_)) {
+        let (xf, yf) = (xn.to_f64(), yn.to_f64());
         // Faithful port of Emacs `Fmod` (data.c): fmod, then fix the sign so the
         // result matches the divisor. `%` on f64 is fmod (the remainder keeps the
         // dividend's sign, so `(mod -0.0 5)` stays `-0.0`, as Emacs returns). A
@@ -202,54 +295,72 @@ fn mod_fn(h: &mut ElispHost, a: &[Value]) -> R {
         }
         return Ok(Value::Float(r));
     }
-    if yi == 0 {
+    let x = as_int_exact(h, &a[0])?;
+    let y = as_int_exact(h, &a[1])?;
+    if y == BigInt::from(0) {
         return Err("arith-error: division by zero".to_string());
     }
-    let mut r = xi % yi;
-    if r != 0 && (r < 0) != (yi < 0) {
-        r += yi;
+    let zero = BigInt::from(0);
+    let mut r = &x % &y;
+    if r != zero && (r < zero) != (y < zero) {
+        r += &y;
     }
-    Ok(Value::Int(r))
+    Ok(h.make_integer(r))
 }
 fn one_plus(h: &mut ElispHost, a: &[Value]) -> R {
-    let (i, f, isf) = as_num(h, &a[0])?;
-    Ok(if isf {
-        Value::Float(f + 1.0)
-    } else {
-        Value::Int(i + 1)
+    Ok(match as_number(h, &a[0])? {
+        Num::Int(i) => h.make_integer(i + 1),
+        Num::Float(f) => Value::Float(f + 1.0),
     })
 }
 fn one_minus(h: &mut ElispHost, a: &[Value]) -> R {
-    let (i, f, isf) = as_num(h, &a[0])?;
-    Ok(if isf {
-        Value::Float(f - 1.0)
-    } else {
-        Value::Int(i - 1)
+    Ok(match as_number(h, &a[0])? {
+        Num::Int(i) => h.make_integer(i - 1),
+        Num::Float(f) => Value::Float(f - 1.0),
     })
 }
 
-fn cmp(h: &ElispHost, a: &[Value], pred: fn(f64, f64) -> bool) -> R {
+/// Compare adjacent arguments with `pred`.
+///
+/// Two integers compare *exactly*, never through `f64`: at 2^53 an `f64` runs
+/// out of mantissa, so the old float-only comparison answered `t` to
+/// `(= 2305843009213693950 2305843009213693951)`.
+fn cmp(h: &ElispHost, a: &[Value], pred: fn(std::cmp::Ordering) -> bool, nan_val: bool) -> R {
     for w in a.windows(2) {
-        if !pred(as_num(h, &w[0])?.1, as_num(h, &w[1])?.1) {
+        let (x, y) = (as_number(h, &w[0])?, as_number(h, &w[1])?);
+        let ord = match (&x, &y) {
+            (Num::Int(i), Num::Int(j)) => i.cmp(j),
+            _ => match x.to_f64().partial_cmp(&y.to_f64()) {
+                Some(o) => o,
+                // A NaN operand: `=`/`<`/`>`/`<=`/`>=` are all false.
+                None => {
+                    if nan_val {
+                        continue;
+                    }
+                    return Ok(Value::Undef);
+                }
+            },
+        };
+        if !pred(ord) {
             return Ok(Value::Undef);
         }
     }
     Ok(Value::Bool(true))
 }
 fn num_eq(h: &mut ElispHost, a: &[Value]) -> R {
-    cmp(h, a, |x, y| x == y)
+    cmp(h, a, |o| o.is_eq(), false)
 }
 fn lt(h: &mut ElispHost, a: &[Value]) -> R {
-    cmp(h, a, |x, y| x < y)
+    cmp(h, a, |o| o.is_lt(), false)
 }
 fn gt(h: &mut ElispHost, a: &[Value]) -> R {
-    cmp(h, a, |x, y| x > y)
+    cmp(h, a, |o| o.is_gt(), false)
 }
 fn le(h: &mut ElispHost, a: &[Value]) -> R {
-    cmp(h, a, |x, y| x <= y)
+    cmp(h, a, |o| o.is_le(), false)
 }
 fn ge(h: &mut ElispHost, a: &[Value]) -> R {
-    cmp(h, a, |x, y| x >= y)
+    cmp(h, a, |o| o.is_ge(), false)
 }
 
 // ── equality ──
@@ -273,6 +384,12 @@ fn el_eq(h: &ElispHost, a: &Value, b: &Value) -> bool {
 fn el_eql(h: &ElispHost, a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        // Bignums compare by value, like every other number: Emacs's `eql` is
+        // `eq` plus by-value comparison for the boxed numeric types.
+        (Value::Obj(_), Value::Obj(_)) => match (h.obj(a), h.obj(b)) {
+            (Some(Obj::Bignum(x)), Some(Obj::Bignum(y))) => x == y,
+            _ => el_eq(h, a, b),
+        },
         _ => el_eq(h, a, b),
     }
 }
@@ -449,7 +566,7 @@ fn simple_case(cp: i64, upper: bool) -> i64 {
         cp
     }
 }
-fn case_fold(a: &[Value], upper: bool) -> R {
+fn case_fold(h: &ElispHost, a: &[Value], upper: bool) -> R {
     match &a[0] {
         Value::Int(c) => Ok(Value::Int(simple_case(*c, upper))),
         Value::Str(s) => Ok(Value::str(if upper {
@@ -457,14 +574,17 @@ fn case_fold(a: &[Value], upper: bool) -> R {
         } else {
             s.to_lowercase()
         })),
-        _ => Err("wrong-type-argument: char-or-string-p".to_string()),
+        v => Err(format!(
+            "wrong-type-argument: char-or-string-p {}",
+            h.print(v, true)
+        )),
     }
 }
-fn downcase_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    case_fold(a, false)
+fn downcase_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    case_fold(h, a, false)
 }
-fn upcase_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    case_fold(a, true)
+fn upcase_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    case_fold(h, a, true)
 }
 fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
     match &a[0] {
@@ -620,11 +740,19 @@ fn symbolp(h: &mut ElispHost, a: &[Value]) -> R {
 fn stringp(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(a[0], Value::Str(_))))
 }
-fn numberp(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(matches!(a[0], Value::Int(_) | Value::Float(_))))
+fn numberp(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(h.is_number(&a[0])))
 }
-fn integerp(_h: &mut ElispHost, a: &[Value]) -> R {
+fn integerp(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(h.is_integer(&a[0])))
+}
+/// `fixnump` — an integer small enough to need no heap cell. A bignum is an
+/// integer, so `integerp` accepts it and this does not.
+fn fixnump(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(a[0], Value::Int(_))))
+}
+fn bignump(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(h.is_bignum(&a[0])))
 }
 fn floatp(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(a[0], Value::Float(_))))
@@ -632,7 +760,14 @@ fn floatp(_h: &mut ElispHost, a: &[Value]) -> R {
 fn vectorp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::Vector(_)))))
 }
-fn zerop(_h: &mut ElispHost, a: &[Value]) -> R {
+fn zerop(h: &mut ElispHost, a: &[Value]) -> R {
+    if !h.is_number(&a[0]) {
+        return Err(format!(
+            "wrong-type-argument: number-or-marker-p {}",
+            h.print(&a[0], true)
+        ));
+    }
+    // A bignum is out of fixnum range by construction, so it is never zero.
     Ok(nil_or(
         matches!(a[0], Value::Int(0)) || matches!(a[0], Value::Float(f) if f == 0.0),
     ))
@@ -643,7 +778,7 @@ fn vector_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.alloc(Obj::Vector(a.to_vec())))
 }
 fn make_vector(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = check_array_len(as_num(h, &a[0])?.0)?;
+    let n = check_array_len_val(h, &a[0])?;
     // Fallible allocation: a length that fits `most-positive-fixnum` can still
     // exceed available memory (or `isize::MAX` bytes). Emacs signals a plain
     // `error` there instead of aborting, so `try_reserve_exact` maps both the
@@ -1105,7 +1240,10 @@ fn concat_fn(h: &mut ElispHost, a: &[Value]) -> R {
                         }
                     }
                 } else {
-                    return Err("wrong-type-argument: sequencep".to_string());
+                    return Err(format!(
+                        "wrong-type-argument: sequencep {}",
+                        h.print(v, true)
+                    ));
                 }
             }
         }
@@ -1137,19 +1275,19 @@ fn pad_digits(mag: &str, prec: Option<usize>) -> String {
         Some(_) => mag.to_string(),
     }
 }
-fn format_radix(n: i64, radix: u32, upper: bool, alt: bool, prec: Option<usize>) -> String {
-    let (sign, mag) = if n < 0 {
-        ("-", n.unsigned_abs())
-    } else {
-        ("", n as u64)
-    };
+fn format_radix(n: &BigInt, radix: u32, upper: bool, alt: bool, prec: Option<usize>) -> String {
+    use num_traits::Signed;
+    let negative = n.is_negative();
+    let mag = n.abs();
+    let sign = if negative { "-" } else { "" };
+    // Emacs prints a negative %x/%o as sign + magnitude, not the two's complement.
     let body = match (radix, upper) {
-        (16, true) => format!("{mag:X}"),
-        (16, false) => format!("{mag:x}"),
-        _ => format!("{mag:o}"),
+        (16, true) => mag.to_str_radix(16).to_uppercase(),
+        (16, false) => mag.to_str_radix(16),
+        _ => mag.to_str_radix(8),
     };
     let body = pad_digits(&body, prec);
-    let prefix = if alt && mag != 0 {
+    let prefix = if alt && mag != BigInt::from(0) {
         match (radix, upper) {
             (16, true) => "0X",
             (16, false) => "0x",
@@ -1411,6 +1549,17 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
             as_num(h, arg).map_err(|_| BAD_TYPE.to_string())
         };
+        // The integer directives (%d/%o/%x/%X) print the *exact* value: a bignum
+        // must not be truncated to an i64. A float argument truncates toward
+        // zero, as in Emacs.
+        let bigf = |idx: usize| -> Result<BigInt, String> {
+            let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
+            match arg {
+                Value::Float(f) => <BigInt as num_traits::FromPrimitive>::from_f64(f.trunc())
+                    .ok_or_else(|| BAD_TYPE.to_string()),
+                _ => as_int_exact(h, arg).map_err(|_| BAD_TYPE.to_string()),
+            }
+        };
         let body = match conv {
             's' => {
                 let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
@@ -1427,13 +1576,21 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             // The `+`/space sign flags apply to the signed conversions (d/e/f/g).
             // `%i` is an accepted alias for `%d` (as in C printf).
             'd' | 'i' => {
-                let n = numf(idx)?.0;
-                let mag = pad_digits(&n.unsigned_abs().to_string(), spec.prec);
-                apply_sign(if n < 0 { format!("-{mag}") } else { mag }, &spec)
+                use num_traits::Signed;
+                let n = bigf(idx)?;
+                let mag = pad_digits(&n.abs().to_string(), spec.prec);
+                apply_sign(
+                    if n.is_negative() {
+                        format!("-{mag}")
+                    } else {
+                        mag
+                    },
+                    &spec,
+                )
             }
-            'o' => format_radix(numf(idx)?.0, 8, false, spec.alt, spec.prec),
-            'x' => format_radix(numf(idx)?.0, 16, false, spec.alt, spec.prec),
-            'X' => format_radix(numf(idx)?.0, 16, true, spec.alt, spec.prec),
+            'o' => format_radix(&bigf(idx)?, 8, false, spec.alt, spec.prec),
+            'x' => format_radix(&bigf(idx)?, 16, false, spec.alt, spec.prec),
+            'X' => format_radix(&bigf(idx)?, 16, true, spec.alt, spec.prec),
             'c' => char::from_u32(numf(idx)?.0 as u32)
                 .map(String::from)
                 .unwrap_or_default(),
@@ -1497,6 +1654,7 @@ fn prin1_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(a[0].clone())
 }
 fn number_to_string(h: &mut ElispHost, a: &[Value]) -> R {
+    as_number_p(h, &a[0], false)?;
     Ok(Value::str(h.print(&a[0], false)))
 }
 
@@ -1505,9 +1663,9 @@ fn hash_eq(h: &ElispHost, test: u8, a: &Value, b: &Value) -> bool {
     match test {
         // `equal` test: deep structural equality.
         2 => el_equal(h, a, b),
-        // `eql` test (the make-hash-table default): like `eq` but equal floats
-        // (and, in real Emacs, equal bignums) compare the same, so a float key
-        // put with `puthash` is found again by `gethash`.
+        // `eql` test (the make-hash-table default): like `eq` but equal floats and
+        // equal bignums compare the same, so a float or bignum key put with
+        // `puthash` is found again by `gethash`.
         1 => el_eql(h, a, b),
         // `eq` test: identity.
         _ => el_eq(h, a, b),
@@ -1670,7 +1828,7 @@ fn substring(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let s = as_string(&a[0])?;
+    let s = as_string(h, &a[0])?;
     // With the default separators (whitespace) OMIT-NULLS is implicitly on; with
     // an explicit SEPARATORS it defaults off unless the 3rd arg is non-nil.
     let default_seps = a.len() < 2 || is_nil(&a[1]);
@@ -1678,7 +1836,7 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
     let mut parts: Vec<String> = if default_seps {
         s.split_whitespace().map(|w| w.to_string()).collect()
     } else {
-        let sep = as_string(&a[1])?;
+        let sep = as_string(h, &a[1])?;
         if sep.is_empty() {
             s.chars().map(|c| c.to_string()).collect()
         } else {
@@ -1695,8 +1853,8 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(h.list_from(parts.into_iter().map(Value::str).collect()))
 }
-fn string_prefix_p(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (pre, s) = (as_string(&a[0])?, as_string(&a[1])?);
+fn string_prefix_p(h: &mut ElispHost, a: &[Value]) -> R {
+    let (pre, s) = (as_string(h, &a[0])?, as_string(h, &a[1])?);
     let ignore_case = a.get(2).is_some_and(|v| !is_nil(v));
     Ok(nil_or(if ignore_case {
         s.to_lowercase().starts_with(&pre.to_lowercase())
@@ -1704,8 +1862,17 @@ fn string_prefix_p(_h: &mut ElispHost, a: &[Value]) -> R {
         s.starts_with(&pre)
     }))
 }
-fn string_suffix_p(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (suf, s) = (as_string(&a[0])?, as_string(&a[1])?);
+fn string_suffix_p(h: &mut ElispHost, a: &[Value]) -> R {
+    // Emacs: (let ((start-pos (- (length string) (length suffix))))
+    //          (and (>= start-pos 0) (eq t (compare-strings ...))))
+    // The length test comes first, so a STRING shorter than SUFFIX is nil even
+    // when it is not a string at all.
+    if let (Some(sv), Some(sufv)) = (h.seq_vec(&a[1]), h.seq_vec(&a[0])) {
+        if sv.len() < sufv.len() {
+            return Ok(Value::Undef);
+        }
+    }
+    let (suf, s) = (as_string(h, &a[0])?, as_string(h, &a[1])?);
     let ignore_case = a.get(2).is_some_and(|v| !is_nil(v));
     Ok(nil_or(if ignore_case {
         s.to_lowercase().ends_with(&suf.to_lowercase())
@@ -1713,17 +1880,24 @@ fn string_suffix_p(_h: &mut ElispHost, a: &[Value]) -> R {
         s.ends_with(&suf)
     }))
 }
-fn string_empty_p(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(as_string(&a[0])?.is_empty()))
+fn string_empty_p(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(as_string(h, &a[0])?.is_empty()))
 }
 fn string_join(h: &mut ElispHost, a: &[Value]) -> R {
-    let items = h.list_vec(&a[0]).ok_or("string-join: not a list")?;
-    let sep = match a.get(1) {
-        Some(v) if !is_nil(v) => as_string(v)?,
-        _ => String::new(),
-    };
-    let strs: Result<Vec<String>, String> = items.iter().map(as_string).collect();
-    Ok(Value::str(strs?.join(&sep)))
+    let items = h
+        .seq_vec(&a[0])
+        .ok_or_else(|| format!("wrong-type-argument: sequencep {}", h.print(&a[0], true)))?;
+    let sep = a.get(1).cloned().unwrap_or(Value::Undef);
+    // Interleave the separator and concatenate: `concat`'s element rules (and its
+    // `sequencep` error) are exactly Emacs's here.
+    let mut parts: Vec<Value> = Vec::with_capacity(items.len() * 2);
+    for (i, it) in items.into_iter().enumerate() {
+        if i > 0 && !is_nil(&sep) {
+            parts.push(sep.clone());
+        }
+        parts.push(it);
+    }
+    concat_fn(h, &parts)
 }
 fn char_to_string(h: &mut ElispHost, a: &[Value]) -> R {
     let n = as_char(h, &a[0])?;
@@ -1731,9 +1905,9 @@ fn char_to_string(h: &mut ElispHost, a: &[Value]) -> R {
         char::from_u32(n).map(|c| c.to_string()).unwrap_or_default(),
     ))
 }
-fn string_to_char(_h: &mut ElispHost, a: &[Value]) -> R {
+fn string_to_char(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Int(
-        as_string(&a[0])?
+        as_string(h, &a[0])?
             .chars()
             .next()
             .map(|c| c as i64)
@@ -1741,7 +1915,7 @@ fn string_to_char(_h: &mut ElispHost, a: &[Value]) -> R {
     ))
 }
 fn make_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = check_array_len(as_int(h, &a[0])?)?;
+    let n = check_array_len_val(h, &a[0])?;
     let c = char::from_u32(as_char(h, &a[1])?).unwrap_or(' ');
     // Fallible allocation, as in `make_vector`: `n * len_utf8` may overflow
     // `usize` or exceed available memory. Emacs signals a plain `error` rather
@@ -1767,15 +1941,25 @@ fn string_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::str(s))
 }
 fn string_to_list(h: &mut ElispHost, a: &[Value]) -> R {
-    let items: Vec<Value> = as_string(&a[0])?
-        .chars()
-        .map(|c| Value::Int(c as i64))
-        .collect();
-    Ok(h.list_from(items))
+    // Emacs defines this as `(append STRING nil)`, so it accepts any sequence and
+    // signals `sequencep` — not `stringp` — on anything else.
+    match &a[0] {
+        Value::Str(st) => {
+            let items: Vec<Value> = st.chars().map(|c| Value::Int(c as i64)).collect();
+            Ok(h.list_from(items))
+        }
+        v => match h.seq_vec(v) {
+            Some(items) => Ok(h.list_from(items)),
+            None => Err(format!(
+                "wrong-type-argument: sequencep {}",
+                h.print(v, true)
+            )),
+        },
+    }
 }
 fn string_search(h: &mut ElispHost, a: &[Value]) -> R {
-    let needle = as_string(&a[0])?;
-    let hay = as_string(&a[1])?;
+    let needle = as_string(h, &a[0])?;
+    let hay = as_string(h, &a[1])?;
     // Optional START is a char index; search only the tail from there, then map
     // the byte offset back to an absolute char index. Emacs bounds-checks START
     // against [0, len], signalling args-out-of-range with the raw START value.
@@ -1819,7 +2003,9 @@ pub(crate) fn char_of_byte(s: &str, byte_idx: usize) -> usize {
 /// for `case-fold-search`), surfacing translation and compilation failures as
 /// elisp-style `invalid-regexp` errors.
 pub(crate) fn compile_cf(pat: &str, case_insensitive: bool) -> Result<fancy_regex::Regex, String> {
-    let translated = crate::regexp::translate(pat)?;
+    // `translate` reports Emacs's own diagnostics ("Unmatched [ or [^", …); they
+    // ride under the `invalid-regexp` error symbol, as in Emacs.
+    let translated = crate::regexp::translate(pat).map_err(|e| format!("invalid-regexp: {e}"))?;
     // Elisp `^`/`$` always match line boundaries, so compile in multiline mode;
     // `\``/`\'` (translated to \A/\z) keep matching the absolute start/end.
     let flags = if case_insensitive { "(?mi)" } else { "(?m)" };
@@ -1864,8 +2050,8 @@ fn run_match(
 /// set the match data, and return the char index where the match begins (nil if
 /// no match).
 fn string_match(h: &mut ElispHost, a: &[Value]) -> R {
-    let pat = as_string(&a[0])?;
-    let subject = as_string(&a[1])?;
+    let pat = as_string(h, &a[0])?;
+    let subject = as_string(h, &a[1])?;
     let start = match a.get(2) {
         Some(Value::Undef) | Some(Value::Bool(false)) | None => 0,
         Some(v) => {
@@ -1964,10 +2150,15 @@ fn match_string(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(beg0 end0 beg1 end1 …)`, with `nil nil` for groups that did not match.
 /// Pairs with `set-match-data` to save/restore around inner searches.
 fn match_data_fn(h: &mut ElispHost, _a: &[Value]) -> R {
-    let spans = match &h.match_data {
+    let mut spans = match &h.match_data {
         Some(md) => md.spans.clone(),
         None => return Ok(Value::Undef),
     };
+    // Emacs reports only up to the last group that matched: an optional trailing
+    // group that did not participate contributes no `nil nil` pair at all.
+    while spans.len() > 1 && spans.last().is_some_and(|s| s.is_none()) {
+        spans.pop();
+    }
     let mut items = Vec::with_capacity(spans.len() * 2);
     for span in spans {
         match span {
@@ -2017,8 +2208,8 @@ fn set_match_data(h: &mut ElispHost, a: &[Value]) -> R {
 
 /// `(regexp-quote STRING)` — STRING with every regexp-special character escaped
 /// so it matches literally under elisp regexp rules.
-fn regexp_quote(_h: &mut ElispHost, a: &[Value]) -> R {
-    let s = as_string(&a[0])?;
+fn regexp_quote(h: &mut ElispHost, a: &[Value]) -> R {
+    let s = as_string(h, &a[0])?;
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         // The set Emacs's own `regexp-quote` escapes (search.c Fregexp_quote:
@@ -2106,9 +2297,9 @@ fn adapt_replacement_case(matched: &str, rep: String) -> String {
 /// `\N` backrefs) unless LITERAL is non-nil. Function-valued REP is not yet
 /// supported (string templates cover the common case without re-entering the VM).
 fn replace_regexp_in_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let pat = as_string(&a[0])?;
-    let rep = as_string(&a[1])?;
-    let subject = as_string(&a[2])?;
+    let pat = as_string(h, &a[0])?;
+    let rep = as_string(h, &a[1])?;
+    let subject = as_string(h, &a[2])?;
     // FIXEDCASE (4th arg) nil → adapt the replacement's case to the match's.
     let fixedcase = !matches!(
         a.get(3),
@@ -2160,7 +2351,37 @@ enum Rm {
 /// `(OP NUMBER &optional DIVISOR)` — round NUMBER (or NUMBER/DIVISOR) to an
 /// integer under `rm`. Integer operands use exact integer division so large
 /// magnitudes don't lose precision; a float operand routes through `f64`.
-fn quotient(h: &ElispHost, a: &[Value], rm: Rm) -> R {
+fn quotient(h: &mut ElispHost, a: &[Value], rm: Rm) -> R {
+    // `floor`/`ceiling`/`round`/`truncate` signal `numberp`, not
+    // `number-or-marker-p`.
+    // Integer operands stay exact — `(floor (expt 2 70) 3)` is a bignum, and
+    // `(truncate 1e30)` is the exact integer value of that float, not a clamped
+    // i64.
+    let xn = as_number_p(h, &a[0], false)?;
+    match a.get(1) {
+        Some(d) if !is_nil(d) => {
+            let dn = as_number_p(h, d, false)?;
+            if let (Num::Int(x), Num::Int(y)) = (&xn, &dn) {
+                if *y == BigInt::from(0) {
+                    return Err("arith-error: division by zero".to_string());
+                }
+                let q = big_div(x, y, rm);
+                return Ok(h.make_integer(q));
+            }
+        }
+        _ => {
+            return match xn {
+                Num::Int(i) => Ok(h.make_integer(i)),
+                Num::Float(f) => {
+                    if !f.is_finite() {
+                        // (truncate 1.0e+INF), (round (/ 0.0 0.0)) => overflow-error.
+                        return Err("overflow-error".to_string());
+                    }
+                    Ok(float_to_integer(h, apply_rm(f, rm)))
+                }
+            };
+        }
+    }
     let (xi, xf, xisf) = as_num(h, &a[0])?;
     match a.get(1) {
         Some(d) if !is_nil(d) => {
@@ -2196,6 +2417,50 @@ fn quotient(h: &ElispHost, a: &[Value], rm: Rm) -> R {
         }
     }
 }
+/// Divide two exact integers with the given rounding mode (Emacs's `floor`,
+/// `ceiling`, `round`, `truncate` with a DIVISOR).
+fn big_div(x: &BigInt, y: &BigInt, rm: Rm) -> BigInt {
+    use num_integer::Integer;
+    let zero = BigInt::from(0);
+    let (q, r) = x.div_rem(y);
+    match rm {
+        Rm::Trunc => q,
+        Rm::Floor if r != zero && (r < zero) != (*y < zero) => q - 1,
+        Rm::Ceil if r != zero && (r < zero) == (*y < zero) => q + 1,
+        Rm::Round => {
+            // Round half to even, as Emacs does: compare |2r| with |y|.
+            use num_traits::Signed;
+            let twice: BigInt = (&r * BigInt::from(2)).abs();
+            let mag = y.abs();
+            let away = match twice.cmp(&mag) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => q.is_odd(),
+                std::cmp::Ordering::Less => false,
+            };
+            let toward = if (r < zero) != (*y < zero) { -1 } else { 1 };
+            if away {
+                q + toward
+            } else {
+                q
+            }
+        }
+        _ => q,
+    }
+}
+
+/// An already-rounded `f64` as an exact elisp integer. A float beyond `i64` is a
+/// bignum in Emacs: `(truncate 1e30)` is 1000000000000000019884624838656.
+fn float_to_integer(h: &mut ElispHost, f: f64) -> Value {
+    use num_traits::ToPrimitive;
+    match f.to_i64() {
+        Some(i) => h.make_integer(BigInt::from(i)),
+        None => match <BigInt as num_traits::FromPrimitive>::from_f64(f) {
+            Some(b) => h.make_integer(b),
+            None => Value::Float(f),
+        },
+    }
+}
+
 fn apply_rm(f: f64, rm: Rm) -> f64 {
     match rm {
         Rm::Floor => f.floor(),
@@ -2229,53 +2494,96 @@ fn truncate_fn(h: &mut ElispHost, a: &[Value]) -> R {
     quotient(h, a, Rm::Trunc)
 }
 fn float_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let (_i, f, _isf) = as_num(h, &a[0])?;
-    Ok(Value::Float(f))
+    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64()))
 }
-fn logand_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let mut r: i64 = -1;
-    for v in a {
-        r &= as_int_om(h, v)?;
+/// The exact integer value of `v` for a bit/shift op, bignum included.
+/// Emacs's bitwise ops reject floats (`integer-or-marker-p`) but accept any
+/// integer, of any size: `(logand (expt 2 70) (expt 2 70))` is 2^70.
+fn as_int_exact(h: &ElispHost, v: &Value) -> Result<BigInt, String> {
+    as_int_exact_p(h, v, true)
+}
+
+/// [`as_int_exact`] with Emacs's predicate for the calling builtin: the bit-logic
+/// ops (`logand`/`logior`/`logxor`/`%`) take a marker and signal
+/// `integer-or-marker-p`, while the shifts and `lognot`/`logcount` take strictly
+/// an integer and signal `integerp`.
+fn as_int_exact_p(h: &ElispHost, v: &Value, markers_ok: bool) -> Result<BigInt, String> {
+    match v {
+        Value::Int(n) => Ok(BigInt::from(*n)),
+        _ => {
+            if let Some(b) = h.as_bigint(v) {
+                return Ok(b);
+            }
+            if markers_ok {
+                if let Some(p) = h.marker_position(v) {
+                    return Ok(BigInt::from(p));
+                }
+            }
+            Err(format!(
+                "wrong-type-argument: {} {}",
+                if markers_ok {
+                    "integer-or-marker-p"
+                } else {
+                    "integerp"
+                },
+                h.print(v, true)
+            ))
+        }
     }
-    Ok(Value::Int(r))
+}
+
+fn logand_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let mut r = BigInt::from(-1);
+    for v in a {
+        r &= as_int_exact(h, v)?;
+    }
+    Ok(h.make_integer(r))
 }
 fn logior_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let mut r: i64 = 0;
+    let mut r = BigInt::from(0);
     for v in a {
-        r |= as_int_om(h, v)?;
+        r |= as_int_exact(h, v)?;
     }
-    Ok(Value::Int(r))
+    Ok(h.make_integer(r))
 }
 fn logxor_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let mut r: i64 = 0;
+    let mut r = BigInt::from(0);
     for v in a {
-        r ^= as_int_om(h, v)?;
+        r ^= as_int_exact(h, v)?;
     }
-    Ok(Value::Int(r))
+    Ok(h.make_integer(r))
 }
 fn lognot_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Int(!as_integer(h, &a[0])?))
+    let n = as_int_exact_p(h, &a[0], false)?;
+    Ok(h.make_integer(!n))
 }
+/// `(ash VALUE COUNT)` — arithmetic shift. A left shift is exact: Emacs's
+/// integers are unbounded, so `(ash 1 70)` is 2^70, not a wrapped fixnum.
 fn ash_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_integer(h, &a[0])?;
+    let n = as_int_exact_p(h, &a[0], false)?;
     let c = as_integer(h, &a[1])?;
-    Ok(Value::Int(if c >= 0 {
-        n.wrapping_shl(c as u32)
+    let r = if c >= 0 {
+        // A shift count that large would exhaust memory long before it completed;
+        // Emacs signals `overflow-error` rather than trying.
+        if c > 1 << 30 {
+            return Err("overflow-error".to_string());
+        }
+        n << (c as u64)
     } else {
-        // Arithmetic right shift; a shift ≥ 64 fills with the sign bit, so a
-        // positive value collapses to 0 and a negative one to -1 (Rust's `>>`
-        // would panic on an out-of-range count).
-        let sh = (-c) as u32;
-        if sh >= 64 {
-            if n < 0 {
-                -1
+        // `BigInt`'s `>>` is already an arithmetic shift (it floors toward
+        // negative infinity for negatives), which is what Emacs's `ash` does.
+        let sh = c.unsigned_abs();
+        if sh > 1 << 30 {
+            if n.sign() == num_bigint::Sign::Minus {
+                BigInt::from(-1)
             } else {
-                0
+                BigInt::from(0)
             }
         } else {
             n >> sh
         }
-    }))
+    };
+    Ok(h.make_integer(r))
 }
 
 /// `(lsh VALUE COUNT)` — *logical* shift, unlike `ash`'s arithmetic shift.
@@ -2286,6 +2594,17 @@ fn ash_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// = 2^61-1), so mask to 62 bits before the unsigned shift.
 fn lsh_fn(h: &mut ElispHost, a: &[Value]) -> R {
     const FIXNUM_MASK: u64 = (1u64 << 62) - 1;
+    // A left shift is exact, like `ash` — `(lsh 1 70)` is 2^70.
+    if let Ok(c) = as_integer(h, &a[1]) {
+        if c >= 0 {
+            let n = as_int_exact_p(h, &a[0], false)?;
+            if c > 1 << 30 {
+                return Err("overflow-error".to_string());
+            }
+            let r = n << (c as u64);
+            return Ok(h.make_integer(r));
+        }
+    }
     let n = as_integer(h, &a[0])?;
     let c = as_integer(h, &a[1])?;
     Ok(Value::Int(if c >= 0 {
@@ -2308,16 +2627,25 @@ fn lsh_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// non-negative integer; otherwise float `BASE**EXP` (covers negative and
 /// fractional exponents). `(expt 2 10)`=>1024, `(expt 2 -1)`=>0.5, `(expt 2.0 0.5)`.
 fn expt_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let (bi, bf, bisf) = as_num(h, &a[0])?;
-    let (ei, ef, eisf) = as_num(h, &a[1])?;
-    if !bisf && !eisf && ei >= 0 {
-        Ok(Value::Int(bi.wrapping_pow(ei as u32)))
-    } else {
-        Ok(Value::Float(bf.powf(ef)))
+    let base = as_number_p(h, &a[0], false)?;
+    let exp = as_number_p(h, &a[1], false)?;
+    if let (Num::Int(b), Num::Int(e)) = (&base, &exp) {
+        use num_traits::{Signed, ToPrimitive};
+        if !e.is_negative() {
+            // Exact: `(expt 2 70)` is 2^70, not a wrapped i64. A huge exponent
+            // would exhaust memory; Emacs signals rather than trying.
+            let e_u32 = e.to_u32().ok_or_else(|| "overflow-error".to_string())?;
+            if e_u32 > 1 << 24 {
+                return Err("overflow-error".to_string());
+            }
+            let r = num_traits::Pow::pow(b.clone(), e_u32);
+            return Ok(h.make_integer(r));
+        }
     }
+    Ok(Value::Float(base.to_f64().powf(exp.to_f64())))
 }
 fn sqrt_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(h, &a[0])?.1.sqrt()))
+    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().sqrt()))
 }
 fn exp_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Float(as_num(h, &a[0])?.1.exp()))
@@ -2455,7 +2783,7 @@ fn ftruncate_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// BASE (2–16) parse an integer in that radix; otherwise parse an int, or a
 /// float when a `.` or exponent is present. Non-numeric input yields 0.
 fn string_to_number(h: &mut ElispHost, a: &[Value]) -> R {
-    let raw = as_string(&a[0])?;
+    let raw = as_string(h, &a[0])?;
     let s = raw.trim_start();
     if let Some(bv) = a.get(1) {
         // Base 10 (and nil) use the float-capable default parser below; only a
@@ -2481,17 +2809,21 @@ fn string_to_number(h: &mut ElispHost, a: &[Value]) -> R {
                     }
                     _ => {}
                 }
-                let (mut n, mut seen) = (0i64, false);
+                let (mut n, mut seen) = (BigInt::from(0), false);
                 for c in chars {
                     match c.to_digit(base) {
                         Some(d) => {
-                            n = n.wrapping_mul(base as i64) + d as i64;
+                            n = n * base as i64 + d as i64;
                             seen = true;
                         }
                         None => break,
                     }
                 }
-                return Ok(Value::Int(if seen { sign * n } else { 0 }));
+                return Ok(if seen {
+                    h.make_integer(n * sign)
+                } else {
+                    Value::Int(0)
+                });
             }
         }
     }
@@ -2543,7 +2875,12 @@ fn string_to_number(h: &mut ElispHost, a: &[Value]) -> R {
         // dot position when one was consumed without becoming a float.
         let end = dot_pos.unwrap_or(i);
         let tok: String = b[start..end].iter().collect();
-        Ok(Value::Int(tok.parse().unwrap_or(0)))
+        // Exact at any size: `(string-to-number "1180591620717411303424")` is that
+        // integer, not the 0 an `i64` parse failure used to yield.
+        match tok.parse::<BigInt>() {
+            Ok(n) => Ok(h.make_integer(n)),
+            Err(_) => Ok(Value::Int(0)),
+        }
     }
 }
 
@@ -2564,6 +2901,11 @@ fn hash_bytes(s: &str) -> u64 {
 }
 /// Structural hash (for `sxhash-equal`), depth-bounded like Emacs.
 fn sxhash_equal(h: &ElispHost, v: &Value, depth: u32) -> u64 {
+    // A bignum hashes by value: `(equal (expt 2 70) (expt 2 70))` is t, so the
+    // two must land in the same bucket even though their handles differ.
+    if let Some(b) = h.as_bigint(v) {
+        return hash_bytes(&b.to_string());
+    }
     match v {
         Value::Int(n) => *n as u64,
         Value::Float(f) => f.to_bits(),
@@ -2623,9 +2965,11 @@ fn sxhash_eq_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(sxhash_fixnum(sxhash_eq(&a[0])))
 }
 fn sxhash_eql_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    // eql: numbers by value, everything else by identity.
+    // eql: numbers by value (bignums included — they are `eql` by value),
+    // everything else by identity.
     let x = match &a[0] {
         Value::Int(_) | Value::Float(_) => sxhash_equal(h, &a[0], 0),
+        other if h.is_bignum(other) => sxhash_equal(h, other, 0),
         other => sxhash_eq(other),
     };
     Ok(sxhash_fixnum(x))
@@ -2646,6 +2990,9 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
         Value::Bool(_) | Value::Undef => "symbol",
         Value::Obj(_) => match h.obj(&a[0]) {
             Some(Obj::Cons(..)) => "cons",
+            // Emacs answers `integer` for a bignum too — fixnum and bignum are one
+            // type, split only by `fixnump`/`bignump`.
+            Some(Obj::Bignum(_)) => "integer",
             Some(Obj::Symbol(_)) => "symbol",
             Some(Obj::Vector(_)) => "vector",
             Some(Obj::Subr { .. }) => "subr",
@@ -2872,9 +3219,9 @@ fn char_uppercase_p(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(string-distance S1 S2 &optional BYTECOMPARE)` — Levenshtein edit distance.
 /// With BYTECOMPARE non-nil, Emacs measures over UTF-8 bytes, not characters
 /// (editfns.c Fstring_distance).
-fn string_distance(_h: &mut ElispHost, a: &[Value]) -> R {
-    let a0 = as_string(&a[0])?;
-    let a1 = as_string(&a[1])?;
+fn string_distance(h: &mut ElispHost, a: &[Value]) -> R {
+    let a0 = as_string(h, &a[0])?;
+    let a1 = as_string(h, &a[1])?;
     let bytewise = a.len() > 2 && !is_nil(&a[2]);
     let (s1, s2): (Vec<u32>, Vec<u32>) = if bytewise {
         (
@@ -2928,25 +3275,29 @@ fn vconcat_fn(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// `(abs NUMBER)` — absolute value, keeping the int/float type (and turning
 /// `-0.0` into `0.0`, which a `(< x 0)` test would miss).
-fn abs_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    match &a[0] {
-        Value::Int(n) => Ok(Value::Int(n.wrapping_abs())),
-        Value::Float(f) => Ok(Value::Float(f.abs())),
-        _ => Err(format!(
-            "wrong-type-argument: numberp {}",
-            a[0].as_str_cow()
-        )),
-    }
+fn abs_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(match as_number_p(h, &a[0], false)? {
+        Num::Int(n) => {
+            use num_traits::Signed;
+            h.make_integer(n.abs())
+        }
+        Num::Float(f) => Value::Float(f.abs()),
+    })
 }
 /// `(logcount N)` — count of set bits for N≥0, or of clear bits for N<0 (i.e.
 /// bits differing from the sign bit), matching Emacs.
 fn logcount_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_integer(h, &a[0])?;
-    let bits = if n >= 0 {
-        n.count_ones()
-    } else {
-        (!n).count_ones()
-    };
+    use num_traits::Signed;
+    let n = as_int_exact_p(h, &a[0], false)?;
+    // Emacs counts set bits for N>=0 and clear bits (of the two's complement)
+    // for N<0 — i.e. the bits that differ from the sign bit either way.
+    let counted = if n.is_negative() { !n } else { n };
+    let bits: u64 = counted
+        .to_bytes_le()
+        .1
+        .iter()
+        .map(|b| b.count_ones() as u64)
+        .sum();
     Ok(Value::Int(bits as i64))
 }
 // ── secure-hash / sha1 / md5 (self-contained, no crates) ──
@@ -3338,7 +3689,7 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 /// The string argument's bytes between optional char START/END.
 fn hash_input(h: &ElispHost, a: &[Value], obj_idx: usize) -> Result<Vec<u8>, String> {
-    let s = as_string(&a[obj_idx])?;
+    let s = as_string(h, &a[obj_idx])?;
     let chars: Vec<char> = s.chars().collect();
     let start = match a.get(obj_idx + 1) {
         Some(v) if !is_nil(v) => as_int(h, v)?.max(0) as usize,
@@ -3362,7 +3713,7 @@ fn secure_hash(h: &mut ElispHost, a: &[Value]) -> R {
     // ALGORITHM is a symbol (md5/sha1/sha256/…); accept a string too.
     let algo = h
         .sym_name(&a[0])
-        .or_else(|| as_string(&a[0]).ok())
+        .or_else(|| as_string(h, &a[0]).ok())
         .unwrap_or_default();
     let bytes = hash_input(h, a, 1)?;
     let digest = match algo.as_str() {
@@ -3460,29 +3811,29 @@ fn b64_decode(input: &str) -> Result<Vec<u8>, String> {
 fn bytes_to_str(bytes: &[u8]) -> Value {
     Value::str(bytes.iter().map(|&b| b as char).collect::<String>())
 }
-fn base64_encode_string(_h: &mut ElispHost, a: &[Value]) -> R {
-    let raw = b64_encode(as_string(&a[0])?.as_bytes(), B64_STD, true);
+fn base64_encode_string(h: &mut ElispHost, a: &[Value]) -> R {
+    let raw = b64_encode(as_string(h, &a[0])?.as_bytes(), B64_STD, true);
     let no_break = a.get(1).is_some_and(|v| !is_nil(v));
     Ok(Value::str(if no_break { raw } else { b64_wrap(&raw) }))
 }
-fn base64_decode_string(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(bytes_to_str(&b64_decode(&as_string(&a[0])?)?))
+fn base64_decode_string(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(bytes_to_str(&b64_decode(&as_string(h, &a[0])?)?))
 }
-fn base64url_encode_string(_h: &mut ElispHost, a: &[Value]) -> R {
+fn base64url_encode_string(h: &mut ElispHost, a: &[Value]) -> R {
     let no_pad = a.get(1).is_some_and(|v| !is_nil(v));
     Ok(Value::str(b64_encode(
-        as_string(&a[0])?.as_bytes(),
+        as_string(h, &a[0])?.as_bytes(),
         B64_URL,
         !no_pad,
     )))
 }
-fn base64url_decode_string(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(bytes_to_str(&b64_decode(&as_string(&a[0])?)?))
+fn base64url_decode_string(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(bytes_to_str(&b64_decode(&as_string(h, &a[0])?)?))
 }
 /// `(url-hexify-string STRING)` — percent-encode all but `[A-Za-z0-9-._~]`.
-fn url_hexify_string(_h: &mut ElispHost, a: &[Value]) -> R {
+fn url_hexify_string(h: &mut ElispHost, a: &[Value]) -> R {
     let mut out = String::new();
-    for b in as_string(&a[0])?.as_bytes() {
+    for b in as_string(h, &a[0])?.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             out.push(*b as char);
         } else {
@@ -3492,8 +3843,8 @@ fn url_hexify_string(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::str(out))
 }
 /// `(url-unhex-string STRING)` — decode `%XX` escapes.
-fn url_unhex_string(_h: &mut ElispHost, a: &[Value]) -> R {
-    let s = as_string(&a[0])?;
+fn url_unhex_string(h: &mut ElispHost, a: &[Value]) -> R {
+    let s = as_string(h, &a[0])?;
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -3516,8 +3867,11 @@ fn url_unhex_string(_h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// `(string-to-vector STRING)` — a vector of STRING's character codes.
 fn string_to_vector(h: &mut ElispHost, a: &[Value]) -> R {
-    let s = as_string(&a[0])?;
-    let items: Vec<Value> = s.chars().map(|c| Value::Int(c as i64)).collect();
+    // `(string-to-vector SEQ)` is `(vconcat SEQ)`: any sequence, so `nil` is the
+    // empty vector rather than a `stringp` error.
+    let items = h
+        .seq_vec(&a[0])
+        .ok_or_else(|| format!("wrong-type-argument: sequencep {}", h.print(&a[0], true)))?;
     Ok(h.alloc(Obj::Vector(items)))
 }
 /// `(logb X)` — the binary exponent of |X|: floor(log2(|X|)).
@@ -3799,7 +4153,7 @@ fn default_toplevel_value(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// `(read STRING)` — read the first Lisp form from STRING.
 fn read_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let s = as_string(&a[0])?;
+    let s = as_string(h, &a[0])?;
     let forms = crate::reader::read_all(h, &s)?;
     forms
         .into_iter()
@@ -3809,7 +4163,7 @@ fn read_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(read-from-string STRING &optional START END)` — read the first object from
 /// STRING (from char index START), returning `(OBJECT . END-INDEX)`.
 fn read_from_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let s = as_string(&a[0])?;
+    let s = as_string(h, &a[0])?;
     let size = s.chars().count() as i64;
     // START/END follow Emacs `validate_subarray`: a negative index counts from
     // the end (`i + len`), nil defaults to 0 / len, and the checked range is
@@ -3850,9 +4204,9 @@ fn read_from_string(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(compare-strings S1 START1 END1 S2 START2 END2 &optional IGNORE-CASE)` —
 /// `t` if the substrings are equal, else a signed 1-based index of the first
 /// mismatch (negative when S1 sorts before S2), per Emacs.
-fn compare_strings(_h: &mut ElispHost, a: &[Value]) -> R {
-    let s1: Vec<char> = as_string(&a[0])?.chars().collect();
-    let s2: Vec<char> = as_string(&a[3])?.chars().collect();
+fn compare_strings(h: &mut ElispHost, a: &[Value]) -> R {
+    let s1: Vec<char> = as_string(h, &a[0])?.chars().collect();
+    let s2: Vec<char> = as_string(h, &a[3])?.chars().collect();
     let bound = |v: &Value, default: usize| -> usize {
         match v {
             Value::Int(n) => (*n).max(0) as usize,
@@ -4213,7 +4567,7 @@ fn current_time(_h: &mut ElispHost, _a: &[Value]) -> R {
 }
 
 fn format_time_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let fmt = as_string(&a[0])?;
+    let fmt = as_string(h, &a[0])?;
     let secs = time_arg_secs(h, a.get(1))?;
     let tm = time_decompose(secs, a.get(2));
     Ok(Value::str(fmt_time_string(&fmt, &tm, secs)))
@@ -4294,15 +4648,15 @@ fn encode_time(h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── environment / working directory ──
-fn getenv_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let name = as_string(&a[0])?;
+fn getenv_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let name = as_string(h, &a[0])?;
     Ok(std::env::var(&name).map(Value::str).unwrap_or(Value::Undef))
 }
-fn setenv_fn(_h: &mut ElispHost, a: &[Value]) -> R {
-    let name = as_string(&a[0])?;
+fn setenv_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let name = as_string(h, &a[0])?;
     match a.get(1) {
         Some(v) if !is_nil(v) => {
-            let val = as_string(v)?;
+            let val = as_string(h, v)?;
             std::env::set_var(&name, &val);
             Ok(Value::str(val))
         }
@@ -4449,23 +4803,23 @@ fn fs_access(p: &std::path::Path, mode: libc::c_int) -> bool {
         Err(_) => false,
     }
 }
-fn file_exists_p(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(fs_expand(&as_string(&a[0])?).exists()))
+fn file_exists_p(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(fs_expand(&as_string(h, &a[0])?).exists()))
 }
-fn file_directory_p(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(fs_expand(&as_string(&a[0])?).is_dir()))
+fn file_directory_p(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(fs_expand(&as_string(h, &a[0])?).is_dir()))
 }
-fn file_regular_p(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(fs_expand(&as_string(&a[0])?).is_file()))
+fn file_regular_p(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(fs_expand(&as_string(h, &a[0])?).is_file()))
 }
-fn file_readable_p(_h: &mut ElispHost, a: &[Value]) -> R {
+fn file_readable_p(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(fs_access(
-        &fs_expand(&as_string(&a[0])?),
+        &fs_expand(&as_string(h, &a[0])?),
         libc::R_OK,
     )))
 }
-fn file_writable_p(_h: &mut ElispHost, a: &[Value]) -> R {
-    let p = fs_expand(&as_string(&a[0])?);
+fn file_writable_p(h: &mut ElispHost, a: &[Value]) -> R {
+    let p = fs_expand(&as_string(h, &a[0])?);
     // For a non-existent file, writability is the parent directory's.
     let target = if p.exists() {
         p.clone()
@@ -4474,15 +4828,15 @@ fn file_writable_p(_h: &mut ElispHost, a: &[Value]) -> R {
     };
     Ok(nil_or(fs_access(&target, libc::W_OK)))
 }
-fn file_symlink_p(_h: &mut ElispHost, a: &[Value]) -> R {
-    match std::fs::read_link(fs_expand(&as_string(&a[0])?)) {
+fn file_symlink_p(h: &mut ElispHost, a: &[Value]) -> R {
+    match std::fs::read_link(fs_expand(&as_string(h, &a[0])?)) {
         Ok(t) => Ok(Value::str(t.to_string_lossy().into_owned())),
         Err(_) => Ok(Value::Undef),
     }
 }
-fn file_executable_p(_h: &mut ElispHost, a: &[Value]) -> R {
+fn file_executable_p(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(fs_access(
-        &fs_expand(&as_string(&a[0])?),
+        &fs_expand(&as_string(h, &a[0])?),
         libc::X_OK,
     )))
 }
@@ -4497,9 +4851,9 @@ fn invocation_file(_h: &mut ElispHost, _a: &[Value]) -> R {
     ))
 }
 fn directory_files_raw(h: &mut ElispHost, a: &[Value]) -> R {
-    let raw = as_string(&a[0])?;
+    let raw = as_string(h, &a[0])?;
     let match_re = match a.get(1) {
-        Some(v) if !is_nil(v) => Some(compile_cf(&as_string(v)?, false)?),
+        Some(v) if !is_nil(v) => Some(compile_cf(&as_string(h, v)?, false)?),
         _ => None,
     };
     let nosort = a.get(2).is_some_and(|v| !is_nil(v));
@@ -4536,17 +4890,17 @@ fn get_buffer(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 fn get_buffer_create(h: &mut ElispHost, a: &[Value]) -> R {
-    let name = as_string(&a[0])?;
+    let name = as_string(h, &a[0])?;
     Ok(h.get_buffer_create(&name))
 }
 fn generate_new_buffer(h: &mut ElispHost, a: &[Value]) -> R {
-    let base = as_string(&a[0])?;
+    let base = as_string(h, &a[0])?;
     let name = h.generate_new_buffer_name(&base);
     // generate-new-buffer always makes a fresh buffer (the unique name is free).
     Ok(h.get_buffer_create(&name))
 }
 fn generate_new_buffer_name(h: &mut ElispHost, a: &[Value]) -> R {
-    let base = as_string(&a[0])?;
+    let base = as_string(h, &a[0])?;
     Ok(Value::str(h.generate_new_buffer_name(&base)))
 }
 fn buffer_name(h: &mut ElispHost, a: &[Value]) -> R {
@@ -4571,7 +4925,7 @@ fn kill_buffer(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.kill_buffer(a.first()))
 }
 fn rename_buffer(h: &mut ElispHost, a: &[Value]) -> R {
-    let newname = as_string(&a[0])?;
+    let newname = as_string(h, &a[0])?;
     h.rename_buffer(&newname)
 }
 fn buffer_list(h: &mut ElispHost, _a: &[Value]) -> R {
@@ -4702,17 +5056,20 @@ fn use_local_map_fn(h: &mut ElispHost, a: &[Value]) -> R {
 fn current_local_map_fn(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(h.current_local_map())
 }
-fn insert_chars(v: &Value) -> Result<Vec<char>, String> {
+fn insert_chars(h: &ElispHost, v: &Value) -> Result<Vec<char>, String> {
     match v {
         Value::Str(s) => Ok(s.chars().collect()),
         Value::Int(n) => Ok(vec![char::from_u32(*n as u32).unwrap_or('\u{fffd}')]),
-        _ => Err("wrong-type-argument: char-or-string-p".to_string()),
+        _ => Err(format!(
+            "wrong-type-argument: char-or-string-p {}",
+            h.print(v, true)
+        )),
     }
 }
 fn insert_fn(h: &mut ElispHost, a: &[Value]) -> R {
     for v in a {
         let start = h.cur_buf_ref().point; // 1-based insertion position
-        let chars = insert_chars(v)?;
+        let chars = insert_chars(h, v)?;
         let n = chars.len();
         h.cur_insert(chars, true);
         // A propertized string carries its text properties into the buffer.
@@ -4731,7 +5088,7 @@ fn insert_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// `--insert-before-markers--`: insert one string/char, relocating markers at the
 /// insertion point past the new text (the `insert-before-markers` primitive).
 fn insert_before_markers_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let chunks = insert_chars(&a[0])?;
+    let chunks = insert_chars(h, &a[0])?;
     h.cur_insert_before_markers(chunks);
     Ok(Value::Undef)
 }
@@ -5074,7 +5431,7 @@ fn remove_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// `(propertize STRING &rest PROPS)` — a fresh copy of STRING carrying PROPS.
 fn propertize_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let base = as_string(&a[0])?;
+    let base = as_string(h, &a[0])?;
     let len = base.chars().count();
     let out = Value::str(base);
     // Build the plist from the trailing PROP VALUE pairs (in given order).
@@ -5102,7 +5459,7 @@ fn delete_region(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Undef)
 }
 fn insert_file_contents(h: &mut ElispHost, a: &[Value]) -> R {
-    let raw = as_string(&a[0])?;
+    let raw = as_string(h, &a[0])?;
     let content = std::fs::read_to_string(fs_expand(&raw))
         .map_err(|_| format!("file-missing: Opening input file: No such file: {raw}"))?;
     let chars: Vec<char> = content.chars().collect();
@@ -5284,7 +5641,7 @@ fn set_buf_match(h: &mut ElispHost, spans0: &[Option<(usize, usize)>], text: Str
     });
 }
 fn search_forward(h: &mut ElispHost, a: &[Value]) -> R {
-    let needle: Vec<char> = as_string(&a[0])?.chars().collect();
+    let needle: Vec<char> = as_string(h, &a[0])?.chars().collect();
     let len = h.cur_buf().text.len();
     let bound = match a.get(1) {
         Some(v) if !is_nil(v) => (as_int(h, v)?.max(0) as usize).min(len + 1),
@@ -5320,11 +5677,11 @@ fn search_forward(h: &mut ElispHost, a: &[Value]) -> R {
             Ok(Value::Int((end + 1) as i64))
         }
         None if noerror => Ok(Value::Undef),
-        None => Err(format!("search-failed: {}", as_string(&a[0])?)),
+        None => Err(format!("search-failed: {}", as_string(h, &a[0])?)),
     }
 }
 fn re_search_forward(h: &mut ElispHost, a: &[Value]) -> R {
-    let pat = as_string(&a[0])?;
+    let pat = as_string(h, &a[0])?;
     let re = compile_cf(&pat, case_fold_search(h))?;
     let bound = match a.get(1) {
         Some(v) if !is_nil(v) => Some(as_int(h, v)?.max(0) as usize),
@@ -5350,7 +5707,7 @@ fn re_search_forward(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 fn looking_at(h: &mut ElispHost, a: &[Value]) -> R {
-    let re = compile_cf(&as_string(&a[0])?, case_fold_search(h))?;
+    let re = compile_cf(&as_string(h, &a[0])?, case_fold_search(h))?;
     let text: String = h.cur_buf().text.iter().collect();
     let start_char = h.cur_buf().point - 1;
     match run_match(&re, &text, start_char) {
@@ -5397,7 +5754,7 @@ fn expand_repl(newtext: &str, gt: &dyn Fn(usize) -> String) -> String {
 /// replacement. Expands `\&`/`\N`/`\\` unless LITERAL, adapts case unless
 /// FIXEDCASE.
 fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
-    let newtext = as_string(&a[0])?;
+    let newtext = as_string(h, &a[0])?;
     let fixedcase = !matches!(
         a.get(1),
         Some(Value::Undef) | Some(Value::Bool(false)) | None
@@ -5503,7 +5860,7 @@ fn write_region(h: &mut ElispHost, a: &[Value]) -> R {
                 .collect()
         }
     };
-    let filename = as_string(&a[2])?;
+    let filename = as_string(h, &a[2])?;
     let path = fs_expand(&filename);
     let res = if append {
         use std::io::Write;
@@ -5518,13 +5875,13 @@ fn write_region(h: &mut ElispHost, a: &[Value]) -> R {
     res.map_err(|_| format!("file-error: Opening output file: {filename}"))?;
     Ok(Value::Undef)
 }
-fn delete_file(_h: &mut ElispHost, a: &[Value]) -> R {
-    let f = as_string(&a[0])?;
+fn delete_file(h: &mut ElispHost, a: &[Value]) -> R {
+    let f = as_string(h, &a[0])?;
     std::fs::remove_file(fs_expand(&f)).map_err(|_| format!("file-error: Removing file: {f}"))?;
     Ok(Value::Undef)
 }
-fn make_directory(_h: &mut ElispHost, a: &[Value]) -> R {
-    let f = as_string(&a[0])?;
+fn make_directory(h: &mut ElispHost, a: &[Value]) -> R {
+    let f = as_string(h, &a[0])?;
     let parents = a.get(1).is_some_and(|v| !is_nil(v));
     let p = fs_expand(&f);
     let r = if parents {
@@ -5535,21 +5892,21 @@ fn make_directory(_h: &mut ElispHost, a: &[Value]) -> R {
     r.map_err(|_| format!("file-error: Creating directory: {f}"))?;
     Ok(Value::Undef)
 }
-fn rename_file(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (o, n) = (as_string(&a[0])?, as_string(&a[1])?);
+fn rename_file(h: &mut ElispHost, a: &[Value]) -> R {
+    let (o, n) = (as_string(h, &a[0])?, as_string(h, &a[1])?);
     std::fs::rename(fs_expand(&o), fs_expand(&n))
         .map_err(|_| format!("file-error: Renaming: {o}"))?;
     Ok(Value::Undef)
 }
-fn copy_file(_h: &mut ElispHost, a: &[Value]) -> R {
-    let (o, n) = (as_string(&a[0])?, as_string(&a[1])?);
+fn copy_file(h: &mut ElispHost, a: &[Value]) -> R {
+    let (o, n) = (as_string(h, &a[0])?, as_string(h, &a[1])?);
     std::fs::copy(fs_expand(&o), fs_expand(&n)).map_err(|_| format!("file-error: Copying: {o}"))?;
     Ok(Value::Undef)
 }
 
 // ── subprocesses ──
-fn shell_command_to_string(_h: &mut ElispHost, a: &[Value]) -> R {
-    let cmd = as_string(&a[0])?;
+fn shell_command_to_string(h: &mut ElispHost, a: &[Value]) -> R {
+    let cmd = as_string(h, &a[0])?;
     match std::process::Command::new("sh")
         .arg("-c")
         .arg(&cmd)
@@ -5560,13 +5917,13 @@ fn shell_command_to_string(_h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 fn call_process(h: &mut ElispHost, a: &[Value]) -> R {
-    let program = as_string(&a[0])?;
+    let program = as_string(h, &a[0])?;
     // a[1] INFILE and a[3] DISPLAY are ignored; a[2] DESTINATION; a[4..] ARGS.
     let args: Vec<String> = a
         .get(4..)
         .unwrap_or(&[])
         .iter()
-        .filter_map(|v| as_string(v).ok())
+        .filter_map(|v| as_string(h, v).ok())
         .collect();
     let insert = matches!(a.get(2), Some(v) if !is_nil(v));
     let out = std::process::Command::new(&program)
@@ -5580,12 +5937,12 @@ fn call_process(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Int(out.status.code().unwrap_or(-1) as i64))
 }
 fn process_lines(h: &mut ElispHost, a: &[Value]) -> R {
-    let program = as_string(&a[0])?;
+    let program = as_string(h, &a[0])?;
     let args: Vec<String> = a
         .get(1..)
         .unwrap_or(&[])
         .iter()
-        .filter_map(|v| as_string(v).ok())
+        .filter_map(|v| as_string(h, v).ok())
         .collect();
     let out = std::process::Command::new(&program)
         .args(&args)
@@ -5682,7 +6039,7 @@ fn current_column(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(Value::Int(col as i64))
 }
 fn search_backward(h: &mut ElispHost, a: &[Value]) -> R {
-    let needle: Vec<char> = as_string(&a[0])?.chars().collect();
+    let needle: Vec<char> = as_string(h, &a[0])?.chars().collect();
     let bound = match a.get(1) {
         Some(v) if !is_nil(v) => (as_int(h, v)?.max(1) as usize) - 1,
         _ => 0,
@@ -5718,11 +6075,11 @@ fn search_backward(h: &mut ElispHost, a: &[Value]) -> R {
             Ok(Value::Int((i + 1) as i64))
         }
         None if noerror => Ok(Value::Undef),
-        None => Err(format!("search-failed: {}", as_string(&a[0])?)),
+        None => Err(format!("search-failed: {}", as_string(h, &a[0])?)),
     }
 }
 fn re_search_backward(h: &mut ElispHost, a: &[Value]) -> R {
-    let pat = as_string(&a[0])?;
+    let pat = as_string(h, &a[0])?;
     let re = compile_cf(&pat, case_fold_search(h))?;
     let noerror = a.get(2).is_some_and(|v| !is_nil(v));
     let text: String = h.cur_buf().text.iter().collect();
@@ -5773,7 +6130,7 @@ fn in_char_set(c: char, ranges: &[(char, char)], neg: bool) -> bool {
     m != neg
 }
 fn skip_chars_forward(h: &mut ElispHost, a: &[Value]) -> R {
-    let (neg, ranges) = parse_char_set(&as_string(&a[0])?);
+    let (neg, ranges) = parse_char_set(&as_string(h, &a[0])?);
     let buf = h.cur_buf();
     let start = buf.point;
     while buf.point <= buf.text.len() && in_char_set(buf.text[buf.point - 1], &ranges, neg) {
@@ -5782,7 +6139,7 @@ fn skip_chars_forward(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Int((buf.point - start) as i64))
 }
 fn skip_chars_backward(h: &mut ElispHost, a: &[Value]) -> R {
-    let (neg, ranges) = parse_char_set(&as_string(&a[0])?);
+    let (neg, ranges) = parse_char_set(&as_string(h, &a[0])?);
     let buf = h.cur_buf();
     let start = buf.point;
     while buf.point > 1 && in_char_set(buf.text[buf.point - 2], &ranges, neg) {
@@ -5857,6 +6214,8 @@ pub fn install(h: &mut ElispHost) {
     s("stringp", 1, Some(1), stringp);
     s("numberp", 1, Some(1), numberp);
     s("integerp", 1, Some(1), integerp);
+    s("fixnump", 1, Some(1), fixnump);
+    s("bignump", 1, Some(1), bignump);
     s("floatp", 1, Some(1), floatp);
     s("vectorp", 1, Some(1), vectorp);
     s("zerop", 1, Some(1), zerop);

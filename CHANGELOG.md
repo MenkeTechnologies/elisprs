@@ -5,7 +5,75 @@ All notable changes to elisprs are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Bignums.** Emacs has no fixed-width integers: an integer that leaves fixnum
+  range (±2^61, `most-positive-fixnum`) becomes a bignum and stays exact. elisprs
+  now has `Obj::Bignum` (num-bigint), and integers promote through the whole
+  interpreter — arithmetic, `expt` / `ash` / `lsh` / `abs` / the bit ops, `/` `%`
+  `mod`, the rounding family, the reader, the printer, `eq` / `eql` / `equal`,
+  `sxhash`, hash-table keys, `format` `%d` / `%x` / `%o`, `number-to-string` /
+  `string-to-number`. `(expt 2 70)` was `0`; `(* 1000000000000 1000000000000)`
+  wrapped. `fixnump` / `bignump` are real subrs now (they were prelude stubs
+  answering `(integerp x)` / `nil`).
+- **Strict numeric typing.** `+` `-` `*` `1+` `1-` and the numeric comparisons are
+  lowered straight to fusevm ops, whose semantics are awk's: a non-numeric operand
+  coerced (`(+ 1 "a")` was `1.0`) and integer overflow wrapped. fusevm 0.14.6 adds
+  a *numeric hook* — installed by `host::run_chunk` — so those ops hand the host
+  every case they cannot compute natively, and elisp signals
+  `(wrong-type-argument number-or-marker-p "a")` or promotes to a bignum. The
+  arithmetic stays JIT-compiled: the checked lowering folds the overflow and
+  fixnum-range tests into one accumulator with no branch on the hot path.
+- **Differential fuzz harness** (`scripts/fuzz_parity.sh`, `scripts/fuzz/`):
+  generates a seeded corpus of random elisp forms, evaluates every form under both
+  `emacs -Q --batch` and `elisp` through one shared driver, and reports each form
+  whose value — or whose signalled error — differs. Everything below was found
+  with it.
+
+### Fixed (correctness)
+- **The script cache could shadow a builtin.** A cache hit skips the prelude and
+  re-imports a serialized heap image, which used to re-intern *every* symbol it
+  carried into the global obarray — including uninterned ones (a lambda parameter,
+  a `let` binding in a macro body). The prelude binds a local named `exp`, so a
+  *warm* cache rebound the global `exp` to a symbol with no function cell:
+  `(exp -1.0)` worked on the first run of a script and answered `void-function exp`
+  on every run after. `SerObj::Symbol` now records whether the obarray maps the
+  name to that symbol, and only those re-claim it. Cache format → v3.
+- **A float chunk result was truncated to an integer** once the block-JIT cache
+  warmed up (fusevm returned the result register as `Value::Int` unconditionally):
+  the second and later `(eval 2.5 t)` in a process answered `2`. Fixed in fusevm
+  0.14.6.
+
 ### Fixed (Emacs parity — see BUGS.md)
+- Float printing follows Emacs's `float_to_string` (gnulib `dtoastr`): the shortest
+  `%g` form that reads back as the same float, so `(float most-positive-fixnum)` is
+  `2.305843009213694e+18` (was `2305843009213694000.0`) and `(ldexp 1.0 -1074)` is
+  `5e-324`.
+- Integer comparison is exact. `=` `<` `>` `<=` `>=` compared as `f64`, which runs
+  out of mantissa at 2^53: `(= 2305843009213693950 2305843009213693951)` answered
+  `t`.
+- Error data carries the offending value and the predicate the *specific* builtin
+  checks. The value used to be a raw heap handle (`(wrong-type-argument stringp
+  (obj:154357))`) or missing entirely. `abs` / `floor` / `ceiling` / `round` /
+  `truncate` / `float` / `expt` / `sqrt` / `number-to-string` signal `numberp`;
+  arithmetic signals `number-or-marker-p`; `logand` / `logior` / `logxor` / `%`
+  signal `integer-or-marker-p`; `ash` / `lsh` / `lognot` / `logcount` signal
+  `integerp`. `wrong-number-of-arguments` now carries `(CALLEE COUNT)`.
+- Regexp diagnostics are Emacs's own strings (`"Unmatched [ or [^"`, `"Invalid
+  content of \{\}"`, `"Trailing backslash"`, …) under `invalid-regexp`, instead of
+  leaking `fancy-regex`'s parser message and byte offsets. Emacs's tolerances too:
+  a repetition operator with nothing to repeat is a literal (`(string-match "*x"
+  "*x")` is 0) and a reversed range `[z-a]` matches nothing rather than failing to
+  compile.
+- `match-data` drops trailing unmatched groups, as Emacs does.
+- `print-escape-control-characters` is honoured (and defvar'd), printing a control
+  character as a backslash + octal escape.
+- `seq-union` dedups *within* the first sequence, not only across the two.
+- Sequence functions inherit their Emacs Lisp definitions' tolerances:
+  `string-suffix-p` length-tests before it type-checks, `nconc`'s last argument may
+  be any object (`(nconc (list 1) (cons 2 "s"))` → `(1 2 . "s")`), `string-to-vector`
+  / `string-to-list` take any sequence, `concat` / `string-join` signal `sequencep`,
+  `remq` / `delq` signal `listp`, `string=` signals `stringp`.
+
 - `assq` / `assoc` / `rassq` now skip non-cons list elements instead of signalling
   `wrong-type-argument listp` (Emacs C `FOR_EACH_TAIL` + a `CONSP` guard), so e.g.
   `(assq 'interactive '("doc" (…)))` returns nil — the lookup `cl-defmethod`

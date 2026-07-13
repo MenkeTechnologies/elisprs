@@ -14,7 +14,8 @@
 //! re-entrant entry point and only ever borrows the host for short, nested-free
 //! operations.
 
-use fusevm::{Chunk, VMResult, Value, VM};
+use fusevm::{Chunk, NumOp, VMResult, Value, VM};
+use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -43,6 +44,18 @@ pub enum SerObj {
         buffer_local_auto: bool,
         #[serde(default)]
         alias_of: Option<u32>,
+        /// Whether the global obarray maps `name` to *this* symbol.
+        ///
+        /// An uninterned symbol (a `make-symbol`/gensym result, a lambda
+        /// parameter, a `let` binding in a macro body) has a name but no obarray
+        /// entry. Without this flag the image cannot tell the two apart, and
+        /// re-interning every symbol on import silently rebinds the global name
+        /// to the uninterned copy: the prelude binds a local named `exp`
+        /// (`prelude.rs`), so a cache hit used to shadow the `exp` builtin with a
+        /// symbol that has no function cell — `(exp 1)` answered `void-function`
+        /// on a warm cache and worked on a cold one.
+        #[serde(default)]
+        interned: bool,
     },
     Vector(Vec<Value>),
     HashTable {
@@ -63,6 +76,7 @@ pub enum SerObj {
         body: Chunk,
         is_macro: bool,
     },
+    Bignum(BigInt),
 }
 
 /// Extension-op IDs emitted by the compiler and dispatched here.
@@ -200,6 +214,17 @@ pub enum Obj {
     /// `obarray` variable) is the one with `global == true`; its symbol set is
     /// `ElispHost::obarray`, not `symbols`. See [`ObarrayData`].
     Obarray(ObarrayData),
+    /// An integer too large for a fixnum. Emacs has no fixed-width integers: an
+    /// arithmetic result that leaves fixnum range (±2^61, see
+    /// `most-positive-fixnum`) becomes a bignum, and stays exact. `type-of` still
+    /// answers `integer` — bignum-ness is an implementation detail of the same
+    /// type, which is why `integerp` accepts these and `fixnump` does not.
+    ///
+    /// Never in fixnum range: [`ElispHost::make_integer`] is the only constructor
+    /// and it demotes a small value back to `Value::Int`, so `eql`/`equal` can
+    /// compare a bignum against a fixnum by value without a cross-representation
+    /// case, and two equal bignums always have the same printed form.
+    Bignum(BigInt),
 }
 
 /// An `Obj::Obarray` payload. A private obarray owns its `symbols` map
@@ -553,6 +578,115 @@ impl ElispHost {
         let id = self.arena.len() as u32;
         self.arena.push(obj);
         Value::Obj(id)
+    }
+
+    /// The only way to make an elisp integer: a value inside fixnum range is a
+    /// `Value::Int`, anything else a heap `Obj::Bignum`.
+    ///
+    /// Normalizing here is what lets the rest of the interpreter stay simple —
+    /// `eql`, `equal`, `sxhash` and the printer never have to consider a bignum
+    /// that happens to hold a small value, because one cannot exist.
+    pub fn make_integer(&mut self, n: BigInt) -> Value {
+        use num_traits::ToPrimitive;
+        match n.to_i64() {
+            Some(i) if (MOST_NEGATIVE_FIXNUM..=MOST_POSITIVE_FIXNUM).contains(&i) => Value::Int(i),
+            _ => self.alloc(Obj::Bignum(n)),
+        }
+    }
+
+    /// The integer value of `v`, if it is one (fixnum or bignum).
+    pub fn as_bigint(&self, v: &Value) -> Option<BigInt> {
+        match v {
+            Value::Int(n) => Some(BigInt::from(*n)),
+            Value::Obj(_) => match self.obj(v) {
+                Some(Obj::Bignum(b)) => Some(b.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether `v` is an integer (fixnum or bignum) — elisp `integerp`.
+    pub fn is_integer(&self, v: &Value) -> bool {
+        matches!(v, Value::Int(_)) || matches!(self.obj(v), Some(Obj::Bignum(_)))
+    }
+
+    /// Whether `v` is a number — elisp `numberp`.
+    pub fn is_number(&self, v: &Value) -> bool {
+        matches!(v, Value::Int(_) | Value::Float(_)) || self.is_bignum(v)
+    }
+
+    /// Whether `v` is specifically a bignum — elisp `bignump`.
+    pub fn is_bignum(&self, v: &Value) -> bool {
+        matches!(self.obj(v), Some(Obj::Bignum(_)))
+    }
+
+    /// Apply a fusevm arithmetic/comparison op to two elisp numbers.
+    ///
+    /// Reached only from the numeric hook, i.e. only for the operands fusevm
+    /// could not compute natively. Integer arithmetic is exact (promoting to a
+    /// bignum as needed); any float operand makes the result a float, as in
+    /// Emacs.
+    pub fn apply_num_op(&mut self, op: NumOp, a: Num, b: Num) -> Result<Value, String> {
+        use NumOp::*;
+        // Comparisons first: they answer a bool for any pair, and comparing two
+        // exact integers must not detour through `f64` (which would call
+        // 2^62 and 2^62+1 equal).
+        if matches!(op, Lt | Gt | Le | Ge | Eq | Ne) {
+            let ord = match (&a, &b) {
+                (Num::Int(x), Num::Int(y)) => x.cmp(y),
+                _ => match a.to_f64().partial_cmp(&b.to_f64()) {
+                    Some(o) => o,
+                    // A NaN operand: every comparison is false, `/=` is true.
+                    None => return Ok(Value::Bool(matches!(op, Ne))),
+                },
+            };
+            let yes = match op {
+                Lt => ord.is_lt(),
+                Gt => ord.is_gt(),
+                Le => ord.is_le(),
+                Ge => ord.is_ge(),
+                Eq => ord.is_eq(),
+                _ => ord.is_ne(),
+            };
+            return Ok(Value::Bool(yes));
+        }
+
+        match (a, b) {
+            (Num::Int(x), Num::Int(y)) => {
+                let r = match op {
+                    Add => x + y,
+                    Sub => x - y,
+                    Mul => x * y,
+                    Neg => -x,
+                    Mod => {
+                        if y == BigInt::from(0) {
+                            return Err("arith-error".to_string());
+                        }
+                        x % y
+                    }
+                    // `/` and `expt` are elisp builtins, not lowered to VM ops, so
+                    // the VM never asks us for them with integer operands.
+                    Div | Pow => return Ok(Value::Float(bigint_to_f64(&x) / bigint_to_f64(&y))),
+                    Lt | Gt | Le | Ge | Eq | Ne => unreachable!("handled above"),
+                };
+                Ok(self.make_integer(r))
+            }
+            // Float-contagious, exactly like Emacs.
+            (a, b) => {
+                let (x, y) = (a.to_f64(), b.to_f64());
+                Ok(Value::Float(match op {
+                    Add => x + y,
+                    Sub => x - y,
+                    Mul => x * y,
+                    Neg => -x,
+                    Div => x / y,
+                    Mod => x % y,
+                    Pow => x.powf(y),
+                    Lt | Gt | Le | Ge | Eq | Ne => unreachable!("handled above"),
+                }))
+            }
+        }
     }
     pub fn intern(&mut self, name: &str) -> Value {
         if let Some(&id) = self.obarray.get(name) {
@@ -1301,7 +1435,8 @@ impl ElispHost {
     pub fn export_heap_image(&self) -> Vec<SerObj> {
         self.arena[self.builtin_count..]
             .iter()
-            .map(|o| match o {
+            .enumerate()
+            .map(|(off, o)| match o {
                 Obj::Cons(a, b) => SerObj::Cons(a.clone(), b.clone()),
                 Obj::Symbol(s) => SerObj::Symbol {
                     name: s.name.clone(),
@@ -1310,8 +1445,10 @@ impl ElispHost {
                     special: s.special,
                     buffer_local_auto: s.buffer_local_auto,
                     alias_of: s.alias_of,
+                    interned: self.symbol_is_interned(s, (self.builtin_count + off) as u32),
                 },
                 Obj::Vector(v) => SerObj::Vector(v.clone()),
+                Obj::Bignum(b) => SerObj::Bignum(b.clone()),
                 Obj::HashTable { test, entries } => SerObj::HashTable {
                     test: *test,
                     entries: entries.clone(),
@@ -1333,6 +1470,7 @@ impl ElispHost {
                     special: false,
                     buffer_local_auto: false,
                     alias_of: None,
+                    interned: false,
                 },
                 Obj::Closure {
                     params,
@@ -1354,6 +1492,7 @@ impl ElispHost {
                     special: false,
                     buffer_local_auto: false,
                     alias_of: None,
+                    interned: false,
                 },
             })
             .collect()
@@ -1361,6 +1500,13 @@ impl ElispHost {
     pub fn builtin_count(&self) -> usize {
         self.builtin_count
     }
+    /// Whether the global obarray maps this symbol's name to *this* handle — i.e.
+    /// the symbol is interned, not a `make-symbol` result, a lambda parameter, or
+    /// a macro-local binding that merely shares a name with something interned.
+    fn symbol_is_interned(&self, s: &SymbolData, id: u32) -> bool {
+        self.obarray.get(&s.name) == Some(&id)
+    }
+
     /// A fingerprint of the builtin object layout: the ordered names of every
     /// interned builtin symbol. Compiled chunks bake in builtin arena handles, so
     /// adding / removing / reordering subrs must invalidate the on-disk bytecode
@@ -1419,6 +1565,7 @@ impl ElispHost {
             .map(|(off, o)| {
                 let idx = self.builtin_count + off;
                 match o {
+                    Obj::Bignum(b) => SerObj::Bignum(b.clone()),
                     Obj::Symbol(s) => {
                         let value = if idx < prelude_end {
                             baseline.get(idx - self.builtin_count).cloned().flatten()
@@ -1432,6 +1579,7 @@ impl ElispHost {
                             special: s.special,
                             buffer_local_auto: s.buffer_local_auto,
                             alias_of: s.alias_of,
+                            interned: self.symbol_is_interned(s, idx as u32),
                         }
                     }
                     Obj::Cons(a, b) => SerObj::Cons(a.clone(), b.clone()),
@@ -1455,6 +1603,7 @@ impl ElispHost {
                         special: false,
                         buffer_local_auto: false,
                         alias_of: None,
+                        interned: false,
                     },
                     Obj::Closure {
                         params,
@@ -1475,6 +1624,7 @@ impl ElispHost {
                         special: false,
                         buffer_local_auto: false,
                         alias_of: None,
+                        interned: false,
                     },
                 }
             })
@@ -1487,6 +1637,7 @@ impl ElispHost {
             let id = self.arena.len() as u32;
             let obj = match ser {
                 SerObj::Cons(a, b) => Obj::Cons(a, b),
+                SerObj::Bignum(b) => Obj::Bignum(b),
                 SerObj::Symbol {
                     name,
                     value,
@@ -1494,8 +1645,15 @@ impl ElispHost {
                     special,
                     buffer_local_auto,
                     alias_of,
+                    interned,
                 } => {
-                    self.obarray.insert(name.clone(), id);
+                    // Only a symbol that *was* the global binding for its name may
+                    // claim that name again. Re-interning an uninterned symbol
+                    // here would shadow a builtin of the same name with a copy
+                    // that has no function cell.
+                    if interned {
+                        self.obarray.insert(name.clone(), id);
+                    }
                     Obj::Symbol(SymbolData {
                         name,
                         value,
@@ -1738,6 +1896,20 @@ impl ElispHost {
                     if self.print_flag("print-escape-newlines") {
                         t = t.replace('\n', "\\n").replace('\u{c}', "\\f");
                     }
+                    // print-escape-control-characters: every remaining control
+                    // character prints as a backslash + *octal* escape (Emacs
+                    // `print_object`), so a tab reads back as `\11`.
+                    if self.print_flag("print-escape-control-characters") {
+                        let mut esc = String::with_capacity(t.len());
+                        for c in t.chars() {
+                            if (c as u32) < 0x20 || c as u32 == 0x7f {
+                                esc.push_str(&format!("\\{:o}", c as u32));
+                            } else {
+                                esc.push(c);
+                            }
+                        }
+                        t = esc;
+                    }
                     // A propertized string prints as `#("text" START END (plist) …)`.
                     let intervals = self.string_prop_intervals(s, depth);
                     if intervals.is_empty() {
@@ -1791,6 +1963,8 @@ impl ElispHost {
                         self.print_inner(&t.subtype, readable, depth + 1),
                     )
                 }
+                // A bignum prints exactly like a fixnum — same type in elisp.
+                Some(Obj::Bignum(b)) => b.to_string(),
                 Some(Obj::Buffer(idx)) => {
                     match self.buffers.get(*idx).and_then(|b| b.name.as_ref()) {
                         Some(name) => format!("#<buffer {name}>"),
@@ -2658,25 +2832,62 @@ impl ElispHost {
 /// the exponential string is shorter (so `1e15` => `1e+15` but
 /// `1234567890123456.0` stays decimal). Integer-valued floats keep a `.0`.
 pub fn format_float(f: f64) -> String {
-    let e_full = format!("{f:e}"); // "M[.MMM]eP"
-    let (mantissa, exp_part) = e_full.rsplit_once('e').unwrap();
-    let exp: i64 = exp_part.parse().unwrap_or(0);
-    let dec = {
-        let d = format!("{f}");
-        if d.contains('.') {
-            d
-        } else {
-            format!("{d}.0")
-        }
-    };
-    let exp_str = {
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:0>2}", exp.abs())
-    };
-    if exp <= -5 || (exp >= 15 && exp_str.len() < dec.len()) {
-        exp_str
+    // Emacs prints a float as the shortest string that reads back as the same
+    // float (`float_to_string` → gnulib `dtoastr`), formatted like C's `%g`: it
+    // tries precision 15, 16, then 17 and takes the first that round-trips. That
+    // is why `(float most-positive-fixnum)` prints as `2.305843009213694e+18`
+    // rather than `2305843009213694000.0` — %g goes exponential once the decimal
+    // exponent reaches the precision.
+    // gnulib's `ftoastr` starts at precision 1 for a subnormal (where a single
+    // significant digit already round-trips: 5e-324) and at DBL_DIG = 15
+    // otherwise (so 1e10 prints as 10000000000.0, not 1e+10).
+    let start = if f != 0.0 && f.abs() < f64::MIN_POSITIVE {
+        1
     } else {
-        dec
+        15
+    };
+    for prec in start..=17 {
+        let s = format_g(f, prec);
+        if s.parse::<f64>() == Ok(f) {
+            return ensure_float_syntax(s);
+        }
+    }
+    ensure_float_syntax(format_g(f, 17))
+}
+
+/// C's `%g` with the given precision: fixed notation while the decimal exponent
+/// is in `-4..PREC`, exponential outside it, trailing zeros trimmed either way.
+fn format_g(x: f64, prec: usize) -> String {
+    let prec = prec.max(1);
+    let e_form = format!("{:.*e}", prec - 1, x);
+    let (mantissa, exp_str) = e_form.rsplit_once('e').unwrap_or((e_form.as_str(), "0"));
+    let exp: i32 = exp_str.parse().unwrap_or(0);
+    if exp < -4 || exp >= prec as i32 {
+        let sign = if exp < 0 { '-' } else { '+' };
+        // C pads the exponent to at least two digits: `1e-10`, `1e+300`.
+        format!("{}e{}{:02}", trim_zeros(mantissa), sign, exp.abs())
+    } else {
+        let decimals = (prec as i32 - 1 - exp).max(0) as usize;
+        trim_zeros(&format!("{x:.decimals$}"))
+    }
+}
+
+/// Drop a fraction's trailing zeros (and a bare trailing point), as `%g` does.
+fn trim_zeros(s: &str) -> String {
+    if !s.contains('.') {
+        return s.to_string();
+    }
+    let t = s.trim_end_matches('0');
+    t.strip_suffix('.').unwrap_or(t).to_string()
+}
+
+/// A printed float must read back as a float: Emacs appends `.0` when neither a
+/// decimal point nor an exponent is present (`100` → `100.0`).
+fn ensure_float_syntax(s: String) -> String {
+    if s.contains('.') || s.contains('e') || s.contains("INF") || s.contains("NaN") {
+        s
+    } else {
+        format!("{s}.0")
     }
 }
 
@@ -2976,11 +3187,20 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
         }
     }
 
+    // The callee as written by the caller — a symbol, or the function object when
+    // applied. It goes into the `wrong-number-of-arguments` data, so keep it
+    // before the match binds `f` to the resolved fn pointer.
+    let callee = f.clone();
     let resolved = with_host(|h| h.resolve_function(f))?;
     match resolved {
         Resolved::Subr { f, min, max, name } => {
             if args.len() < min || max.is_some_and(|m| args.len() > m) {
-                return Err(format!("wrong-number-of-arguments: {name}"));
+                let _ = &name;
+                // Emacs's error data is (FUNC N): the callee as the caller wrote
+                // it (a symbol, or the subr object when applied) and the argument
+                // count it was given.
+                let shown = with_host(|h| h.print(&callee, true));
+                return Err(format!("wrong-number-of-arguments: {shown} {}", args.len()));
             }
             with_host(|h| f(h, args))
         }
@@ -3709,12 +3929,107 @@ fn abort(vm: &mut VM, e: String) {
     vm.ip = vm.chunk.ops.len();
 }
 
+/// Emacs `most-positive-fixnum` (2^61-1) and `most-negative-fixnum` (-2^61).
+/// An integer outside this range is a bignum, even though it still fits an
+/// `i64` — matching Emacs, where the two low bits are the type tag.
+pub const MOST_POSITIVE_FIXNUM: i64 = 2305843009213693951;
+/// See [`MOST_POSITIVE_FIXNUM`].
+pub const MOST_NEGATIVE_FIXNUM: i64 = -2305843009213693952;
+
+/// An elisp number in the one place elisp arithmetic has to be exact: an integer
+/// is arbitrary-precision, a float is an `f64`. Mixed arithmetic is
+/// float-contagious, as in Emacs.
+pub enum Num {
+    Int(BigInt),
+    Float(f64),
+}
+
+impl Num {
+    pub fn to_f64(&self) -> f64 {
+        match self {
+            Num::Int(i) => bigint_to_f64(i),
+            Num::Float(f) => *f,
+        }
+    }
+}
+
+/// `BigInt` → `f64`, the conversion Emacs does when an integer meets a float.
+/// Saturates to ±inf beyond `f64` range, which is what Emacs's `(float (expt 10
+/// 400))` yields.
+pub fn bigint_to_f64(i: &BigInt) -> f64 {
+    use num_traits::ToPrimitive;
+    i.to_f64()
+        .unwrap_or(if i.sign() == num_bigint::Sign::Minus {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        })
+}
+
+/// elisp's numeric semantics, installed into fusevm as a [`fusevm::NumericHook`].
+///
+/// fusevm's arithmetic ops are awk-flavoured by default — a non-numeric operand
+/// coerces (`"a"` → `0.0`) and integer overflow wraps — and the compiler lowers
+/// `+`/`-`/`*`/`1+`/`1-` and the numeric comparisons straight to them
+/// (`compiler.rs`, `try_native_op`), which is what makes elisp arithmetic
+/// JIT-compilable. Strict mode keeps that lowering and hands back only the cases
+/// fusevm cannot compute natively:
+///
+/// - a non-number (string, cons, symbol, `t`, `nil`): Emacs signals
+///   `(wrong-type-argument number-or-marker-p X)` — except for a marker, which is
+///   its buffer position;
+/// - a bignum operand, which rides through the VM as a `Value::Obj` handle;
+/// - an integer result that overflowed `i64` *or* left elisp's fixnum range:
+///   Emacs's integers are unbounded, so it becomes a bignum.
+///
+/// Everything else — fixnum arithmetic in range, all float arithmetic — never
+/// reaches here and stays on the VM's (and the JIT's) fast path.
+fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
+    with_host(|h| {
+        // `(+ 1 (point-marker))` — a marker is a number in arithmetic position.
+        let coerce = |h: &ElispHost, v: &Value| -> Option<Num> {
+            match v {
+                Value::Int(n) => Some(Num::Int(BigInt::from(*n))),
+                Value::Float(f) => Some(Num::Float(*f)),
+                Value::Obj(_) => match h.obj(v) {
+                    Some(Obj::Bignum(b)) => Some(Num::Int(b.clone())),
+                    _ => h.marker_position(v).map(|p| Num::Int(BigInt::from(p))),
+                },
+                _ => None,
+            }
+        };
+        let unary = matches!(op, NumOp::Neg);
+        let an = coerce(h, a).ok_or_else(|| {
+            format!(
+                "wrong-type-argument: number-or-marker-p {}",
+                h.print(a, true)
+            )
+        })?;
+        let bn = if unary {
+            Num::Int(BigInt::from(0))
+        } else {
+            coerce(h, b).ok_or_else(|| {
+                format!(
+                    "wrong-type-argument: number-or-marker-p {}",
+                    h.print(b, true)
+                )
+            })?
+        };
+        h.apply_num_op(op, an, bn)
+    })
+}
+
 /// Run a compiled chunk on a fresh fusevm VM, returning the elisp result.
 pub fn run_chunk(chunk: Chunk) -> Result<Value, String> {
     with_host(|h| h.error = None);
     let mut vm = VM::new(chunk);
     vm.set_extension_handler(Box::new(ext_dispatch));
     vm.set_extension_wide_handler(Box::new(ext_dispatch_wide));
+    // elisp is not awk: arithmetic signals on a non-number and promotes past
+    // fixnum range instead of coercing and wrapping. The hook is what the VM
+    // (and its JIT) call for the cases they cannot compute natively.
+    vm.set_numeric_hook(std::sync::Arc::new(numeric_hook));
+    vm.set_fixnum_range(MOST_NEGATIVE_FIXNUM, MOST_POSITIVE_FIXNUM);
     // Hot loops trace-compile through fusevm's Cranelift JIT; with the
     // `jit-disk-cache` feature, compiled native code is persisted across runs.
     vm.enable_tracing_jit();

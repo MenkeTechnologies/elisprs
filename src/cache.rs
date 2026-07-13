@@ -45,8 +45,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Magic header bytes — fail fast if a wrong-format file is read. ("ELSP")
 pub const SHARD_MAGIC: u32 = 0x454C_5350;
-/// Bumped on incompatible rkyv schema changes. v2 adds the header + binary-mtime.
-pub const SHARD_FORMAT_VERSION: u32 = 2;
+/// Bumped on incompatible rkyv schema changes. v2 adds the header + binary-mtime;
+/// v3 adds `SerObj::Symbol::interned`, without which a cache hit re-interned every
+/// symbol in the heap image and an uninterned prelude local could shadow a builtin.
+pub const SHARD_FORMAT_VERSION: u32 = 3;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next

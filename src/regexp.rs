@@ -16,34 +16,84 @@
 //! them the same way.
 
 /// Translate an Emacs regexp string into the `regex` crate's syntax.
+///
+/// The translator also *diagnoses* — with Emacs's own wording (`regex-emacs.c`),
+/// because the error string is part of the `invalid-regexp` error data that elisp
+/// code catches and prints — and *tolerates* what Emacs tolerates. A repetition
+/// operator with nothing to repeat is a literal in Emacs (`(string-match "*x" "x")`
+/// is 0, not an error), and a reversed range like `[z-a]` simply never matches
+/// rather than failing to compile. Both would otherwise surface as a
+/// `fancy-regex` parse failure whose message names byte offsets in the
+/// *translated* pattern — meaningless to the elisp caller.
 pub fn translate(pat: &str) -> Result<String, String> {
     let mut out = String::with_capacity(pat.len() + 8);
     let mut it = pat.chars().peekable();
+    // Depth of open `\(` groups, so a stray `\)` is diagnosed like Emacs's.
+    let mut depth: i32 = 0;
+    // Whether a repetition operator here has something to repeat. False at the
+    // start of the pattern and just after `\(` or `\|`, where Emacs reads
+    // `*`/`+`/`?` as ordinary characters.
+    let mut can_repeat = false;
     while let Some(c) = it.next() {
         match c {
-            '\\' => translate_escape(&mut it, &mut out)?,
+            '\\' => translate_escape(&mut it, &mut out, &mut depth, &mut can_repeat)?,
             // Literal in elisp, special in the crate → escape.
             '(' | ')' | '{' | '}' | '|' => {
                 out.push('\\');
                 out.push(c);
+                can_repeat = true;
             }
             // Character alternative: copy through verbatim. Both dialects agree
             // on `[a-z]`, `[^...]`, a leading/`^`-leading `]`, and `[:class:]`.
-            '[' => copy_class(&mut it, &mut out),
-            // `+ * ? . ^ $` and ordinary chars share meaning across dialects.
-            _ => out.push(c),
+            '[' => {
+                copy_class(&mut it, &mut out)?;
+                can_repeat = true;
+            }
+            // A repetition operator with no preceding expression is a literal
+            // character in Emacs, not an error.
+            '*' | '+' | '?' => {
+                if can_repeat {
+                    out.push(c);
+                } else {
+                    out.push('\\');
+                    out.push(c);
+                    can_repeat = true;
+                }
+            }
+            '^' | '$' => out.push(c),
+            // `.` and ordinary chars share meaning across dialects.
+            _ => {
+                out.push(c);
+                can_repeat = true;
+            }
         }
+    }
+    if depth > 0 {
+        return Err(UNMATCHED_OPEN.into());
     }
     Ok(out)
 }
 
+/// Emacs's own `invalid-regexp` messages (`regex-emacs.c`), reproduced verbatim:
+/// elisp code catches these and prints the string.
+const UNMATCHED_OPEN: &str = "Unmatched ( or \\(";
+const UNMATCHED_CLOSE: &str = "Unmatched ) or \\)";
+const UNMATCHED_BRACKET: &str = "Unmatched [ or [^";
+const UNMATCHED_BRACE: &str = "Unmatched \\{";
+const INVALID_BRACE_CONTENT: &str = "Invalid content of \\{\\}";
+const TRAILING_BACKSLASH: &str = "Trailing backslash";
+
 fn translate_escape(
     it: &mut std::iter::Peekable<std::str::Chars>,
     out: &mut String,
+    depth: &mut i32,
+    can_repeat: &mut bool,
 ) -> Result<(), String> {
     let Some(e) = it.next() else {
-        return Err("trailing backslash in regexp".into());
+        return Err(TRAILING_BACKSLASH.into());
     };
+    // Only a group open / alternation leaves nothing to repeat after it.
+    *can_repeat = !matches!(e, '(' | '|');
     match e {
         // Grouping / alternation / bounds: drop the backslash.
         '(' => {
@@ -79,10 +129,48 @@ fn translate_escape(
             } else {
                 out.push('(');
             }
+            *depth += 1;
         }
-        ')' => out.push(')'),
+        ')' => {
+            if *depth == 0 {
+                return Err(UNMATCHED_CLOSE.into());
+            }
+            *depth -= 1;
+            out.push(')');
+        }
         '|' => out.push('|'),
-        '{' => out.push('{'),
+        // `\{m,n\}` — Emacs validates the bounds itself, and its diagnostics are
+        // what elisp code sees.
+        '{' => {
+            let mut body = String::new();
+            let mut closed = false;
+            while let Some(c) = it.next() {
+                if c == '\\' {
+                    match it.next() {
+                        Some('}') => {
+                            closed = true;
+                            break;
+                        }
+                        Some(o) => {
+                            body.push('\\');
+                            body.push(o);
+                        }
+                        None => return Err(TRAILING_BACKSLASH.into()),
+                    }
+                } else {
+                    body.push(c);
+                }
+            }
+            if !closed {
+                return Err(UNMATCHED_BRACE.into());
+            }
+            if !valid_brace_body(&body) {
+                return Err(INVALID_BRACE_CONTENT.into());
+            }
+            out.push('{');
+            out.push_str(&body);
+            out.push('}');
+        }
         '}' => out.push('}'),
         // Anchors.
         '`' => out.push_str(r"\A"),
@@ -130,10 +218,37 @@ fn translate_escape(
     Ok(())
 }
 
+/// Whether `body` is a valid `\\{…\\}` repetition count: `m`, `m,`, `,n` or
+/// `m,n` with `m <= n`. Emacs signals `Invalid content of \\{\\}` otherwise —
+/// notably for a reversed bound like `a\\{2,1\\}`.
+fn valid_brace_body(body: &str) -> bool {
+    let parse = |s: &str| -> Option<u64> { s.parse().ok() };
+    match body.split_once(',') {
+        None => !body.is_empty() && body.chars().all(|c| c.is_ascii_digit()),
+        Some((lo, hi)) => {
+            let lo_v = if lo.is_empty() { Some(0) } else { parse(lo) };
+            match (lo_v, hi.is_empty()) {
+                (Some(_), true) => true,
+                (Some(l), false) => matches!(parse(hi), Some(h) if l <= h),
+                _ => false,
+            }
+        }
+    }
+}
+
 /// Copy a `[...]` character alternative from `it` into `out`, leading `[`
 /// already consumed. Handles a `^` negation and a `]` that appears first (or
 /// first-after-`^`) as a literal, matching elisp/POSIX rules.
-fn copy_class(it: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
+fn copy_class(
+    it: &mut std::iter::Peekable<std::str::Chars>,
+    out: &mut String,
+) -> Result<(), String> {
+    // Collect the members first: a reversed range (`[z-a]`) has to be rewritten,
+    // because Emacs matches nothing for it where the `regex` crate refuses to
+    // compile at all.
+    let mut buf = String::new();
+    let mut closed = false;
+    let out_start = out.len();
     out.push('[');
     if it.peek() == Some(&'^') {
         out.push('^');
@@ -148,7 +263,10 @@ fn copy_class(it: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
         match c {
             // In an elisp char class a backslash is an ordinary character (no
             // escapes), so escape it for the `regex` crate: `[\"]` matches `\`/`"`.
-            '\\' => out.push_str("\\\\"),
+            '\\' => {
+                out.push_str("\\\\");
+                buf.push('\\');
+            }
             // POSIX class `[:alpha:]` — copy through its closing `:]`.
             '[' if it.peek() == Some(&':') => {
                 out.push('[');
@@ -162,14 +280,44 @@ fn copy_class(it: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
             // A bare `[` is an ordinary member in elisp/POSIX bracket expressions
             // (e.g. `[{[]` matches `{` or `[`), but the `regex` crate rejects an
             // unescaped `[` inside a class — escape it.
-            '[' => out.push_str("\\["),
+            '[' => {
+                out.push_str("\\[");
+                buf.push('[');
+            }
             ']' => {
                 out.push(']');
+                closed = true;
                 break;
             }
-            _ => out.push(c),
+            _ => {
+                out.push(c);
+                buf.push(c);
+            }
         }
     }
+    if !closed {
+        return Err(UNMATCHED_BRACKET.into());
+    }
+    // A reversed range matches nothing in Emacs; emit a class that can never
+    // match rather than letting the engine reject the pattern.
+    if has_reversed_range(&buf) {
+        out.truncate(out_start);
+        out.push_str("[^\\s\\S]");
+    }
+    Ok(())
+}
+
+/// Whether a class body contains a range whose end sorts before its start.
+fn has_reversed_range(body: &str) -> bool {
+    let cs: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i + 2 < cs.len() {
+        if cs[i + 1] == '-' && cs[i + 2] != ']' && cs[i] > cs[i + 2] {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 #[cfg(test)]
