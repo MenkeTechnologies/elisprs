@@ -62,28 +62,6 @@ pub const PRELUDE: &str = r#"
 ;; `abs` is a primitive subr (keeps int/float type; (abs -0.0) => 0.0).
 ;; NaN propagates: any NaN arg makes the result NaN (a NaN never wins `>`/`<`,
 ;; so once it lands in the accumulator no later value can displace it).
-(defun num-or-marker--check (x)
-  ;; Emacs checks each argument in order, so the error names the FIRST
-  ;; non-number: (max t 'foo) is (wrong-type-argument number-or-marker-p t).
-  (unless (number-or-marker-p x)
-    (signal 'wrong-type-argument (list 'number-or-marker-p x)))
-  x)
-(defun max (x &rest xs)
-  (num-or-marker--check x)
-  (while xs
-    (let ((y (num-or-marker--check (car xs))))
-      (if (> y x) (setq x y))
-      (if (and (floatp y) (isnan y)) (setq x y)))
-    (setq xs (cdr xs)))
-  x)
-(defun min (x &rest xs)
-  (num-or-marker--check x)
-  (while xs
-    (let ((y (num-or-marker--check (car xs))))
-      (if (< y x) (setq x y))
-      (if (and (floatp y) (isnan y)) (setq x y)))
-    (setq xs (cdr xs)))
-  x)
 ;; `mod` is a primitive subr (handles float operands + divisor-sign semantics).
 (defun /= (a b) (not (= a b)))
 (defun plusp (x) (> x 0))
@@ -1318,8 +1296,12 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 
 ;;; ---- seq.el (list-oriented) ----
 ;; seq-generic: coerce to a list, then restore SEQ's own type (vector/string).
-(defun seq-take (seq n) (seq-into (take n (append seq nil)) (seq--type-of seq)))
-(defun seq-drop (seq n) (seq-into (nthcdr n (append seq nil)) (seq--type-of seq)))
+(defun seq-take (seq n)
+  (unless (number-or-marker-p n) (signal 'wrong-type-argument (list 'number-or-marker-p n)))
+  (seq-into (take n (append seq nil)) (seq--type-of seq)))
+(defun seq-drop (seq n)
+  (unless (number-or-marker-p n) (signal 'wrong-type-argument (list 'number-or-marker-p n)))
+  (seq-into (nthcdr n (append seq nil)) (seq--type-of seq)))
 (defun seq-subseq (seq start &optional end)
   ;; Sequence-generic, returning SEQ's type; START/END may be negative.
   ;; Out-of-range is an error, and seq.el reports it differently per type: an

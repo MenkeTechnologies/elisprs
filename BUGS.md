@@ -65,6 +65,23 @@ Plus: argument checking order (`(max t 'foo)` names `t`), `seq-subseq` bounds,
 `capitalize` / `sort` / `mapcar` / `format` / `intern` / `last` / `plist-get` type
 contracts.
 
+A third pass took the same corpus from 56 to 46 diverging forms, and found the
+worst bug yet — one that has nothing to do with Emacs parity per se:
+
+- **A handled error poisoned the identity of the next one.** The error message and
+  the structured error object travel on separate channels and were never paired, so
+  an object left behind by an already-caught error was picked up by the next error
+  that only produced a message. `(condition-case e (progn (ignore-errors (error
+  "boom")) (car 1)) (error e))` answered `(error "boom")` — the wrong condition
+  entirely, which any `condition-case` dispatching on the symbol would then
+  mis-handle.
+- **A speculative function lookup left an error behind**: `macroexpand-1` probes a
+  form's head to see whether it names a macro, and a failed probe registered an
+  `invalid-function` object that then replaced the real error.
+
+Plus: `min`/`max` as subrs, improper lists naming their tail, `substring` index
+types, `seq-take`/`seq-drop` argument checks.
+
 Reproduce any of it:
 
 ```sh

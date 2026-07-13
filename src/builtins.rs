@@ -307,6 +307,49 @@ fn mod_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(h.make_integer(r))
 }
+/// `(max NUM…)` / `(min NUM…)` — Emacs checks each argument in order, so the
+/// error names the FIRST non-number, and both are subrs (which is what their
+/// `wrong-number-of-arguments` and `#<subr min>` printing depend on).
+fn min_max(h: &mut ElispHost, a: &[Value], want_max: bool) -> R {
+    let mut best = as_number(h, &a[0])?;
+    let mut best_v = a[0].clone();
+    for v in &a[1..] {
+        let n = as_number(h, v)?;
+        // A NaN operand wins, as in Emacs.
+        let nan = matches!(n, Num::Float(f) if f.is_nan());
+        let better = match (&best, &n) {
+            (Num::Int(x), Num::Int(y)) => {
+                if want_max {
+                    y > x
+                } else {
+                    y < x
+                }
+            }
+            (x, y) => {
+                let (xf, yf) = (x.to_f64(), y.to_f64());
+                if want_max {
+                    yf > xf
+                } else {
+                    yf < xf
+                }
+            }
+        };
+        if better || nan {
+            best = n;
+            best_v = v.clone();
+        }
+    }
+    // Return the argument itself, so a marker stays a marker as in Emacs.
+    let _ = &best;
+    Ok(best_v)
+}
+fn max_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    min_max(h, a, true)
+}
+fn min_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    min_max(h, a, false)
+}
+
 fn one_plus(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(match as_number(h, &a[0])? {
         Num::Int(i) => h.make_integer(i + 1),
@@ -507,6 +550,10 @@ fn reverse_fn(h: &mut ElispHost, a: &[Value]) -> R {
     if let Value::Str(s) = &a[0] {
         return Ok(Value::str(s.chars().rev().collect::<String>()));
     }
+    // Reject an improper list (and a non-sequence) with Emacs's error before
+    // falling through to the list path, which would otherwise silently ignore
+    // the dotted tail.
+    h.seq_vec_checked(&a[0])?;
     let vec_items = match h.obj(&a[0]) {
         Some(Obj::Vector(items)) => Some(items.clone()),
         _ => None,
@@ -1186,8 +1233,10 @@ fn throw_fn(h: &mut ElispHost, a: &[Value]) -> R {
         let sym = h.intern("no-catch");
         let data = h.list_from(vec![tag, val]);
         let display = h.print(&data, true);
-        h.pending_error = Some(h.cons(sym, data));
-        Err(format!("no-catch: {display}"))
+        let obj = h.cons(sym, data);
+        let msg = format!("no-catch: {display}");
+        h.set_pending_error(&msg, obj);
+        Err(msg)
     }
 }
 fn error_fn(h: &mut ElispHost, a: &[Value]) -> R {
@@ -1196,8 +1245,10 @@ fn error_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let esym = h.intern("error");
     let mstr = Value::str(msg.clone());
     let data = h.list_from(vec![mstr]);
-    h.pending_error = Some(h.cons(esym, data));
-    Err(format!("error: {msg}"))
+    let obj = h.cons(esym, data);
+    let full = format!("error: {msg}");
+    h.set_pending_error(&full, obj);
+    Err(full)
 }
 fn user_error_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // Like `error`, but signals the `user-error` condition.
@@ -1205,8 +1256,10 @@ fn user_error_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let esym = h.intern("user-error");
     let mstr = Value::str(msg.clone());
     let data = h.list_from(vec![mstr]);
-    h.pending_error = Some(h.cons(esym, data));
-    Err(format!("user-error: {msg}"))
+    let obj = h.cons(esym, data);
+    let full = format!("user-error: {msg}");
+    h.set_pending_error(&full, obj);
+    Err(full)
 }
 fn signal_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // Error object: (ERROR-SYMBOL . DATA) — preserve the actual data list.
@@ -1214,8 +1267,10 @@ fn signal_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let display = h.print(a.get(1).unwrap_or(&Value::Undef), true);
     let symv = h.intern(&sym);
     let data = a.get(1).cloned().unwrap_or(Value::Undef);
-    h.pending_error = Some(h.cons(symv, data));
-    Err(format!("{sym}: {display}"))
+    let obj = h.cons(symv, data);
+    let msg = format!("{sym}: {display}");
+    h.set_pending_error(&msg, obj);
+    Err(msg)
 }
 
 // ── strings / format / IO ──
@@ -1766,6 +1821,15 @@ fn copy_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
 
 // ── strings ──
 fn substring(h: &mut ElispHost, a: &[Value]) -> R {
+    // FROM/TO must be integers: Emacs signals rather than truncating a float.
+    for idx in a.iter().skip(1) {
+        if !is_nil(idx) && !matches!(idx, Value::Int(_)) {
+            return Err(format!(
+                "wrong-type-argument: integerp {}",
+                h.print(idx, true)
+            ));
+        }
+    }
     // Emacs `substring` works on both strings and vectors (arrays).
     enum Seq {
         Str(Vec<char>),
@@ -6239,6 +6303,8 @@ pub fn install(h: &mut ElispHost) {
     s("stringp", 1, Some(1), stringp);
     s("numberp", 1, Some(1), numberp);
     s("integerp", 1, Some(1), integerp);
+    s("max", 1, None, max_fn);
+    s("min", 1, None, min_fn);
     s("fixnump", 1, Some(1), fixnump);
     s("bignump", 1, Some(1), bignump);
     s("floatp", 1, Some(1), floatp);

@@ -400,7 +400,7 @@ pub struct ElispHost {
     /// The structured error object `(ERROR-SYMBOL . DATA)` from the most recent
     /// `signal`/`error`, so `condition-case` can bind the handler variable to the
     /// real list (not a re-parsed string). Cleared when entering a c-c body.
-    pub(crate) pending_error: Option<Value>,
+    pub(crate) pending_error: Option<(String, Value)>,
     /// Regexp match data from the last successful `string-match`: the subject
     /// string plus char-position spans for the whole match (group 0) and each
     /// capture group. `match-beginning`/`match-end`/`match-string` read it.
@@ -1818,7 +1818,7 @@ impl ElispHost {
 
     /// Resolve a function designator (symbol → function cell, following aliases;
     /// or a literal closure/subr object).
-    pub fn resolve_function(&mut self, f: &Value) -> Result<Resolved, String> {
+    pub fn resolve_function(&self, f: &Value) -> Result<Resolved, String> {
         let mut cur = f.clone();
         for _ in 0..64 {
             match self.obj(&cur) {
@@ -1848,13 +1848,11 @@ impl ElispHost {
                     Some(def) => cur = def.clone(),
                     None => return Err(format!("void-function: {}", s.name)),
                 },
-                _ => {
-                    let sym = self.intern("invalid-function");
-                    let data = self.list_from(vec![cur.clone()]);
-                    let display = self.print(&cur, true);
-                    self.pending_error = Some(self.cons(sym, data));
-                    return Err(format!("invalid-function: {display}"));
-                }
+                // NOTE: no `pending_error` here. This function is also called
+                // speculatively (`macroexpand_1` asks whether a head names a
+                // macro), so a side effect would outlive the failed probe and be
+                // mistaken for the next real error.
+                _ => return Err(format!("invalid-function: {}", self.print(&cur, true))),
             }
         }
         Err("function indirection too deep".to_string())
@@ -2853,6 +2851,31 @@ impl ElispHost {
         self.lex = lex;
     }
 
+    /// A sequence's elements, or Emacs's error for what it actually is.
+    ///
+    /// An improper list names its offending TAIL (`(reverse (cons 1 2))` is
+    /// `(wrong-type-argument listp 2)`), while a non-sequence names itself.
+    pub fn seq_vec_checked(&self, v: &Value) -> Result<Vec<Value>, String> {
+        if let Some(items) = self.seq_vec(v) {
+            return Ok(items);
+        }
+        // A cons that `seq_vec` rejected is an improper list: walk to the tail.
+        if matches!(self.obj(v), Some(Obj::Cons(..))) {
+            let mut cur = v.clone();
+            while let Some(Obj::Cons(_, cdr)) = self.obj(&cur) {
+                cur = cdr.clone();
+            }
+            return Err(format!(
+                "wrong-type-argument: listp {}",
+                self.print(&cur, true)
+            ));
+        }
+        Err(format!(
+            "wrong-type-argument: sequencep {}",
+            self.print(v, true)
+        ))
+    }
+
     /// The function a designator names: a symbol resolves through its function
     /// cell (following aliases), anything else is already a function.
     ///
@@ -2884,8 +2907,26 @@ impl ElispHost {
         let count = Value::Int(argc as i64);
         let data = self.list_from(vec![callee.clone(), count]);
         let display = format!("{} {}", self.print(callee, true), argc);
-        self.pending_error = Some(self.cons(sym, data));
-        format!("wrong-number-of-arguments: {display}")
+        let obj = self.cons(sym, data);
+        let msg = format!("wrong-number-of-arguments: {display}");
+        self.set_pending_error(&msg, obj);
+        msg
+    }
+
+    /// Record the error object that belongs to `msg` (the string the failing call
+    /// returns as its `Err`). See [`Self::take_pending_error`].
+    pub fn set_pending_error(&mut self, msg: &str, obj: Value) {
+        self.pending_error = Some((msg.to_string(), obj));
+    }
+
+    /// The error object recorded for `msg`, if any. An object recorded for a
+    /// *different* message belongs to an error that has already been dealt with —
+    /// it must not stand in for this one.
+    pub fn take_pending_error(&mut self, msg: &str) -> Option<Value> {
+        match &self.pending_error {
+            Some((m, _)) if m == msg => self.pending_error.take().map(|(_, v)| v),
+            _ => None,
+        }
     }
 
     pub fn make_error_object(&mut self, e: &str) -> Value {
@@ -2923,6 +2964,7 @@ impl ElispHost {
                 | "void-variable"
                 | "void-function"
                 | "wrong-number-of-arguments"
+                | "invalid-function"
         ) {
             if let Some(data) = self.read_all_forms(&msg) {
                 let s = self.intern(&sym);
@@ -3927,13 +3969,18 @@ fn intrinsic_condition_case(args: &[Value]) -> Result<Value, String> {
             }
             // Prefer the structured error object's symbol over the message string.
             let esym: String = with_host(|h| {
-                h.pending_error
+                let obj = h
+                    .pending_error
                     .as_ref()
-                    .and_then(|eo| h.obj(eo))
-                    .and_then(|o| match o {
-                        Obj::Cons(car, _) => h.sym_name(car),
-                        _ => None,
-                    })
+                    .filter(|(m, _)| *m == e)
+                    .map(|(_, eo)| eo.clone())?;
+                match h.obj(&obj) {
+                    Some(Obj::Cons(car, _)) => {
+                        let car = car.clone();
+                        h.sym_name(&car)
+                    }
+                    _ => None,
+                }
             })
             .unwrap_or_else(|| e.split(':').next().unwrap_or("error").trim().to_string());
             let hlist = with_host(|h| h.list_vec(&handlers)).unwrap_or_default();
@@ -3983,8 +4030,7 @@ fn intrinsic_condition_case(args: &[Value]) -> Result<Value, String> {
                             // Bind to the real (SYMBOL . DATA) object when we have
                             // it; otherwise reconstruct one from the message.
                             let eobj = h
-                                .pending_error
-                                .take()
+                                .take_pending_error(&e)
                                 .unwrap_or_else(|| h.make_error_object(&e));
                             let _ = h.specbind(&var, eobj);
                         }

@@ -43,6 +43,30 @@ All notable changes to elisprs are documented here. The format follows
   the second and later `(eval 2.5 t)` in a process answered `2`. Fixed in fusevm
   0.14.6.
 
+### Fixed (correctness — round 3, from the same fuzz harness)
+- **A handled error poisoned the next one.** An error travels on two channels: the
+  message returns as a `Result::Err` string, while the structured object
+  `(SYMBOL . DATA)` that `condition-case` binds is parked on the host. Nothing
+  paired them, so an object left by an error that had *already been caught* stood
+  in for the next error that only produced a message —
+  `(condition-case e (progn (ignore-errors (error "boom")) (car 1)) (error e))`
+  answered `(error "boom")` instead of `(wrong-type-argument listp 1)`. The object
+  is now recorded with the message it belongs to and used only for that message.
+- **A speculative function lookup left an error behind.** `macroexpand-1` resolves a
+  form's head to ask "is this a macro?"; when the head is not a function (a `cond`
+  clause's test, `((car 1) 1)`), that failed probe registered an `invalid-function`
+  object which then replaced the clause's real error. Resolution is side-effect-free
+  again.
+
+### Fixed (Emacs parity — round 3)
+- `min` / `max` are subrs, as in Emacs — which is what `(min)` naming `min` and
+  `(seq-min (vector))` naming `#<subr min>` depend on. They check their arguments
+  left to right, so `(max t 'foo)` names `t`.
+- An improper list names its offending TAIL: `(reverse (cons 1 2))` is
+  `(wrong-type-argument listp 2)`, not `sequencep` on the whole cons.
+- `substring`'s FROM/TO must be integers (a float signalled nothing and truncated);
+  `seq-take` / `seq-drop` check N before touching the sequence.
+
 ### Fixed (Emacs parity — round 2, from the same fuzz harness)
 - **`(eval FORM t)` leaked the caller's lexical scope.** `t` means "lexical
   binding", not "inherit my bindings": `(let ((x 5)) (eval 'x t))` returned 5 where
