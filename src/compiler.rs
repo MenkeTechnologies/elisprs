@@ -299,11 +299,18 @@ fn compile_lambda(
     let arglist = elems.get(1).cloned().unwrap_or(Value::Undef);
     let params = h.parse_params(&arglist)?;
     let body = compile_body_chunk(h, elems.get(2..).unwrap_or(&[]))?;
+    // Keep the source: Emacs's interpreted closure prints as `#[ARGLIST BODY ENV]`,
+    // and the compiled `Chunk` cannot be turned back into forms.
+    let src = Rc::new(crate::host::ClosureSrc {
+        arglist: arglist.clone(),
+        body: elems.get(2..).unwrap_or(&[]).to_vec(),
+    });
     let template = h.alloc(Obj::Closure {
         params: Rc::new(params),
         body: Rc::new(body),
         is_macro,
         env: None,
+        src,
     });
     load_const(b, template);
     // Capture the current lexical environment into a fresh closure at runtime.
@@ -324,11 +331,16 @@ fn compile_defun(
     let arglist = elems.get(2).cloned().unwrap_or(Value::Undef);
     let params = h.parse_params(&arglist)?;
     let body = compile_body_chunk(h, elems.get(3..).unwrap_or(&[]))?;
+    let src = Rc::new(crate::host::ClosureSrc {
+        arglist: arglist.clone(),
+        body: elems.get(3..).unwrap_or(&[]).to_vec(),
+    });
     let template = h.alloc(Obj::Closure {
         params: Rc::new(params),
         body: Rc::new(body),
         is_macro,
         env: None,
+        src,
     });
     load_const(b, name); // symbol
     load_const(b, template); // definition template

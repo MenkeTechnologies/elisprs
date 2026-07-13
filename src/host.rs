@@ -128,6 +128,19 @@ pub struct Scope {
 pub type Lex = Option<Rc<Scope>>;
 
 impl Scope {
+    /// The bound symbol's arena handle.
+    pub(crate) fn sym_handle(&self) -> u32 {
+        self.sym
+    }
+    /// The binding's current value.
+    pub(crate) fn value(&self) -> Value {
+        self.val.borrow().clone()
+    }
+    /// The enclosing scope.
+    pub(crate) fn parent_lex(&self) -> Lex {
+        self.parent.clone()
+    }
+
     fn lookup(self: &Rc<Scope>, sym: u32) -> Option<Value> {
         let mut cur = Some(self.clone());
         while let Some(s) = cur {
@@ -186,6 +199,14 @@ pub enum Obj {
         is_macro: bool,
         /// Captured lexical environment (`None` for a template / dynamic macro).
         env: Lex,
+        /// The closure's *source*: its arglist and its body forms, kept so it can
+        /// print the way Emacs prints an interpreted closure —
+        /// `#[(x) ((list x x)) (t)]` — rather than as an opaque `#<closure>`.
+        /// Emacs's interpreted closure is its source; elisprs lowers the body to a
+        /// `Chunk`, so the forms would otherwise be gone. Shared (`Rc`) with every
+        /// instance made from the same template, so capturing a closure in a loop
+        /// does not copy the source.
+        src: Rc<ClosureSrc>,
     },
     /// An elisp hash table. `test`: 0 = eq, 1 = eql, 2 = equal. Association-vector
     /// storage (linear scan) — fine for the table sizes elisp config uses.
@@ -417,6 +438,13 @@ pub struct ElispHost {
     /// compiler's closure-template construction untouched. Session-local: not part
     /// of the AOT heap image (oclosure-heavy libraries load at runtime).
     pub(crate) oclosure_meta: HashMap<u32, OClosureMeta>,
+}
+
+/// A closure's printable source: the arglist as written and the body forms.
+#[derive(Default)]
+pub struct ClosureSrc {
+    pub arglist: Value,
+    pub body: Vec<Value>,
 }
 
 /// Type + slot layout attached to an [`Obj::Closure`] to make it an OClosure.
@@ -1290,16 +1318,19 @@ impl ElispHost {
             params,
             body,
             is_macro,
+            src,
             ..
         }) = self.obj(template)
         {
-            let (params, body, is_macro) = (params.clone(), body.clone(), *is_macro);
+            let (params, body, is_macro, src) =
+                (params.clone(), body.clone(), *is_macro, src.clone());
             let env = self.lex.clone();
             return self.alloc(Obj::Closure {
                 params,
                 body,
                 is_macro,
                 env,
+                src,
             });
         }
         template.clone()
@@ -1385,13 +1416,20 @@ impl ElispHost {
         };
         let slots = self.oclosure_meta.get(&id)?.slots.clone();
         let ty = self.oclosure_meta.get(&id)?.ty;
-        let (params, body, is_macro, base_env) = match self.obj(src) {
+        let (params, body, is_macro, base_env, csrc) = match self.obj(src) {
             Some(Obj::Closure {
                 params,
                 body,
                 is_macro,
                 env,
-            }) => (params.clone(), body.clone(), *is_macro, env.clone()),
+                src: csrc,
+            }) => (
+                params.clone(),
+                body.clone(),
+                *is_macro,
+                env.clone(),
+                csrc.clone(),
+            ),
             _ => return None,
         };
         // New value for each slot: the passed arg, else the original slot value.
@@ -1421,6 +1459,7 @@ impl ElispHost {
             body,
             is_macro,
             env,
+            src: csrc,
         });
         if let Value::Obj(nid) = newv {
             self.oclosure_meta.insert(nid, OClosureMeta { ty, slots });
@@ -1500,6 +1539,28 @@ impl ElispHost {
     pub fn builtin_count(&self) -> usize {
         self.builtin_count
     }
+    /// The captured lexical environment as Emacs prints it in a closure: an alist
+    /// of the captured bindings, newest first, or `(t)` when nothing is captured
+    /// (`t` is Emacs's marker that the closure is lexically bound).
+    fn captured_alist(&self, env: &Lex, readable: bool, depth: usize) -> String {
+        let mut cells = Vec::new();
+        let mut cur = env.clone();
+        while let Some(scope) = cur {
+            let name = match self.arena.get(scope.sym_handle() as usize) {
+                Some(Obj::Symbol(s)) => s.name.clone(),
+                _ => break,
+            };
+            let val = self.print_inner(&scope.value(), readable, depth + 1);
+            cells.push(format!("({name} . {val})"));
+            cur = scope.parent_lex();
+        }
+        if cells.is_empty() {
+            "(t)".to_string()
+        } else {
+            format!("({})", cells.join(" "))
+        }
+    }
+
     /// Whether the global obarray maps this symbol's name to *this* handle — i.e.
     /// the symbol is interned, not a `make-symbol` result, a lambda parameter, or
     /// a macro-local binding that merely shares a name with something interned.
@@ -1690,6 +1751,7 @@ impl ElispHost {
                         optional,
                         rest,
                     }),
+                    src: Rc::new(ClosureSrc::default()),
                     body: Rc::new(body),
                     is_macro,
                     env: None,
@@ -1756,7 +1818,7 @@ impl ElispHost {
 
     /// Resolve a function designator (symbol → function cell, following aliases;
     /// or a literal closure/subr object).
-    pub fn resolve_function(&self, f: &Value) -> Result<Resolved, String> {
+    pub fn resolve_function(&mut self, f: &Value) -> Result<Resolved, String> {
         let mut cur = f.clone();
         for _ in 0..64 {
             match self.obj(&cur) {
@@ -1773,6 +1835,7 @@ impl ElispHost {
                     body,
                     is_macro,
                     env,
+                    ..
                 }) => {
                     return Ok(Resolved::Closure {
                         params: params.clone(),
@@ -1785,7 +1848,13 @@ impl ElispHost {
                     Some(def) => cur = def.clone(),
                     None => return Err(format!("void-function: {}", s.name)),
                 },
-                _ => return Err("invalid-function".to_string()),
+                _ => {
+                    let sym = self.intern("invalid-function");
+                    let data = self.list_from(vec![cur.clone()]);
+                    let display = self.print(&cur, true);
+                    self.pending_error = Some(self.cons(sym, data));
+                    return Err(format!("invalid-function: {display}"));
+                }
             }
         }
         Err("function indirection too deep".to_string())
@@ -1990,11 +2059,25 @@ impl ElispHost {
                     format!("#<obarray n={n}>")
                 }
                 Some(Obj::Subr { name, .. }) => format!("#<subr {name}>"),
-                Some(Obj::Closure { is_macro, .. }) => {
+                Some(Obj::Closure {
+                    is_macro, env, src, ..
+                }) => {
+                    // Emacs: `#[ARGLIST BODY ENV]` for an interpreted closure, where
+                    // ENV is the captured lexical alist — newest binding first — or
+                    // `(t)` when nothing is captured. A macro is that, consed onto
+                    // `macro`.
+                    let arglist = self.print_inner(&src.arglist, readable, depth + 1);
+                    let body: Vec<String> = src
+                        .body
+                        .iter()
+                        .map(|f| self.print_inner(f, readable, depth + 1))
+                        .collect();
+                    let captures = self.captured_alist(env, readable, depth + 1);
+                    let closure = format!("#[{arglist} ({}) {captures}]", body.join(" "));
                     if *is_macro {
-                        "#<macro>".to_string()
+                        format!("(macro . {closure})")
                     } else {
-                        "#<closure>".to_string()
+                        closure
                     }
                 }
                 Some(Obj::HashTable { test, entries }) => {
@@ -2758,6 +2841,53 @@ impl ElispHost {
 
     /// Build the `(error-symbol "message")` object a `condition-case` handler
     /// binds its variable to, from a rendered "symbol: message" error string.
+    /// Detach the current lexical scope chain, returning it. Used by `eval`,
+    /// whose FORM runs in the environment its LEXICAL argument names rather than
+    /// in the caller's.
+    pub fn take_lex(&mut self) -> Lex {
+        self.lex.take()
+    }
+
+    /// Restore a scope chain taken by [`Self::take_lex`].
+    pub fn restore_lex(&mut self, lex: Lex) {
+        self.lex = lex;
+    }
+
+    /// The function a designator names: a symbol resolves through its function
+    /// cell (following aliases), anything else is already a function.
+    ///
+    /// `funcall`/`apply` resolve before calling, which is why Emacs's arity error
+    /// from them names `#<subr char-to-string>` where a direct `(char-to-string)`
+    /// names the symbol.
+    pub fn function_designator(&mut self, f: &Value) -> Value {
+        let mut cur = f.clone();
+        for _ in 0..16 {
+            match self.obj(&cur) {
+                Some(Obj::Symbol(s)) => match s.function.clone() {
+                    Some(next) => cur = next,
+                    None => return cur,
+                },
+                _ => return cur,
+            }
+        }
+        cur
+    }
+
+    /// Signal Emacs's `(wrong-number-of-arguments FUNCTION COUNT)`.
+    ///
+    /// The data holds the function *object*. Rendering it into the message and
+    /// re-reading it (which is how the other error helpers build their data) cannot
+    /// work here: a closure prints as `#[(x) (x) (t)]`, and no reader can turn that
+    /// back into the closure it came from.
+    pub fn signal_wrong_nargs(&mut self, callee: &Value, argc: usize) -> String {
+        let sym = self.intern("wrong-number-of-arguments");
+        let count = Value::Int(argc as i64);
+        let data = self.list_from(vec![callee.clone(), count]);
+        let display = format!("{} {}", self.print(callee, true), argc);
+        self.pending_error = Some(self.cons(sym, data));
+        format!("wrong-number-of-arguments: {display}")
+    }
+
     pub fn make_error_object(&mut self, e: &str) -> Value {
         // Conditions Emacs signals with an empty DATA list: the condition object
         // is just `(SYMBOL)` with no message datum (`arith-error`, `end-of-file`,
@@ -2955,7 +3085,8 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 if args.is_empty() {
                     return Err("wrong-number-of-arguments: funcall 0".to_string());
                 }
-                return call_function(&args[0], &args[1..]);
+                let f = with_host(|h| h.function_designator(&args[0]));
+                return call_function(&f, &args[1..]);
             }
             "apply" => {
                 if args.is_empty() {
@@ -2977,13 +3108,19 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                     Vec::new()
                 };
                 a.extend(tail);
-                return call_function(&args[0], &a);
+                let f = with_host(|h| h.function_designator(&args[0]));
+                return call_function(&f, &a);
             }
             "mapcar" => {
                 if args.len() < 2 {
                     return Err(format!("wrong-number-of-arguments: mapcar {}", args.len()));
                 }
-                let seq = with_host(|h| h.seq_vec(&args[1])).ok_or("mapcar: not a sequence")?;
+                let seq = with_host(|h| h.seq_vec(&args[1])).ok_or_else(|| {
+                    format!(
+                        "wrong-type-argument: sequencep {}",
+                        with_host(|h| h.print(&args[1], true))
+                    )
+                })?;
                 let mut out = Vec::with_capacity(seq.len());
                 for e in seq {
                     out.push(call_function(&args[0], &[e])?);
@@ -2994,7 +3131,12 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 if args.len() < 2 {
                     return Err(format!("wrong-number-of-arguments: mapc {}", args.len()));
                 }
-                let seq = with_host(|h| h.seq_vec(&args[1])).ok_or("mapc: not a sequence")?;
+                let seq = with_host(|h| h.seq_vec(&args[1])).ok_or_else(|| {
+                    format!(
+                        "wrong-type-argument: sequencep {}",
+                        with_host(|h| h.print(&args[1], true))
+                    )
+                })?;
                 for e in seq {
                     call_function(&args[0], &[e])?;
                 }
@@ -3009,10 +3151,18 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 if args.is_empty() {
                     return Err("wrong-number-of-arguments: sort 0".to_string());
                 }
-                let (items, was_vec) = with_host(|h| match h.obj(&args[0]) {
-                    Some(Obj::Vector(v)) => (v.clone(), true),
-                    _ => (h.list_vec(&args[0]).unwrap_or_default(), false),
-                });
+                let (items, was_vec) = match with_host(|h| match h.obj(&args[0]) {
+                    Some(Obj::Vector(v)) => Some((v.clone(), true)),
+                    _ => h.list_vec(&args[0]).map(|l| (l, false)),
+                }) {
+                    Some(pair) => pair,
+                    None => {
+                        return Err(format!(
+                            "wrong-type-argument: list-or-vector-p {}",
+                            with_host(|h| h.print(&args[0], true))
+                        ))
+                    }
+                };
                 let is_kw =
                     |v: &Value| with_host(|h| h.sym_name(v)).is_some_and(|n| n.starts_with(':'));
                 let mut pred: Option<Value> = None;
@@ -3146,7 +3296,16 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 }
                 let expanded = macroexpand_all(form)?;
                 let chunk = with_host(|h| crate::compiler::compile_top(h, &expanded))?;
-                return run_chunk(chunk);
+                // FORM is evaluated in the lexical environment given by LEXICAL —
+                // NOT in the caller's. `(let ((x 5)) (eval 'x t))` signals
+                // `void-variable x` in Emacs: `t` means "lexical binding, empty
+                // environment". Running the chunk in the live scope chain instead
+                // leaked every binding the caller happened to hold, and any closure
+                // FORM created captured (and printed) them.
+                let saved = with_host(|h| h.take_lex());
+                let out = run_chunk(chunk);
+                with_host(|h| h.restore_lex(saved));
+                return out;
             }
             // The macro-expansion functions run macro expanders (re-entrant).
             "macroexpand-1" => {
@@ -3199,8 +3358,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 // Emacs's error data is (FUNC N): the callee as the caller wrote
                 // it (a symbol, or the subr object when applied) and the argument
                 // count it was given.
-                let shown = with_host(|h| h.print(&callee, true));
-                return Err(format!("wrong-number-of-arguments: {shown} {}", args.len()));
+                return Err(with_host(|h| h.signal_wrong_nargs(&callee, args.len())));
             }
             with_host(|h| f(h, args))
         }
@@ -3212,6 +3370,12 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
         } => {
             if is_macro {
                 return Err("macro called as a function (use it in a macro position)".to_string());
+            }
+            // Emacs's data is (FUNCTION COUNT) — the closure itself, printed, and
+            // the number of arguments it was handed.
+            let max = params.required.len() + params.optional.len();
+            if args.len() < params.required.len() || (params.rest.is_none() && args.len() > max) {
+                return Err(with_host(|h| h.signal_wrong_nargs(&callee, args.len())));
             }
             run_closure(&params, &body, env, args)
         }

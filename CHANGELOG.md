@@ -43,6 +43,34 @@ All notable changes to elisprs are documented here. The format follows
   the second and later `(eval 2.5 t)` in a process answered `2`. Fixed in fusevm
   0.14.6.
 
+### Fixed (Emacs parity — round 2, from the same fuzz harness)
+- **`(eval FORM t)` leaked the caller's lexical scope.** `t` means "lexical
+  binding", not "inherit my bindings": `(let ((x 5)) (eval 'x t))` returned 5 where
+  Emacs signals `(void-variable x)`. FORM now runs in an empty lexical environment,
+  and a closure FORM builds no longer captures — or prints — the caller's bindings.
+- **A closure prints as its source**, the way Emacs prints an interpreted function:
+  `#[(x) ((list x x)) (t)]`, with the captured lexical alist (newest first) as the
+  third slot. It printed an opaque `#<closure>`; elisprs lowers the body to a
+  fusevm `Chunk`, so closures now retain their arglist and body forms.
+- `wrong-number-of-arguments` carries `(FUNCTION COUNT)` — with the function
+  *object* (`#<subr char-to-string>`, `#[(x) (x) (t)]`) when called through
+  `funcall`/`apply`, which resolve the designator, and the symbol on a direct call.
+  `invalid-function` carries the offending object. Both are built as real error
+  objects: a closure cannot survive being rendered to a message and re-read.
+- Numeric arguments are checked left to right, so `(max t 'foo)` names `t`, and
+  `seq-max`/`seq-min` inherit that.
+- `seq-subseq` signals out of range instead of clamping: `args-out-of-range` for an
+  array, `(error "Start index out of bounds: N")` for a list, `(error "Unsupported
+  sequence: X")` otherwise.
+- Type contracts: `capitalize` / `upcase-initials` (`char-or-string-p`), `sort`
+  (`list-or-vector-p`), `mapcar` / `mapc` (`sequencep`), `format` and `intern`
+  (`stringp`), `string-equal-ignore-case` (`stringp`). And where Emacs is *lenient*
+  and elisprs signalled: `(last t 0)` is `t`, `(plist-get 'sym 1)` is nil.
+- `split-string` with an empty separator yields the leading and trailing `""`
+  Emacs does: `(split-string "a1b" "")` is `("" "a" "1" "b" "")`.
+- `ash` accepts a bignum shift count (`overflow-error` on a left shift that cannot
+  be materialised, sign collapse on a right shift).
+
 ### Fixed (Emacs parity — see BUGS.md)
 - Float printing follows Emacs's `float_to_string` (gnulib `dtoastr`): the shortest
   `%g` form that reads back as the same float, so `(float most-positive-fixnum)` is

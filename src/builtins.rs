@@ -1030,7 +1030,7 @@ fn obarray_arg(h: &ElispHost, v: Option<&Value>) -> Result<Option<u32>, String> 
 fn intern_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let name = match &a[0] {
         Value::Str(s) => s.to_string(),
-        _ => return Err("wrong-type-argument: stringp".to_string()),
+        v => return Err(format!("wrong-type-argument: stringp {}", h.print(v, true))),
     };
     match obarray_arg(h, a.get(1))? {
         None => Ok(h.intern(&name)),
@@ -1440,7 +1440,7 @@ fn pad(body: String, spec: &FmtSpec) -> String {
 fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
     let fmt = match &a[0] {
         Value::Str(s) => s.to_string(),
-        _ => return Err("format: not a string".to_string()),
+        v => return Err(format!("wrong-type-argument: stringp {}", h.print(v, true))),
     };
     let mut out = String::new();
     let mut ai = 1;
@@ -1838,7 +1838,18 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
     } else {
         let sep = as_string(h, &a[1])?;
         if sep.is_empty() {
-            s.chars().map(|c| c.to_string()).collect()
+            // An empty separator regexp matches at every position, including
+            // before the first character and after the last, so Emacs yields a
+            // leading and a trailing "" — (split-string "a1b" "") is
+            // ("" "a" "1" "b" ""). They drop out under OMIT-NULLS.
+            if s.is_empty() {
+                vec![String::new()]
+            } else {
+                let mut out = vec![String::new()];
+                out.extend(s.chars().map(|c| c.to_string()));
+                out.push(String::new());
+                out
+            }
         } else {
             // SEPARATORS is a regexp in Emacs, not a literal string.
             let re = compile_cf(&sep, false)?;
@@ -2560,8 +2571,22 @@ fn lognot_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(ash VALUE COUNT)` — arithmetic shift. A left shift is exact: Emacs's
 /// integers are unbounded, so `(ash 1 70)` is 2^70, not a wrapped fixnum.
 fn ash_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    use num_traits::{Signed, ToPrimitive};
     let n = as_int_exact_p(h, &a[0], false)?;
-    let c = as_integer(h, &a[1])?;
+    let cb = as_int_exact_p(h, &a[1], false)?;
+    let c = match cb.to_i64() {
+        Some(c) => c,
+        // A count that does not even fit an i64: shifting left by it would exhaust
+        // memory; shifting right by it collapses to the sign.
+        None if cb.is_negative() => {
+            return Ok(h.make_integer(if n.is_negative() {
+                BigInt::from(-1)
+            } else {
+                BigInt::from(0)
+            }))
+        }
+        None => return Err("overflow-error".to_string()),
+    };
     let r = if c >= 0 {
         // A shift count that large would exhaust memory long before it completed;
         // Emacs signals `overflow-error` rather than trying.
@@ -6696,8 +6721,15 @@ mod tests {
         assert_eq!(eval("(string-split \"\")"), "nil");
         // Explicit separator regexp, omit-nulls default off keeps empty fields.
         assert_eq!(eval("(string-split \"a,,b\" \",\")"), "(\"a\" \"\" \"b\")");
-        // Empty separator splits into single characters.
-        assert_eq!(eval("(string-split \"abc\" \"\")"), "(\"a\" \"b\" \"c\")");
+        // An empty separator regexp matches at every position, INCLUDING before
+        // the first character and after the last, so Emacs 30.2 answers
+        // ("" "a" "b" "c" "") — verified against `emacs -Q --batch`. This
+        // assertion previously encoded elisprs's own (leading/trailing-less)
+        // output rather than Emacs's.
+        assert_eq!(
+            eval("(string-split \"abc\" \"\")"),
+            "(\"\" \"a\" \"b\" \"c\" \"\")"
+        );
     }
 
     #[test]

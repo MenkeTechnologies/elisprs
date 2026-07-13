@@ -62,16 +62,24 @@ pub const PRELUDE: &str = r#"
 ;; `abs` is a primitive subr (keeps int/float type; (abs -0.0) => 0.0).
 ;; NaN propagates: any NaN arg makes the result NaN (a NaN never wins `>`/`<`,
 ;; so once it lands in the accumulator no later value can displace it).
+(defun num-or-marker--check (x)
+  ;; Emacs checks each argument in order, so the error names the FIRST
+  ;; non-number: (max t 'foo) is (wrong-type-argument number-or-marker-p t).
+  (unless (number-or-marker-p x)
+    (signal 'wrong-type-argument (list 'number-or-marker-p x)))
+  x)
 (defun max (x &rest xs)
+  (num-or-marker--check x)
   (while xs
-    (let ((y (car xs)))
+    (let ((y (num-or-marker--check (car xs))))
       (if (> y x) (setq x y))
       (if (and (floatp y) (isnan y)) (setq x y)))
     (setq xs (cdr xs)))
   x)
 (defun min (x &rest xs)
+  (num-or-marker--check x)
   (while xs
-    (let ((y (car xs)))
+    (let ((y (num-or-marker--check (car xs))))
       (if (< y x) (setq x y))
       (if (and (floatp y) (isnan y)) (setq x y)))
     (setq xs (cdr xs)))
@@ -97,9 +105,14 @@ pub const PRELUDE: &str = r#"
   ;; The last N cons cells of L (default 1): (last '(1 2 3) 2) => (2 3).
   ;; Guard on consp so an improper tail stops the walk instead of erroring:
   ;; (last '(1 2 . 3)) => (2 . 3).
-  (if (or (null n) (= n 1))
-      (progn (while (consp (cdr l)) (setq l (cdr l))) l)
-    (nthcdr (max 0 (- (length l) n)) l)))
+  (cond
+   ;; A non-list has no cons cells to take: Emacs returns it unchanged --
+   ;; (last t) and (last t 0) are both t.
+   ((not (consp l)) l)
+   ((or (null n) (= n 1))
+    (while (consp (cdr l)) (setq l (cdr l)))
+    l)
+   (t (nthcdr (max 0 (- (length l) n)) l))))
 (defun make-list (n x)
   (unless (and (integerp n) (>= n 0) (<= n most-positive-fixnum))
     (signal 'wrong-type-argument (list 'wholenump n)))
@@ -196,11 +209,17 @@ pub const PRELUDE: &str = r#"
   (let ((p (if testfn (assoc k al testfn) (assq k al))))
     (if p (cdr p) default)))
 (defun plist-get (pl k &optional predicate)
+  ;; Emacs walks cons cells and simply stops at a non-cons -- (plist-get 'sym 1)
+  ;; is nil, not an error.
   (let ((test (or predicate #'eq)) (r nil))
-    (while pl (if (funcall test (car pl) k) (progn (setq r (cadr pl)) (setq pl nil)) (setq pl (cddr pl)))) r))
+    (while (consp pl)
+      (if (funcall test (car pl) k) (progn (setq r (cadr pl)) (setq pl nil)) (setq pl (cddr pl))))
+    r))
 (defun plist-member (pl k &optional predicate)
   (let ((test (or predicate #'eq)) (r nil))
-    (while pl (if (funcall test (car pl) k) (progn (setq r pl) (setq pl nil)) (setq pl (cddr pl)))) r))
+    (while (consp pl)
+      (if (funcall test (car pl) k) (progn (setq r pl) (setq pl nil)) (setq pl (cddr pl))))
+    r))
 
 ;;; ---- higher-order / sequence ----
 ;; seq-* accept any sequence; coerce list/vector/string to a list to iterate.
@@ -1129,7 +1148,12 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 (defun text-quoting-style () 'curve)
 (defun string-reverse (s) (reverse s))
 ;; `upcase` / `downcase` are primitive subrs (accept a string or a character).
+(defun char-or-string--check (s)
+  (unless (or (stringp s) (integerp s))
+    (signal 'wrong-type-argument (list 'char-or-string-p s)))
+  s)
 (defun capitalize (s)
+  (char-or-string--check s)
   ;; Upcase the first letter of every word (run of alphanumerics), downcase the
   ;; rest: (capitalize "hello world") => "Hello World". A character argument
   ;; capitalizes to its uppercase form (like `upcase').
@@ -1298,13 +1322,21 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 (defun seq-drop (seq n) (seq-into (nthcdr n (append seq nil)) (seq--type-of seq)))
 (defun seq-subseq (seq start &optional end)
   ;; Sequence-generic, returning SEQ's type; START/END may be negative.
+  ;; Out-of-range is an error, and seq.el reports it differently per type: an
+  ;; array signals `args-out-of-range', a list signals a plain `error'.
+  (unless (sequencep seq)
+    (error "Unsupported sequence: %S" seq))
   (let* ((lst (append seq nil)) (len (length lst))
          (s (if (< start 0) (+ len start) start))
-         (e (cond ((null end) len) ((< end 0) (+ len end)) (t end)))
-         (sub (take (- e s) (nthcdr s lst))))
-    (cond ((stringp seq) (apply (function string) sub))
-          ((vectorp seq) (vconcat sub))
-          (t sub))))
+         (e (cond ((null end) len) ((< end 0) (+ len end)) (t end))))
+    (when (or (< s 0) (> s len) (< e 0) (> e len) (> s e))
+      (if (listp seq)
+          (error "Start index out of bounds: %d" start)
+        (signal 'args-out-of-range (list seq start end))))
+    (let ((sub (take (- e s) (nthcdr s lst))))
+      (cond ((stringp seq) (apply (function string) sub))
+            ((vectorp seq) (vconcat sub))
+            (t sub)))))
 (defun seq-uniq (seq &optional testfn)
   (if (null testfn)
       (delete-dups (append seq nil))
@@ -2614,9 +2646,13 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
             (t (push cur lines) (setq cur w))))
     (unless (string= cur "") (push cur lines))
     (mapconcat 'identity (reverse lines) "\n")))
-(defun string-equal-ignore-case (a b) (string= (downcase a) (downcase b)))
+(defun string-equal-ignore-case (a b)
+  (unless (or (stringp a) (symbolp a)) (signal 'wrong-type-argument (list 'stringp a)))
+  (unless (or (stringp b) (symbolp b)) (signal 'wrong-type-argument (list 'stringp b)))
+  (string= (downcase (string--name a)) (downcase (string--name b))))
 (defun upcase-initials (s)
   ;; Upcase the first letter of every word, leaving the rest unchanged.
+  (char-or-string--check s)
   (let ((out nil) (in-word nil))
     (dolist (c (string-to-list s))
       (let* ((lower (and (>= c ?a) (<= c ?z)))

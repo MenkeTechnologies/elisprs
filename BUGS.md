@@ -50,6 +50,21 @@ on some `seq-*` paths). What it found and what was fixed:
   `seq-union` dedup, and the `string-suffix-p` / `nconc` / `string-to-vector` /
   `concat` / `remq` / `delq` / `string=` tolerances.
 
+A second pass over the same corpus took it from 119 to 56 diverging forms and
+found two more semantic bugs (not just error shapes):
+
+- **`(eval FORM t)` evaluated FORM in the caller's lexical scope.**
+  `(let ((x 5)) (eval 'x t))` returned 5; Emacs signals `(void-variable x)`. Any
+  closure FORM created also captured — and printed — the caller's bindings.
+- **A closure printed as `#<closure>`** rather than as its source
+  (`#[(x) ((list x x)) (t)]`), which also made every `wrong-number-of-arguments`
+  involving a closure or subr diverge.
+
+Plus: argument checking order (`(max t 'foo)` names `t`), `seq-subseq` bounds,
+`split-string` with an empty separator, `ash` with a bignum count, and the
+`capitalize` / `sort` / `mapcar` / `format` / `intern` / `last` / `plist-get` type
+contracts.
+
 Reproduce any of it:
 
 ```sh
