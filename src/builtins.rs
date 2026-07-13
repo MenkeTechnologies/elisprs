@@ -2770,10 +2770,10 @@ fn sqrt_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().sqrt()))
 }
 fn exp_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(h, &a[0])?.1.exp()))
+    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().exp()))
 }
 fn log_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let x = as_num(h, &a[0])?.1;
+    let x = as_number_p(h, &a[0], false)?.to_f64();
     Ok(Value::Float(match a.get(1) {
         // Emacs uses `log10`/`log2` for base 10/2 (exact for powers of the base:
         // (log 1000 10) => 3.0), falling back to ln(x)/ln(base) otherwise.
@@ -2791,22 +2791,22 @@ fn log_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }))
 }
 fn sin_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(h, &a[0])?.1.sin()))
+    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().sin()))
 }
 fn cos_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(h, &a[0])?.1.cos()))
+    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().cos()))
 }
 fn tan_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(h, &a[0])?.1.tan()))
+    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().tan()))
 }
 fn asin_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(h, &a[0])?.1.asin()))
+    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().asin()))
 }
 fn acos_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(h, &a[0])?.1.acos()))
+    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().acos()))
 }
 fn atan_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let y = as_num(h, &a[0])?.1;
+    let y = as_number_p(h, &a[0], false)?.to_f64();
     Ok(Value::Float(match a.get(1) {
         Some(x) => y.atan2(as_num(h, x)?.1),
         None => y.atan(),
@@ -2847,13 +2847,15 @@ fn scalbn(x: f64, mut n: i64) -> f64 {
     y * f64::from_bits(((0x3ff + n) as u64) << 52)
 }
 fn ldexp_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let m = as_num(h, &a[0])?.1;
+    let m = as_number_p(h, &a[0], false)?.to_f64();
     let e = as_num(h, &a[1])?.0;
     Ok(Value::Float(scalbn(m, e)))
 }
 fn copysign_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Float(
-        as_num(h, &a[0])?.1.copysign(as_num(h, &a[1])?.1),
+        as_number_p(h, &a[0], false)?
+            .to_f64()
+            .copysign(as_number_p(h, &a[1], false)?.to_f64()),
     ))
 }
 /// Decompose V into (SIGNIFICAND . EXPONENT) with the significand in [0.5,1).
@@ -2882,7 +2884,7 @@ fn frexp_parts(x: f64) -> (f64, i64) {
     }
 }
 fn frexp_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let (m, e) = frexp_parts(as_num(h, &a[0])?.1);
+    let (m, e) = frexp_parts(as_number_p(h, &a[0], false)?.to_f64());
     Ok(h.cons(Value::Float(m), Value::Int(e)))
 }
 fn isnan_fn(h: &mut ElispHost, a: &[Value]) -> R {
@@ -2895,16 +2897,18 @@ fn isnan_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 fn fround_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(h, &a[0])?.1.round_ties_even()))
+    Ok(Value::Float(
+        as_number_p(h, &a[0], false)?.to_f64().round_ties_even(),
+    ))
 }
 fn ffloor_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(h, &a[0])?.1.floor()))
+    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().floor()))
 }
 fn fceiling_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(h, &a[0])?.1.ceil()))
+    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().ceil()))
 }
 fn ftruncate_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_num(h, &a[0])?.1.trunc()))
+    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().trunc()))
 }
 
 /// `(string-to-number STRING &optional BASE)` — parse a leading number. With
@@ -4009,7 +4013,7 @@ fn string_to_vector(h: &mut ElispHost, a: &[Value]) -> R {
 /// NaN) falls through to C `logb`, which returns a *float* — `-inf` for zero,
 /// `+inf` for either infinity, and NaN for NaN.
 fn logb_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let f = as_num(h, &a[0])?.1;
+    let f = as_number_p(h, &a[0], false)?.to_f64();
     if f.is_finite() && f != 0.0 {
         return Ok(Value::Int(f.abs().log2().floor() as i64));
     }

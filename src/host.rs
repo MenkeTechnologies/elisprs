@@ -1939,6 +1939,17 @@ impl ElispHost {
                 // speculatively (`macroexpand_1` asks whether a head names a
                 // macro), so a side effect would outlive the failed probe and be
                 // mistaken for the next real error.
+                //
+                // `t` and `nil` ARE symbols in Emacs — they just have no function
+                // cell — so calling one is `void-function`, not `invalid-function`.
+                // elisprs represents them as `Value::Bool`/`Value::Undef` rather
+                // than heap symbols, so they need naming here.
+                None if matches!(cur, Value::Bool(true)) => {
+                    return Err("void-function: t".to_string())
+                }
+                None if matches!(cur, Value::Undef | Value::Bool(false)) => {
+                    return Err("void-function: nil".to_string())
+                }
                 _ => return Err(format!("invalid-function: {}", self.print(&cur, true))),
             }
         }
@@ -3302,6 +3313,13 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                     _ => h.list_vec(&args[0]).map(|l| (l, false)),
                 }) {
                     Some(pair) => pair,
+                    // A cons that is not a proper list: Emacs's list walk names the
+                    // offending tail. Anything else is not a sortable container at
+                    // all.
+                    None if with_host(|h| matches!(h.obj(&args[0]), Some(Obj::Cons(..)))) => {
+                        return Err(with_host(|h| h.seq_vec_checked(&args[0]))
+                            .expect_err("a cons that is not a proper list must fail"))
+                    }
                     None => {
                         return Err(format!(
                             "wrong-type-argument: list-or-vector-p {}",

@@ -141,18 +141,37 @@ pub const PRELUDE: &str = r#"
 (defun caar-safe (x) (if (consp x) (car x) nil))
 
 ;;; ---- membership / search ----
-(defun memq (x l) (while (and l (not (eq x (car l)))) (setq l (cdr l))) l)
-(defun member (x l) (while (and l (not (equal x (car l)))) (setq l (cdr l))) l)
-(defun memql (x l) (while (and l (not (eql x (car l)))) (setq l (cdr l))) l)
+(defun mem--end-check (tail whole)
+  ;; Emacs's CHECK_LIST_END: a non-nil, non-cons tail signals `listp' naming the
+  ;; WHOLE list -- (memq 1 (cons 9 3)) => (wrong-type-argument listp (9 . 3)).
+  (unless (or (null tail) (consp tail))
+    (signal 'wrong-type-argument (list 'listp whole)))
+  tail)
+(defun memq (x l)
+  (let ((whole l))
+    (while (and (consp l) (not (eq x (car l)))) (setq l (cdr l)))
+    (mem--end-check l whole)
+    (and (consp l) l)))
+(defun member (x l)
+  (let ((whole l))
+    (while (and (consp l) (not (equal x (car l)))) (setq l (cdr l)))
+    (mem--end-check l whole)
+    (and (consp l) l)))
+(defun memql (x l)
+  (let ((whole l))
+    (while (and (consp l) (not (eql x (car l)))) (setq l (cdr l)))
+    (mem--end-check l whole)
+    (and (consp l) l)))
 (defun assoc-string (key alist &optional case-fold)
   ;; First ALIST element equal to KEY as a string (elements may be strings or
   ;; (STRING . VALUE) conses); CASE-FOLD ignores case.
   (let ((k (if (symbolp key) (symbol-name key) key)) (r nil))
-    (while (and alist (not r))
+    (while (and (consp alist) (not r))
       (let* ((el (car alist))
              (raw (if (consp el) (car el) el))
              (s (if (symbolp raw) (symbol-name raw) raw)))
-        (if (if case-fold (string-equal-ignore-case k s) (string= k s))
+        (if (and (stringp s)
+                 (if case-fold (string-equal-ignore-case k s) (string= k s)))
             (setq r el)
           (setq alist (cdr alist)))))
     r))
@@ -176,11 +195,12 @@ pub const PRELUDE: &str = r#"
         (setq l (cdr l))))
     r))
 (defun rassq (v l)
-  (let ((r nil))
-    (while (and l (not r))
+  (let ((r nil) (whole l))
+    (while (and (consp l) (not r))
       (if (and (consp (car l)) (eq (cdr (car l)) v))
           (setq r (car l))
         (setq l (cdr l))))
+    (unless r (mem--end-check l whole))
     r))
 (defun alist-get (k al &optional default _remove testfn)
   ;; Value associated with K in alist AL (DEFAULT if absent); TESTFN overrides eq.
@@ -1172,8 +1192,12 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
       (concat "..." (substring string (min (1- strlen)
                                            (max 0 (- strlen length))))))))
 (defun string-remove-prefix (prefix s)
+  ;; `length' is what rejects a non-sequence here (`sequencep'), exactly as in
+  ;; subr-x, rather than a `stringp' check of our own.
+  (length s)
   (if (string-prefix-p prefix s) (substring s (length prefix) (length s)) s))
 (defun string-remove-suffix (suffix s)
+  (length s)
   (if (string-suffix-p suffix s) (substring s 0 (- (length s) (length suffix))) s))
 
 ;;; ---- lists ----
@@ -1201,7 +1225,10 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
         (t (list tree))))
 (defun flatten-list (tree) (flatten-tree tree))
 (defun copy-tree (tree) (if (consp tree) (cons (copy-tree (car tree)) (copy-tree (cdr tree))) tree))
-(defun copy-sequence (seq) (if (listp seq) (append seq nil) seq))
+(defun copy-sequence (seq)
+  (cond ((listp seq) (append seq nil))
+        ((or (stringp seq) (vectorp seq)) seq)
+        (t (signal 'wrong-type-argument (list 'sequencep seq)))))
 (defun ensure-list (x) (if (listp x) x (list x)))
 (defun mapcan (fn lst) (apply (function append) (mapcar fn lst)))
 (defun assoc-default (key alist &optional test default)
@@ -2350,7 +2377,7 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
   ;; Mutate PLIST in place: overwrite an existing PROP, or append (PROP VAL) to
   ;; the tail via setcdr. Only a nil PLIST yields a fresh list (can't mutate nil).
   ;; A non-list PLIST is `plistp' -- its own predicate, not `listp'.
-  (unless (listp plist) (signal 'wrong-type-argument (list 'plistp plist)))
+  (unless (plistp plist) (signal 'wrong-type-argument (list 'plistp plist)))
   (let ((test (or predicate #'eq)))
    (if (null plist)
       (list prop val)
@@ -2542,6 +2569,9 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
     2)
    (t 1)))
 (defun string-width (s &optional _from _to)
+  ;; `string-to-list' accepts any sequence, so the string check has to be explicit:
+  ;; Emacs signals `stringp', not `sequencep'.
+  (unless (stringp s) (signal 'wrong-type-argument (list 'stringp s)))
   (let ((w 0) (l (string-to-list s)))
     (while l (setq w (+ w (char-width (car l))) l (cdr l)))
     w))
@@ -2637,16 +2667,19 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
   (string= (downcase (string--name a)) (downcase (string--name b))))
 (defun upcase-initials (s)
   ;; Upcase the first letter of every word, leaving the rest unchanged.
+  ;; A character argument upcases to its uppercase form, like `upcase'.
   (char-or-string--check s)
-  (let ((out nil) (in-word nil))
-    (dolist (c (string-to-list s))
-      (let* ((lower (and (>= c ?a) (<= c ?z)))
-             (alnum (or lower (and (>= c ?A) (<= c ?Z)) (and (>= c ?0) (<= c ?9)))))
-        (cond ((not alnum) (setq out (cons c out)))
-              (in-word (setq out (cons c out)))
-              (t (setq out (cons (if lower (- c 32) c) out))))
-        (setq in-word alnum)))
-    (apply (function string) (reverse out))))
+  (if (integerp s)
+      (upcase s)
+    (let ((out nil) (in-word nil))
+      (dolist (c (string-to-list s))
+        (let* ((lower (and (>= c ?a) (<= c ?z)))
+               (alnum (or lower (and (>= c ?A) (<= c ?Z)) (and (>= c ?0) (<= c ?9)))))
+          (cond ((not alnum) (setq out (cons c out)))
+                (in-word (setq out (cons c out)))
+                (t (setq out (cons (if lower (- c 32) c) out))))
+          (setq in-word alnum)))
+      (apply (function string) (reverse out)))))
 (defun string-replace (from to s)
   ;; Emacs signals on an empty FROMSTRING rather than looping forever.
   (if (string-empty-p from) (signal 'wrong-length-argument (list 0))

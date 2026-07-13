@@ -43,6 +43,23 @@ All notable changes to elisprs are documented here. The format follows
   the second and later `(eval 2.5 t)` in a process answered `2`. Fixed in fusevm
   0.14.6.
 
+### Fixed (Emacs parity — round 6)
+- **An improper list is reported differently depending on who walks it.**
+  `memq` / `member` / `memql` / `rassq` use Emacs's `CHECK_LIST_END`, which names the
+  WHOLE list — `(memq 1 (cons 9 3))` is `(wrong-type-argument listp (9 . 3))` —
+  while `reverse` / `append` / `sort` name the offending TAIL. elisprs silently
+  stopped at the dotted tail and answered nil.
+- **Calling `t` or `nil` is `void-function`, not `invalid-function`**: both are
+  symbols in Emacs, they just have no function cell. elisprs represents them as
+  `Value::Bool`/`Value::Undef` rather than heap symbols, so they fell through to the
+  "not a function object" arm.
+- The float math primitives (`sin`, `cos`, `sqrt`, `exp`, `log`, …) signal `numberp`,
+  not the arithmetic ops' `number-or-marker-p`.
+- `copy-sequence` of a non-sequence signals rather than handing the value back;
+  `string-width` signals `stringp`; `plist-put` validates the plist's shape and names
+  the whole plist; `upcase-initials` of a character upcases it; `assoc-string` skips
+  an element it cannot compare and stops at a dotted tail.
+
 ### Fixed (Emacs parity — round 5, widened fuzz grammar)
 The fuzz generator now also covers hash tables, Emacs regexp syntax (valid *and*
 malformed), text properties, cl-lib, the printer's dynamic variables, and `format`
