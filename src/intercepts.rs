@@ -334,7 +334,10 @@ pub fn run_intercepts(f: &Value, name: &str, args: &[Value]) -> Result<Option<Va
     });
 
     // `before` advice.
-    for advice in matching.iter().filter(|i| matches!(i.kind, AdviceKind::Before)) {
+    for advice in matching
+        .iter()
+        .filter(|i| matches!(i.kind, AdviceKind::Before))
+    {
         if let Err(e) = eval_advice(&advice.code) {
             with_host(intercept_finish);
             return Err(e);
@@ -342,7 +345,9 @@ pub fn run_intercepts(f: &Value, name: &str, args: &[Value]) -> Result<Option<Va
     }
 
     // `around` advice wins first-match, as in zshrs.
-    let around = matching.iter().find(|i| matches!(i.kind, AdviceKind::Around));
+    let around = matching
+        .iter()
+        .find(|i| matches!(i.kind, AdviceKind::Around));
     let has_after = matching.iter().any(|i| matches!(i.kind, AdviceKind::After));
 
     let t0 = Instant::now();
@@ -377,7 +382,10 @@ pub fn run_intercepts(f: &Value, name: &str, args: &[Value]) -> Result<Option<Va
     with_host(|h| h.set_intercept_timing(elapsed));
 
     // `after` advice.
-    for advice in matching.iter().filter(|i| matches!(i.kind, AdviceKind::After)) {
+    for advice in matching
+        .iter()
+        .filter(|i| matches!(i.kind, AdviceKind::After))
+    {
         if let Err(e) = eval_advice(&advice.code) {
             with_host(intercept_finish);
             return Err(e);
@@ -587,15 +595,31 @@ mod tests {
 
     #[test]
     fn glob_star_matches_elisp_function_prefix() {
-        assert!(intercept_matches("forward-*", "forward-char", "forward-char"));
-        assert!(intercept_matches("forward-*", "forward-word", "forward-word 2"));
-        assert!(!intercept_matches("forward-*", "backward-char", "backward-char"));
+        assert!(intercept_matches(
+            "forward-*",
+            "forward-char",
+            "forward-char"
+        ));
+        assert!(intercept_matches(
+            "forward-*",
+            "forward-word",
+            "forward-word 2"
+        ));
+        assert!(!intercept_matches(
+            "forward-*",
+            "backward-char",
+            "backward-char"
+        ));
     }
 
     #[test]
     fn glob_mid_and_suffix_stars() {
         assert!(intercept_matches("*-mode", "text-mode", "text-mode"));
-        assert!(intercept_matches("save-*-excursion", "save-window-excursion", "x"));
+        assert!(intercept_matches(
+            "save-*-excursion",
+            "save-window-excursion",
+            "x"
+        ));
         assert!(!intercept_matches("*-mode", "mode-line", "mode-line"));
     }
 
