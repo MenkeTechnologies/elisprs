@@ -452,6 +452,26 @@ pub struct ElispHost {
     /// compiler's closure-template construction untouched. Session-local: not part
     /// of the AOT heap image (oclosure-heavy libraries load at runtime).
     pub(crate) oclosure_meta: HashMap<u32, OClosureMeta>,
+    /// Registered AOP pattern-intercepts (elisprs extension, ported from zshrs's
+    /// `src/extensions/intercepts.rs`). This is the GLOB/pattern-matching advice
+    /// layer — distinct from elisp's per-symbol nadvice (`advice-add`): one
+    /// registration fires across every symbol whose name matches a glob such as
+    /// `"forward-*"`, `"_*"`, or `"all"`, with before/after/around timing and a
+    /// `proceed` protocol. Fired from [`call_function`]. Runtime-only (never
+    /// serialized). See [`crate::intercepts`].
+    pub(crate) intercepts: Vec<crate::intercepts::Intercept>,
+    /// Re-entrancy guard for the intercept layer: set while an advice body (or a
+    /// proceeded original) runs so nested function calls dispatch normally instead
+    /// of re-triggering intercepts (prevents infinite recursion when advice calls
+    /// a function its own pattern matches).
+    pub(crate) intercept_active: bool,
+    /// The callee + argument values of the function currently under an `around`
+    /// intercept, so `(intercept-proceed)` can run the original. `None` outside an
+    /// active around advice.
+    pub(crate) intercept_current: Option<(Value, Vec<Value>)>,
+    /// Set by `(intercept-proceed)` — records that an around advice ran the
+    /// original command (mirrors zshrs's `__intercept_proceed` flag).
+    pub(crate) intercept_proceeded: bool,
 }
 
 /// A closure's printable source: the arglist as written and the body forms.
@@ -602,6 +622,10 @@ impl ElispHost {
             current: 0,
             string_props: HashMap::new(),
             oclosure_meta: HashMap::new(),
+            intercepts: Vec::new(),
+            intercept_active: false,
+            intercept_current: None,
+            intercept_proceeded: false,
         };
         crate::builtins::install(&mut h);
         // The default buffer's own object handle (allocated after the arena
@@ -3508,7 +3532,28 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             "--catch--" => return intrinsic_catch(args),
             "--unwind--" => return intrinsic_unwind(args),
             "--condition-case--" => return intrinsic_condition_case(args),
+            // AOP pattern-intercept proceed protocol (elisprs extension). Runs the
+            // original command from inside an `around` advice — re-entrant, so it
+            // lives here (outside any host borrow), like the other intrinsics.
+            "intercept-proceed" => return crate::intercepts::intrinsic_intercept_proceed(),
             _ => {}
+        }
+    }
+
+    // ── zshrs-original AOP pattern-intercept layer (elisprs extension) ──
+    // Distinct from elisp nadvice (`advice-add`, per-symbol): this fires on a
+    // GLOB/pattern match across many symbol names at once (`"forward-*"`, `"_*"`,
+    // `"all"`) with before/after/around advice + a timing/proceed protocol. Only a
+    // named (symbol) callee participates — an anonymous closure has no name to
+    // match. The zero-intercept common case is a single cheap bool load; the
+    // `intercept_active` guard makes advice bodies (and the proceeded original)
+    // dispatch normally without re-triggering (recursion guard). See
+    // [`crate::intercepts`].
+    if with_host(|h| !h.intercepts.is_empty() && !h.intercept_active) {
+        if let Some(name) = with_host(|h| h.sym_name(f)) {
+            if let Some(result) = crate::intercepts::run_intercepts(f, &name, args)? {
+                return Ok(result);
+            }
         }
     }
 

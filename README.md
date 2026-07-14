@@ -151,6 +151,21 @@ elisp --version
 
 **Markers & text properties.** First-class markers (`make-marker` / `point-marker` / `copy-marker` / `set-marker` / `marker-position` / `marker-buffer` / `marker-insertion-type`) auto-adjust when text is inserted or deleted, honoring insertion type, and serve as buffer positions. String and buffer text carry property intervals: `propertize` / `put-text-property` / `get-text-property` / `set-text-properties` / `add-text-properties` / `remove-text-properties` / `text-properties-at` / `next-single-property-change` / `next-property-change` / `previous-single-property-change` / `get-char-property`; `buffer-substring` and `buffer-string` carry properties (the `-no-properties` variant drops them). This is enough that `tabulated-list-print` produces byte-identical propertized output to GNU Emacs.
 
+**AOP pattern intercepts** (an elisprs extension, ported from `zshrs`; distinct from elisp's native per-symbol nadvice). Where `advice-add` attaches to one named symbol, an intercept fires on a **glob across many function names at once** — `"forward-*"`, `"_*"`, or the catch-alls `"*"` / `"all"` — with `before` / `after` / `around` advice and a timing/`proceed` protocol. Advice bodies are ordinary elisp forms evaluated in the running host (no subprocess); a re-entrancy guard keeps advice that calls a matching function from recursing.
+
+```elisp
+(defun greet (x) (concat "hi " x))
+(intercept 'before "gr*"    '(message "calling %s with %s" intercept-name intercept-args))
+(intercept 'around "greet"  '(upcase (intercept-proceed)))   ; => "HI BOB"
+(intercept 'after  "greet"  '(message "took %s us" intercept-us))
+(greet "bob")
+(intercept-list)     ; => ((1 before "gr*" …) (2 around "greet" …) (3 after "greet" …))
+(intercept-remove 1) ; => t
+(intercept-clear)    ; => 2
+```
+
+Registration returns an integer ID; `(intercept-list)` returns `(ID KIND PATTERN FORM)` entries; advice reads the dynamic context vars `intercept-name` / `intercept-args` / `intercept-cmd`, and (in `after`) `intercept-ms` / `intercept-us`. `(intercept-proceed)` runs the original from inside an `around` body.
+
 **Not in scope** — surfaced loudly rather than silently misread: this is a useful elisp core, **not** the ~1000-subr GNU Emacs surface. Within the editor layer, **overlays**, a real **interval tree** (properties use a per-character plist vector, observably identical for get/put/next-change but O(n) in storage), and **redisplay** (windows, header lines, faces) are not modeled.
 
 ---
@@ -169,6 +184,7 @@ elisp cells (cons / symbol / vector / closure / macro / subr) live in the `Elisp
 | `src/host.rs` | `ElispHost`: the object heap, Lisp-2 obarray, dynamic binding, and the `fusevm` extension handler that runs elisp ops |
 | `src/compiler.rs` | Lowers elisp forms to a `fusevm::Chunk`; lambda bodies become sub-chunks |
 | `src/builtins.rs` | The subr standard library (reached host-side from the `CALL` extension op) |
+| `src/intercepts.rs` | AOP pattern-intercept layer (glob advice across many function names) — an elisprs extension ported from `zshrs`, fired on the `call_function` join point |
 | `src/prelude.rs` | The `[DERIVED]` elisp prelude — breadth written in elisp on top of the primitives |
 | `src/aot.rs` | `--aot` / `--aot-exe` driver: lowers a `.el` file to a `fusevm::Chunk`, emits a native object via `fusevm::aot::compile_object`, and links a standalone executable |
 | `src/lsp.rs` / `src/dap.rs` | `--lsp` (completion/hover/diagnostics/signature help) and `--dap` (breakpoints/stepping/variables) servers |

@@ -13,6 +13,7 @@ pub mod cache;
 pub mod compiler;
 pub mod dap;
 pub mod host;
+pub mod intercepts;
 pub mod lsp;
 pub mod prelude;
 pub mod reader;

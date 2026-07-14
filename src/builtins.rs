@@ -6770,6 +6770,9 @@ pub fn install(h: &mut ElispHost) {
     // Emacs 28 alias for split-string with identical semantics (direct forwarder).
     s("string-split", 1, Some(4), split_string);
     s("member-ignore-case", 2, Some(2), member_ignore_case);
+    // AOP pattern-intercept layer (elisprs extension, ported from zshrs). Registers
+    // the `intercept*` subrs and marks its context variables special.
+    crate::intercepts::install(h);
 }
 
 #[cfg(test)]

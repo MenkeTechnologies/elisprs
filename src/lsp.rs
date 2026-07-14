@@ -1639,6 +1639,38 @@ pub const SUBRS: &[Entry] = &[
         sig: "(--pop-output-capture--)",
         doc: "Internal: stop capturing output and return the captured string.",
     },
+    // AOP pattern-intercept layer (elisprs extension, ported from zshrs). Glob
+    // advice across many function names at once — distinct from nadvice.
+    Entry {
+        name: "intercept",
+        kind: Kind::Function,
+        sig: "(intercept KIND PATTERN FORM)",
+        doc: "Register AOP advice. KIND is before/after/around; PATTERN is a glob (\"forward-*\", \"_*\", \"all\") matched against function names; FORM is the (quoted) advice form. Returns the intercept ID. Distinct from nadvice's advice-add: one registration fires on every matching name.",
+    },
+    Entry {
+        name: "intercept-list",
+        kind: Kind::Function,
+        sig: "(intercept-list)",
+        doc: "Return registered intercepts as a list of (ID KIND PATTERN FORM) entries, or nil.",
+    },
+    Entry {
+        name: "intercept-remove",
+        kind: Kind::Function,
+        sig: "(intercept-remove ID)",
+        doc: "Remove the intercept with integer ID. Returns t if removed, nil otherwise.",
+    },
+    Entry {
+        name: "intercept-clear",
+        kind: Kind::Function,
+        sig: "(intercept-clear)",
+        doc: "Remove all intercepts. Returns the count removed.",
+    },
+    Entry {
+        name: "intercept-proceed",
+        kind: Kind::Function,
+        sig: "(intercept-proceed)",
+        doc: "From an around advice, run the original function and return its value. Bound context in advice: intercept-name, intercept-args, intercept-cmd, and (after) intercept-ms/intercept-us.",
+    },
 ];
 
 pub fn lookup(name: &str) -> Option<&'static Entry> {
