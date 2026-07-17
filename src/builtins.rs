@@ -418,6 +418,10 @@ fn el_eq(h: &ElispHost, a: &Value, b: &Value) -> bool {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Obj(x), Value::Obj(y)) => x == y,
         (Value::Bool(true), Value::Bool(true)) => true,
+        // Emacs keeps ONE shared empty-string object (`empty_unibyte_string`
+        // in alloc.c): every 0-length string construction returns it, so
+        // (eq "" "") and (eq (make-string 0 10) "") are t.
+        (Value::Str(x), Value::Str(y)) => x.is_empty() && y.is_empty(),
         _ => {
             let _ = h;
             false
@@ -607,6 +611,14 @@ fn simple_case(cp: i64, upper: bool) -> i64 {
 }
 fn case_fold(h: &ElispHost, a: &[Value], upper: bool) -> R {
     match &a[0] {
+        // casefiddle.c: a negative fixnum is not a character (char-or-string-p),
+        // but one above the character range is returned UNCHANGED — Emacs treats
+        // the high bits as event modifiers, so (upcase 4194304) => 4194304.
+        Value::Int(c) if *c < 0 => Err(format!(
+            "wrong-type-argument: char-or-string-p {}",
+            h.print(&a[0], true)
+        )),
+        Value::Int(c) if *c > 0x3F_FFFF => Ok(Value::Int(*c)),
         Value::Int(c) => Ok(Value::Int(simple_case(*c, upper))),
         Value::Str(s) => Ok(Value::str(if upper {
             s.to_uppercase()
@@ -688,8 +700,7 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn nth_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // `(nth n list)` = `(car (nthcdr n list))`: walk the cons spine n times, then
-    // take the car. Improper lists are fine (`(nth 0 '(a . 1))` => a); only when
-    // we actually need the car/cdr of a non-list does Emacs signal listp. N must
+    // take the car. Improper lists are fine (`(nth 0 '(a . 1))` => a). N must
     // be an integer — a float or other type signals `integerp`.
     let n = as_integer(h, &a[0])?;
     let mut cur = a[1].clone();
@@ -698,10 +709,14 @@ fn nth_fn(h: &mut ElispHost, a: &[Value]) -> R {
         let next = match h.obj(&cur) {
             Some(Obj::Cons(_, d)) => d.clone(),
             _ if is_nil(&cur) => return Ok(Value::Undef),
+            // Fnthcdr running off a dotted tail mid-walk is CHECK_LIST_END
+            // naming the WHOLE list: (nth 2 '(1 . 2)) => listp (1 . 2). Only
+            // the final Fcar (below) names the tail value itself: (nth 1
+            // '(1 . 2)) => listp 2.
             _ => {
                 return Err(format!(
                     "wrong-type-argument: listp {}",
-                    h.print(&cur, true)
+                    h.print(&a[1], true)
                 ))
             }
         };
@@ -783,13 +798,30 @@ fn atom(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(!matches!(h.obj(&a[0]), Some(Obj::Cons(..)))))
 }
 fn symbolp(h: &mut ElispHost, a: &[Value]) -> R {
+    // `nil` travels as either `Undef` or `Bool(false)`; both are the symbol nil.
     Ok(nil_or(
-        matches!(a[0], Value::Bool(true) | Value::Undef)
+        matches!(a[0], Value::Bool(_) | Value::Undef)
             || matches!(h.obj(&a[0]), Some(Obj::Symbol(_))),
     ))
 }
 fn stringp(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(a[0], Value::Str(_))))
+}
+/// `natnump` is a C subr in Emacs (data.c), so `#'natnump` must be — and print
+/// as — `#<subr natnump>` (a prelude lambda would print its closure source in
+/// e.g. a `wrong-number-of-arguments` error).
+fn natnump_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    use num_traits::Signed;
+    let ok = match &a[0] {
+        Value::Int(n) => *n >= 0,
+        v => h.as_bigint(v).is_some_and(|b| !b.is_negative()),
+    };
+    Ok(nil_or(ok))
+}
+/// `nlistp` is a C subr in Emacs (data.c) — same identity requirement as natnump.
+fn nlistp_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let is_list = is_nil(&a[0]) || matches!(h.obj(&a[0]), Some(Obj::Cons(..)));
+    Ok(nil_or(!is_list))
 }
 fn numberp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(h.is_number(&a[0])))
@@ -810,18 +842,6 @@ fn floatp(_h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn vectorp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::Vector(_)))))
-}
-fn zerop(h: &mut ElispHost, a: &[Value]) -> R {
-    if !h.is_number(&a[0]) {
-        return Err(format!(
-            "wrong-type-argument: number-or-marker-p {}",
-            h.print(&a[0], true)
-        ));
-    }
-    // A bignum is out of fixnum range by construction, so it is never zero.
-    Ok(nil_or(
-        matches!(a[0], Value::Int(0)) || matches!(a[0], Value::Float(f) if f == 0.0),
-    ))
 }
 
 // ── vectors ──
@@ -851,17 +871,19 @@ fn aref(h: &mut ElispHost, a: &[Value]) -> R {
         Value::Int(n) => *n,
         v => return Err(format!("wrong-type-argument: fixnump {}", h.print(v, true))),
     };
+    // Faref dispatches on the ARRAY's type before any bounds check, so a
+    // non-array names itself even with a negative index: (aref 97 -7) =>
+    // (wrong-type-argument arrayp 97), while (aref "ab" -1) is
+    // args-out-of-range.
     let oor = |h: &ElispHost| format!("args-out-of-range: {} {idx}", h.print(&a[0], true));
-    if idx < 0 {
-        return Err(oor(h));
-    }
-    let i = idx as usize;
+    let get = |len: usize| -> Option<usize> { usize::try_from(idx).ok().filter(|i| *i < len) };
     match h.obj(&a[0]) {
-        Some(Obj::Vector(items)) => items.get(i).cloned().ok_or_else(|| oor(h)),
+        Some(Obj::Vector(items)) => get(items.len())
+            .map(|i| items[i].clone())
+            .ok_or_else(|| oor(h)),
         _ => match &a[0] {
-            Value::Str(s) => s
-                .chars()
-                .nth(i)
+            Value::Str(s) => get(s.chars().count())
+                .and_then(|i| s.chars().nth(i))
                 .map(|c| Value::Int(c as i64))
                 .ok_or_else(|| oor(h)),
             _ => Err(format!(
@@ -1133,7 +1155,7 @@ fn unintern_fn(h: &mut ElispHost, a: &[Value]) -> R {
 fn make_symbol_fn(h: &mut ElispHost, a: &[Value]) -> R {
     match &a[0] {
         Value::Str(s) => Ok(h.make_symbol(&s.to_string())),
-        _ => Err("wrong-type-argument: stringp".to_string()),
+        v => Err(format!("wrong-type-argument: stringp {}", h.print(v, true))),
     }
 }
 fn set_fn(h: &mut ElispHost, a: &[Value]) -> R {
@@ -1285,32 +1307,55 @@ fn signal_fn(h: &mut ElispHost, a: &[Value]) -> R {
 
 // ── strings / format / IO ──
 fn concat_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    // Fconcat: each argument is a string, nil, or a list/vector of CHARACTERS.
+    // Errors are per-argument, left to right: a non-char element signals
+    // `characterp' naming it ((concat '(a)) => characterp a), a dotted list
+    // names its tail ((concat '(1 . 2)) => listp 2), and a non-sequence names
+    // itself ((concat t) => sequencep t).
     let mut out = String::new();
+    // A char code Emacs accepts (characterp: 0..=#x3FFFFF); codes valid in
+    // Emacs but unrepresentable as a Rust char (surrogates, > #x10FFFF)
+    // degrade to U+FFFD rather than mis-signalling characterp.
+    let push_char = |h: &ElispHost, out: &mut String, it: &Value| -> Result<(), String> {
+        match it {
+            Value::Int(c) if (0..=0x3F_FFFF).contains(c) => {
+                out.push(char::from_u32(*c as u32).unwrap_or('\u{FFFD}'));
+                Ok(())
+            }
+            _ => Err(format!(
+                "wrong-type-argument: characterp {}",
+                h.print(it, true)
+            )),
+        }
+    };
     for v in a {
+        if is_nil(v) {
+            continue;
+        }
         match v {
             Value::Str(s) => out.push_str(s),
-            Value::Undef => {}
-            _ => {
-                // concat over a list OR vector of character codes.
-                let items = h.list_vec(v).or_else(|| match h.obj(v) {
-                    Some(Obj::Vector(items)) => Some(items.clone()),
-                    _ => None,
-                });
-                if let Some(items) = items {
-                    for it in items {
-                        if let Value::Int(c) = it {
-                            if let Some(ch) = char::from_u32(c as u32) {
-                                out.push(ch);
-                            }
-                        }
+            _ => match h.obj(v) {
+                Some(Obj::Vector(items)) => {
+                    for it in items.clone() {
+                        push_char(h, &mut out, &it)?;
                     }
-                } else {
+                }
+                Some(Obj::Cons(..)) => {
+                    // concat_to_string validates each list arg's STRUCTURE
+                    // (list_length => listp on a dotted tail) before checking
+                    // any element: (concat '(a . 2)) => listp 2, not
+                    // characterp a. seq_vec_checked is exactly that walk.
+                    for it in h.seq_vec_checked(v)? {
+                        push_char(h, &mut out, &it)?;
+                    }
+                }
+                _ => {
                     return Err(format!(
                         "wrong-type-argument: sequencep {}",
                         h.print(v, true)
-                    ));
+                    ))
                 }
-            }
+            },
         }
     }
     Ok(Value::str(out))
@@ -1640,25 +1685,59 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
             }
             // The `+`/space sign flags apply to the signed conversions (d/e/f/g).
             // `%i` is an accepted alias for `%d` (as in C printf).
-            'd' | 'i' => {
-                use num_traits::Signed;
-                let n = bigf(idx)?;
-                let mag = pad_digits(&n.abs().to_string(), spec.prec);
-                apply_sign(
-                    if n.is_negative() {
-                        format!("-{mag}")
+            'd' | 'i' => match a.get(idx) {
+                // A non-finite float renders as the word "nan"/"inf"/"-inf",
+                // exactly like %e/%f/%g (editfns.c styled_format): precision and
+                // the `0` flag are ignored (space-padded to width), and the
+                // `+`/space sign flags apply to infinities but never to NaN.
+                Some(Value::Float(f)) if !f.is_finite() => {
+                    spec.zero = false;
+                    if f.is_nan() {
+                        "nan".to_string()
+                    } else if *f < 0.0 {
+                        "-inf".to_string()
                     } else {
-                        mag
-                    },
-                    &spec,
-                )
+                        apply_sign("inf".to_string(), &spec)
+                    }
+                }
+                _ => {
+                    use num_traits::Signed;
+                    let n = bigf(idx)?;
+                    let mag = pad_digits(&n.abs().to_string(), spec.prec);
+                    apply_sign(
+                        if n.is_negative() {
+                            format!("-{mag}")
+                        } else {
+                            mag
+                        },
+                        &spec,
+                    )
+                }
+            },
+            // The unsigned radix conversions have no word rendering for a
+            // non-finite float: Emacs signals `(overflow-error)` (a NaN/Inf has
+            // no integer value to print).
+            'o' | 'x' | 'X' => {
+                if let Some(Value::Float(f)) = a.get(idx) {
+                    if !f.is_finite() {
+                        return Err("overflow-error".to_string());
+                    }
+                }
+                let upper = conv == 'X';
+                let radix = if conv == 'o' { 8 } else { 16 };
+                format_radix(&bigf(idx)?, radix, upper, spec.alt, spec.prec)
             }
-            'o' => format_radix(&bigf(idx)?, 8, false, spec.alt, spec.prec),
-            'x' => format_radix(&bigf(idx)?, 16, false, spec.alt, spec.prec),
-            'X' => format_radix(&bigf(idx)?, 16, true, spec.alt, spec.prec),
-            'c' => char::from_u32(numf(idx)?.0 as u32)
-                .map(String::from)
-                .unwrap_or_default(),
+            'c' => {
+                // %c takes a character: any float — even an integral one — is a
+                // type mismatch in Emacs (`CHARACTERP` is integers only).
+                let (i, _, is_float) = numf(idx)?;
+                if is_float {
+                    return Err(BAD_TYPE.to_string());
+                }
+                char::from_u32(i as u32)
+                    .map(String::from)
+                    .unwrap_or_default()
+            }
             'e' | 'f' | 'g' => {
                 let v = numf(idx)?.1;
                 if v.is_finite() {
@@ -1830,17 +1909,23 @@ fn copy_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── strings ──
-fn substring(h: &mut ElispHost, a: &[Value]) -> R {
-    // FROM/TO must be integers: Emacs signals rather than truncating a float.
-    for idx in a.iter().skip(1) {
-        if !is_nil(idx) && !matches!(idx, Value::Int(_)) {
-            return Err(format!(
-                "wrong-type-argument: integerp {}",
-                h.print(idx, true)
-            ));
-        }
+/// `(substring-no-properties STRING &optional FROM TO)` — a property-free copy.
+/// A C subr in Emacs (editfns.c) that demands `stringp` (never a vector, unlike
+/// `substring`); index handling is then identical to `substring`.
+fn substring_no_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    if !matches!(&a[0], Value::Str(_)) {
+        return Err(format!(
+            "wrong-type-argument: stringp {}",
+            h.print(&a[0], true)
+        ));
     }
-    // Emacs `substring` works on both strings and vectors (arrays).
+    // `substring` on a string builds a fresh string value, which carries no
+    // text properties — exactly the copy this subr must return.
+    substring(h, a)
+}
+fn substring(h: &mut ElispHost, a: &[Value]) -> R {
+    // Emacs `substring` works on both strings and vectors (arrays), and checks
+    // the array BEFORE the indices: (substring -1 1.5) is `arrayp -1`.
     enum Seq {
         Str(Vec<char>),
         Vec(Vec<Value>),
@@ -1857,6 +1942,16 @@ fn substring(h: &mut ElispHost, a: &[Value]) -> R {
             }
         },
     };
+    // FROM/TO must be fixnums: Emacs signals `integerp` rather than truncating
+    // a float — and a bignum index draws the same signal.
+    for idx in a.iter().skip(1) {
+        if !is_nil(idx) && !matches!(idx, Value::Int(_)) {
+            return Err(format!(
+                "wrong-type-argument: integerp {}",
+                h.print(idx, true)
+            ));
+        }
+    }
     let len = match &seq {
         Seq::Str(c) => c.len() as i64,
         Seq::Vec(v) => v.len() as i64,
@@ -1902,15 +1997,22 @@ fn substring(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let s = as_string(h, &a[0])?;
     // With the default separators (whitespace) OMIT-NULLS is implicitly on; with
     // an explicit SEPARATORS it defaults off unless the 3rd arg is non-nil.
     let default_seps = a.len() < 2 || is_nil(&a[1]);
+    // subr.el splits via `(string-match SEPARATORS STRING …)`, which type-checks
+    // the regexp before the string: (split-string [1 2] 97) is `stringp 97`.
+    let explicit_sep = if default_seps {
+        None
+    } else {
+        Some(as_string(h, &a[1])?)
+    };
+    let s = as_string(h, &a[0])?;
     let omit_nulls = default_seps || a.get(2).is_some_and(|v| !is_nil(v));
     let mut parts: Vec<String> = if default_seps {
         s.split_whitespace().map(|w| w.to_string()).collect()
     } else {
-        let sep = as_string(h, &a[1])?;
+        let sep = explicit_sep.unwrap();
         if sep.is_empty() {
             // An empty separator regexp matches at every position, including
             // before the first character and after the last, so Emacs yields a
@@ -1925,8 +2027,10 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
                 out
             }
         } else {
-            // SEPARATORS is a regexp in Emacs, not a literal string.
-            let re = compile_cf(&sep, false)?;
+            // SEPARATORS is a regexp in Emacs, not a literal string, and the
+            // split honors `case-fold-search` (default t) exactly as the
+            // `string-match` loop in subr.el does.
+            let re = compile_cf(&sep, case_fold_search(h))?;
             re.split(&s)
                 .filter_map(|w| w.ok())
                 .map(|w| w.to_string())
@@ -1938,37 +2042,86 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(h.list_from(parts.into_iter().map(Value::str).collect()))
 }
-fn string_prefix_p(h: &mut ElispHost, a: &[Value]) -> R {
-    let (pre, s) = (as_string(h, &a[0])?, as_string(h, &a[1])?);
-    let ignore_case = a.get(2).is_some_and(|v| !is_nil(v));
-    Ok(nil_or(if ignore_case {
-        s.to_lowercase().starts_with(&pre.to_lowercase())
-    } else {
-        s.starts_with(&pre)
-    }))
+/// The `(length V)` the Lisp definitions of `string-prefix-p`/`string-suffix-p`
+/// take before any string check — with `length`'s own `sequencep`/`listp`
+/// signals for a non-sequence or an improper list.
+fn emacs_length(h: &mut ElispHost, v: &Value) -> Result<i64, String> {
+    match length_fn(h, std::slice::from_ref(v))? {
+        Value::Int(n) => Ok(n),
+        _ => Ok(0), // length_fn only ever returns an Int on success
+    }
 }
-fn string_suffix_p(h: &mut ElispHost, a: &[Value]) -> R {
-    // Emacs: (let ((start-pos (- (length string) (length suffix))))
-    //          (and (>= start-pos 0) (eq t (compare-strings ...))))
-    // The length test comes first, so a STRING shorter than SUFFIX is nil even
-    // when it is not a string at all.
-    if let (Some(sv), Some(sufv)) = (h.seq_vec(&a[1]), h.seq_vec(&a[0])) {
-        if sv.len() < sufv.len() {
-            return Ok(Value::Undef);
+/// `compare-strings`' per-char case fold: simple one-char lowercasing.
+fn cs_fold(ignore_case: bool) -> impl Fn(char) -> char {
+    move |c| {
+        if ignore_case {
+            c.to_lowercase().next().unwrap_or(c)
+        } else {
+            c
         }
     }
-    let (suf, s) = (as_string(h, &a[0])?, as_string(h, &a[1])?);
-    let ignore_case = a.get(2).is_some_and(|v| !is_nil(v));
-    Ok(nil_or(if ignore_case {
-        s.to_lowercase().ends_with(&suf.to_lowercase())
-    } else {
-        s.ends_with(&suf)
-    }))
+}
+fn string_prefix_p(h: &mut ElispHost, a: &[Value]) -> R {
+    // subr.el: (if (> (length prefix) (length string)) nil
+    //            (eq t (compare-strings prefix 0 prefix-length string 0 …)))
+    // Both lengths are taken before any string check — so a non-sequence
+    // signals `sequencep` (PREFIX first), a too-long PREFIX answers nil even
+    // for a non-string STRING, and only then does `compare-strings` signal
+    // `stringp` (again PREFIX first).
+    let plen = emacs_length(h, &a[0])?;
+    let slen = emacs_length(h, &a[1])?;
+    if plen > slen {
+        return Ok(Value::Undef);
+    }
+    let pre = as_string(h, &a[0])?;
+    let s = as_string(h, &a[1])?;
+    let fold = cs_fold(a.get(2).is_some_and(|v| !is_nil(v)));
+    Ok(nil_or(
+        pre.chars()
+            .map(&fold)
+            .eq(s.chars().take(plen as usize).map(&fold)),
+    ))
+}
+fn string_suffix_p(h: &mut ElispHost, a: &[Value]) -> R {
+    // subr.el: (let ((start-pos (- (length string) (length suffix))))
+    //          (and (>= start-pos 0) (eq t (compare-strings suffix nil nil …))))
+    // STRING's length is taken first (so (string-suffix-p 97 0) signals
+    // `sequencep 0`, not about 97), a SUFFIX longer than STRING answers nil
+    // before any string check, and `compare-strings` signals `stringp` for
+    // SUFFIX first.
+    let slen = emacs_length(h, &a[1])?;
+    let suflen = emacs_length(h, &a[0])?;
+    if slen < suflen {
+        return Ok(Value::Undef);
+    }
+    let suf = as_string(h, &a[0])?;
+    let s = as_string(h, &a[1])?;
+    let fold = cs_fold(a.get(2).is_some_and(|v| !is_nil(v)));
+    Ok(nil_or(
+        suf.chars()
+            .map(&fold)
+            .eq(s.chars().skip((slen - suflen) as usize).map(&fold)),
+    ))
 }
 fn string_empty_p(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(as_string(h, &a[0])?.is_empty()))
+    // simple.el: (string= STRING "") — so a symbol compares by name
+    // ((string-empty-p nil) => nil, no error) and anything else draws
+    // `string=`'s `stringp` signal.
+    match &a[0] {
+        Value::Str(s) => Ok(nil_or(s.is_empty())),
+        v if is_nil(v) => Ok(Value::Undef), // symbol name "nil" is non-empty
+        v => match h.sym_name(v) {
+            Some(name) => Ok(nil_or(name.is_empty())),
+            None => Err(format!("wrong-type-argument: stringp {}", h.print(v, true))),
+        },
+    }
 }
 fn string_join(h: &mut ElispHost, a: &[Value]) -> R {
+    // subr-x: (mapconcat #'identity strings separator) — mapconcat takes
+    // `(length STRINGS)` up front, so an improper list signals `listp TAIL`
+    // ((string-join (cons '- 9) 1.5) => (wrong-type-argument listp 9)) and a
+    // non-sequence signals `sequencep`, before any element is looked at.
+    emacs_length(h, &a[0])?;
     let items = h
         .seq_vec(&a[0])
         .ok_or_else(|| format!("wrong-type-argument: sequencep {}", h.print(&a[0], true)))?;
@@ -2307,39 +2460,6 @@ fn regexp_quote(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::str(out))
 }
 
-/// Expand a `replace-regexp-in-string` template against one match: `\&` is the
-/// whole match, `\1`..`\9` are capture groups, `\\` is a literal backslash.
-fn expand_replacement(rep: &str, caps: &fancy_regex::Captures, subject: &str) -> String {
-    let mut out = String::with_capacity(rep.len());
-    let mut it = rep.chars().peekable();
-    while let Some(c) = it.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match it.next() {
-            Some('&') => {
-                if let Some(m) = caps.get(0) {
-                    out.push_str(&subject[m.start()..m.end()]);
-                }
-            }
-            Some(d @ '0'..='9') => {
-                let idx = d as usize - '0' as usize;
-                if let Some(m) = caps.get(idx) {
-                    out.push_str(&subject[m.start()..m.end()]);
-                }
-            }
-            Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'),
-        }
-    }
-    out
-}
-
 /// Adapt REP's case to MATCHED's (Emacs FIXEDCASE-nil behavior): an all-uppercase
 /// match upcases REP; a capitalized match (first letter upper, some lowercase)
 /// upcases the first letter of each word in REP; otherwise REP is unchanged.
@@ -2377,52 +2497,11 @@ fn adapt_replacement_case(matched: &str, rep: String) -> String {
     }
 }
 
-/// `(replace-regexp-in-string REGEXP REP STRING &optional FIXEDCASE LITERAL)` —
-/// replace every match of REGEXP in STRING with REP. REP is a template (`\&`,
-/// `\N` backrefs) unless LITERAL is non-nil. Function-valued REP is not yet
-/// supported (string templates cover the common case without re-entering the VM).
-fn replace_regexp_in_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let pat = as_string(h, &a[0])?;
-    let rep = as_string(h, &a[1])?;
-    let subject = as_string(h, &a[2])?;
-    // FIXEDCASE (4th arg) nil → adapt the replacement's case to the match's.
-    let fixedcase = !matches!(
-        a.get(3),
-        Some(Value::Undef) | Some(Value::Bool(false)) | None
-    );
-    let literal = !matches!(
-        a.get(4),
-        Some(Value::Undef) | Some(Value::Bool(false)) | None
-    );
-    let re = compile_cf(&pat, case_fold_search(h))?;
-    let mut out = String::with_capacity(subject.len());
-    let mut last = 0usize;
-    for caps in re.captures_iter(&subject) {
-        let Ok(caps) = caps else { break };
-        let m = caps.get(0).unwrap();
-        out.push_str(&subject[last..m.start()]);
-        let piece = if literal {
-            rep.clone()
-        } else {
-            expand_replacement(&rep, &caps, &subject)
-        };
-        out.push_str(&if fixedcase {
-            piece
-        } else {
-            adapt_replacement_case(m.as_str(), piece)
-        });
-        last = m.end();
-        // Avoid an infinite loop on a zero-width match.
-        if m.start() == m.end() {
-            if let Some(c) = subject[last..].chars().next() {
-                out.push(c);
-                last += c.len_utf8();
-            }
-        }
-    }
-    out.push_str(&subject[last.min(subject.len())..]);
-    Ok(Value::str(out))
-}
+// `replace-regexp-in-string` is a Lisp function in Emacs (subr.el) and here
+// (prelude.rs): its argument checks, function-valued REP, and zero-width-match
+// stepping all fall out of the Lisp definition, which a Rust reimplementation
+// kept getting subtly wrong (it type-checked REP eagerly and appended a
+// replacement for the empty match at end-of-string).
 
 // ── numeric: float → integer rounding, and integer bit ops ──
 /// Rounding mode for `floor`/`ceiling`/`round`/`truncate`.
@@ -2896,19 +2975,26 @@ fn isnan_fn(h: &mut ElispHost, a: &[Value]) -> R {
         )),
     }
 }
+/// The argument of the `f*` rounding subrs (`fround`/`ffloor`/`fceiling`/
+/// `ftruncate`): exactly a float — Emacs's `CHECK_FLOAT` — so an integer is as
+/// much a `(wrong-type-argument floatp X)` as a non-number is.
+fn as_float_strict(h: &ElispHost, v: &Value) -> Result<f64, String> {
+    match v {
+        Value::Float(f) => Ok(*f),
+        _ => Err(format!("wrong-type-argument: floatp {}", h.print(v, true))),
+    }
+}
 fn fround_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(
-        as_number_p(h, &a[0], false)?.to_f64().round_ties_even(),
-    ))
+    Ok(Value::Float(as_float_strict(h, &a[0])?.round_ties_even()))
 }
 fn ffloor_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().floor()))
+    Ok(Value::Float(as_float_strict(h, &a[0])?.floor()))
 }
 fn fceiling_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().ceil()))
+    Ok(Value::Float(as_float_strict(h, &a[0])?.ceil()))
 }
 fn ftruncate_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(as_number_p(h, &a[0], false)?.to_f64().trunc()))
+    Ok(Value::Float(as_float_strict(h, &a[0])?.trunc()))
 }
 
 /// `(string-to-number STRING &optional BASE)` — parse a leading number. With
@@ -3273,7 +3359,11 @@ fn symbol_function(h: &mut ElispHost, a: &[Value]) -> R {
 fn intern_soft(h: &mut ElispHost, a: &[Value]) -> R {
     let name = match &a[0] {
         Value::Str(s) => s.to_string(),
-        _ => h.sym_name(&a[0]).ok_or("wrong-type-argument: stringp")?,
+        // A symbol argument is looked up by its own name; anything else names
+        // itself in the error data, as Emacs's `CHECK_STRING` does.
+        v => h
+            .sym_name(v)
+            .ok_or_else(|| format!("wrong-type-argument: stringp {}", h.print(v, true)))?,
     };
     match obarray_arg(h, a.get(1))? {
         None => Ok(h.find_symbol(&name).unwrap_or(Value::Undef)),
@@ -3391,15 +3481,10 @@ fn vconcat_fn(h: &mut ElispHost, a: &[Value]) -> R {
             Some(Obj::Vector(items)) => out.extend(items.clone()),
             _ => match v {
                 Value::Str(s) => out.extend(s.chars().map(|c| Value::Int(c as i64))),
-                _ => match h.list_vec(v) {
-                    Some(items) => out.extend(items),
-                    None => {
-                        return Err(format!(
-                            "wrong-type-argument: sequencep {}",
-                            h.print(v, true)
-                        ))
-                    }
-                },
+                // Fvconcat's list walk names a dotted TAIL with listp
+                // ((vconcat '(t . 9)) => listp 9) and a non-sequence with
+                // sequencep — exactly seq_vec_checked's contract.
+                _ => out.extend(h.seq_vec_checked(v)?),
             },
         }
     }
@@ -5426,7 +5511,12 @@ fn prop_object(h: &ElispHost, obj: Option<&Value>) -> Result<PropObj, String> {
         None | Some(Value::Undef) | Some(Value::Bool(false)) => Ok(PropObj::Buf(h.current)),
         Some(v) => match h.resolve_buffer(v) {
             Some(bi) => Ok(PropObj::Buf(bi)),
-            None => Err(format!("wrong-type-argument: bufferp {}", h.print(v, true))),
+            // Emacs's text-property fns validate OBJECT with `buffer-or-string-p`
+            // (textprop.c validate_interval_range), not plain `bufferp`.
+            None => Err(format!(
+                "wrong-type-argument: buffer-or-string-p {}",
+                h.print(v, true)
+            )),
         },
     }
 }
@@ -6338,12 +6428,13 @@ pub fn install(h: &mut ElispHost) {
     s("eql", 2, Some(2), eql_fn);
     s("equal", 2, Some(2), equal_fn);
     s("null", 1, Some(1), null_fn);
-    s("not", 1, Some(1), null_fn);
     s("consp", 1, Some(1), consp);
     s("listp", 1, Some(1), listp);
     s("atom", 1, Some(1), atom);
     s("symbolp", 1, Some(1), symbolp);
     s("stringp", 1, Some(1), stringp);
+    s("natnump", 1, Some(1), natnump_fn);
+    s("nlistp", 1, Some(1), nlistp_fn);
     s("numberp", 1, Some(1), numberp);
     s("integerp", 1, Some(1), integerp);
     s("max", 1, None, max_fn);
@@ -6352,7 +6443,12 @@ pub fn install(h: &mut ElispHost) {
     s("bignump", 1, Some(1), bignump);
     s("floatp", 1, Some(1), floatp);
     s("vectorp", 1, Some(1), vectorp);
-    s("zerop", 1, Some(1), zerop);
+    // NOTE: `zerop` is deliberately NOT a subr: in Emacs it is a byte-compiled
+    // defsubst from subr.el ((subrp (symbol-function 'zerop)) => nil) whose
+    // arity error is (wrong-number-of-arguments (1 . 1) N), so it is defined in
+    // the prelude. Registering it here would also lose the prelude's shadowing
+    // definition on a bytecode-cache HIT, since builtin-range symbols' function
+    // cells are not part of the exported heap image.
     // lists
     s("cons", 2, Some(2), cons_fn);
     s("car", 1, Some(1), car);
@@ -6648,6 +6744,12 @@ pub fn install(h: &mut ElispHost) {
     s("encode-time", 1, None, encode_time);
     // strings
     s("substring", 1, Some(3), substring);
+    s(
+        "substring-no-properties",
+        1,
+        Some(3),
+        substring_no_properties_fn,
+    );
     s("split-string", 1, Some(4), split_string);
     s("string-prefix-p", 2, Some(3), string_prefix_p);
     s("string-suffix-p", 2, Some(3), string_suffix_p);
@@ -6668,12 +6770,8 @@ pub fn install(h: &mut ElispHost) {
     s("match-data", 0, Some(3), match_data_fn);
     s("set-match-data", 1, Some(2), set_match_data);
     s("regexp-quote", 1, Some(1), regexp_quote);
-    s(
-        "replace-regexp-in-string",
-        3,
-        Some(6),
-        replace_regexp_in_string,
-    );
+    // `replace-regexp-in-string` is Lisp in Emacs (subr.el) and Lisp here — see
+    // the prelude, which mirrors that definition.
     // strings / IO
     s("concat", 0, None, concat_fn);
     s("format", 1, None, format_fn);
@@ -6770,6 +6868,12 @@ pub fn install(h: &mut ElispHost) {
     // Emacs 28 alias for split-string with identical semantics (direct forwarder).
     s("string-split", 1, Some(4), split_string);
     s("member-ignore-case", 2, Some(2), member_ignore_case);
+    // `not` is `(defalias 'not #'null)` in Emacs (subr.el), not a subr of its
+    // own: `(symbol-function 'not)` is the symbol `null`, and an arity error
+    // through `#'not` names `#<subr null>`. Alias the symbol rather than
+    // registering a second subr so both render exactly that way.
+    let null_sym = h.intern("null");
+    h.set_function("not", null_sym);
     // AOP pattern-intercept layer (elisprs extension, ported from zshrs). Registers
     // the `intercept*` subrs and marks its context variables special.
     crate::intercepts::install(h);

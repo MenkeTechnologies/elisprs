@@ -780,10 +780,25 @@ fn classify(h: &mut ElispHost, tok: &str) -> Value {
 /// Does this token read back as an elisp number (integer or float)? Used by the
 /// printer to decide whether a symbol name needs a leading escape.
 pub(crate) fn token_is_number(tok: &str) -> bool {
-    if tok.parse::<i64>().is_ok() {
+    // Mirror the reader's numeric paths above: bignum-sized integers, a
+    // trailing-dot integer (`1.`), ordinary floats, and the non-finite float
+    // read syntax (`1.0e+INF` / `0.0e+NaN`) all read back as numbers, so a
+    // symbol spelled that way needs the leading escape.
+    if tok.parse::<BigInt>().is_ok() {
         return true;
     }
-    looks_numeric(tok) && tok.parse::<f64>().is_ok()
+    if let Some(intpart) = tok.strip_suffix('.') {
+        if intpart.parse::<BigInt>().is_ok() {
+            return true;
+        }
+    }
+    if looks_numeric(tok) && tok.parse::<f64>().is_ok() {
+        return true;
+    }
+    ["e+INF", "e+NaN"].iter().any(|suffix| {
+        tok.strip_suffix(suffix)
+            .is_some_and(|m| m.parse::<f64>().is_ok())
+    })
 }
 
 fn looks_numeric(tok: &str) -> bool {

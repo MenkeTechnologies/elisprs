@@ -140,7 +140,7 @@ elisp --version
 - **Backquote / unquote.** `` ` ``, `,`, and `,@` are read and expanded.
 - **`setcar` / `setcdr`** mutate cons cells in place.
 - **`pcase`.** Structural dispatch over `_`, literals, `'x`, symbol binders, `(pred FN)`, `(guard EXPR)`, `(and …)`, `(or …)`, and **backquote patterns** `` `(,a ,b) `` / `` `(,a . ,rest) `` (incl. nested), recognized from the reader's eager backquote expansion.
-- **Regexps.** `string-match` & friends translate elisp regexp syntax (`\(` `\|` `\{`, `\<`/`\>`, `\w`/`\s-`) to a backing engine and record char-indexed match data; `replace-regexp-in-string` expands `\&`/`\N` templates. (Pattern backreferences `\1` are rejected — the engine doesn't backtrack.)
+- **Regexps.** `string-match` & friends translate elisp regexp syntax (`\(` `\|` `\{`, `\<`/`\>`, `\w`/`\s-`, backreferences `\1`..`\9`) to a backing engine, honor `case-fold-search`, and record char-indexed match data; `replace-regexp-in-string` is the subr.el Lisp definition (function-valued REP, `\&`/`\N` templates, FIXEDCASE/LITERAL/SUBEXP/START).
 - **Vector literals.** `[1 2 3]` reads as a self-evaluating vector (elements unevaluated); `aref` / `elt` / `length` / `append` / `sort` operate on it.
 - **Generalized `setf`** over the common places: `car`, `cdr`, `nth`, `elt`, `aref`, `gethash`, `symbol-value`, plus plain variables and multiple place/value pairs.
 - **`format` field specs.** `%[-][0][width][.prec]` with `s S d o x X c e f g`, e.g. `(format "%05d" 42)` → `00042`.

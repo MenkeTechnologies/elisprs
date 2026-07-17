@@ -68,9 +68,21 @@ pub const PRELUDE: &str = r#"
 (defun minusp (x) (< x 0))
 (defun cl-plusp (x) (> x 0))
 (defun cl-minusp (x) (< x 0))
+;; zerop is a byte-compiled defsubst from subr.el in Emacs -- NOT a C subr
+;; ((subrp (symbol-function 'zerop)) => nil) -- so a wrong argument count is
+;; caught by exec_byte_code and signalled as ((MANDATORY . NONREST) NARGS):
+;; (wrong-number-of-arguments (1 . 1) 2), never as #<subr zerop>. Take &rest
+;; and reproduce that exact shape, like cl-evenp/cl-oddp below; the body is
+;; subr.el's (= 0 number), whose own `=' supplies number-or-marker-p errors.
+;; This defun shadows the native subr registered in builtins.rs.
+(defun zerop (&rest args)
+  (unless (= (length args) 1)
+    (signal 'wrong-number-of-arguments (list (cons 1 1) (length args))))
+  (= 0 (car args)))
 (defun evenp (x) (zerop (% x 2)))
 (defun oddp (x) (not (zerop (% x 2))))
-(defun natnump (x) (and (integerp x) (>= x 0)))
+;; natnump is a native subr (builtins.rs): it is a C subr in Emacs, so its
+;; error objects must carry `#<subr natnump>`, not a closure.
 (defun wholenump (x) (natnump x))
 
 ;;; ---- list construction / access ----
@@ -78,7 +90,14 @@ pub const PRELUDE: &str = r#"
   ;; Emacs signals on a non-integer index (a float is rejected even when it
   ;; is integer-valued): (nthcdr 1.5 '(a b c)) => wrong-type-argument integerp.
   (unless (integerp n) (signal 'wrong-type-argument (list 'integerp n)))
-  (while (and (> n 0) l) (setq l (cdr l)) (setq n (1- n))) l)
+  ;; Fnthcdr walks conses only; running off a dotted tail with steps remaining
+  ;; is CHECK_LIST_END naming the WHOLE list: (nthcdr 2 '(1 . 2)) =>
+  ;; (wrong-type-argument listp (1 . 2)), while (nthcdr 1 '(1 . 2)) => 2.
+  (let ((whole l))
+    (while (and (> n 0) (consp l)) (setq l (cdr l)) (setq n (1- n)))
+    (when (and (> n 0) l)
+      (signal 'wrong-type-argument (list 'listp whole)))
+    l))
 (defun last (l &optional n)
   ;; The last N cons cells of L (default 1): (last '(1 2 3) 2) => (2 3).
   ;; Guard on consp so an improper tail stops the walk instead of erroring:
@@ -164,15 +183,18 @@ pub const PRELUDE: &str = r#"
     (and (consp l) l)))
 (defun assoc-string (key alist &optional case-fold)
   ;; First ALIST element equal to KEY as a string (elements may be strings or
-  ;; (STRING . VALUE) conses); CASE-FOLD ignores case.
-  (let ((k (if (symbolp key) (symbol-name key) key)) (r nil))
-    (while (and (consp alist) (not r))
+  ;; (STRING . VALUE) conses); CASE-FOLD ignores case.  A matched element may
+  ;; itself be nil (e.g. key nil over (... nil)), so track a separate DONE
+  ;; flag like C `Fassoc_string' returning ELT directly -- looping on
+  ;; (not r) spins forever when r is set to nil.
+  (let ((k (if (symbolp key) (symbol-name key) key)) (r nil) (done nil))
+    (while (and (consp alist) (not done))
       (let* ((el (car alist))
              (raw (if (consp el) (car el) el))
              (s (if (symbolp raw) (symbol-name raw) raw)))
         (if (and (stringp s)
                  (if case-fold (string-equal-ignore-case k s) (string= k s)))
-            (setq r el)
+            (setq r el done t)
           (setq alist (cdr alist)))))
     r))
 ;; assq/assoc/rassq skip non-cons list elements (Emacs C `FOR_EACH_TAIL' + a
@@ -180,19 +202,23 @@ pub const PRELUDE: &str = r#"
 ;; than signalling `wrong-type-argument listp' — cl-generic relies on this via
 ;; `(assq 'interactive BODY)'.
 (defun assq (k l)
-  (let ((r nil))
-    (while (and l (not r))
+  ;; A dotted tail signals via CHECK_LIST_END naming the WHOLE list:
+  ;; (assq 'a (cons -1 10)) => (wrong-type-argument listp (-1 . 10)).
+  (let ((r nil) (whole l))
+    (while (and (consp l) (not r))
       (if (and (consp (car l)) (eq (car (car l)) k))
           (setq r (car l))
         (setq l (cdr l))))
+    (unless r (mem--end-check l whole))
     r))
 (defun assoc (k l &optional testfn)
-  (let ((r nil))
-    (while (and l (not r))
+  (let ((r nil) (whole l))
+    (while (and (consp l) (not r))
       (if (and (consp (car l))
                (if testfn (funcall testfn (car (car l)) k) (equal (car (car l)) k)))
           (setq r (car l))
         (setq l (cdr l))))
+    (unless r (mem--end-check l whole))
     r))
 (defun rassq (v l)
   (let ((r nil) (whole l))
@@ -207,17 +233,28 @@ pub const PRELUDE: &str = r#"
   (let ((p (if testfn (assoc k al testfn) (assq k al))))
     (if p (cdr p) default)))
 (defun plist-get (pl k &optional predicate)
-  ;; Emacs walks cons cells and simply stops at a non-cons -- (plist-get 'sym 1)
-  ;; is nil, not an error.
+  ;; Fplist_get walks with FOR_EACH_TAIL_SAFE and never signals: it breaks as
+  ;; soon as the cdr is not a cons -- BEFORE testing the key -- so an improper
+  ;; or odd plist just answers nil: (plist-get '(1 . 2) 1) => nil,
+  ;; (plist-get '(1) 1) => nil, (plist-get 5 1) => nil.
   (let ((test (or predicate #'eq)) (r nil))
-    (while (consp pl)
-      (if (funcall test (car pl) k) (progn (setq r (cadr pl)) (setq pl nil)) (setq pl (cddr pl))))
+    (while (and (consp pl) (consp (cdr pl)))
+      (if (funcall test (car pl) k) (progn (setq r (cadr pl)) (setq pl nil))
+        (setq pl (cddr pl))))
     r))
 (defun plist-member (pl k &optional predicate)
-  (unless (listp pl) (signal 'wrong-type-argument (list 'plistp pl)))
-  (let ((test (or predicate #'eq)) (r nil))
-    (while (consp pl)
-      (if (funcall test (car pl) k) (progn (setq r pl) (setq pl nil)) (setq pl (cddr pl))))
+  ;; Fplist_member tests the key FIRST, then steps by two, breaking mid-step
+  ;; when the odd-position cdr is not a cons; CHECK_TYPE at the end names the
+  ;; WHOLE plist under `plistp': (plist-member '(1 . 2) 1) => (1 . 2), but
+  ;; (plist-member '(1 . 2) 2) => (wrong-type-argument plistp (1 . 2)) and
+  ;; (plist-member 5 1) => (wrong-type-argument plistp 5).
+  (let ((test (or predicate #'eq)) (tail pl) (r nil) (done nil))
+    (while (and (not done) (consp tail))
+      (if (funcall test (car tail) k) (setq r tail done t)
+        (progn (setq tail (cdr tail))
+               (if (consp tail) (setq tail (cdr tail)) (setq done t)))))
+    (unless (or r (null tail))
+      (signal 'wrong-type-argument (list 'plistp pl)))
     r))
 
 ;;; ---- higher-order / sequence ----
@@ -246,24 +283,36 @@ pub const PRELUDE: &str = r#"
     r))
 (defun seq-reverse (l) (reverse l))
 (defun mapconcat (f seq &optional sep)
-  ;; SEQ may be any sequence (list/vector/string); coerce to a list of elements.
-  (setq sep (or sep ""))
-  (let ((l (append seq nil)) (r "") (first t))
-    (while l
-      (if first (setq first nil) (setq r (concat r sep)))
-      (setq r (concat r (funcall f (car l))))
-      (setq l (cdr l)))
-    r))
+  ;; Fmapconcat: `length' validates SEQ up front (a dotted list names its
+  ;; tail: (mapconcat #'identity (cons "a" 9)) => wrong-type-argument listp 9);
+  ;; F runs over EVERY element before any concatenation; then the results and
+  ;; the separator all go to `concat', which enforces its own contract --
+  ;; results/separator must be strings or char lists/vectors, so
+  ;; (mapconcat (lambda (x) (cons x x)) "ab") => (wrong-type-argument listp 97)
+  ;; and a non-sequence separator only signals when there are >= 2 elements.
+  (length seq)
+  (let ((results (mapcar f seq)) (out nil) (first t))
+    (while results
+      (if first (setq first nil) (setq out (cons sep out)))
+      (setq out (cons (car results) out))
+      (setq results (cdr results)))
+    (apply #'concat (nreverse out))))
 
 ;;; ---- set-ish list ops ----
-(defun remove (x l)
-  (let ((r (seq-filter (lambda (e) (not (equal e x))) (append l nil))))
-    (if (vectorp l) (vconcat r) r)))
-(defun remq (x l)
-  ;; Emacs: (delq X (copy-sequence LIST)) -- a non-list signals `listp', where
-  ;; the seq-filter form this used to be signalled `sequencep'.
-  (unless (listp l) (signal 'wrong-type-argument (list 'listp l)))
-  (seq-filter (lambda (e) (not (eq e x))) l))
+(defun remove (elt seq)
+  ;; subr.el: (delete elt (if (nlistp seq) seq (copy-sequence seq))) -- a
+  ;; dotted list dies inside `copy-sequence' naming the TAIL, and a
+  ;; non-sequence inside `delete' naming itself under `sequencep'.
+  (delete elt (if (nlistp seq) seq (copy-sequence seq))))
+(defun remq (elt list)
+  ;; subr.el: cdr past `eq' matches at the head (a non-cons LIST signals
+  ;; `listp' via `car'), then copy -- (delq ELT (copy-sequence LIST)) -- only
+  ;; when a match remains. `memq' names the WHOLE (post-skip) list on a dotted
+  ;; tail; `copy-sequence' names the TAIL.
+  (while (and (eq elt (car list)) (setq list (cdr list))))
+  (if (memq elt list)
+      (delq elt (copy-sequence list))
+    list))
 (defun string-to-multibyte (s) s)
 (defun string-as-multibyte (s) s)
 (defun string-to-unibyte (s &rest _) s)
@@ -274,53 +323,88 @@ pub const PRELUDE: &str = r#"
     (while (and l (not r)) (when (>= (car l) 128) (setq r t)) (setq l (cdr l)))
     r))
 ;; delete/delq remove matching elements destructively (splicing cons cells) for
-;; lists; non-lists fall back to the copying remove/remq.
-(defun delete (x l)
-  (if (not (listp l)) (remove x l)
-    (while (and (consp l) (equal (car l) x)) (setq l (cdr l)))
-    (let ((tail l))
-      (while (and (consp tail) (consp (cdr tail)))
-        (if (equal (car (cdr tail)) x) (setcdr tail (cddr tail))
-          (setq tail (cdr tail)))))
-    l))
-(defun delq (x l)
-  (unless (or (null l) (proper-list-p l))
-    (signal 'wrong-type-argument (list 'listp l)))
-  (if (not (listp l)) (remq x l)
-    (while (and (consp l) (eq (car l) x)) (setq l (cdr l)))
-    (let ((tail l))
-      (while (and (consp tail) (consp (cdr tail)))
-        (if (eq (car (cdr tail)) x) (setcdr tail (cddr tail))
-          (setq tail (cdr tail)))))
-    l))
+;; lists; delete filters vectors/strings into a fresh copy.
+(defun delete (elt seq)
+  ;; Fdelete: vectors and strings filter into a fresh copy; a cons/nil walks
+  ;; like Fdelq with `equal', where CHECK_LIST_END names SEQ as rebound by any
+  ;; head removals -- (delete "a" '("a" . [1 2])) => (wrong-type-argument
+  ;; listp [1 2]) but with "b" the data is the whole dotted list. Anything
+  ;; else is not a sequence at all.
+  (cond
+   ((vectorp seq)
+    (vconcat (seq-filter (lambda (e) (not (equal e elt))) (append seq nil))))
+   ((stringp seq)
+    (concat (seq-filter (lambda (e) (not (equal e elt))) (append seq nil))))
+   ((not (listp seq)) (signal 'wrong-type-argument (list 'sequencep seq)))
+   (t
+    (let ((tail seq) (prev nil))
+      (while (consp tail)
+        (if (equal elt (car tail))
+            (if (null prev) (setq seq (cdr tail)) (setcdr prev (cdr tail)))
+          (setq prev tail))
+        (setq tail (cdr tail)))
+      (unless (null tail)
+        (signal 'wrong-type-argument (list 'listp seq)))
+      seq))))
+(defun delq (elt list)
+  ;; Fdelq: the same walk with `eq'; CHECK_LIST_END names LIST as rebound by
+  ;; head removals, so (delq 'a (cons 'a 5)) => (wrong-type-argument listp 5)
+  ;; while (delq 'x (cons 'a 5)) names the whole (a . 5).
+  (let ((tail list) (prev nil))
+    (while (consp tail)
+      (if (eq elt (car tail))
+          (if (null prev) (setq list (cdr tail)) (setcdr prev (cdr tail)))
+        (setq prev tail))
+      (setq tail (cdr tail)))
+    (unless (null tail)
+      (signal 'wrong-type-argument (list 'listp list)))
+    list))
 (defun delete-dups (l)
   ;; Destructively remove `equal' duplicates, keeping the first occurrence.
+  ;; subr.el sizes a hash table with (length list) FIRST, which is what makes a
+  ;; non-list signal sequencep and a dotted list signal listp on its tail:
+  ;; (delete-dups 'sym) => (wrong-type-argument sequencep sym).
+  (length l)
   (let ((tail l))
     (while tail
       (setcdr tail (delete (car tail) (cdr tail)))
       (setq tail (cdr tail))))
   l)
-(defun nconc (&rest lists)
-  ;; Destructively concatenate LISTS by splicing each onto the previous tail.
-  ;; (Uses `while`, not `dolist`, which is defined later in this prelude.)
-  ;; Only the arguments BEFORE the last must be lists; the last may be any object
-  ;; and becomes the final cdr: (nconc (list 1) (cons 2 "s")) => (1 2 . "s").
-  (let ((result nil) (tail nil))
-    (while lists
-      (let ((seg (car lists)) (last (null (cdr lists))))
-        (unless (or last (listp seg))
-          (signal 'wrong-type-argument (list 'listp seg)))
-        (when seg
-          (if result (setcdr tail seg) (setq result seg))
-          ;; Walk to the last cons; a non-cons segment (only possible as the last
-          ;; argument) has no tail to walk.
-          (when (consp seg)
-            (setq tail seg)
-            (while (consp (cdr tail)) (setq tail (cdr tail))))))
-      (setq lists (cdr lists)))
-    result))
+(defun nconc (&rest args)
+  ;; Faithful Fnconc: nil arguments are skipped; every argument but the last
+  ;; must be a cons (CHECK_CONS => `consp', not `listp': (nconc 0 '(1)) =>
+  ;; wrong-type-argument consp 0); each argument's cons spine is walked to its
+  ;; LAST CONS -- a dotted tail is simply overwritten, never an error, so
+  ;; (nconc '(1) '(2 . 3) '(4)) => (1 2 4) -- and spliced onto the next
+  ;; argument. The last argument is never validated and becomes the final cdr.
+  (let ((val nil))
+    (while args
+      (let ((tem (car args)))
+        (when tem
+          (when (null val) (setq val tem))
+          (when (cdr args)
+            (unless (consp tem)
+              (signal 'wrong-type-argument (list 'consp tem)))
+            (let ((tail tem))
+              (while (consp (cdr tail)) (setq tail (cdr tail)))
+              (setcdr tail (cadr args))
+              ;; Fnconc: when the NEXT arg is nil, substitute the tail cons we
+              ;; just spliced so the following iteration keeps extending it.
+              (when (null (cadr args)) (setcar (cdr args) tail))))))
+      (setq args (cdr args)))
+    val))
 (defun rassq-delete-all (value alist)
-  (seq-filter (lambda (p) (not (and (consp p) (eq (cdr p) value)))) alist))
+  ;; Faithful subr.el port (destructive): drop leading matches by advancing
+  ;; ALIST, then setcdr out interior ones. `(car alist)' on a non-list is what
+  ;; signals: (rassq-delete-all "x" -1) => (wrong-type-argument listp -1).
+  (while (and (consp (car alist)) (eq (cdr (car alist)) value))
+    (setq alist (cdr alist)))
+  (let ((tail alist) tail-cdr)
+    (while (setq tail-cdr (cdr tail))
+      (if (and (consp (car tail-cdr)) (eq (cdr (car tail-cdr)) value))
+          (setcdr tail (cdr tail-cdr))
+        (setq tail tail-cdr))))
+  alist)
 
 ;;; ---- cl-lib niceties ----
 (defun cl-first (l) (car l))
@@ -329,15 +413,21 @@ pub const PRELUDE: &str = r#"
 (defun cl-rest (l) (cdr l))
 (defun cl-remove-if (pred seq &rest keys)
   ;; Honors :key, :count, :start, :end and :from-end (the latter removes the
-  ;; LAST COUNT matches).
+  ;; LAST COUNT matches). cl-seq.el routes through (cl-remove nil SEQ :if
+  ;; PRED ...), and with a nil PRED cl--check-test falls back to matching the
+  ;; ITEM (nil) with `eql' -- so (cl-remove-if nil '(nil 2 nil)) => (2).
   (let ((count (cl--getkey keys :count nil))
         (key (cl--getkey keys :key 'identity))
         (from-end (cl--getkey keys :from-end nil))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil)))
-    (cl--remove-by (lambda (x) (funcall pred (funcall key x)))
+    (cl--remove-by (lambda (x) (if pred (funcall pred (funcall key x))
+                                 (null (funcall key x))))
                    seq start end count from-end)))
 (defun cl-remove-if-not (pred seq &rest keys)
-  (apply 'cl-remove-if (lambda (x) (not (funcall pred x))) seq keys))
+  ;; A nil PRED takes the same cl--check-test item-eql fallback as
+  ;; cl-remove-if -- the NOT is dropped, so nils are removed here too.
+  (if pred (apply 'cl-remove-if (lambda (x) (not (funcall pred x))) seq keys)
+    (apply 'cl-remove-if nil seq keys)))
 (defun cl-delete-if (pred seq &rest keys) (apply (function cl-remove-if) pred seq keys))
 (defun cl-delete-if-not (pred seq &rest keys) (apply (function cl-remove-if-not) pred seq keys))
 (defun cl-find-if (pred seq &rest keys)
@@ -353,9 +443,22 @@ pub const PRELUDE: &str = r#"
 (defun cl-find-if-not (pred seq &rest keys)
   (apply 'cl-find-if (lambda (x) (not (funcall pred x))) seq keys))
 (defun cl-sort (seq pred &rest keys)
-  (let ((key (cl--getkey keys :key nil)))
-    (if key (sort seq (lambda (a b) (funcall pred (funcall key a) (funcall key b))))
-      (sort seq pred))))
+  ;; Faithful cl-seq.el: a non-list SEQ is sorted as a list and written back
+  ;; (cl-replace); a string round-trips through vconcat/concat. The
+  ;; (append SEQ nil) coercion is what makes a non-sequence signal `sequencep'
+  ;; -- (cl-sort -1 #'1+) => (wrong-type-argument sequencep -1) -- where bare
+  ;; `sort' says list-or-vector-p.
+  (if (nlistp seq)
+      (if (stringp seq)
+          (concat (apply #'cl-sort (vconcat seq) pred keys))
+        (let ((sorted (apply #'cl-sort (append seq nil) pred keys)) (i 0))
+          (while (consp sorted)
+            (aset seq i (car sorted))
+            (setq i (1+ i) sorted (cdr sorted)))
+          seq))
+    (let ((key (cl--getkey keys :key nil)))
+      (if key (sort seq (lambda (a b) (funcall pred (funcall key a) (funcall key b))))
+        (sort seq pred)))))
 (defun commandp (_obj &optional _) nil)
 (defun plistp (l)
   (let ((n 0)) (while (consp l) (setq n (1+ n)) (setq l (cdr l))) (and (null l) (= 0 (% n 2)))))
@@ -919,7 +1022,8 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 (defun sequencep (x) (or (listp x) (vectorp x) (stringp x) (char-table-p x)))
 (defun arrayp (x) (or (vectorp x) (stringp x) (char-table-p x)))
 (defun string-or-null-p (x) (or (null x) (stringp x)))
-(defun nlistp (x) (not (listp x)))
+;; nlistp is a native subr (builtins.rs): a C subr in Emacs, same identity
+;; requirement as natnump.
 ;; ROT13: rotate ASCII letters by 13, leaving everything else unchanged.
 (defun rot13-string (string)
   (mapconcat (lambda (c)
@@ -953,12 +1057,23 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 (defun lcm (a b) (if (or (= a 0) (= b 0)) 0 (/ (abs (* a b)) (gcd a b))))
 (defun isqrt (n) (let ((r 0)) (while (<= (* (1+ r) (1+ r)) n) (setq r (1+ r))) r))
 (defun cl-signum (x) (cond ((> x 0) 1) ((< x 0) -1) (t 0)))
-(defun cl-evenp (n)
-  (unless (integerp n) (signal 'wrong-type-argument (list 'integer-or-marker-p n)))
-  (= (% n 2) 0))
-(defun cl-oddp (n)
-  (unless (integerp n) (signal 'wrong-type-argument (list 'integer-or-marker-p n)))
-  (/= (% n 2) 0))
+;; cl-evenp/cl-oddp are byte-compiled in Emacs, where a wrong argument count is
+;; caught by exec_byte_code and signalled as ((MANDATORY . NONREST) NARGS) —
+;; (wrong-number-of-arguments (1 . 1) 2) — never as the function object. Take
+;; &rest and reproduce that exact error shape; the interpreter's own arity
+;; check would name this interpreted closure instead.
+(defun cl-evenp (&rest args)
+  (unless (= (length args) 1)
+    (signal 'wrong-number-of-arguments (list (cons 1 1) (length args))))
+  (let ((n (car args)))
+    (unless (integerp n) (signal 'wrong-type-argument (list 'integer-or-marker-p n)))
+    (= (% n 2) 0)))
+(defun cl-oddp (&rest args)
+  (unless (= (length args) 1)
+    (signal 'wrong-number-of-arguments (list (cons 1 1) (length args))))
+  (let ((n (car args)))
+    (unless (integerp n) (signal 'wrong-type-argument (list 'integer-or-marker-p n)))
+    (/= (% n 2) 0)))
 ;; Two-value division: each returns (QUOTIENT REMAINDER) where the remainder is
 ;; X - QUOTIENT*Y, matching the single-value floor/ceiling/truncate/round builtins.
 (defun cl-floor (x &optional y)
@@ -1125,6 +1240,10 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
   (equal (string--name a) (string--name b)))
 (defun string-equal (a b) (string= a b))
 (defun string< (a b)
+  ;; Like `string=': a string or a symbol on either side, `stringp' on anything
+  ;; else — the first argument is checked first, so (string< 97 "a") names 97.
+  (unless (or (stringp a) (symbolp a)) (signal 'wrong-type-argument (list 'stringp a)))
+  (unless (or (stringp b) (symbolp b)) (signal 'wrong-type-argument (list 'stringp b)))
   (let ((la (string-to-list (string--name a))) (lb (string-to-list (string--name b)))
         (res nil) (done nil))
     (while (not done)
@@ -1177,7 +1296,47 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
   (let ((re (concat "\\(?:" (or regexp "[ \t\n\r]+") "\\)\\'")))
     (if (string-match re s) (substring s 0 (match-beginning 0)) s)))
 (defun string-trim (s &optional trim-left trim-right)
-  (string-trim-right (string-trim-left s trim-left) trim-right))
+  ;; subr-x: (string-trim-left (string-trim-right STRING TRIM-RIGHT) TRIM-LEFT)
+  ;; -- the RIGHT trim runs first, so with two bad regexps the right one's
+  ;; compile error wins: (string-trim "" "\\(" "[") => (invalid-regexp
+  ;; "Unmatched [ or [^").
+  (string-trim-left (string-trim-right s trim-right) trim-left))
+;; Port of subr.el's Lisp definition (the Emacs-29 shape, which re-matches
+;; REGEXP against the matched substring instead of Emacs 30's internal
+;; `match-data--translate`). Everything observable falls out of the original:
+;; `(length string)` rejects a non-sequence up front (`sequencep`), a nil
+;; STRING flows through to `(substring nil 0 0)` (`arrayp nil`), REGEXP is only
+;; type-checked/compiled when the loop runs (l > 0), REP may be a function and
+;; is not looked at until a match happens, and `(< start l)` stops the
+;; empty-regexp loop from appending one more replacement at end-of-string —
+;; (replace-regexp-in-string "" "t" "-4.5") => "t-t4t.t5".
+(defun replace-regexp-in-string (regexp rep string &optional fixedcase literal subexp start)
+  (let ((l (length string))
+        (start (or start 0))
+        matches str mb me)
+    (save-match-data
+      (while (and (< start l) (string-match regexp string start))
+        (setq mb (match-beginning 0)
+              me (match-end 0))
+        ;; If we matched the empty string, make sure we advance by one char
+        (when (= me mb) (setq me (min l (1+ mb))))
+        ;; Generate a replacement for the matched substring.
+        ;; Operate on only the substring to minimize string consing.
+        ;; Set up match data for the substring for replacement;
+        ;; presumably this is likely to be faster than munging the
+        ;; match data directly in Lisp.
+        (string-match regexp (setq str (substring string mb me)))
+        (setq matches
+              (cons (replace-match (if (stringp rep)
+                                       rep
+                                     (funcall rep (match-string 0 str)))
+                                   fixedcase literal str subexp)
+                    (cons (substring string start mb) ; unmatched prefix
+                          matches)))
+        (setq start me))
+      ;; Reconstruct a string from the pieces.
+      (setq matches (cons (substring string start l) matches)) ; leftover
+      (apply #'concat (nreverse matches)))))
 (defun string-blank-p (s) (string-match-p "\\`[ \t\n\r]*\\'" s))
 (defun string-clean-whitespace (s)
   ;; Collapse internal whitespace runs to a single space and trim the ends.
@@ -1191,23 +1350,23 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
       (setq length (max 0 (- length 3)))
       (concat "..." (substring string (min (1- strlen)
                                            (max 0 (- strlen length))))))))
+;; Verbatim subr-x: all argument rejection falls out of `string-prefix-p' /
+;; `string-suffix-p' (whose `length' calls signal `sequencep'), so
+;; (string-remove-prefix "..." nil) is nil when the prefix cannot fit.
 (defun string-remove-prefix (prefix s)
-  ;; `length' is what rejects a non-sequence here (`sequencep'), exactly as in
-  ;; subr-x, rather than a `stringp' check of our own.
-  (length s)
-  (if (string-prefix-p prefix s) (substring s (length prefix) (length s)) s))
+  (if (string-prefix-p prefix s) (substring s (length prefix)) s))
 (defun string-remove-suffix (suffix s)
-  (length s)
   (if (string-suffix-p suffix s) (substring s 0 (- (length s) (length suffix))) s))
 
 ;;; ---- lists ----
 (defun butlast (lst &optional n)
   ;; All but the last N elements of LST (default 1): (butlast '(1 2 3) 2) => (1).
   (setq n (or n 1))
-  ;; Negative or zero N keeps the whole list; clamp so we never index past the end.
-  (let ((keep (min (length lst) (- (length lst) n))) (r nil) (i 0))
-    (while (< i keep) (setq r (cons (nth i lst) r)) (setq i (1+ i)))
-    (reverse r)))
+  ;; subr.el: N <= 0 returns LST itself, UNVALIDATED -- (butlast 0 0) => 0.
+  (if (<= n 0) lst
+    (let ((keep (min (length lst) (- (length lst) n))) (r nil) (i 0))
+      (while (< i keep) (setq r (cons (nth i lst) r)) (setq i (1+ i)))
+      (reverse r))))
 (defun nbutlast (lst &optional n)
   ;; Destructively drop the last N (default 1) elements.
   (let ((n (or n 1)) (len (length lst)))
@@ -1230,7 +1389,13 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
         ((or (stringp seq) (vectorp seq)) seq)
         (t (signal 'wrong-type-argument (list 'sequencep seq)))))
 (defun ensure-list (x) (if (listp x) x (list x)))
-(defun mapcan (fn lst) (apply (function append) (mapcar fn lst)))
+(defun mapcan (fn lst)
+  ;; Fmapcan = mapcar then Fnconc, NOT append: results are spliced through
+  ;; their last cons, so dotted results are legal -- (mapcan (lambda (x)
+  ;; (cons x x)) (list -0.0 t)) => (-0.0 t . t) -- and a non-cons non-last
+  ;; result signals `consp': (mapcan #'downcase (make-list 5 3)) =>
+  ;; (wrong-type-argument consp 3).
+  (apply (function nconc) (mapcar fn lst)))
 (defun assoc-default (key alist &optional test default)
   ;; Faithful port of subr.el: each element (or its car) is compared to KEY via
   ;; (funcall (or TEST 'equal) ELEM KEY); on a hit return its cdr, else DEFAULT.
@@ -1242,25 +1407,29 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
       (setq tail (cdr tail)))
     value))
 (defun rassoc (val alist)
-  (let ((res nil))
-    (while (and alist (not res))
+  ;; Frassoc walks conses and CHECK_LIST_END names the WHOLE list on a dotted
+  ;; tail: (rassoc 'a (cons -1 10)) => (wrong-type-argument listp (-1 . 10)).
+  (let ((res nil) (whole alist))
+    (while (and (consp alist) (not res))
       (if (and (consp (car alist)) (equal (cdr (car alist)) val)) (setq res (car alist)))
       (setq alist (cdr alist)))
+    (unless res (mem--end-check alist whole))
     res))
-(defun assq-delete-all (key alist)
-  (let ((out nil))
-    (while alist
-      (unless (and (consp (car alist)) (eq (car (car alist)) key)) (setq out (cons (car alist) out)))
-      (setq alist (cdr alist)))
-    (reverse out)))
 (defun assoc-delete-all (key alist &optional test)
-  ;; Like assq-delete-all but compares with TEST (default `equal').
-  (let ((tf (or test #'equal)) (out nil))
-    (while alist
-      (unless (and (consp (car alist)) (funcall tf (car (car alist)) key))
-        (setq out (cons (car alist) out)))
-      (setq alist (cdr alist)))
-    (reverse out)))
+  ;; Faithful subr.el port (destructive, like rassq-delete-all): `(car alist)'
+  ;; on a non-list signals listp naming it.
+  (unless test (setq test #'equal))
+  (while (and (consp (car alist)) (funcall test (car (car alist)) key))
+    (setq alist (cdr alist)))
+  (let ((tail alist) tail-cdr)
+    (while (setq tail-cdr (cdr tail))
+      (if (and (consp (car tail-cdr)) (funcall test (car (car tail-cdr)) key))
+          (setcdr tail (cdr tail-cdr))
+        (setq tail tail-cdr))))
+  alist)
+(defun assq-delete-all (key alist)
+  ;; subr.el: assq-delete-all is assoc-delete-all with `eq'.
+  (assoc-delete-all key alist #'eq))
 ;; Minimal completion API over a list (plain or alist), or a hash-table's keys.
 ;; (Function collections, obarrays, and completion-ignore-case are unsupported.)
 (defun completion--str (e)
@@ -1301,6 +1470,10 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
           (let ((next (cdr cur)))
             (setcdr cur prev)
             (setq prev cur cur next)))
+        ;; Fnreverse's CHECK_LIST_END fires AFTER the relinking, so a dotted
+        ;; tail signals listp naming the (already mutated) original head cons:
+        ;; (nreverse (cons "p" 32)) => (wrong-type-argument listp ("p")).
+        (when cur (signal 'wrong-type-argument (list 'listp seq)))
         prev)
     ;; Non-list: only arrays are reversible in place; else signal arrayp (Emacs).
     (if (arrayp seq) (reverse seq)
@@ -1328,25 +1501,44 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
   (unless (number-or-marker-p n) (signal 'wrong-type-argument (list 'number-or-marker-p n)))
   (seq-into (take n (append seq nil)) (seq--type-of seq)))
 (defun seq-drop (seq n)
-  (unless (number-or-marker-p n) (signal 'wrong-type-argument (list 'number-or-marker-p n)))
-  (seq-into (nthcdr n (append seq nil)) (seq--type-of seq)))
+  ;; seq.el: the list method is literally (nthcdr n list) -- so a non-integer
+  ;; N signals `integerp' via nthcdr -- while other sequences go through the
+  ;; generic (<= n 0) path, whose comparison signals number-or-marker-p:
+  ;; (seq-drop '(1) "s") => integerp "s"; (seq-drop "abc" 's) =>
+  ;; number-or-marker-p s.
+  (if (listp seq)
+      (nthcdr n seq)
+    (if (<= n 0) seq
+      (let ((len (seq-length seq)))
+        (seq-subseq seq (min n len) len)))))
 (defun seq-subseq (seq start &optional end)
-  ;; Sequence-generic, returning SEQ's type; START/END may be negative.
-  ;; Out-of-range is an error, and seq.el reports it differently per type: an
-  ;; array signals `args-out-of-range', a list signals a plain `error'.
-  (unless (sequencep seq)
-    (error "Unsupported sequence: %S" seq))
-  (let* ((lst (append seq nil)) (len (length lst))
-         (s (if (< start 0) (+ len start) start))
-         (e (cond ((null end) len) ((< end 0) (+ len end)) (t end))))
-    (when (or (< s 0) (> s len) (< e 0) (> e len) (> s e))
-      (if (listp seq)
-          (error "Start index out of bounds: %d" start)
-        (signal 'args-out-of-range (list seq start end))))
-    (let ((sub (take (- e s) (nthcdr s lst))))
-      (cond ((stringp seq) (apply (function string) sub))
-            ((vectorp seq) (vconcat sub))
-            (t sub)))))
+  ;; Faithful seq.el: strings and vectors defer to `substring' (so a
+  ;; non-integer index signals `integerp' and out-of-range signals
+  ;; args-out-of-range); the list branch is subr.el's arithmetic walk, whose
+  ;; out-of-range report is a plain `error'.
+  (cond
+   ((or (stringp seq) (vectorp seq)) (substring seq start end))
+   ((listp seq)
+    (let (len (orig-start start) (orig-end end))
+      (and end (< end 0) (setq end (+ end (setq len (length seq)))))
+      (if (< start 0) (setq start (+ start (or len (setq len (length seq))))))
+      (unless (>= start 0)
+        (error "Start index out of bounds: %s" orig-start))
+      (when (> start 0)
+        (setq seq (nthcdr (1- start) seq))
+        (unless seq
+          (error "Start index out of bounds: %s" orig-start))
+        (setq seq (cdr seq)))
+      (if end
+          (let ((n (- end start)))
+            (when (or (< n 0)
+                      (if len
+                          (> end len)
+                        (and (> n 0) (null (nthcdr (1- n) seq)))))
+              (error "End index out of bounds: %s" orig-end))
+            (take n seq))
+        (copy-sequence seq))))
+   (t (error "Unsupported sequence: %s" seq))))
 (defun seq-uniq (seq &optional testfn)
   (if (null testfn)
       (delete-dups (append seq nil))
@@ -1388,11 +1580,15 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 (defun seq-sort (pred seq) (seq-into (sort (append seq nil) pred) (seq--type-of seq)))
 (defun seq-partition (seq n)
   ;; Each chunk keeps SEQ's type (string→strings, vector→vectors, list→lists).
-  (let ((out nil) (type (seq--type-of seq)) (l (append seq nil)))
-    (while l
-      (setq out (cons (seq-into (take n l) type) out))
-      (setq l (nthcdr n l)))
-    (reverse out)))
+  ;; seq.el guards with (unless (< n 1)): N < 1 returns nil WITHOUT touching
+  ;; SEQ at all -- (seq-partition 0 0) => nil, and (seq-partition "ab" 0) is
+  ;; nil, not an infinite zero-progress loop.
+  (unless (< n 1)
+    (let ((out nil) (type (seq--type-of seq)) (l (append seq nil)))
+      (while l
+        (setq out (cons (seq-into (take n l) type) out))
+        (setq l (nthcdr n l)))
+      (reverse out))))
 (defun seq-split (seq n) (seq-partition seq n))
 (defun seq-set-equal-p (seq1 seq2 &optional testfn)
   (and (seq-every-p (lambda (x) (seq-contains-p seq2 x testfn)) seq1)
@@ -2344,8 +2540,9 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
    (t (equal x y))))
 (defun copy-alist (al)
   (mapcar (lambda (p) (if (consp p) (cons (car p) (cdr p)) p)) al))
-(defun substring-no-properties (s &optional from to)
-  (if to (substring s (or from 0) to) (substring s (or from 0))))
+;; substring-no-properties is a native subr (builtins.rs): it is a C subr in
+;; Emacs, so `#'substring-no-properties` must print `#<subr …>`, and the subr
+;; checks `stringp` before the indices.
 ;; The human-readable message for an error object (ERROR-SYMBOL . DATA).
 (defun error-message-string (err)
   (let* ((sym (car err)) (data (cdr err)) (msg (get sym 'error-message))
@@ -2374,20 +2571,25 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
    nil))
 
 (defun plist-put (plist prop val &optional predicate)
-  ;; Mutate PLIST in place: overwrite an existing PROP, or append (PROP VAL) to
-  ;; the tail via setcdr. Only a nil PLIST yields a fresh list (can't mutate nil).
-  ;; A non-list PLIST is `plistp' -- its own predicate, not `listp'.
-  (unless (plistp plist) (signal 'wrong-type-argument (list 'plistp plist)))
-  (let ((test (or predicate #'eq)))
-   (if (null plist)
-      (list prop val)
-    (let ((p plist) (done nil))
-      (while (not done)
-        (cond
-         ((funcall test (car p) prop) (setcar (cdr p) val) (setq done t))
-         ((cddr p) (setq p (cddr p)))
-         (t (setcdr (cdr p) (list prop val)) (setq done t))))
-      plist))))
+  ;; Fplist_put: step by two, breaking BEFORE the key test when the cdr is not
+  ;; a cons; overwrite in place on a match; CHECK_TYPE names the WHOLE plist
+  ;; under `plistp' when the walk ends on a non-nil tail -- so both
+  ;; (plist-put '(1) 1 9) and (plist-put '(1 . 2) 1 9) are plistp errors even
+  ;; though the key is present. Otherwise splice a fresh (PROP VAL) cell onto
+  ;; the last pair (nil PLIST returns the new cell bare).
+  (let ((test (or predicate #'eq)) (prev nil) (tail plist) (r nil) (done nil))
+    (while (and (not done) (consp tail))
+      (cond
+       ((not (consp (cdr tail))) (setq done t))
+       ((funcall test (car tail) prop) (setcar (cdr tail) val) (setq r plist done t))
+       (t (setq prev tail tail (cddr tail)))))
+    (cond
+     (r r)
+     (t
+      (unless (null tail) (signal 'wrong-type-argument (list 'plistp plist)))
+      (let ((newcell (cons prop (cons val (if prev (cddr prev) plist)))))
+        (if (null prev) newcell
+          (progn (setcdr (cdr prev) newcell) plist)))))))
 ;; Symbol property lists, backed by a hash table (we have no per-symbol plist
 ;; slot). Enough for `get`/`put`/`define-error` and the error-condition system.
 (defvar symbol-plist--table (make-hash-table :test 'eq))
@@ -2662,9 +2864,12 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
     (unless (string= cur "") (push cur lines))
     (mapconcat 'identity (reverse lines) "\n")))
 (defun string-equal-ignore-case (a b)
-  (unless (or (stringp a) (symbolp a)) (signal 'wrong-type-argument (list 'stringp a)))
-  (unless (or (stringp b) (symbolp b)) (signal 'wrong-type-argument (list 'stringp b)))
-  (string= (downcase (string--name a)) (downcase (string--name b))))
+  ;; Unlike `string=', this is `compare-strings' underneath in Emacs, which
+  ;; takes only actual strings: (string-equal-ignore-case nil "x") signals
+  ;; `stringp nil' rather than comparing the symbol's name.
+  (unless (stringp a) (signal 'wrong-type-argument (list 'stringp a)))
+  (unless (stringp b) (signal 'wrong-type-argument (list 'stringp b)))
+  (string= (downcase a) (downcase b)))
 (defun upcase-initials (s)
   ;; Upcase the first letter of every word, leaving the rest unchanged.
   ;; A character argument upcases to its uppercase form, like `upcase'.
@@ -2673,12 +2878,14 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
       (upcase s)
     (let ((out nil) (in-word nil))
       (dolist (c (string-to-list s))
-        (let* ((lower (and (>= c ?a) (<= c ?z)))
-               (alnum (or lower (and (>= c ?A) (<= c ?Z)) (and (>= c ?0) (<= c ?9)))))
-          (cond ((not alnum) (setq out (cons c out)))
+        ;; Word constituent: a digit, or a cased letter (upcase ≠ downcase) —
+        ;; the same test `capitalize' uses, so Greek/Cyrillic/accented letters
+        ;; both start words and get upcased: (upcase-initials "αβγ") => "Αβγ".
+        (let ((wordc (or (and (>= c ?0) (<= c ?9)) (/= (downcase c) (upcase c)))))
+          (cond ((not wordc) (setq out (cons c out)))
                 (in-word (setq out (cons c out)))
-                (t (setq out (cons (if lower (- c 32) c) out))))
-          (setq in-word alnum)))
+                (t (setq out (cons (upcase c) out))))
+          (setq in-word wordc)))
       (apply (function string) (reverse out)))))
 (defun string-replace (from to s)
   ;; Emacs signals on an empty FROMSTRING rather than looping forever.

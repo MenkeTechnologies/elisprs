@@ -590,9 +590,9 @@ pub const SUBRS: &[Entry] = &[
     Entry {
         name: "replace-regexp-in-string",
         kind: Kind::Function,
-        sig: "(replace-regexp-in-string REGEXP REP STRING &optional FIXEDCASE LITERAL)",
+        sig: "(replace-regexp-in-string REGEXP REP STRING &optional FIXEDCASE LITERAL SUBEXP START)",
         doc:
-            "Replace every match of REGEXP in STRING with REP (\\& / \\N templates unless LITERAL).",
+            "Replace every match of REGEXP in STRING with REP — a string (\\& / \\N templates unless LITERAL) or a function of the matched text.",
     },
     Entry {
         name: "regexp-quote",

@@ -82,12 +82,209 @@ worst bug yet — one that has nothing to do with Emacs parity per se:
 Plus: `min`/`max` as subrs, improper lists naming their tail, `substring` index
 types, `seq-take`/`seq-drop` argument checks.
 
+A fourth pass (three fresh 3,000-form corpora, seeds 20260716 / 424242 / 987654)
+cleared the numeric/format/symbol-identity cluster:
+
+- **`%d` erred on non-finite floats.** Emacs renders the word:
+  `(format "%d%%" 0.0e+NaN)` → `"nan%"`, `(format "%+d" 1.0e+INF)` → `"+inf"` —
+  space-padded to width (the `0` flag is ignored), the sign flags applying to
+  infinities but never to NaN. `%o`/`%x`/`%X` instead signal `(overflow-error)`,
+  and `%c` rejects any float (even integral) as a type mismatch.
+- **`fround`/`ffloor`/`fceiling`/`ftruncate` accepted any number.** They are
+  `CHECK_FLOAT` subrs: `(fround 0)` is `(wrong-type-argument floatp 0)`, and the
+  error names the offender (`floatp`, not `numberp`).
+- **`make-symbol`/`intern-soft` dropped the offender** from their `stringp` error
+  data: `(make-symbol 1.5)` said `(wrong-type-argument stringp)` with no datum.
+- **`(symbolp (= 1 2))` answered nil.** A computed nil traveled as a raw boolean
+  that `symbolp` didn't recognize as the symbol nil.
+- **Number-lookalike symbol names printed unescaped.** `(intern "0.0e+NaN")`
+  printed `0.0e+NaN` (which reads back as a float); the printer's numeric-token
+  check missed the non-finite float syntax, bignum-sized integers, and `1.`.
+- **Error-object identity of the predicate pool.** `natnump`/`nlistp` were
+  prelude lambdas, so `(sort '(…) #'natnump)` reported a closure where Emacs
+  says `#<subr natnump>` — both are C subrs now. `not` was its own subr where
+  Emacs has `(defalias 'not #'null)`, so `#'not` misprinted as `#<subr not>`.
+  Byte-compiled `cl-evenp`/`cl-oddp` report a wrong argument count as
+  exec_byte_code's `((MANDATORY . NONREST) NARGS)` cons — `(1 . 1)`, never a
+  printed closure. `substring-no-properties` likewise became the C subr it is
+  in Emacs (with its `stringp`-before-indices check).
+- **Text-property fns validated OBJECT with `bufferp`.** Emacs uses
+  `buffer-or-string-p` (`(get-text-property 1 't 97)`), and one `propertize`
+  call covering a range is ONE printed interval — per-char plists sharing an
+  object no longer split into `0 1 … 1 2 …` runs even when a plist key is a
+  string (which the structural merge couldn't compare).
+- **`(- -0.0)`** is float negation → `0.0` (verified already correct; pinned by
+  a regression test alongside `(+ -0.0)` / `(- -0.0 0)` staying `-0.0`).
+
 Reproduce any of it:
 
 ```sh
 bash scripts/fuzz_parity.sh -n 2000 -s 1      # seeded: same corpus every run
 bash scripts/fuzz_parity.sh -c corpus.el      # re-check a saved corpus
 ```
+
+A fourth pass (three 3,000-form seeded corpora) targeted the string functions,
+and its through-line was that **Emacs defines most of them in Lisp, and the Lisp
+definition — check order included — is the contract**:
+
+- **`replace-regexp-in-string` is now the subr.el Lisp definition** (ported into
+  the prelude, replacing a Rust reimplementation). That one move fixed five
+  distinct gaps: `(length string)` rejects a non-sequence first (`sequencep 97`,
+  not `stringp 97`), a nil STRING flows to `(substring nil 0 0)` (`arrayp nil` —
+  even when the regexp is invalid, since l = 0 never compiles it), REGEXP is
+  type-checked by `string-match` only when the loop runs (`stringp sym`), REP is
+  not examined until a match happens (`(replace-regexp-in-string "123" [1 2]
+  "line\nbreak")` returns the string), and `(< start l)` stops the empty-regexp
+  loop from appending one more replacement at end-of-string
+  (`(replace-regexp-in-string "" "t" "-4.5")` => `"t-t4t.t5"`, no trailing `t`).
+- **`string-prefix-p` / `string-suffix-p` / `string-remove-prefix` /
+  `string-remove-suffix`** now length-test exactly like subr.el / subr-x.el:
+  both `length`s come before any string check (so `(string-prefix-p 97 "ab")` is
+  `sequencep 97` and `(string-suffix-p 97 0)` names `0`, the STRING, whose
+  length is taken first), a too-long prefix answers nil even for a non-string
+  STRING (`(string-prefix-p "hello world" [1 2])` => nil, and
+  `(string-remove-prefix "Hello, World" nil)` => nil), and only then does
+  `compare-strings` signal `stringp`.
+- **`string-join` is `mapconcat`**, whose up-front `length` names an improper
+  list's tail: `(string-join (cons '- 9) 1.5)` => `(wrong-type-argument listp 9)`.
+- **`string-empty-p` is `(string= STRING "")`** — `(string-empty-p nil)` is nil
+  (symbol name), not a `stringp` error; `string-equal-ignore-case` is
+  `compare-strings` and takes ONLY strings (`(string-equal-ignore-case nil "x")`
+  signals `stringp nil`); `string-lessp` accepts a string or symbol and checks
+  its first argument first (`(string< 97 "aa")` => `stringp 97`, and vectors are
+  rejected, not silently compared).
+- **`case-fold-search` reaches everything `string-match` reaches**:
+  `split-string` compiled its separator case-sensitively
+  (`(split-string "HELLO" "hello")` => `("" "")` in batch Emacs), and a
+  backreference under folding must match cross-case
+  (`(string-trim "aAbB" "\\(a\\)\\1" "a+")` => `"bB"` — fancy-regex 0.14
+  compared backrefs case-sensitively under `(?i)`; 0.16 is the new floor).
+- **`upcase`/`downcase`/`capitalize` on a character**: a negative integer is not
+  a character (`char-or-string-p -1`), but one above the character range comes
+  back unchanged (`(upcase 4194304)` => `4194304` — Emacs treats high bits as
+  event modifiers). `upcase-initials` treated only ASCII as word constituents,
+  leaving `"αβγ"` untouched; word chars are digits or cased letters, so it is
+  `"Αβγ"`.
+- **Check order elsewhere**: `substring` checks the array before the indices
+  (`(substring -1 1.5)` => `arrayp -1`), `substring-no-properties` insists on a
+  string (`stringp 97`, not `arrayp`), `split-string` type-checks its separator
+  regexp before the string (`(split-string [1 2] 97)` => `stringp 97`).
+- **GNU regex's two `\{` diagnostics**: content that can never appear in an
+  interval is `Invalid content of \{\}` even when the pattern then ends
+  (`"a\{x"`, `"a\{2\)"`), while running out of pattern with the interval still
+  well-formed is `Unmatched \{` (`"a\{2,"`). An empty interval is valid:
+  `(string-match "a\\{\\}" "b")` => 0.
+
+The same pass's list/sequence cluster — and one **process-killing crash**:
+
+- **`assoc-string` with a nil key spun forever.** A matched element may itself
+  be nil (`(assoc-string nil '(… nil))`: key nil and element nil both compare
+  as `"nil"` via `symbol-name`), and the walk looped on "result still nil",
+  never advancing — 100% CPU, unbounded allocation, dead process (fuzz form
+  #2745, seed 424242). The walk now carries a DONE flag like C `Fassoc_string`.
+- **`nconc` is Fnconc, not an append-alike.** Every argument but the last must
+  be a *cons* — `(nconc 0 '(1))` is `(wrong-type-argument consp 0)`, not
+  `listp` — and each argument's spine is walked to its LAST CONS, so a dotted
+  tail is overwritten, never an error: `(nconc '(1) '(2 . 3) '(4))` => `(1 2 4)`.
+  `mapcan` is mapcar + `nconc` (it used `append`), so dotted per-element
+  results splice: `(mapcan (lambda (x) (cons x x)) (list -0.0 t))` =>
+  `(-0.0 t . t)`.
+- **`mapconcat` mapped and concatenated incrementally.** Fmapconcat length-checks
+  SEQ first (dotted SEQ names its tail), runs FUNCTION over *every* element,
+  and only then concatenates — `(mapconcat #'zerop (vector 0 'nil))` fails
+  inside `zerop` on the second element, never on concatenating the first `t`.
+  `concat` itself now enforces Fconcat's contract: an argument is a string,
+  nil, or a list/vector of *characters*; a list argument's structure is checked
+  before its elements (`(concat '(a . 2))` => `listp 2`, `(concat '(a a))` =>
+  `characterp a`); elisprs silently skipped non-characters, so
+  `(mapconcat (lambda (x) (list x x)) (vector 'car t 1000) "z")` answered
+  `"zzϨϨ"`. `vconcat` shares the list walk (`(vconcat '(t . 9))` => `listp 9`).
+- **`cl-sort` rejected strings and mis-named its error.** cl-seq.el coerces any
+  non-list with `(append SEQ nil)` — whose failure is `sequencep`, not bare
+  `sort`'s `list-or-vector-p` — sorts a string via vconcat/concat round-trip,
+  and writes a vector's sorted elements back in place (`:key` honored).
+- **Which end of an improper list an error names.** `assq`/`assoc`/`rassoc`/
+  `alist-get`, and `nth`/`nthcdr` mid-walk, are `CHECK_LIST_END`: they name the
+  WHOLE list (`(assq 'a (cons -1 10))` => `listp (-1 . 10)`); `nth`'s *final*
+  `car` names the tail value (`(nth 1 '(1 . 2))` => `listp 2`); `nreverse`
+  relinks first and signals after, so it names the now-mutated head cons
+  (`(nreverse (cons "p" 32))` => `listp ("p")`); `delete-dups` sizes with
+  `length` first (`sequencep sym` / `listp 2.5`).
+- **seq.el/subr.el guards were missing.** `seq-partition` with N < 1 is nil
+  without touching SEQ — elisprs looped forever on zero progress
+  (`(seq-partition "ab" 0)` hung). `butlast` with N ≤ 0 returns LIST
+  unvalidated (`(butlast 0 0)` => `0`). `seq-drop` on a list is `(nthcdr n
+  list)` (`integerp` on a bad N) while other sequences hit the generic
+  `(<= n 0)` (`number-or-marker-p`); `seq-subseq` defers strings/vectors to
+  `substring` (`integerp`, `args-out-of-range`) and keeps seq.el's plain
+  `error` for list indices. `rassq-delete-all`/`assq-delete-all` are the
+  destructive subr.el loops, whose `(car alist)` names a non-list with `listp`.
+- **`aref` dispatches on the array's type before any bounds check** —
+  `(aref 97 -7)` is `(wrong-type-argument arrayp 97)`, not `args-out-of-range`.
+
+A fifth pass (fresh 3,000-form corpus, seed 555001) cleared the plist /
+delete-family / sort-order cluster — its through-line is that the C walks'
+exact break points and CHECK_LIST_END data are the contract:
+
+- **`plist-get` never signals.** Fplist_get walks with `FOR_EACH_TAIL_SAFE`
+  and breaks on a non-cons cdr BEFORE testing the key: `(plist-get '(1 . 2) 1)`,
+  `(plist-get '(1) 1)`, `(plist-get 5 1)` are all nil (elisprs signalled
+  `listp` on the dotted cdr). `plist-member` tests the key FIRST — so
+  `(plist-member '(1 . 2) 1)` => `(1 . 2)` — but ends with CHECK_TYPE naming
+  the WHOLE plist under `plistp` (`(plist-member '(1 2 . 3) 99)` =>
+  `plistp (1 2 . 3)`, and a non-list is `plistp`, never `listp`). `plist-put`
+  breaks BEFORE its key test, so `(plist-put '(1 . 2) 1 9)` and
+  `(plist-put '(1) 1 9)` are `plistp` errors even though the key is present.
+- **Empty strings are `eq`.** Emacs keeps ONE shared `empty_unibyte_string`
+  object (alloc.c), so every 0-length construction — `""`, `(make-string 0 C)`,
+  `(substring s 0 0)`, `(copy-sequence "")` — is the same object, and
+  plist-put's default `eq` test REPLACES under an equal-but-differently-written
+  `""` key: `(plist-put '("" -65536) "" V)` => `("" V)`, where elisprs
+  appended a second pair.
+- **`delq`/`delete` error data is the list AFTER head removals.** Fdelq/Fdelete
+  rebind LIST past deleted head cells before `CHECK_LIST_END`, so
+  `(delq 'a (cons 'a 5))` => `listp 5` while `(delq 'x (cons 'a 5))` names the
+  whole `(a . 5)`. `delete` on a dotted list SIGNALED nothing at all in elisprs
+  (`(delete "str" '("a" . [1 2]))` returned the list); it now walks like Fdelete
+  and filters vectors/strings into fresh copies (`(delete ?a "abca")` =>
+  `"bc"`, previously a char list). `remq` is subr.el's: cdr past head matches,
+  then `memq` (names the WHOLE list) and only on a hit
+  `(delq ELT (copy-sequence LIST))` (names the TAIL) — so
+  `(remq "x" '("αβγ" . N))` => `listp ("αβγ" . N)` but `(remq 'a '(x a . 3))`
+  => `listp 3`. `remove` is delete-over-copy-sequence, and a non-sequence is
+  `sequencep` through `delete`/`remove` but `listp` through `delq`/`remq`.
+- **`sort`'s comparison ORDER is tim_sort's.** Emacs 30 sorts with src/sort.c
+  (the CPython listsort port); under MAX_MINRUN (64) that is exactly count_run
+  + binary insertion, whose FIRST predicate call is `pred(a[1], a[0])` — a
+  throwing predicate therefore names a[1]: `(cl-sort '(t 1.0 nil)
+  #'string-to-number)` => `stringp 1.0` (elisprs's merge sort first compared
+  the nil). The host sort now reproduces count_run + binarysort verbatim below
+  64 elements, logging-predicate-identical to Emacs.
+- **`zerop` is not a subr.** It is a byte-compiled defsubst from subr.el
+  (`(subrp (symbol-function 'zerop))` => nil), so a wrong argument count is
+  exec_byte_code's `((MANDATORY . NONREST) NARGS)`: `(seq-reduce #'zerop "ab"
+  0)` => `(wrong-number-of-arguments (1 . 1) 2)`, never `#<subr zerop>`. The
+  Rust subr is gone; the prelude defines it (which also survives the
+  bytecode-cache heap image, where a shadowing defun over a registered subr
+  was silently lost on cache HIT).
+- **`string-trim` trims the RIGHT side first** — subr-x's
+  `(string-trim-left (string-trim-right S TRIM-RIGHT) TRIM-LEFT)` — so with two
+  bad regexps the right one's compile error wins:
+  `(string-trim "" "\\(" "[")` => `(invalid-regexp "Unmatched [ or [^")`.
+- **`apply`'s improper spread names the TAIL.** Fapply sizes SPREAD with
+  `list_length`, whose CHECK_LIST_END names the loop variable:
+  `(apply #'1- (cons 2.5 -2))` => `listp -2` (elisprs named the whole cons).
+- **`cl-remove-if` with a nil predicate removes nils.** cl-seq.el routes
+  through `(cl-remove nil SEQ :if PRED …)` and a nil `:if` falls back to
+  cl--check-test's item-`eql` matching — `(cl-remove-if nil '(nil 2 nil))` =>
+  `(2)`, `(cl-remove-if nil '(2 +))` => `(2 +)` (elisprs funcalled nil). The
+  NOT is dropped in the fallback, so `cl-remove-if-not` removes nils too.
+
+Still open from this corpus: interpreted closures capture (and print) the whole
+enclosing lexical environment where Emacs 30's cconv captures only free
+variables — `(let ((x 1.5e300)) (sort '(42 t) (lambda (x) (cons x x))))` errors
+naming `#[(x) ((cons x x)) ((x . 1.5e+300))]` where Emacs prints
+`#[(x) ((cons x x)) (t)]`.
 
 ---
 

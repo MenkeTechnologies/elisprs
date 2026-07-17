@@ -142,6 +142,12 @@ fn translate_escape(
         // `\{m,n\}` — Emacs validates the bounds itself, and its diagnostics are
         // what elisp code sees.
         '{' => {
+            // GNU regex reads the interval strictly as digits[,digits] and
+            // diagnoses the FIRST wrong thing it sees: a character that can
+            // never appear in an interval (including `\X` for X ≠ `}`) is
+            // "Invalid content of \{\}" even when the pattern then ends, while
+            // running out of pattern with only valid interval content so far is
+            // "Unmatched \{" — so `a\{2,` is Unmatched but `a\{x` is Invalid.
             let mut body = String::new();
             let mut closed = false;
             while let Some(c) = it.next() {
@@ -151,14 +157,13 @@ fn translate_escape(
                             closed = true;
                             break;
                         }
-                        Some(o) => {
-                            body.push('\\');
-                            body.push(o);
-                        }
+                        Some(_) => return Err(INVALID_BRACE_CONTENT.into()),
                         None => return Err(TRAILING_BACKSLASH.into()),
                     }
-                } else {
+                } else if c.is_ascii_digit() || (c == ',' && !body.contains(',')) {
                     body.push(c);
+                } else {
+                    return Err(INVALID_BRACE_CONTENT.into());
                 }
             }
             if !closed {
@@ -167,7 +172,12 @@ fn translate_escape(
             if !valid_brace_body(&body) {
                 return Err(INVALID_BRACE_CONTENT.into());
             }
+            // Emacs allows an empty lower bound (`\{,3\}`, even `\{\}`) meaning
+            // 0; the `regex` dialect does not, so make the 0 explicit.
             out.push('{');
+            if body.is_empty() || body.starts_with(',') {
+                out.push('0');
+            }
             out.push_str(&body);
             out.push('}');
         }
@@ -224,7 +234,8 @@ fn translate_escape(
 fn valid_brace_body(body: &str) -> bool {
     let parse = |s: &str| -> Option<u64> { s.parse().ok() };
     match body.split_once(',') {
-        None => !body.is_empty() && body.chars().all(|c| c.is_ascii_digit()),
+        // An empty count is a valid interval in Emacs — `a\{\}` means `a\{0\}`.
+        None => body.chars().all(|c| c.is_ascii_digit()),
         Some((lo, hi)) => {
             let lo_v = if lo.is_empty() { Some(0) } else { parse(lo) };
             match (lo_v, hi.is_empty()) {

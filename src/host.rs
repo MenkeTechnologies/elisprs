@@ -2903,7 +2903,15 @@ impl ElispHost {
         let mut i = 0;
         while i < n {
             let mut j = i + 1;
-            while j < n && self.plist_struct_eq(&props[i], &props[j]) {
+            // Chars that share the SAME plist object (one `propertize`/
+            // `set-text-properties` call covers a range with one plist) are one
+            // Emacs interval no matter what the plist holds — `values_eq` catches
+            // that even when the plist's keys (e.g. a string key) would defeat
+            // the structural walk below.
+            while j < n
+                && (self.values_eq(&props[i], &props[j])
+                    || self.plist_struct_eq(&props[i], &props[j]))
+            {
                 j += 1;
             }
             if el_truthy(&props[i]) {
@@ -3285,10 +3293,18 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 // with `(wrong-type-argument listp +)`, matching Emacs).
                 let spread = args.last().unwrap();
                 let tail = with_host(|h| h.list_vec(spread)).ok_or_else(|| {
-                    format!(
-                        "wrong-type-argument: listp {}",
-                        with_host(|h| h.print(spread, true))
-                    )
+                    // Fapply sizes SPREAD with `list_length`, whose
+                    // CHECK_LIST_END names the loop variable: the improper
+                    // TAIL of a dotted list -- (apply #'+ '(1 . 2)) =>
+                    // (wrong-type-argument listp 2) -- or SPREAD itself when
+                    // it is not a cons at all.
+                    with_host(|h| {
+                        let mut t = spread.clone();
+                        while let Some(Obj::Cons(_, cdr)) = h.obj(&t) {
+                            t = cdr.clone();
+                        }
+                        format!("wrong-type-argument: listp {}", h.print(&t, true))
+                    })
                 })?;
                 let mut a: Vec<Value> = if args.len() >= 2 {
                     args[1..args.len() - 1].to_vec()
@@ -3521,12 +3537,9 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                         .ok_or("wrong-number-of-arguments: macroexpand-all")?,
                 )
             }
-            // `replace-regexp-in-string` with a *function* REP must call that
-            // function per match — VM re-entry — so it's handled here rather than
-            // in the (host-borrowing) subr, which only does string templates.
-            "replace-regexp-in-string" if args.len() >= 3 && !matches!(args[1], Value::Str(_)) => {
-                return replace_regexp_with_fn(args);
-            }
+            // (`replace-regexp-in-string` needs no interception: it is a Lisp
+            // function here as in Emacs — the prelude port funcalls a function
+            // REP itself.)
             // Nonlocal-exit intrinsics (the compiler rewrites catch/unwind-protect/
             // condition-case into these, passing lambda thunks).
             "--catch--" => return intrinsic_catch(args),
@@ -3593,63 +3606,6 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
     }
 }
 
-/// `(replace-regexp-in-string REGEXP FUNC STRING …)` where FUNC is called on each
-/// match's text and returns its replacement. Match data is set before each call
-/// so the function can use `match-string`. Runs outside any host borrow.
-fn replace_regexp_with_fn(args: &[Value]) -> Result<Value, String> {
-    let pat = match &args[0] {
-        Value::Str(s) => s.to_string(),
-        _ => return Err("replace-regexp-in-string: regexp must be a string".to_string()),
-    };
-    let subject = match &args[2] {
-        Value::Str(s) => s.to_string(),
-        _ => return Err("replace-regexp-in-string: not a string".to_string()),
-    };
-    let repfn = args[1].clone();
-    let cf = with_host(|h| crate::builtins::case_fold_search(h));
-    let re = crate::builtins::compile_cf(&pat, cf)?;
-    let mut out = String::with_capacity(subject.len());
-    let mut last = 0usize;
-    for caps in re.captures_iter(&subject) {
-        let Ok(caps) = caps else { break };
-        let m = caps.get(0).unwrap();
-        out.push_str(&subject[last..m.start()]);
-        // Char-indexed match data so `match-string`/`match-beginning` work in FUNC.
-        let spans: Vec<Option<(usize, usize)>> = (0..caps.len())
-            .map(|i| {
-                caps.get(i).map(|g| {
-                    (
-                        crate::builtins::char_of_byte(&subject, g.start()),
-                        crate::builtins::char_of_byte(&subject, g.end()),
-                    )
-                })
-            })
-            .collect();
-        let matched = Value::str(subject[m.start()..m.end()].to_string());
-        with_host(|h| {
-            h.match_data = Some(MatchData {
-                subject: subject.clone(),
-                spans,
-                from_buffer: false,
-            })
-        });
-        let r = call_function(&repfn, &[matched])?;
-        match r {
-            Value::Str(s) => out.push_str(&s),
-            _ => return Err("replace-regexp-in-string: replacement must be a string".to_string()),
-        }
-        last = m.end();
-        if m.start() == m.end() {
-            if let Some(c) = subject[last..].chars().next() {
-                out.push(c);
-                last += c.len_utf8();
-            }
-        }
-    }
-    out.push_str(&subject[last.min(subject.len())..]);
-    Ok(Value::str(out))
-}
-
 /// Stable merge sort driven by an elisp less-than predicate. `pred` is called as
 /// `(pred a b)`; a non-nil result means `a` precedes `b`. Equal elements keep
 /// their input order (the merge takes from the left run on ties).
@@ -3681,6 +3637,54 @@ fn value_lt(a: &Value, b: &Value) -> Result<bool, String> {
 fn merge_sort_by(items: &mut Vec<(Value, Value)>, pred: Option<&Value>) -> Result<(), String> {
     let n = items.len();
     if n < 2 {
+        return Ok(());
+    }
+    let lt = |x: &Value, y: &Value| -> Result<bool, String> {
+        match pred {
+            Some(p) => {
+                let r = call_function(p, &[x.clone(), y.clone()])?;
+                Ok(!matches!(r, Value::Undef | Value::Bool(false)))
+            }
+            None => value_lt(x, y),
+        }
+    };
+    // Emacs 30 sorts with `tim_sort` (src/sort.c, the CPython listsort port),
+    // and its COMPARISON ORDER is observable through a side-effecting or
+    // throwing predicate: `count_run` first calls pred(a[1], a[0]) — so
+    // (sort '(t 1.0 nil) #'string-to-number) dies on 1.0, not nil. For inputs
+    // shorter than MAX_MINRUN (64) — every list differential fuzzing produces —
+    // tim_sort is exactly count_run + binary insertion, reproduced verbatim
+    // here. Longer inputs keep the stable merge sort below (same result;
+    // Emacs's merge machinery would call the predicate in a different order).
+    if n < 64 {
+        // count_run: pred(a[1], a[0]) picks ascending (extend while NOT less)
+        // vs strictly-descending (extend while less, then reverse — strictness
+        // is what keeps the reversal stable).
+        let mut run = 2;
+        if lt(&items[1].0, &items[0].0)? {
+            while run < n && lt(&items[run].0, &items[run - 1].0)? {
+                run += 1;
+            }
+            items[..run].reverse();
+        } else {
+            while run < n && !lt(&items[run].0, &items[run - 1].0)? {
+                run += 1;
+            }
+        }
+        // binarysort: insert a[start] into the sorted prefix a[0..start],
+        // probing pred(pivot, a[mid]) and landing AFTER equals (stable).
+        for start in run..n {
+            let (mut l, mut r) = (0usize, start);
+            while l < r {
+                let p = l + ((r - l) >> 1);
+                if lt(&items[start].0, &items[p].0)? {
+                    r = p;
+                } else {
+                    l = p + 1;
+                }
+            }
+            items[l..=start].rotate_right(1);
+        }
         return Ok(());
     }
     let mid = n / 2;
