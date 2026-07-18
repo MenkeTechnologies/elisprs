@@ -434,9 +434,15 @@ fn number_lookalike_symbols_print_escaped() {
         r#""\\12345678901234567890123""#
     );
     assert_eq!(eval(r#"(prin1-to-string (intern "1."))"#), r#""\\1.""#);
-    assert_eq!(
-        eval("(intern (number-to-string (sqrt -1.5)))"),
-        "\\0.0e+NaN"
+    // `sqrt` of a negative yields a NaN whose sign bit is implementation-defined:
+    // x86-64 `sqrtsd` returns a negative NaN, aarch64 `fsqrt` a positive one, and
+    // GNU Emacs (libm `sqrt`) exhibits the same per-platform split. So accept
+    // either sign — the point of this finding is that the NaN string interns to a
+    // symbol that prints escaped, not which sign the host FPU produced.
+    let nan_sym = eval("(intern (number-to-string (sqrt -1.5)))");
+    assert!(
+        nan_sym == "\\0.0e+NaN" || nan_sym == "\\-0.0e+NaN",
+        "expected an escaped NaN symbol, got {nan_sym}"
     );
 }
 
