@@ -11,8 +11,10 @@ use fusevm::Value;
 use num_bigint::BigInt;
 
 pub fn read_all(h: &mut ElispHost, src: &str) -> Result<Vec<Value>, String> {
+    let chars: Vec<char> = src.chars().collect();
     let mut r = Reader {
-        chars: src.chars().collect(),
+        newlines: newline_positions(&chars),
+        chars,
         pos: 0,
     };
     let mut out = Vec::new();
@@ -29,9 +31,12 @@ pub fn read_all(h: &mut ElispHost, src: &str) -> Result<Vec<Value>, String> {
 /// Read a single form starting at char index `start`, returning it together
 /// with the char index just past it (for `read-from-string`).
 pub fn read_one(h: &mut ElispHost, src: &str, start: usize) -> Result<(Value, usize), String> {
+    let chars: Vec<char> = src.chars().collect();
+    let pos = start.min(chars.len());
     let mut r = Reader {
-        chars: src.chars().collect(),
-        pos: start.min(src.chars().count()),
+        newlines: newline_positions(&chars),
+        chars,
+        pos,
     };
     r.skip_ws();
     if r.pos >= r.chars.len() {
@@ -44,6 +49,19 @@ pub fn read_one(h: &mut ElispHost, src: &str, start: usize) -> Result<(Value, us
 struct Reader {
     chars: Vec<char>,
     pos: usize,
+    /// Sorted char-indices of every `\n`, so `line_at` is an O(log n) lookup
+    /// instead of rescanning from the start for each form (the DAP needs a
+    /// source line for every list it reads).
+    newlines: Vec<usize>,
+}
+
+/// Char-indices of every newline in `chars` (ascending), for `Reader::line_at`.
+fn newline_positions(chars: &[char]) -> Vec<usize> {
+    chars
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &c)| (c == '\n').then_some(i))
+        .collect()
 }
 
 fn is_delim(c: char) -> bool {
@@ -53,6 +71,10 @@ fn is_delim(c: char) -> bool {
 impl Reader {
     fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
+    }
+    /// 1-based source line of char index `pos` (number of preceding newlines + 1).
+    fn line_at(&self, pos: usize) -> u32 {
+        self.newlines.partition_point(|&p| p < pos) as u32 + 1
     }
     fn peek_at(&self, n: usize) -> Option<char> {
         self.chars.get(self.pos + n).copied()
@@ -163,6 +185,9 @@ impl Reader {
     }
 
     fn read_list(&mut self, h: &mut ElispHost) -> Result<Value, String> {
+        // Line of the opening `(`, recorded on the resulting head cons so the
+        // compiler can emit a DAP statement marker for this form.
+        let line = self.line_at(self.pos);
         self.pos += 1; // consume '('
         let mut items = Vec::new();
         loop {
@@ -195,12 +220,15 @@ impl Reader {
                     for x in items.into_iter().rev() {
                         acc = h.cons(x, acc);
                     }
+                    h.record_form_line(&acc, line);
                     return Ok(acc);
                 }
                 _ => items.push(self.read_form(h)?),
             }
         }
-        Ok(h.list_from(items))
+        let form = h.list_from(items);
+        h.record_form_line(&form, line);
+        Ok(form)
     }
 
     fn read_vector(&mut self, h: &mut ElispHost) -> Result<Value, String> {

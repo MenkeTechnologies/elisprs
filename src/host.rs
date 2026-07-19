@@ -96,6 +96,7 @@ pub mod ops {
     pub const UNBIND: u16 = 7; // wide: close the innermost scope (keep stack value)
     pub const SCOPE_OPEN: u16 = 8; // open an empty lexical scope (for let*)
     pub const MAKE_CLOSURE: u16 = 9; // pop a closure template; push one capturing the env
+    pub const DBG_LINE: u16 = 10; // DAP statement marker (debug only): fire dap::check_line
 }
 
 pub type SubrFn = fn(&mut ElispHost, &[Value]) -> Result<Value, String>;
@@ -472,6 +473,11 @@ pub struct ElispHost {
     /// Set by `(intercept-proceed)` — records that an around advice ran the
     /// original command (mirrors zshrs's `__intercept_proceed` flag).
     pub(crate) intercept_proceeded: bool,
+    /// Source line (1-based) of each list form, keyed by the head cons's arena
+    /// handle. Populated by the reader; read by the compiler in debug mode to
+    /// emit the DAP statement markers that drive line-level breakpoints/stepping.
+    /// Session-local (never serialized); a fresh `reset_host` clears it.
+    pub(crate) form_lines: HashMap<u32, u32>,
 }
 
 /// A closure's printable source: the arglist as written and the body forms.
@@ -626,6 +632,7 @@ impl ElispHost {
             intercept_active: false,
             intercept_current: None,
             intercept_proceeded: false,
+            form_lines: HashMap::new(),
         };
         crate::builtins::install(&mut h);
         // The default buffer's own object handle (allocated after the arena
@@ -1329,6 +1336,21 @@ impl ElispHost {
     }
     /// Pop scopes until `frame_stack` is back to `target_len`. A non-local exit
     /// (`throw`/error) out of an inner `let` skips its `UNBIND`, leaking the
+    /// Record the source line of a list form (keyed by its head-cons handle).
+    /// Called by the reader as it builds each `(...)`. No-op for non-`Obj` forms.
+    pub fn record_form_line(&mut self, form: &Value, line: u32) {
+        if let Value::Obj(id) = form {
+            self.form_lines.insert(*id, line);
+        }
+    }
+    /// The recorded source line of a form, if the reader saw it as a list.
+    pub fn form_line(&self, form: &Value) -> Option<u32> {
+        match form {
+            Value::Obj(id) => self.form_lines.get(id).copied(),
+            _ => None,
+        }
+    }
+
     /// lexical scope; `run_closure` calls this to recover, so the caller's
     /// lexical environment isn't corrupted.
     pub fn unwind_scopes_to(&mut self, target_len: usize) {
@@ -3251,6 +3273,22 @@ fn print_symbol_readable(name: &str) -> String {
 thread_local! {
     static HOST: RefCell<ElispHost> = RefCell::new(ElispHost::new());
     static PRELUDE_LOADED: Cell<bool> = const { Cell::new(false) };
+    /// DAP debug execution: when on, the compiler emits `DBG_LINE` statement
+    /// markers and `run_chunk` skips the tracing JIT so every marker fires
+    /// through the interpreter. Off = zero overhead (no markers emitted at all).
+    static DEBUG_MODE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Enable/disable DAP debug execution (statement markers + JIT-off). Set by the
+/// `--dap` server around the program compile+run; a single `Cell` load per
+/// `run_chunk` when off.
+pub fn set_debug_mode(on: bool) {
+    DEBUG_MODE.with(|d| d.set(on));
+}
+/// Is DAP debug execution active? Read by the compiler (marker emission) and
+/// `run_chunk` (JIT gating).
+pub fn debug_mode() -> bool {
+    DEBUG_MODE.with(|d| d.get())
 }
 
 pub fn with_host<R>(f: impl FnOnce(&mut ElispHost) -> R) -> R {
@@ -4273,6 +4311,15 @@ pub fn ext_dispatch(vm: &mut VM, id: u16, arg: u8) {
             let clo = with_host(|h| h.instantiate_closure(&template));
             vm.push(clo);
         }
+        ops::DBG_LINE => {
+            // A DAP statement marker (emitted only in debug mode). The line rides
+            // in the chunk's line table for this op; `vm.ip` has already advanced
+            // past the marker, so the marker's slot is `ip - 1`. Stack-neutral.
+            let line = *vm.chunk.lines.get(vm.ip.saturating_sub(1)).unwrap_or(&0);
+            if line != 0 {
+                crate::dap::check_line(line as u32);
+            }
+        }
         _ => {}
     }
 }
@@ -4415,7 +4462,12 @@ pub fn run_chunk(chunk: Chunk) -> Result<Value, String> {
     vm.set_fixnum_range(MOST_NEGATIVE_FIXNUM, MOST_POSITIVE_FIXNUM);
     // Hot loops trace-compile through fusevm's Cranelift JIT; with the
     // `jit-disk-cache` feature, compiled native code is persisted across runs.
-    vm.enable_tracing_jit();
+    // Under the DAP debugger the JIT is disabled so every `DBG_LINE` statement
+    // marker fires through the interpreter (a JIT-compiled trace would elide the
+    // extension-op callback and the debugger could never pause).
+    if !debug_mode() {
+        vm.enable_tracing_jit();
+    }
     let outcome = vm.run();
     if let Some(e) = with_host(|h| h.take_error()) {
         return Err(e);

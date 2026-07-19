@@ -3,7 +3,7 @@
 //!   elisp FILE.el            evaluate a file (lowered to fusevm, run on fusevm)
 //!   elisp -e "EXPR"          evaluate an expression, print its value
 //!   elisp                    REPL
-//!   elisp --lsp / --dap      language server / debug adapter (stubs)
+//!   elisp --lsp / --dap      language server (stub) / line-level debug adapter
 //!   elisp --aot FILE -o OUT  lower to a fusevm chunk / native object
 //!   elisp --version
 
@@ -244,7 +244,7 @@ fn print_help() {
                 "  elisp                    \x1b[32m//\x1b[0m start a REPL\n",
                 "  elisp --repl             \x1b[32m//\x1b[0m start the reedline REPL (Tab-completion + stats banner)\n",
                 "  elisp --lsp              \x1b[32m//\x1b[0m language server over stdio (stub)\n",
-                "  elisp --dap              \x1b[32m//\x1b[0m debug adapter over stdio (stub)\n",
+                "  elisp --dap              \x1b[32m//\x1b[0m line-level debug adapter over stdio (breakpoints, stepping, variables)\n",
                 "  elisp --aot FILE -o OUT  \x1b[32m//\x1b[0m lower to a fusevm chunk / native object\n",
                 "  elisp --cache-stats      \x1b[32m//\x1b[0m show the rkyv bytecode cache stats\n",
                 "  elisp --cache-clear      \x1b[32m//\x1b[0m delete the rkyv bytecode cache\n",

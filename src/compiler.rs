@@ -32,12 +32,25 @@ pub fn compile_program(h: &mut ElispHost, forms: &[Value]) -> Result<Chunk, Stri
         b.emit(Op::LoadUndef, 0);
     }
     for (i, form) in forms.iter().enumerate() {
+        emit_line_marker(h, &mut b, form);
         compile_form(h, &mut b, form)?;
         if i + 1 < forms.len() {
             b.emit(Op::Pop, 0);
         }
     }
     Ok(b.build())
+}
+
+/// Emit a DAP statement marker for `form` when debug mode is on. The line rides
+/// in the chunk's line table for the marker op; the `DBG_LINE` handler
+/// (`host::ext_dispatch`) reads it back and calls `dap::check_line`. Stack-
+/// neutral, and emitted only under `--dap` (zero bytes in an ordinary run).
+fn emit_line_marker(h: &ElispHost, b: &mut ChunkBuilder, form: &Value) {
+    if crate::host::debug_mode() {
+        if let Some(line) = h.form_line(form) {
+            b.emit(Op::Extended(ops::DBG_LINE, 0), line);
+        }
+    }
 }
 
 fn compile_form(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result<(), String> {
@@ -419,6 +432,9 @@ fn compile_progn(h: &mut ElispHost, b: &mut ChunkBuilder, forms: &[Value]) -> Re
         return Ok(());
     }
     for (i, f) in forms.iter().enumerate() {
+        // Statement marker so breakpoints/stepping fire inside function bodies,
+        // `progn`, `let` bodies, etc. — not just at top-level forms.
+        emit_line_marker(h, b, f);
         compile_form(h, b, f)?;
         if i + 1 < forms.len() {
             b.emit(Op::Pop, 0);
