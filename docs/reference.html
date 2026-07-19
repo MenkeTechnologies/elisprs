@@ -142,7 +142,7 @@
           <span class="sep">/</span>
           <a href="https://github.com/MenkeTechnologies/elisprs" target="_blank" rel="noopener noreferrer">GitHub</a>
         </nav>
-        <p class="docs-build-line">elisprs v0.1.6 · 270 builtins &amp; special forms · 10 chapters · generated from <code>elisprs/lsp.rs</code></p>
+        <p class="docs-build-line">elisprs v0.1.7 · 270 builtins &amp; special forms · 10 chapters · generated from <code>elisprs/lsp.rs</code></p>
       </div>
       <div class="tutorial-toolbar">
         <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -984,9 +984,9 @@
       </article>
       <article class="doc-entry" id="doc-replace-regexp-in-string">
         <h3><a class="doc-anchor" href="#doc-replace-regexp-in-string">#</a> <code>replace-regexp-in-string</code></h3>
-        <pre><code class="lang-elisp">(replace-regexp-in-string REGEXP REP STRING &amp;optional FIXEDCASE LITERAL)
+        <pre><code class="lang-elisp">(replace-regexp-in-string REGEXP REP STRING &amp;optional FIXEDCASE LITERAL SUBEXP START)
 </code></pre>
-        <p>Replace every match of REGEXP in STRING with REP (\&amp; / \N templates unless LITERAL).</p>
+        <p>Replace every match of REGEXP in STRING with REP — a string (\&amp; / \N templates unless LITERAL) or a function of the matched text.</p>
       </article>
       <article class="doc-entry" id="doc-regexp-quote">
         <h3><a class="doc-anchor" href="#doc-regexp-quote">#</a> <code>regexp-quote</code></h3>
