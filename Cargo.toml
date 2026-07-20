@@ -40,7 +40,7 @@ crate-type = ["rlib", "staticlib"]
 # persistent on-disk cache of compiled native code (keyed by chunk hash), so
 # hot elisp loops trace-compile and warm runs skip recompilation. The cache
 # directory defaults to fusevm's own, or `FUSEVM_JIT_CACHE_DIR` if set.
-fusevm = { version = "0.14.10", features = ["jit-disk-cache", "aot"] }
+fusevm = { version = "0.14.11", features = ["jit-disk-cache", "aot"] }
 
 # `elisp --lsp` speaks LSP over stdio (src/lsp.rs); `elisp --dap` speaks the
 # Debug Adapter Protocol over stdio (src/dap.rs). libc gives the DAP server a

@@ -61,6 +61,21 @@ Ahead-of-time compile \fIFILE\fR to a native object \fIOUT\fR via
 \fBfusevm::aot::compile_object\fR. Requires the milestone-2 lowering; reports a
 not-implemented signal until then.
 .TP
+.BR \-\-dump\-tokens " " \fIFILE\fR
+Print the reader's lexical token stream for \fIFILE\fR (one \fBline  Tok\fR per
+line) and exit.
+.TP
+.BR \-\-dump\-ast " " \fIFILE\fR
+Print each top-level form of \fIFILE\fR as its read s-expression (the elisp
+AST), one form per line, and exit.
+.TP
+.BR \-\-dump\-bytecode " " \fIFILE\fR
+Print the compiled \fBfusevm\fR ops for \fIFILE\fR and exit.
+.TP
+.BR \-\-disasm " " \fIFILE\fR
+Print a \fBfusevm\fR bytecode disassembly of \fIFILE\fR (via the shared
+\fBfusevm::Chunk::disassemble\fR) and exit.
+.TP
 .BR \-V ", " \-\-version
 Print version and exit.
 .TP

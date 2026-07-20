@@ -10,6 +10,10 @@ _elisp() {
     '(- *)--dap[run the debug adapter over stdio]' \
     '--aot[ahead-of-time compile to a native object]' \
     '-o[output object path (with --aot)]:output file:_files' \
+    '--dump-tokens[print the reader lexical token stream]:Emacs Lisp file:_files -g "*.el"' \
+    '--dump-ast[print the read s-expression forms (AST)]:Emacs Lisp file:_files -g "*.el"' \
+    '--dump-bytecode[print the compiled fusevm ops]:Emacs Lisp file:_files -g "*.el"' \
+    '--disasm[print a fusevm bytecode disassembly]:Emacs Lisp file:_files -g "*.el"' \
     {-e,--eval}'[evaluate an expression and print its value]:expression' \
     '*:Emacs Lisp file:_files -g "*.el"'
 }

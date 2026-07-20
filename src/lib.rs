@@ -28,6 +28,25 @@ pub fn eval_str(src: &str) -> Result<Value, String> {
     eval_forms(src)
 }
 
+/// Read every top-level form of `src` into the reader's s-expression form — the
+/// elisp AST. Backs `elisp --dump-ast`; does not macro-expand, lower, or run.
+pub fn read_forms(src: &str) -> Result<Vec<Value>, String> {
+    host::with_host(|h| reader::read_all(h, src))
+}
+
+/// Read + lower `src` into a single fusevm chunk, exactly as an evaluated run
+/// would (prelude loaded, top-level `progn` spliced, macros expanded) but
+/// WITHOUT running it. Backs `elisp --dump-bytecode` / `--disasm`.
+pub fn compile_str(src: &str) -> Result<fusevm::Chunk, String> {
+    load_prelude();
+    let forms = host::with_host(|h| reader::read_all(h, src).map(|fs| splice_top_forms(h, fs)))?;
+    let mut expanded = Vec::with_capacity(forms.len());
+    for form in &forms {
+        expanded.push(host::macroexpand_all(form)?);
+    }
+    host::with_host(|h| compiler::compile_program(h, &expanded))
+}
+
 /// Splice literal top-level `(progn …)` forms into their subforms (recursively),
 /// so an earlier subform's `defmacro`/`defun` is in effect before a later subform
 /// is compiled — matching Emacs's top-level handling.

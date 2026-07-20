@@ -69,6 +69,18 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--repl") {
         return repl::run();
     }
+    if args.iter().any(|a| a == "--dump-tokens") {
+        return finish(dump_target(&args).and_then(|f| dump_tokens(&f)));
+    }
+    if args.iter().any(|a| a == "--dump-ast") {
+        return finish(dump_target(&args).and_then(|f| dump_ast(&f)));
+    }
+    if args.iter().any(|a| a == "--dump-bytecode") {
+        return finish(dump_target(&args).and_then(|f| dump_bytecode(&f)));
+    }
+    if args.iter().any(|a| a == "--disasm") {
+        return finish(dump_target(&args).and_then(|f| disasm(&f)));
+    }
     if let Some(pos) = args.iter().position(|a| a == "-e" || a == "--eval") {
         let Some(expr) = args.get(pos + 1) else {
             eprintln!("elisp: -e requires an expression");
@@ -103,6 +115,65 @@ fn main() -> ExitCode {
         repl::run()
     } else {
         repl_stdin()
+    }
+}
+
+/// The `.el` file an introspection flag (`--dump-*` / `--disasm`) targets: the
+/// first non-flag argument.
+fn dump_target(args: &[String]) -> Result<String, String> {
+    args.iter()
+        .find(|a| !a.starts_with('-'))
+        .cloned()
+        .ok_or_else(|| "expected a .el file".to_string())
+}
+
+/// `--dump-tokens`: print the reader's lexical token stream, one `line  Tok`
+/// per line.
+fn dump_tokens(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    for t in elisprs::reader::tokenize(&src)? {
+        println!("{}\t{:?}", t.line, t.tok);
+    }
+    Ok(())
+}
+
+/// `--dump-ast`: print each top-level form as its read s-expression (the elisp
+/// AST), one form per line.
+fn dump_ast(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    for form in elisprs::read_forms(&src)? {
+        println!("{}", elisprs::print(&form, true));
+    }
+    Ok(())
+}
+
+/// `--dump-bytecode`: print the compiled fusevm ops for the whole program.
+fn dump_bytecode(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let chunk = elisprs::compile_str(&src)?;
+    // Bytecode dump is explicit user-requested output.
+    println!("== main ==\n{:#?}", chunk.ops);
+    Ok(())
+}
+
+/// `--disasm`: print a fusevm bytecode disassembly of the program chunk (and its
+/// nested sub-chunks) via the shared `fusevm::Chunk::disassemble`.
+fn disasm(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let chunk = elisprs::compile_str(&src)?;
+    println!("; elisp fusevm — main\n{}", chunk.disassemble());
+    Ok(())
+}
+
+/// Map an introspection result onto a process exit code, reporting errors in the
+/// terse `elisp: <reason>` form.
+fn finish(r: Result<(), String>) -> ExitCode {
+    match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("elisp: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -246,6 +317,10 @@ fn print_help() {
                 "  elisp --lsp              \x1b[32m//\x1b[0m language server over stdio (stub)\n",
                 "  elisp --dap              \x1b[32m//\x1b[0m line-level debug adapter over stdio (breakpoints, stepping, variables)\n",
                 "  elisp --aot FILE -o OUT  \x1b[32m//\x1b[0m lower to a fusevm chunk / native object\n",
+                "  elisp --dump-tokens FILE \x1b[32m//\x1b[0m print the reader's lexical token stream\n",
+                "  elisp --dump-ast FILE    \x1b[32m//\x1b[0m print the read s-expression forms (AST)\n",
+                "  elisp --dump-bytecode FILE \x1b[32m//\x1b[0m print the compiled fusevm ops\n",
+                "  elisp --disasm FILE      \x1b[32m//\x1b[0m print a fusevm bytecode disassembly\n",
                 "  elisp --cache-stats      \x1b[32m//\x1b[0m show the rkyv bytecode cache stats\n",
                 "  elisp --cache-clear      \x1b[32m//\x1b[0m delete the rkyv bytecode cache\n",
                 "  elisp --version          \x1b[32m//\x1b[0m print version\n",

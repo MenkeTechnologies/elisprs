@@ -840,3 +840,232 @@ fn looks_numeric(tok: &str) -> bool {
     }
     seen_digit
 }
+
+/// A lexical token of elisp surface syntax, produced by [`tokenize`] to back
+/// `elisp --dump-tokens`. The `read`/`read_all` reader goes straight from
+/// characters to heap forms (no intermediate token list), so this is a separate
+/// lexical scan over the same grammar — it reuses the reader's delimiter,
+/// comment, string, and dotted-pair rules (`is_delim`, `token_is_number`,
+/// `dot_is_separator`) and exposes the token layer on its own.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Tok {
+    /// `(`
+    LParen,
+    /// `)`
+    RParen,
+    /// `[`
+    LBracket,
+    /// `]`
+    RBracket,
+    /// `'` (quote)
+    Quote,
+    /// `` ` `` (backquote)
+    Backquote,
+    /// `,` (unquote)
+    Unquote,
+    /// `,@` (unquote-splicing)
+    UnquoteSplice,
+    /// `#'` (function quote)
+    FunctionQuote,
+    /// A `#` reader-macro dispatch lexeme: `#s`, `#x10`, `#o17`, `#b101`, `#(`
+    /// leaves a bare `#`. Holds the raw `#…` text.
+    Hash(String),
+    /// A dotted-pair separator `.`.
+    Dot,
+    /// A `?c` / `?\C-a` character literal; holds the raw lexeme after the `?`.
+    Char(String),
+    /// A `"…"` string; holds the raw contents (escape sequences preserved).
+    Str(String),
+    /// An integer or float atom.
+    Number(String),
+    /// A symbol or keyword atom.
+    Symbol(String),
+}
+
+/// One [`Tok`] plus its 1-based source line.
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub tok: Tok,
+    pub line: u32,
+}
+
+/// Is the `.` at `chars[pos]` a dotted-pair separator (vs. the start of a
+/// symbol/number)? Free-function mirror of `Reader::dot_is_separator`.
+fn dot_is_sep(chars: &[char], pos: usize) -> bool {
+    match chars.get(pos + 1) {
+        None => true,
+        Some(c) => {
+            c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '(' | '[' | '#' | '?' | '`' | ',')
+        }
+    }
+}
+
+/// Scan `src` into its lexical token stream, for `elisp --dump-tokens`. Skips
+/// whitespace and `;` line comments; each token carries its 1-based source line.
+pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
+    let chars: Vec<char> = src.chars().collect();
+    let newlines = newline_positions(&chars);
+    let line_at = |p: usize| newlines.partition_point(|&x| x < p) as u32 + 1;
+    let mut pos = 0usize;
+    let mut out: Vec<Token> = Vec::new();
+
+    loop {
+        // Skip whitespace and `;` line comments (mirrors `Reader::skip_ws`).
+        loop {
+            match chars.get(pos) {
+                Some(c) if c.is_whitespace() => pos += 1,
+                Some(';') => {
+                    while let Some(&c) = chars.get(pos) {
+                        pos += 1;
+                        if c == '\n' {
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        let Some(&c) = chars.get(pos) else { break };
+        let line = line_at(pos);
+        let tok = match c {
+            '(' => {
+                pos += 1;
+                Tok::LParen
+            }
+            ')' => {
+                pos += 1;
+                Tok::RParen
+            }
+            '[' => {
+                pos += 1;
+                Tok::LBracket
+            }
+            ']' => {
+                pos += 1;
+                Tok::RBracket
+            }
+            '\'' => {
+                pos += 1;
+                Tok::Quote
+            }
+            '`' => {
+                pos += 1;
+                Tok::Backquote
+            }
+            ',' => {
+                pos += 1;
+                if chars.get(pos) == Some(&'@') {
+                    pos += 1;
+                    Tok::UnquoteSplice
+                } else {
+                    Tok::Unquote
+                }
+            }
+            '"' => {
+                pos += 1;
+                let mut s = String::new();
+                loop {
+                    match chars.get(pos) {
+                        None => return Err("unterminated string".to_string()),
+                        Some('"') => {
+                            pos += 1;
+                            break;
+                        }
+                        Some('\\') => {
+                            s.push('\\');
+                            pos += 1;
+                            match chars.get(pos) {
+                                Some(&e) => {
+                                    s.push(e);
+                                    pos += 1;
+                                }
+                                None => return Err("unterminated string".to_string()),
+                            }
+                        }
+                        Some(&ch) => {
+                            s.push(ch);
+                            pos += 1;
+                        }
+                    }
+                }
+                Tok::Str(s)
+            }
+            '?' => {
+                pos += 1;
+                let mut s = String::new();
+                match chars.get(pos) {
+                    None => return Err("unterminated char literal".to_string()),
+                    // `?\…` escape (incl. modifier prefixes `\C-`, `\M-`, `\x41`):
+                    // consume the escape body up to the next delimiter.
+                    Some('\\') => {
+                        s.push('\\');
+                        pos += 1;
+                        while let Some(&ch) = chars.get(pos) {
+                            if is_delim(ch) {
+                                break;
+                            }
+                            s.push(ch);
+                            pos += 1;
+                        }
+                    }
+                    Some(&ch) => {
+                        s.push(ch);
+                        pos += 1;
+                    }
+                }
+                Tok::Char(s)
+            }
+            '#' if chars.get(pos + 1) == Some(&'\'') => {
+                pos += 2;
+                Tok::FunctionQuote
+            }
+            '#' => {
+                let mut s = String::from("#");
+                pos += 1;
+                while let Some(&ch) = chars.get(pos) {
+                    if is_delim(ch) {
+                        break;
+                    }
+                    s.push(ch);
+                    pos += 1;
+                }
+                Tok::Hash(s)
+            }
+            '.' if dot_is_sep(&chars, pos) => {
+                pos += 1;
+                Tok::Dot
+            }
+            _ => {
+                // A symbol/number atom. A `\` escapes the next char into the name
+                // and forces a symbol classification (mirrors `Reader::read_atom`).
+                let mut s = String::new();
+                let mut escaped = false;
+                while let Some(&ch) = chars.get(pos) {
+                    if ch == '\\' {
+                        pos += 1;
+                        match chars.get(pos) {
+                            Some(&e) => {
+                                s.push(e);
+                                pos += 1;
+                                escaped = true;
+                            }
+                            None => return Err("trailing backslash in symbol".to_string()),
+                        }
+                    } else if is_delim(ch) {
+                        break;
+                    } else {
+                        s.push(ch);
+                        pos += 1;
+                    }
+                }
+                if !escaped && token_is_number(&s) {
+                    Tok::Number(s)
+                } else {
+                    Tok::Symbol(s)
+                }
+            }
+        };
+        out.push(Token { tok, line });
+    }
+    Ok(out)
+}
