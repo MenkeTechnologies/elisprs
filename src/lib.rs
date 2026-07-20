@@ -18,6 +18,7 @@ pub mod lsp;
 pub mod prelude;
 pub mod reader;
 pub mod regexp;
+pub mod rust_ffi;
 
 pub use fusevm::Value;
 pub use host::{reset_host, run_chunk, with_host};
@@ -75,7 +76,10 @@ fn splice_top_forms(h: &mut host::ElispHost, forms: Vec<Value>) -> Vec<Value> {
 /// machinery shared by `eval_forms`, `eval_file`'s cache-miss path, and the
 /// `load` builtin, so none of them re-implement a divergent evaluator.
 pub(crate) fn run_top_forms(src: &str) -> Result<(Vec<fusevm::Chunk>, Value), String> {
-    let forms = host::with_host(|h| reader::read_all(h, src).map(|fs| splice_top_forms(h, fs)))?;
+    // Rewrite any inline `rust { ... }` FFI block into a `(__rust-compile ...)`
+    // call before the reader runs (no-op when the source has no `rust` token).
+    let src = rust_ffi::desugar(src);
+    let forms = host::with_host(|h| reader::read_all(h, &src).map(|fs| splice_top_forms(h, fs)))?;
     let mut chunks = Vec::with_capacity(forms.len());
     let mut last = Value::Undef;
     for form in &forms {

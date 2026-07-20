@@ -3587,6 +3587,18 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             // original command from inside an `around` advice — re-entrant, so it
             // lives here (outside any host borrow), like the other intrinsics.
             "intercept-proceed" => return crate::intercepts::intrinsic_intercept_proceed(),
+            // Inline Rust FFI: the `rust { ... }` desugar (src/rust_ffi.rs) emits
+            // `(__rust-compile B64 LINE)`; compile the block to a cached cdylib
+            // and register its `pub extern "C"` exports (which become callable by
+            // bareword). Shells out to rustc, so it must run outside any host
+            // borrow — hence here with the other intrinsics. Returns nil.
+            "__rust-compile" => {
+                let b64 = match args.first() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    _ => String::new(),
+                };
+                return fusevm::ffi::compile_and_register(&b64).map(|_| Value::Undef);
+            }
             _ => {}
         }
     }
@@ -3612,7 +3624,25 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
     // applied. It goes into the `wrong-number-of-arguments` data, so keep it
     // before the match binds `f` to the resolved fn pointer.
     let callee = f.clone();
-    let resolved = with_host(|h| h.resolve_function(f))?;
+    let resolved = match with_host(|h| h.resolve_function(f)) {
+        Ok(r) => r,
+        Err(e) => {
+            // Inline Rust FFI fallback: a `rust { ... }` exported function is
+            // callable by bareword when no elisp function shadows it. A user
+            // `defun` still wins — it resolves above; only a `void-function` miss
+            // (no function cell) reaches here, and the cheap membership check
+            // keeps this off the hot path. elisp Values ARE fusevm Values, so the
+            // args (ints/floats/strings) marshal straight through `try_call`.
+            if let Some(name) = with_host(|h| h.sym_name(f)) {
+                if fusevm::ffi::is_registered(&name) {
+                    if let Some(r) = fusevm::ffi::try_call(&name, args) {
+                        return r;
+                    }
+                }
+            }
+            return Err(e);
+        }
+    };
     match resolved {
         Resolved::Subr { f, min, max, name } => {
             if args.len() < min || max.is_some_and(|m| args.len() > m) {
