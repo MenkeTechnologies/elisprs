@@ -22,7 +22,7 @@
  │ ENGINE: FUSEVM &nbsp; FRONTEND: PURE &nbsp; AOT: STANDALONE BIN &nbsp; CACHE: RKYV │
  └──────────────────────────────────────────────────────────────┘
 
-### [`Read the Docs`](https://menketechnologies.github.io/elisprs/) &middot; [`Engineering Report`](https://menketechnologies.github.io/elisprs/report.html) · [`strykelang`](https://github.com/MenkeTechnologies/strykelang) · [`zshrs`](https://github.com/MenkeTechnologies/zshrs) · [`fusevm`](https://github.com/MenkeTechnologies/fusevm)
+### [`Read the Docs`](https://menketechnologies.github.io/elisprs/) &middot; [`Engineering Report`](https://menketechnologies.github.io/elisprs/report.html) &middot; [`Builtin Reference`](https://menketechnologies.github.io/elisprs/reference.html) · [`strykelang`](https://github.com/MenkeTechnologies/strykelang) · [`zshrs`](https://github.com/MenkeTechnologies/zshrs) · [`fusevm`](https://github.com/MenkeTechnologies/fusevm)
 
 ---
 
@@ -274,6 +274,7 @@ The seed makes a divergence reproduce exactly on any machine, and a crash or han
 | Doc | Source | Live URL |
 |---|---|---|
 | User reference (architecture, coverage, status, taste) | [`docs/index.html`](docs/index.html) | <https://menketechnologies.github.io/elisprs/> |
+| Builtin reference (every function, variable, and special form — generated from `src/lsp.rs`) | [`docs/reference.html`](docs/reference.html) | <https://menketechnologies.github.io/elisprs/reference.html> |
 | Engineering report (reuse/own split, fusevm frontend design, dependency posture) | [`docs/report.html`](docs/report.html) | <https://menketechnologies.github.io/elisprs/report.html> |
 
 The HUD-themed HTML docs share `hud-static.css`, `hud-theme.js`, and `tutorial.css` — open them locally via `file://` or browse the GitHub Pages URL above.
