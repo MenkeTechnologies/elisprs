@@ -104,18 +104,22 @@ fn load_prelude() {
         return;
     }
     host::set_prelude_loaded(true);
-    let Ok(forms) = host::with_host(|h| reader::read_all(h, prelude::PRELUDE)) else {
-        return;
-    };
-    for form in &forms {
-        let r = (|| -> Result<(), String> {
-            let expanded = host::macroexpand_all(form)?;
-            let chunk = host::with_host(|h| compiler::compile_top(h, &expanded))?;
-            host::run_chunk(chunk)?;
-            Ok(())
-        })();
-        if let Err(e) = r {
-            eprintln!("elisprs: prelude form failed: {e}");
+    // The nadvice segment is loaded after the core PRELUDE because it depends on
+    // oclosure/gv/cl-lib defined there (and is kept separate — see prelude::NADVICE).
+    for src in [prelude::PRELUDE, prelude::NADVICE] {
+        let Ok(forms) = host::with_host(|h| reader::read_all(h, src)) else {
+            continue;
+        };
+        for form in &forms {
+            let r = (|| -> Result<(), String> {
+                let expanded = host::macroexpand_all(form)?;
+                let chunk = host::with_host(|h| compiler::compile_top(h, &expanded))?;
+                host::run_chunk(chunk)?;
+                Ok(())
+            })();
+            if let Err(e) = r {
+                eprintln!("elisprs: prelude form failed: {e}");
+            }
         }
     }
 }

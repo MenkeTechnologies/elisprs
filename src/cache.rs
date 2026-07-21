@@ -49,7 +49,9 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// v3 adds `SerObj::Symbol::interned`; v4 rolls every runtime-mutated symbol cell
 /// (function, buffer-local-auto, alias) back to its pre-run state, not just the value.
 /// symbol in the heap image and an uninterned prelude local could shadow a builtin.
-pub const SHARD_FORMAT_VERSION: u32 = 4;
+/// v5 adds `SerObj::Record`/`SerObj::BoolVector` — mid-enum variants that shift the
+/// bincode discriminants of every later `SerObj`, so a v4 heap image misdeserializes.
+pub const SHARD_FORMAT_VERSION: u32 = 5;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next
@@ -60,6 +62,9 @@ pub fn schema_key(builtin_fingerprint: u64) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     builtin_fingerprint.hash(&mut hasher);
     crate::prelude::PRELUDE.hash(&mut hasher);
+    // NADVICE is a second prelude segment (loaded after PRELUDE); it defines heap
+    // symbols too, so a change to it must invalidate the heap image just like PRELUDE.
+    crate::prelude::NADVICE.hash(&mut hasher);
     format!("{}-{:016x}", env!("CARGO_PKG_VERSION"), hasher.finish())
 }
 

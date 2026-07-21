@@ -165,6 +165,8 @@ impl Reader {
                 self.pos += 2;
                 self.read_record(h)
             }
+            // #&N"…" — a bool-vector literal.
+            '#' if self.peek_at(1) == Some('&') => self.read_bool_vector(h),
             // #("string" …intervals) — read the string, dropping text properties.
             '#' if self.peek_at(1) == Some('(') => {
                 self.pos += 1;
@@ -511,7 +513,7 @@ impl Reader {
     }
 
     /// Read a `#s(…)` literal: a hash-table (`#s(hash-table test … data (k v …))`)
-    /// or a record (`#s(NAME slot…)`, stored as a `cl-struct-NAME`-tagged vector).
+    /// or a record (`#s(NAME slot…)`, an `Obj::Record` with NAME in slot 0).
     /// `self.pos` is at the `(`.
     fn read_record(&mut self, h: &mut ElispHost) -> Result<Value, String> {
         let lst = self.read_list(h)?;
@@ -545,14 +547,46 @@ impl Reader {
             }
             Ok(h.alloc(Obj::HashTable { test, entries }))
         } else {
-            let name = h
-                .sym_name(&items[0])
+            // A record literal `#s(NAME slot…)`: slot 0 is the type symbol NAME,
+            // exactly as written (`(aref rec 0)` returns it).
+            h.sym_name(&items[0])
                 .ok_or("#s record type must be a symbol")?;
-            let tag = h.intern(&format!("cl-struct-{name}"));
-            let mut v = vec![tag];
-            v.extend_from_slice(&items[1..]);
-            Ok(h.alloc(Obj::Vector(v)))
+            Ok(h.alloc(Obj::Record(items)))
         }
+    }
+
+    /// Read a `#&N"PACKED"` bool-vector literal: N is the bit count, PACKED a
+    /// unibyte string of `ceil(N/8)` bytes holding the bits LSB-first. `self.pos`
+    /// is at the leading `#`.
+    fn read_bool_vector(&mut self, h: &mut ElispHost) -> Result<Value, String> {
+        self.pos += 2; // consume `#&`
+        let mut num = String::new();
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() {
+                num.push(c);
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let len: usize = num
+            .parse()
+            .map_err(|_| "malformed #& bool-vector length".to_string())?;
+        if self.peek() != Some('"') {
+            return Err("expected packed string in #& bool-vector".to_string());
+        }
+        // The packed byte string reads with normal string-escape rules (`\OOO`
+        // octal for bytes >= 128); each resulting code point is one packed byte.
+        let packed: Vec<u32> = match self.read_string()? {
+            Value::Str(s) => s.chars().map(|c| c as u32).collect(),
+            _ => unreachable!("read_string returns a string"),
+        };
+        let mut bits = Vec::with_capacity(len);
+        for i in 0..len {
+            let byte = packed.get(i / 8).copied().unwrap_or(0);
+            bits.push((byte >> (i % 8)) & 1 == 1);
+        }
+        Ok(h.alloc(Obj::BoolVector(bits)))
     }
 
     fn read_atom(&mut self, h: &mut ElispHost) -> Result<Value, String> {

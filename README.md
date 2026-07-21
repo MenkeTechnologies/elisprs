@@ -105,6 +105,9 @@ elisp --version
 | c*r combinators | `caar cadr cdar cddr caadr cadar cdaar cdadr cddar` (+ `cl-caar cl-cadr cl-cdar cl-cddr`) |
 | Mutation | `setcar setcdr aset` |
 | Vectors | `vector make-vector aref vectorp` |
+| Records | `record make-record recordp` (a distinct type — slot 0 is the type symbol, `vectorp` is nil; backs `cl-defstruct`) |
+| Bool-vectors | `make-bool-vector bool-vector bool-vector-p bool-vector-count-population bool-vector-subsetp bool-vector-not` (`#&N"…"` syntax) |
+| Advice (nadvice) | `advice-add advice-remove add-function remove-function define-advice advice-member-p` (all `:around`/`:before`/`:after`/`:override`/`:filter-*`/`:*-while`/`:*-until` combinators) |
 | Hash tables | `make-hash-table gethash puthash remhash clrhash maphash hash-table-count hash-table-keys hash-table-values hash-table-p` |
 | Predicates | `eq eql equal null not numberp integerp floatp stringp symbolp consp listp atom functionp` |
 | Symbols/cells | `set symbol-value symbol-function fset boundp fboundp symbol-name intern make-symbol` |

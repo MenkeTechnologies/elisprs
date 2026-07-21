@@ -58,6 +58,8 @@ pub enum SerObj {
         interned: bool,
     },
     Vector(Vec<Value>),
+    Record(Vec<Value>),
+    BoolVector(Vec<bool>),
     HashTable {
         test: u8,
         entries: Vec<(Value, Value)>,
@@ -202,6 +204,21 @@ pub enum Obj {
     Cons(Value, Value),
     Symbol(SymbolData),
     Vector(Vec<Value>),
+    /// An Emacs record (`record`/`make-record`, `#s(NAME …)`). Slot 0 holds the
+    /// type symbol (the bare NAME, exactly as passed — `(aref rec 0)` returns it),
+    /// slots 1.. hold the fields. A record is a *distinct* type from a vector:
+    /// `recordp` is true and `vectorp` is nil, and — unlike a vector — a record is
+    /// NOT a sequence (`vconcat`/`append`/`mapcar` signal `sequencep`), only
+    /// `aref`/`aset`/`length`/`copy-sequence` apply. This is the storage for every
+    /// `cl-defstruct` instance (and the cl-generic/EIEIO class descriptors built on
+    /// them), whose slot 0 is the struct type symbol.
+    Record(Vec<Value>),
+    /// An Emacs bool-vector (`make-bool-vector`/`bool-vector`, `#&N"…"`). Each
+    /// element is `t` or `nil`; stored one `bool` per element (the LSB-first byte
+    /// packing is materialized only for the `#&N"…"` printed/read form). A
+    /// bool-vector is an array and a sequence (so `aref`/`aset`/`length`/`elt`/
+    /// `append`/`mapcar` apply) but NOT a vector (`vectorp` is nil).
+    BoolVector(Vec<bool>),
     Subr {
         name: String,
         min: usize,
@@ -923,6 +940,12 @@ impl ElispHost {
             Value::Str(s) => Some(s.chars().map(|c| Value::Int(c as i64)).collect()),
             Value::Obj(id) => match self.arena.get(*id as usize) {
                 Some(Obj::Vector(items)) => Some(items.clone()),
+                // A bool-vector's elements are `t`/`nil`.
+                Some(Obj::BoolVector(bits)) => Some(
+                    bits.iter()
+                        .map(|&b| if b { Value::Bool(true) } else { Value::Undef })
+                        .collect(),
+                ),
                 _ => self.list_vec(v),
             },
             _ => self.list_vec(v),
@@ -1559,6 +1582,8 @@ impl ElispHost {
                     interned: self.symbol_is_interned(s, (self.builtin_count + off) as u32),
                 },
                 Obj::Vector(v) => SerObj::Vector(v.clone()),
+                Obj::Record(v) => SerObj::Record(v.clone()),
+                Obj::BoolVector(v) => SerObj::BoolVector(v.clone()),
                 Obj::Bignum(b) => SerObj::Bignum(b.clone()),
                 Obj::HashTable { test, entries } => SerObj::HashTable {
                     test: *test,
@@ -1714,6 +1739,8 @@ impl ElispHost {
             },
             Obj::Cons(a, b) => SerObj::Cons(a.clone(), b.clone()),
             Obj::Vector(v) => SerObj::Vector(v.clone()),
+            Obj::Record(v) => SerObj::Record(v.clone()),
+            Obj::BoolVector(v) => SerObj::BoolVector(v.clone()),
             Obj::HashTable { test, entries } => SerObj::HashTable {
                 test: *test,
                 entries: entries.clone(),
@@ -1857,6 +1884,8 @@ impl ElispHost {
                     })
                 }
                 SerObj::Vector(v) => Obj::Vector(v),
+                SerObj::Record(v) => Obj::Record(v),
+                SerObj::BoolVector(v) => Obj::BoolVector(v),
                 SerObj::HashTable { test, entries } => Obj::HashTable { test, entries },
                 SerObj::CharTable {
                     subtype,
@@ -2002,13 +2031,6 @@ impl ElispHost {
         Err("function indirection too deep".to_string())
     }
 
-    /// If `items` is a cl-defstruct instance (slot 0 is a symbol `cl-struct-NAME`),
-    /// return the struct NAME; otherwise `None`.
-    pub fn struct_tag_name(&self, items: &[Value]) -> Option<String> {
-        let tag = self.sym_name(items.first()?)?;
-        tag.strip_prefix("cl-struct-").map(|s| s.to_string())
-    }
-
     // ── printing ──
     pub fn print(&self, v: &Value, readable: bool) -> String {
         self.print_overflow.set(false);
@@ -2142,22 +2164,52 @@ impl ElispHost {
                 }
                 Some(Obj::Cons(..)) => self.print_list(v, readable, depth),
                 Some(Obj::Vector(items)) => {
-                    // print-level: a vector/record one level too deep prints `...`.
+                    // print-level: a vector one level too deep prints `...`.
                     if self
                         .print_limit("print-level")
                         .is_some_and(|lvl| depth + 1 > lvl)
                     {
                         return "...".to_string();
                     }
-                    // A cl-defstruct instance is a vector tagged `cl-struct-NAME`
-                    // in slot 0; print it as Emacs's record syntax `#s(NAME …)`.
-                    if let Some(name) = self.struct_tag_name(items) {
-                        let parts = self.print_seq(&items[1..], readable, depth + 1);
-                        format!("#s({name} {})", parts.join(" "))
-                    } else {
-                        let parts = self.print_seq(items, readable, depth + 1);
-                        format!("[{}]", parts.join(" "))
+                    let parts = self.print_seq(items, readable, depth + 1);
+                    format!("[{}]", parts.join(" "))
+                }
+                Some(Obj::Record(items)) => {
+                    // print-level: a record one level too deep prints `...`.
+                    if self
+                        .print_limit("print-level")
+                        .is_some_and(|lvl| depth + 1 > lvl)
+                    {
+                        return "...".to_string();
                     }
+                    // Emacs record syntax `#s(SLOT0 SLOT1 …)` — slot 0 is the type
+                    // symbol, printed like any other slot (so a cl-defstruct
+                    // instance reads back as `#s(NAME …)`).
+                    let parts = self.print_seq(items, readable, depth + 1);
+                    format!("#s({})", parts.join(" "))
+                }
+                Some(Obj::BoolVector(bits)) => {
+                    // Emacs prints a bool-vector as `#&LEN"PACKED"`, where PACKED is
+                    // the bits LSB-first in `ceil(LEN/8)` bytes. The byte string
+                    // uses print.c's rules: `"`/`\` are backslash-escaped, bytes
+                    // >= 128 are `\OOO` octal, all others (incl. controls) are raw.
+                    let nbytes = (bits.len() + 7) / 8;
+                    let mut packed = vec![0u8; nbytes];
+                    for (i, &b) in bits.iter().enumerate() {
+                        if b {
+                            packed[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    let mut inner = String::new();
+                    for &byte in &packed {
+                        match byte {
+                            b'"' => inner.push_str("\\\""),
+                            b'\\' => inner.push_str("\\\\"),
+                            0..=127 => inner.push(byte as char),
+                            _ => inner.push_str(&format!("\\{byte:o}")),
+                        }
+                    }
+                    format!("#&{}\"{}\"", bits.len(), inner)
                 }
                 Some(Obj::CharTable(t)) => {
                     // Emacs prints char-tables as `#^[DEFAULT PARENT SUBTYPE …]`
@@ -3140,6 +3192,7 @@ impl ElispHost {
                 | "void-variable"
                 | "void-function"
                 | "wrong-number-of-arguments"
+                | "wrong-length-argument"
                 | "invalid-function"
         ) {
             if let Some(data) = self.read_all_forms(&msg) {

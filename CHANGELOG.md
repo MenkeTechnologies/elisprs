@@ -6,6 +6,30 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Real `record` type (`Obj::Record`).** Records (and every `cl-defstruct`
+  instance) were `cl-struct-NAME`-tagged vectors, so `(aref (record 'foo 1 2) 0)`
+  leaked `cl-struct-foo` instead of `foo`, and `(vectorp REC)` was wrongly `t`.
+  There is now a distinct `Obj::Record` heap kind whose slot 0 holds the bare type
+  symbol: `record` / `make-record` are primitives; `aref` / `aset` / `length` /
+  `equal` / `copy-sequence` / `type-of` / `recordp` / the printer (`#s(…)`) and the
+  `#s(NAME …)` reader all handle it; `vectorp` is `nil` and a record is not a
+  sequence (`vconcat` / `append` / `mapcar` signal `sequencep`). `cl-defstruct`
+  builds records tagged by bare NAME, with the predicate walking a bare-name parent
+  chain. Matches Emacs 30.2 byte-for-byte.
+- **`bool-vector`.** Added `Obj::BoolVector`, `make-bool-vector` / `bool-vector`,
+  the `#&N"…"` reader + printer (LSB-first byte packing with print.c escaping),
+  `aref` / `aset` (`t`/`nil`; any non-nil stored as `t`) / `length` / `elt`,
+  `bool-vector-p`, `arrayp` / `sequencep` membership (a bool-vector is an array and
+  a sequence but not a vector), and `bool-vector-count-population` / `-subsetp` /
+  `-not`. Matches Emacs 30.2 including the `wrong-length-argument` data shapes.
+- **`nadvice` (source-symbol advice).** Faithful port of `emacs-lisp/nadvice.el`
+  (Emacs 30.2): `advice-add` / `advice-remove` / `add-function` / `remove-function`
+  / `define-advice` / `advice-member-p`, with all ten combinators (`:around`
+  `:before` `:after` `:override` `:filter-args` `:filter-return` `:before-while`
+  `:before-until` `:after-while` `:after-until`) and `depth` ordering. Advices are
+  `advice` oclosures threaded into the symbol-function cell. Distinct from the
+  glob-AOP intercept layer (`src/intercepts.rs`). Legacy `defadvice` (the separate
+  `advice.el` `ad-*` subsystem) remains unimplemented.
 - **Bignums.** Emacs has no fixed-width integers: an integer that leaves fixnum
   range (±2^61, `most-positive-fixnum`) becomes a bignum and stays exact. elisprs
   now has `Obj::Bignum` (num-bigint), and integers promote through the whole

@@ -333,8 +333,9 @@ recursion), `let-alist`, `and-let*`, `cl-dolist`/`cl-dotimes`, `fset`/`fboundp`.
 Added `cl-block`/`cl-return-from`/`cl-return`, `cl-pushnew`, `cl-find-if-not`;
 `cl-subseq`/`seq-subseq` are sequence-generic (optional/negative END). `cl-defstruct`
 (constructor/accessors/predicate/copier, setf-able slots; instances print as
-`#s(NAME …)`, `type-of`/`recordp`/`cl-struct-p` recognize them — but `vectorp` is
-still t since they're vectors underneath). `cl-member`/`cl-assoc`/`cl-find`/
+`#s(NAME …)`, `type-of`/`recordp`/`cl-struct-p` recognize them — at the time of this
+round `vectorp` was still t since they were vectors underneath; superseded by R5-U,
+which gave records a real `Obj::Record` type so `vectorp` is now nil). `cl-member`/`cl-assoc`/`cl-find`/
 `cl-position`/`cl-count`/`cl-remove`/`cl-delete`/`cl-substitute` take `:test`/`:key`/
 `:count` keyword args. Fixed `condition-case` to bind the real `(SYMBOL . DATA)`
 error object (data list preserved, not stringified); added `ignore-error`,
@@ -990,3 +991,29 @@ Areas probed in round 4 that PASSED: `while-let`, `dlet` (was R3-missing — now
   (all, least specific first). `cl-call-next-method`/`cl-next-method-p` walk the chain via the
   dynamic `cl--cnm-next`/`cl--cnm-args`; exhaustion signals `cl-no-next-method`. Added the three
   `cl-` functions. Verified vs Emacs (before/after order, around wrapping, primary chaining `1 2 3`).
+
+### R5-U. Real `record` type + `bool-vector` + `nadvice` — ✅ FIXED
+- **Record slot-0 leak.** Records/cl-defstruct instances were `cl-struct-NAME`-tagged vectors, so
+  `(aref (record 'foo 1 2) 0)` returned `cl-struct-foo` instead of `foo`, and `(vectorp REC)`
+  was wrongly `t`. Added a real `Obj::Record` variant (slot 0 = the bare type symbol): `aref`/
+  `aset`/`length`/`equal`/`copy-sequence`/`type-of`/`recordp`/print (`#s(…)`) and the `#s(NAME …)`
+  reader all handle it; `record`/`make-record` are now primitives; `vectorp` is `nil` and a record
+  is not a sequence (`vconcat`/`append`/`mapcar` signal `sequencep`). cl-defstruct builds records
+  (bare-NAME tag; predicate walks the bare-name parent chain). This resolves the R5-I "STILL TODO"
+  above. Verified vs Emacs 30.2 (14 cases, byte-for-byte).
+- **`bool-vector`.** Was type-name-only. Added `Obj::BoolVector`, `make-bool-vector`/`bool-vector`,
+  the `#&N"…"` reader+printer (LSB-first byte packing, print.c escaping), `aref`/`aset` (t/nil,
+  non-nil stored as t)/`length`/`elt`, `bool-vector-p`, `arrayp`/`sequencep` (bool-vector is an
+  array AND a sequence, not a vector), and `bool-vector-count-population`/`-subsetp`/`-not`.
+  Resolves the R5-P "architectural/deferred" note. Verified vs Emacs 30.2 (32 cases, incl. the
+  `(wrong-length-argument …)` shapes).
+- **`nadvice`.** `advice-add`/`advice-remove`/`add-function`/`remove-function`/`define-advice`/
+  `advice-member-p` were all void. Faithful port of `emacs-lisp/nadvice.el` (Emacs 30.2) into the
+  prelude (`prelude::NADVICE`, loaded after the oclosure/gv substrate it needs) — advices are
+  `advice` oclosures threaded into the symbol-function cell honoring `depth`. All ten combinators
+  (`:around`/`:before`/`:after`/`:override`/`:filter-args`/`:filter-return`/`:before-while`/
+  `:before-until`/`:after-while`/`:after-until`) work. Distinct from the glob-AOP intercept layer
+  (`src/intercepts.rs`). Emacs-help cosmetics (docstring/interactive-form/print/called-interactively
+  machinery, buffer-local advice places) are omitted (NAMED in the port header). Verified vs Emacs
+  30.2. Still absent: legacy `defadvice` (a separate ~3.3k-line `advice.el` `ad-*` subsystem, not
+  nadvice — deferred rather than shimmed).

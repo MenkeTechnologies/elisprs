@@ -450,9 +450,11 @@ fn el_equal(h: &ElispHost, a: &Value, b: &Value) -> bool {
             (Some(Obj::Cons(a1, a2)), Some(Obj::Cons(b1, b2))) => {
                 el_equal(h, a1, b1) && el_equal(h, a2, b2)
             }
-            (Some(Obj::Vector(va)), Some(Obj::Vector(vb))) => {
+            (Some(Obj::Vector(va)), Some(Obj::Vector(vb)))
+            | (Some(Obj::Record(va)), Some(Obj::Record(vb))) => {
                 va.len() == vb.len() && va.iter().zip(vb).all(|(x, y)| el_equal(h, x, y))
             }
+            (Some(Obj::BoolVector(ba)), Some(Obj::BoolVector(bb))) => ba == bb,
             // Two markers are `equal` when they share a buffer and position.
             (Some(Obj::Marker(_)), Some(Obj::Marker(_))) => h.markers_equal(a, b),
             _ => false,
@@ -648,7 +650,10 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
             h.print(&a[0], true)
         )),
         Value::Obj(_) => match h.obj(&a[0]) {
-            Some(Obj::Vector(items)) => Ok(Value::Int(items.len() as i64)),
+            Some(Obj::Vector(items)) | Some(Obj::Record(items)) => {
+                Ok(Value::Int(items.len() as i64))
+            }
+            Some(Obj::BoolVector(bits)) => Ok(Value::Int(bits.len() as i64)),
             Some(Obj::Cons(..)) => {
                 // Walk the cons spine, Floyd-detecting cycles. A non-nil, non-cons
                 // tail is an improper list -> `wrong-type-argument listp TAIL`
@@ -860,6 +865,112 @@ fn make_vector(h: &mut ElispHost, a: &[Value]) -> R {
     v.resize(n, a[1].clone());
     Ok(h.alloc(Obj::Vector(v)))
 }
+
+// ── records ──
+/// `(record TYPE &rest SLOTS)` — a new record whose slot 0 is TYPE and whose
+/// remaining slots are SLOTS (Emacs `Frecord`).
+fn record_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(h.alloc(Obj::Record(a.to_vec())))
+}
+/// `(make-record TYPE SLOTS INIT)` — a record with SLOTS non-type slots, each
+/// INIT, and slot 0 = TYPE (Emacs `Fmake_record`). SLOTS must be a wholenum, and
+/// the record is capped at `PSEUDOVECTOR_SIZE_MASK` (4095) total slots.
+fn make_record(h: &mut ElispHost, a: &[Value]) -> R {
+    let slots = match &a[1] {
+        Value::Int(n) if *n >= 0 => *n as usize,
+        _ => {
+            return Err(format!(
+                "wrong-type-argument: wholenump {}",
+                h.print(&a[1], true)
+            ))
+        }
+    };
+    let total = slots + 1;
+    if total > 4095 {
+        return Err(format!(
+            "Attempt to allocate a record of {total} slots; max is 4095"
+        ));
+    }
+    let mut v: Vec<Value> = Vec::new();
+    v.try_reserve_exact(total)
+        .map_err(|_| MEMORY_EXHAUSTED.to_string())?;
+    v.resize(total, a[2].clone());
+    v[0] = a[0].clone();
+    Ok(h.alloc(Obj::Record(v)))
+}
+
+// ── bool-vectors ──
+/// Clone a bool-vector's bits, or signal `(wrong-type-argument bool-vector-p X)`.
+fn as_bool_vector(h: &ElispHost, v: &Value) -> Result<Vec<bool>, String> {
+    match h.obj(v) {
+        Some(Obj::BoolVector(bits)) => Ok(bits.clone()),
+        _ => Err(format!(
+            "wrong-type-argument: bool-vector-p {}",
+            h.print(v, true)
+        )),
+    }
+}
+/// `(make-bool-vector LENGTH INIT)` — a bool-vector of LENGTH elements, each `t`
+/// if INIT is non-nil, else `nil` (Emacs `Fmake_bool_vector`).
+fn make_bool_vector(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = check_array_len_val(h, &a[0])?;
+    let bit = !is_nil(&a[1]);
+    let mut v: Vec<bool> = Vec::new();
+    v.try_reserve_exact(n)
+        .map_err(|_| MEMORY_EXHAUSTED.to_string())?;
+    v.resize(n, bit);
+    Ok(h.alloc(Obj::BoolVector(v)))
+}
+/// `(bool-vector &rest OBJECTS)` — a bool-vector whose element I is `t` when
+/// OBJECT I is non-nil (Emacs `Fbool_vector`).
+fn bool_vector_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let bits: Vec<bool> = a.iter().map(|x| !is_nil(x)).collect();
+    Ok(h.alloc(Obj::BoolVector(bits)))
+}
+fn bool_vector_p(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::BoolVector(_)))))
+}
+/// `(bool-vector-count-population A)` — the number of `t` elements of A.
+fn bool_vector_count_population(h: &mut ElispHost, a: &[Value]) -> R {
+    let bits = as_bool_vector(h, &a[0])?;
+    Ok(Value::Int(bits.iter().filter(|&&b| b).count() as i64))
+}
+/// `(bool-vector-subsetp A B)` — non-nil when every `t` bit of A is `t` in B. A
+/// and B must have equal length, else `wrong-length-argument`.
+fn bool_vector_subsetp(h: &mut ElispHost, a: &[Value]) -> R {
+    let ba = as_bool_vector(h, &a[0])?;
+    let bb = as_bool_vector(h, &a[1])?;
+    if ba.len() != bb.len() {
+        // Emacs's `Fbool_vector_subsetp` reports (len-A len-B len-B).
+        return Err(format!(
+            "wrong-length-argument: {} {} {}",
+            ba.len(),
+            bb.len(),
+            bb.len()
+        ));
+    }
+    Ok(nil_or(ba.iter().zip(&bb).all(|(&x, &y)| !x || y)))
+}
+/// `(bool-vector-not A &optional B)` — store the complement of A into B (or a new
+/// bool-vector) and return it. B, if given, must have A's length.
+fn bool_vector_not(h: &mut ElispHost, a: &[Value]) -> R {
+    let ba = as_bool_vector(h, &a[0])?;
+    let out: Vec<bool> = ba.iter().map(|&x| !x).collect();
+    if a.len() > 1 && !is_nil(&a[1]) {
+        let bb = as_bool_vector(h, &a[1])?;
+        if bb.len() != ba.len() {
+            return Err(format!("wrong-length-argument: {} {}", ba.len(), bb.len()));
+        }
+        if let Value::Obj(id) = &a[1] {
+            if let Some(Obj::BoolVector(bits)) = h.arena.get_mut(*id as usize) {
+                bits.clear();
+                bits.extend_from_slice(&out);
+            }
+        }
+        return Ok(a[1].clone());
+    }
+    Ok(h.alloc(Obj::BoolVector(out)))
+}
 fn aref(h: &mut ElispHost, a: &[Value]) -> R {
     // A char-table indexes by character (0..=MAX_CHAR) with parent/default
     // fallback, unlike a plain vector's positional index.
@@ -878,8 +989,11 @@ fn aref(h: &mut ElispHost, a: &[Value]) -> R {
     let oor = |h: &ElispHost| format!("args-out-of-range: {} {idx}", h.print(&a[0], true));
     let get = |len: usize| -> Option<usize> { usize::try_from(idx).ok().filter(|i| *i < len) };
     match h.obj(&a[0]) {
-        Some(Obj::Vector(items)) => get(items.len())
+        Some(Obj::Vector(items)) | Some(Obj::Record(items)) => get(items.len())
             .map(|i| items[i].clone())
+            .ok_or_else(|| oor(h)),
+        Some(Obj::BoolVector(bits)) => get(bits.len())
+            .map(|i| nil_or(bits[i]))
             .ok_or_else(|| oor(h)),
         _ => match &a[0] {
             Value::Str(s) => get(s.chars().count())
@@ -909,13 +1023,26 @@ fn aset(h: &mut ElispHost, a: &[Value]) -> R {
         return Err(format!("args-out-of-range: {} {idx}", h.print(&a[0], true)));
     }
     let i = idx as usize;
+    // A bool-vector stores `t`/`nil`: any non-nil VALUE is stored as `t`.
+    let bit = !is_nil(&a[2]);
     if let Value::Obj(id) = &a[0] {
-        if let Some(Obj::Vector(items)) = h.arena.get_mut(*id as usize) {
-            if i < items.len() {
-                items[i] = a[2].clone();
-                return Ok(a[2].clone());
+        match h.arena.get_mut(*id as usize) {
+            // A record is aset-able exactly like a vector (including slot 0).
+            Some(Obj::Vector(items)) | Some(Obj::Record(items)) => {
+                if i < items.len() {
+                    items[i] = a[2].clone();
+                    return Ok(a[2].clone());
+                }
+                return Err(format!("args-out-of-range: {} {idx}", h.print(&a[0], true)));
             }
-            return Err(format!("args-out-of-range: {} {idx}", h.print(&a[0], true)));
+            Some(Obj::BoolVector(bits)) => {
+                if i < bits.len() {
+                    bits[i] = bit;
+                    return Ok(a[2].clone());
+                }
+                return Err(format!("args-out-of-range: {} {idx}", h.print(&a[0], true)));
+            }
+            _ => {}
         }
     }
     Err("wrong-type-argument: arrayp".to_string())
@@ -3195,11 +3322,14 @@ fn sxhash_eql_fn(h: &mut ElispHost, a: &[Value]) -> R {
 
 /// `(type-of OBJECT)` — the symbol naming OBJECT's primitive type.
 fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
-    // A cl-defstruct instance reports its struct name (like an Emacs record).
-    if let Some(Obj::Vector(items)) = h.obj(&a[0]) {
-        if let Some(name) = h.struct_tag_name(&items.clone()) {
-            return Ok(h.intern(&name));
-        }
+    // A record (including every cl-defstruct instance) reports its slot 0 verbatim
+    // — the type symbol for a normal record — matching Emacs's `Ftype_of`.
+    if let Some(Obj::Record(items)) = h.obj(&a[0]) {
+        let slot0 = items.first().cloned();
+        return match slot0 {
+            Some(t) => Ok(t),
+            None => Ok(h.intern("record")),
+        };
     }
     let name = match &a[0] {
         Value::Int(_) => "integer",
@@ -3213,6 +3343,10 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
             Some(Obj::Bignum(_)) => "integer",
             Some(Obj::Symbol(_)) => "symbol",
             Some(Obj::Vector(_)) => "vector",
+            // Unreachable: a record is handled by the early return above; this arm
+            // only keeps the match exhaustive over `Obj`.
+            Some(Obj::Record(_)) => "record",
+            Some(Obj::BoolVector(_)) => "bool-vector",
             Some(Obj::Subr { .. }) => "subr",
             Some(Obj::Closure { .. }) => "function",
             Some(Obj::HashTable { .. }) => "hash-table",
@@ -3226,11 +3360,11 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
     };
     Ok(h.intern(name))
 }
-/// `(recordp OBJECT)` / `(cl-struct-p OBJECT)` — non-nil for a cl-defstruct
-/// instance (a `cl-struct-NAME`-tagged vector, in this model).
+/// `(recordp OBJECT)` — non-nil for any record (a `record`/`make-record` result,
+/// a `#s(…)` literal, or a cl-defstruct instance). Distinct from `cl-struct-p`,
+/// which the prelude overrides to accept only cl-defstruct records.
 fn recordp(h: &mut ElispHost, a: &[Value]) -> R {
-    let ok = matches!(h.obj(&a[0]), Some(Obj::Vector(items)) if h.struct_tag_name(&items.clone()).is_some());
-    Ok(nil_or(ok))
+    Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::Record(_)))))
 }
 
 // ── OClosure C primitives (oclosure.el) ──
@@ -6474,6 +6608,19 @@ pub fn install(h: &mut ElispHost) {
     // vectors
     s("vector", 0, None, vector_fn);
     s("make-vector", 2, Some(2), make_vector);
+    s("record", 1, None, record_fn);
+    s("make-record", 3, Some(3), make_record);
+    s("make-bool-vector", 2, Some(2), make_bool_vector);
+    s("bool-vector", 0, None, bool_vector_fn);
+    s("bool-vector-p", 1, Some(1), bool_vector_p);
+    s(
+        "bool-vector-count-population",
+        1,
+        Some(1),
+        bool_vector_count_population,
+    );
+    s("bool-vector-subsetp", 2, Some(2), bool_vector_subsetp);
+    s("bool-vector-not", 1, Some(2), bool_vector_not);
     s("aref", 2, Some(2), aref);
     s("aset", 3, Some(3), aset);
     s("fillarray", 2, Some(2), fillarray);

@@ -1019,8 +1019,8 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 ;;; ---- predicates ----
 (defun booleanp (x) (if (or (eq x t) (eq x nil)) t nil))
 (defun characterp (x) (and (integerp x) (>= x 0) (<= x #x3FFFFF)))
-(defun sequencep (x) (or (listp x) (vectorp x) (stringp x) (char-table-p x)))
-(defun arrayp (x) (or (vectorp x) (stringp x) (char-table-p x)))
+(defun sequencep (x) (or (listp x) (vectorp x) (stringp x) (char-table-p x) (bool-vector-p x)))
+(defun arrayp (x) (or (vectorp x) (stringp x) (char-table-p x) (bool-vector-p x)))
 (defun string-or-null-p (x) (or (null x) (stringp x)))
 ;; nlistp is a native subr (builtins.rs): a C subr in Emacs, same identity
 ;; requirement as natnump.
@@ -1387,6 +1387,15 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 (defun copy-sequence (seq)
   (cond ((listp seq) (append seq nil))
         ((or (stringp seq) (vectorp seq)) seq)
+        ;; A record is copied slot-for-slot into a fresh record (slot 0, the type,
+        ;; is reproduced): `(copy-sequence rec)' preserves record-ness, so it is the
+        ;; copier a cl-defstruct `copy-NAME' uses.
+        ((recordp seq)
+         (let ((n (length seq)) (i 0) (args nil))
+           (while (< i n) (setq args (cons (aref seq i) args) i (1+ i)))
+           (apply #'record (nreverse args))))
+        ;; A bool-vector copies to a fresh, independent bool-vector.
+        ((bool-vector-p seq) (apply #'bool-vector (append seq nil)))
         (t (signal 'wrong-type-argument (list 'sequencep seq)))))
 (defun ensure-list (x) (if (listp x) x (list x)))
 (defun mapcan (fn lst)
@@ -1872,10 +1881,11 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
     (while (and tag (not res))
       (if (eq tag target) (setq res t) (setq tag (cdr (assq tag cl-struct--parent)))))
     res))
-;; cl-defstruct: a struct is a vector [cl-struct-NAME slot1 slot2 ...]. Generates
-;; the `make-NAME' keyword constructor (with per-slot defaults), `NAME-p'
-;; predicate, `NAME-SLOT' accessors (setf-able), and `copy-NAME' copier. (Printing
-;; and `type-of' differ from Emacs records — these are plain vectors.)
+;; cl-defstruct: a struct is a record #s(NAME slot1 slot2 ...) whose slot 0 is the
+;; bare type symbol NAME (so `type-of'/printing/`aref …0' all report NAME, exactly
+;; like an Emacs record). Generates the `make-NAME' keyword constructor (with
+;; per-slot defaults), `NAME-p' predicate, `NAME-SLOT' accessors (setf-able), and
+;; `copy-NAME' copier. Parentage is tracked by bare NAME in `cl-struct--parent'.
 (defmacro cl-defstruct (name-spec &rest slots)
   ;; An optional docstring may precede the slot specs (cl-macs.el pops it via
   ;; `(if (stringp (car descs)) (pop descs))').  Record it on the struct's plist
@@ -1884,7 +1894,8 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
          (slots (if --doc-- (cdr slots) slots))
          (name (if (consp name-spec) (car name-spec) name-spec))
          (sname (symbol-name name))
-         (tag (intern (concat "cl-struct-" sname)))
+         ;; The record's slot-0 type tag is the bare struct NAME (Emacs records).
+         (tag name)
          ;; Options: (:constructor NAME) renames the make-NAME constructor;
          ;; (:conc-name P) overrides the NAME- accessor prefix.
          ;; Constructors: each (:constructor NAME) is a keyword ctor; (:constructor
@@ -1957,7 +1968,7 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
         (if (eq ckind 'kw)
             (setq forms
                   (cons `(defun ,cname (&rest --args--)
-                           (let ((--v-- (vector ',tag ,@defaults)) (--a-- --args--))
+                           (let ((--v-- (record ',tag ,@defaults)) (--a-- --args--))
                              (while --a--
                                (let ((--k-- (car --a--)) (--val-- (car (cdr --a--))))
                                  (cond ,@kw-clauses))
@@ -1981,9 +1992,9 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
                            (setq vs (cons (if (memq (car sn) avars) (car sn) (car df)) vs))
                            (setq sn (cdr sn) df (cdr df)))
                          (reverse vs))))
-            (setq forms (cons `(defun ,cname ,defargs (vector ',tag ,@vals)) forms))))))
+            (setq forms (cons `(defun ,cname ,defargs (record ',tag ,@vals)) forms))))))
     (setq forms (cons `(defun ,(intern pred) (--o--)
-                         (and (vectorp --o--) (> (length --o--) 0)
+                         (and (recordp --o--) (> (length --o--) 0)
                               (cl-struct--is-a (aref --o-- 0) ',tag)))
                       forms))
     ;; Record the tag's parent so the predicate accepts subtypes.  With an
@@ -1992,14 +2003,14 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
     ;; `parent-type' to it), which is what makes `cl-struct-p' — the predicate
     ;; for `cl-structure-object' — accept any struct.  The root itself is skipped
     ;; so it has no self-parent.
-    (let ((ptag (cond (parent (intern (concat "cl-struct-" (symbol-name parent))))
-                      ((not (eq name 'cl-structure-object)) 'cl-struct-cl-structure-object))))
+    (let ((ptag (cond (parent parent)
+                      ((not (eq name 'cl-structure-object)) 'cl-structure-object))))
       (when ptag
         (setq forms (cons `(setq cl-struct--parent
                                  (cons (cons ',tag ',ptag) cl-struct--parent))
                           forms))))
     (when copier
-      (setq forms (cons `(defun ,(intern copier) (--s--) (vconcat --s--)) forms)))
+      (setq forms (cons `(defun ,(intern copier) (--s--) (copy-sequence --s--)) forms)))
     ;; Register a `cl-structure-class' so cl-generic's typeof generalizer can
     ;; dispatch on this struct type (cl-preloaded.el:205).  Guarded so the many
     ;; structs defined before the class registry is bootstrapped are skipped.
@@ -2603,22 +2614,8 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (defun function-get (f prop &optional _autoload) (get f prop))
 (defun function-put (f prop value) (put f prop value))
 (defun define-symbol-prop (symbol prop value) (put symbol prop value))
-;; Records: elisprs models them (and cl-defstruct instances) as vectors tagged
-;; `cl-struct-TYPE' in slot 0, so `type-of'/printing report the bare TYPE. (aref
-;; slot 0 yields the tag rather than the bare type, a known representation quirk.)
-(defun record (type &rest slots)
-  (apply #'vector (intern (concat "cl-struct-" (symbol-name type))) slots))
-(defun make-record (type slots init)
-  ;; Emacs's `Fmake_record' checks SLOTS is a wholenum, then caps the record at
-  ;; PSEUDOVECTOR_SIZE_MASK (4095) slots; anything larger signals a plain error
-  ;; rather than attempting an impossible allocation.
-  (unless (and (integerp slots) (>= slots 0) (<= slots most-positive-fixnum))
-    (signal 'wrong-type-argument (list 'wholenump slots)))
-  (when (> (1+ slots) 4095)
-    (error "Attempt to allocate a record of %d slots; max is %d" (1+ slots) 4095))
-  (let ((v (make-vector (1+ slots) init)))
-    (aset v 0 (intern (concat "cl-struct-" (symbol-name type))))
-    v))
+;; `record'/`make-record' are `Obj::Record' primitives (see builtins.rs); a record
+;; is a distinct type from a vector, with the type symbol in slot 0.
 (defun define-error (name message &optional parent)
   ;; Register NAME as an error condition: its conditions are NAME plus PARENT's.
   (let* ((parent (or parent 'error))
@@ -9352,3 +9349,294 @@ in the European submenu in each of those two menus."
   (if (equal lang-env current-language-environment)
       (set-language-environment lang-env)))
 "#;
+
+/// Faithful port of emacs-lisp/nadvice.el (Emacs 30.2) — the modern light-weight
+/// advice primitives. `advice-add`/`advice-remove`/`add-function`/
+/// `remove-function`/`define-advice`/`advice-member-p` plus every combinator
+/// (`:around` `:before` `:after` `:override` `:filter-args` `:filter-return`
+/// `:before-while` `:before-until` `:after-while` `:after-until`). An advice is an
+/// `advice` oclosure holding (car cdr how props); `advice--make` threads them into
+/// the symbol-function cell honoring `depth`. This is *source-symbol* advice —
+/// entirely distinct from the glob-AOP intercept layer (src/intercepts.rs).
+///
+/// Kept in its own segment because nadvice.el's `cl-print-object` method embeds
+/// the literal `"#f(advice …)"`, whose `"#` would terminate PRELUDE's `r#"…"#`.
+///
+/// elisprs divergences (NAMED — the advice API/combinators match Emacs exactly;
+/// only Emacs-help cosmetics are omitted):
+///  * Docstring builders (`advice--make-docstring`, `nadvice--make-docstring`,
+///    the `function-documentation` puts) are omitted — they exist only to enrich
+///    `describe-function` output.
+///  * Interactive-spec propagation (`advice--interactive-form*`,
+///    `oclosure-interactive-form`) and the `cl-print-object` printer are omitted
+///    (cosmetic; advised functions still run identically).
+///  * `advice--called-interactively-skip` (+ its hook) is omitted — it only
+///    adjusts `called-interactively-p` frame counting.
+///  * Buffer-local advice places (`advice--buffer-local`/`advice--forward`) are
+///    omitted; `advice--normalize-place` still supports symbol / `(var V)` /
+///    raw gv-place forms (what `advice-add` and typical configs use).
+pub const NADVICE: &str = r##"
+(oclosure-define (advice
+                  (:predicate advice--p)
+                  (:copier advice--cons (cdr))
+                  (:copier advice--copy (car cdr how props)))
+  car cdr how props)
+
+;; advice--how-alist maps each HOW keyword to a prototype `advice' oclosure whose
+;; body combines the added FUNCTION (`car') with the previous definition (`cdr').
+(eval-when-compile
+  (defmacro advice--make-how-alist (&rest args)
+    `(list
+      ,@(mapcar
+         (lambda (arg)
+           (pcase-let ((`(,how . ,body) arg))
+             `(list ,how
+                    (oclosure-lambda (advice (how ,how)) (&rest r)
+                      ,@body))))
+         args))))
+
+(defvar advice--how-alist
+  (advice--make-how-alist
+   (:around (apply car cdr r))
+   (:before (apply car r) (apply cdr r))
+   (:after (prog1 (apply cdr r) (apply car r)))
+   (:override (apply car r))
+   (:after-until (or (apply cdr r) (apply car r)))
+   (:after-while (and (apply cdr r) (apply car r)))
+   (:before-until (or (apply car r) (apply cdr r)))
+   (:before-while (and (apply car r) (apply cdr r)))
+   (:filter-args (apply cdr (funcall car r)))
+   (:filter-return (funcall car (apply cdr r))))
+  "List of descriptions of how to add a function.
+Each element has the form (HOW OCL) where HOW is a keyword and OCL is a
+\"prototype\" function of type `advice'.")
+
+(defun advice--cd*r (f)
+  (while (advice--p f)
+    (setq f (advice--cdr f)))
+  f)
+
+(defun advice--make (how function main props)
+  "Build a function value that adds FUNCTION to MAIN at HOW.
+HOW is a symbol to select an entry in `advice--how-alist'."
+  (let ((fd (or (cdr (assq 'depth props)) 0))
+        (md (if (advice--p main)
+                (or (cdr (assq 'depth (advice--props main))) 0))))
+    (if (and md (> fd md))
+        ;; `function' should go deeper.
+        (let ((rest (advice--make how function (advice--cdr main) props)))
+          (advice--cons main rest))
+      (let ((proto (assq how advice--how-alist)))
+        (unless proto (error "Unknown add-function location `%S'" how))
+        (advice--copy (cadr proto)
+                      function main how props)))))
+
+(defun advice--member-p (function use-name definition)
+  (let ((found nil))
+    (while (and (not found) (advice--p definition))
+      (if (if (eq use-name :use-both)
+	      (or (equal function
+			 (cdr (assq 'name (advice--props definition))))
+		  (equal function (advice--car definition)))
+	    (equal function (if use-name
+				(cdr (assq 'name (advice--props definition)))
+			      (advice--car definition))))
+          (setq found definition)
+        (setq definition (advice--cdr definition))))
+    found))
+
+(defun advice--tweak (flist tweaker)
+  (if (not (advice--p flist))
+      (funcall tweaker nil flist nil)
+    (let ((first (advice--car flist))
+          (rest (advice--cdr flist))
+          (props (advice--props flist)))
+      (let ((val (funcall tweaker first rest props)))
+        (if val (car val)
+          (let ((nrest (advice--tweak rest tweaker)))
+            (if (eq rest nrest) flist
+              (advice--cons flist nrest))))))))
+
+(defun advice--remove-function (flist function)
+  (advice--tweak flist
+                 (lambda (first rest props)
+                   (cond ((not first) rest)
+                         ((or (equal function first)
+                              (equal function (cdr (assq 'name props))))
+                          (list (advice--remove-function rest function)))))))
+
+(eval-and-compile
+  (defun advice--normalize-place (place)
+    (cond ((eq 'local (car-safe place))
+           (error "Buffer-local advice places are unsupported"))
+          ((eq 'var (car-safe place))   (nth 1 place))
+          ((symbolp place)              `(default-value ',place))
+          (t place))))
+
+(defmacro add-function (how place function &optional props)
+  "Add a piece of advice on the function stored at PLACE.
+FUNCTION describes the code to add.  HOW describes how to add it (see
+`advice--how-alist').  PROPS is an alist; `name' and `depth' are special."
+  (declare
+   (debug (form [&or symbolp ("local" form) ("var" sexp) gv-place]
+                form &optional form)))
+  `(advice--add-function ,how (gv-ref ,(advice--normalize-place place))
+                         ,function ,props))
+
+(defun advice--add-function (how ref function props)
+  (let* ((name (cdr (assq 'name props)))
+         (a (advice--member-p (or name function) (if name t) (gv-deref ref))))
+    (when a
+      ;; The advice is already present.  Remove the old one, first.
+      (setf (gv-deref ref)
+            (advice--remove-function (gv-deref ref)
+                                     (or name (advice--car a)))))
+    (setf (gv-deref ref)
+          (advice--make how function (gv-deref ref) props))))
+
+(defmacro remove-function (place function)
+  "Remove the FUNCTION piece of advice from PLACE.
+If FUNCTION was not added to PLACE, do nothing.  FUNCTION can also be the
+`name' of the piece of advice."
+  (declare (debug ([&or symbolp ("local" form) ("var" sexp) gv-place]
+                   form)))
+  (gv-letplace (getter setter) (advice--normalize-place place)
+    (macroexp-let2 nil new `(advice--remove-function ,getter ,function)
+      `(unless (eq ,new ,getter) ,(funcall setter new)))))
+
+(defun advice-function-mapc (f function-def)
+  "Apply F to every advice function in FUNCTION-DEF.
+F is called with two arguments: the added function and its props alist."
+  (while (advice--p function-def)
+    (funcall f (advice--car function-def) (advice--props function-def))
+    (setq function-def (advice--cdr function-def))))
+
+(defun advice-function-member-p (advice function-def)
+  "Return non-nil if ADVICE is already in FUNCTION-DEF.
+ADVICE can also be the `name' of the piece of advice."
+  (advice--member-p advice :use-both function-def))
+
+;;;; Specific application of add-function to `symbol-function' for advice.
+
+(defun advice--subst-main (old new)
+  (advice--tweak old
+                 (lambda (first _rest _props) (if (not first) new))))
+
+(defun advice--normalize (symbol def)
+  (cond
+   ((special-form-p def)
+    (error "Advice impossible: %S is a special form" symbol))
+   ((and (symbolp def) (macrop def))
+    (let ((newval `(macro . ,(lambda (&rest r) (macroexpand `(,def . ,r))))))
+      (put symbol 'advice--saved-rewrite (cons def (cdr newval)))
+      newval))
+   ;; `f' might be a pure (hence read-only) cons!
+   ((and (eq 'macro (car-safe def))
+	 (not (ignore-errors (setcdr def (cdr def)) t)))
+    (cons 'macro (cdr def)))
+   (t def)))
+
+(defsubst advice--strip-macro (x)
+  (if (eq 'macro (car-safe x)) (cdr x) x))
+
+(defun advice--symbol-function (symbol)
+  ;; Conceptually the symbol-function is split into the plain definition plus the
+  ;; list of advice; this returns the advice part (or the pending advice stashed
+  ;; on `advice--pending' while the definition is nil/an autoload).
+  (or (get symbol 'advice--pending)
+      (advice--strip-macro (symbol-function symbol))))
+
+(defun advice--defalias-fset (fsetfun symbol newdef)
+  (unless fsetfun (setq fsetfun #'fset))
+  ;; `newdef' shouldn't include advice wrappers, since that's what *we* manage.
+  (cond
+   ((advice--p newdef) (setq newdef (advice--cd*r newdef)))
+   ((and (eq 'macro (car-safe newdef))
+         (advice--p (cdr newdef)))
+    (setq newdef `(macro . ,(advice--cd*r (cdr newdef))))))
+  (when (get symbol 'advice--saved-rewrite)
+    (put symbol 'advice--saved-rewrite nil))
+  (setq newdef (advice--normalize symbol newdef))
+  (let ((oldadv (advice--symbol-function symbol)))
+    (if (and newdef (not (autoloadp newdef)))
+        (let* ((snewdef (advice--strip-macro newdef))
+               (snewadv (advice--subst-main oldadv snewdef)))
+          (put symbol 'advice--pending nil)
+          (funcall fsetfun symbol
+                   (if (eq snewdef newdef) snewadv (cons 'macro snewadv))))
+      (unless (eq oldadv (get symbol 'advice--pending))
+        (put symbol 'advice--pending (advice--subst-main oldadv nil)))
+      (funcall fsetfun symbol newdef))))
+
+(defun advice-add (symbol how function &optional props)
+  "Like `add-function' but for the function named SYMBOL.
+Handles the cases where SYMBOL is defined as a macro, alias, command, ..."
+  (let* ((f (symbol-function symbol))
+	 (nf (advice--normalize symbol f)))
+    (unless (eq f nf) (fset symbol nf))
+    (add-function how (cond
+                       ((eq (car-safe nf) 'macro) (cdr nf))
+                       ((or (not nf) (autoloadp nf))
+                        (get symbol 'advice--pending))
+                       (t (symbol-function symbol)))
+                  function props)
+    (add-function :around (get symbol 'defalias-fset-function)
+                  #'advice--defalias-fset))
+  nil)
+
+(defun advice-remove (symbol function)
+  "Like `remove-function' but for the function named SYMBOL.
+Works when SYMBOL is a macro or an autoload and preserves `fboundp'.
+FUNCTION can also be the `name' of the piece of advice."
+  (let ((f (symbol-function symbol)))
+    (remove-function (cond ;This is `advice--symbol-function' but as a "place".
+                      ((get symbol 'advice--pending)
+                       (get symbol 'advice--pending))
+                      ((eq (car-safe f) 'macro) (cdr f))
+                      (t (symbol-function symbol)))
+                     function)
+    (unless (advice--p (advice--symbol-function symbol))
+      (remove-function (get symbol 'defalias-fset-function)
+                       #'advice--defalias-fset)
+      (let ((asr (get symbol 'advice--saved-rewrite)))
+        (and asr (eq (cdr-safe (symbol-function symbol))
+                     (cdr asr))
+             (fset symbol (car (get symbol 'advice--saved-rewrite)))))))
+  nil)
+
+(defmacro define-advice (symbol args &rest body)
+  "Define an advice and add it to function named SYMBOL.
+See `advice-add' and `add-function'.  If NAME is non-nil, the advice is
+named `SYMBOL@NAME' and installed with the name NAME; else it is anonymous.
+
+\(fn SYMBOL (HOW LAMBDA-LIST &optional NAME DEPTH) &rest BODY)"
+  (declare (indent 2) (doc-string 3) (debug (sexp sexp def-body)))
+  (or (listp args) (signal 'wrong-type-argument (list 'listp args)))
+  (or (<= 2 (length args) 4)
+      (signal 'wrong-number-of-arguments (list 2 4 (length args))))
+  (let* ((how           (nth 0 args))
+         (lambda-list   (nth 1 args))
+         (name          (nth 2 args))
+         (depth         (nth 3 args))
+         (props         (append
+                         (and depth `((depth . ,depth)))
+                         (and name `((name . ,name)))))
+         (advice (cond ((null name) `(lambda ,lambda-list ,@body))
+                       ((or (stringp name) (symbolp name))
+                        (intern (format "%s@%s" symbol name)))
+                       (t (error "Unrecognized name spec `%S'" name)))))
+    `(prog1 ,@(and (symbolp advice) `((defun ,advice ,lambda-list ,@body)))
+       (advice-add ',symbol ,how #',advice ,@(and props `(',props))))))
+
+(defun advice-mapc (fun symbol)
+  "Apply FUN to every advice function in SYMBOL.
+FUN is called with two arguments: the added function and its props alist."
+  (advice-function-mapc fun (advice--symbol-function symbol)))
+
+(defun advice-member-p (advice symbol)
+  "Return non-nil if ADVICE has been added to SYMBOL.
+ADVICE can also be the `name' of the piece of advice."
+  (advice-function-member-p advice (advice--symbol-function symbol)))
+
+(provide 'nadvice)
+"##;
