@@ -140,7 +140,10 @@ fn dap_breakpoint_step_and_terminate() {
 
     // 1) Stops at the breakpoint on line 3.
     let stop = s.stopped();
-    assert_eq!(stop["body"]["reason"], "breakpoint", "first stop is the breakpoint");
+    assert_eq!(
+        stop["body"]["reason"], "breakpoint",
+        "first stop is the breakpoint"
+    );
     assert_eq!(s.stack_line(), 3, "breakpoint frame is line 3");
 
     // Variables reflect the paused state: a and b are bound, c is not yet.
@@ -186,7 +189,10 @@ fn dap_breakpoint_step_and_terminate() {
             None => break,
         }
     }
-    assert!(saw_output, "program stdout (c=3) streamed as an output event");
+    assert!(
+        saw_output,
+        "program stdout (c=3) streamed as an output event"
+    );
     assert!(saw_terminated, "session terminated after continue");
 
     let _ = std::fs::remove_file(&path);

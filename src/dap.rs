@@ -467,7 +467,8 @@ fn eval_in_host(expr: &str) -> String {
     let prev = host::debug_mode();
     host::set_debug_mode(false);
     let result = (|| {
-        let forms = with_host(|h| crate::reader::read_all(h, expr)).map_err(|e| format!("read error: {e}"))?;
+        let forms = with_host(|h| crate::reader::read_all(h, expr))
+            .map_err(|e| format!("read error: {e}"))?;
         let mut last = String::from("nil");
         for form in &forms {
             let chunk = with_host(|h| crate::compiler::compile_top(h, form))
