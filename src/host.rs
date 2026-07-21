@@ -3609,7 +3609,12 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 let form = args
                     .first()
                     .ok_or("wrong-number-of-arguments: macroexpand-1")?;
-                return Ok(macroexpand_1(form)?.unwrap_or_else(|| form.clone()));
+                // A user macro (if any) wins; otherwise fall back to the intrinsic
+                // `when`/`unless` expansions the compiler lowers as special forms.
+                if let Some(e) = macroexpand_1(form)? {
+                    return Ok(e);
+                }
+                return Ok(expand_intrinsic_macro(form).unwrap_or_else(|| form.clone()));
             }
             "macroexpand" => {
                 // Expand the head to a fixpoint; don't recurse into sub-forms.
@@ -3617,13 +3622,21 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                     .first()
                     .ok_or("wrong-number-of-arguments: macroexpand")?
                     .clone();
-                while let Some(e) = macroexpand_1(&f)? {
-                    f = e;
+                loop {
+                    if let Some(e) = macroexpand_1(&f)? {
+                        f = e;
+                        continue;
+                    }
+                    if let Some(e) = expand_intrinsic_macro(&f) {
+                        f = e;
+                        continue;
+                    }
+                    break;
                 }
                 return Ok(f);
             }
             "macroexpand-all" => {
-                return macroexpand_all(
+                return macroexpand_all_builtin(
                     args.first()
                         .ok_or("wrong-number-of-arguments: macroexpand-all")?,
                 )
@@ -3887,6 +3900,48 @@ pub fn macroexpand_1(form: &Value) -> Result<Option<Value>, String> {
     }
 }
 
+/// Faithful `subr.el` expansions for the two intrinsic macros elisprs lowers as
+/// compiler special forms (`when`/`unless`). Because the compiler intercepts
+/// them by name they have no closure for [`macroexpand_1`] to find, so the
+/// `macroexpand`/`macroexpand-1`/`macroexpand-all` builtins consult this to
+/// reproduce Emacs's macro output. Returns `None` for any other head, and for a
+/// head the user has shadowed with a real macro (that closure wins in the
+/// callers, which try [`macroexpand_1`] first).
+///
+/// Emacs 30.2 `subr.el`:
+/// ```elisp
+/// (defmacro when   (cond &rest body) (list 'if cond (cons 'progn body)))
+/// (defmacro unless (cond &rest body) (cons 'if (cons cond (cons nil body))))
+/// ```
+pub fn expand_intrinsic_macro(form: &Value) -> Option<Value> {
+    with_host(|h| {
+        let elems = h.list_vec(form)?;
+        if elems.is_empty() {
+            return None;
+        }
+        let name = h.sym_name(&elems[0])?;
+        let body = &elems[2.min(elems.len())..];
+        let cond = elems.get(1).cloned().unwrap_or(Value::Undef);
+        match name.as_str() {
+            // (if COND (progn BODY...))
+            "when" => {
+                let if_sym = h.intern("if");
+                let mut progn = vec![h.intern("progn")];
+                progn.extend_from_slice(body);
+                let progn = h.list_from(progn);
+                Some(h.list_from(vec![if_sym, cond, progn]))
+            }
+            // (if COND nil BODY...) — nil is `Value::Undef`.
+            "unless" => {
+                let mut out = vec![h.intern("if"), cond, Value::Undef];
+                out.extend_from_slice(body);
+                Some(h.list_from(out))
+            }
+            _ => None,
+        }
+    })
+}
+
 /// Fully expand macros in `form` (top-level to fixpoint, then recursively into
 /// sub-forms), without descending into quoted data or into positions that are
 /// not expression forms. Run before lowering.
@@ -3897,9 +3952,31 @@ pub fn macroexpand_1(form: &Value) -> Result<Option<Value>, String> {
 /// be *both* a special variable and a macro (e.g. `delay-mode-hooks`) — expanding
 /// the binding head there loops forever.
 pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
+    macroexpand_all_impl(form, false)
+}
+
+/// `macroexpand-all` as the elisp builtin exposes it: identical to
+/// [`macroexpand_all`] but also unfolds the intrinsic `when`/`unless` macros
+/// (see [`expand_intrinsic_macro`]). Kept off the compile pipeline so the
+/// compiler's dedicated `when`/`unless` lowering (`compile_when`) still fires.
+pub fn macroexpand_all_builtin(form: &Value) -> Result<Value, String> {
+    macroexpand_all_impl(form, true)
+}
+
+fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, String> {
     let mut f = form.clone();
-    while let Some(e) = macroexpand_1(&f)? {
-        f = e;
+    loop {
+        if let Some(e) = macroexpand_1(&f)? {
+            f = e;
+            continue;
+        }
+        if expand_intrinsics {
+            if let Some(e) = expand_intrinsic_macro(&f) {
+                f = e;
+                continue;
+            }
+        }
+        break;
     }
     let elems = with_host(|h| {
         if matches!(h.obj(&f), Some(Obj::Cons(..))) {
@@ -3938,7 +4015,7 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
                                 let mut np = Vec::with_capacity(parts.len());
                                 np.push(parts[0].clone()); // VAR, untouched
                                 for p in &parts[1..] {
-                                    np.push(macroexpand_all(p)?);
+                                    np.push(macroexpand_all_impl(p, expand_intrinsics)?);
                                 }
                                 out.push(with_host(|h| h.list_from(np)));
                             }
@@ -3953,7 +4030,7 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
             out.push(elems[0].clone());
             out.push(new_bindings);
             for e in &elems[2..] {
-                out.push(macroexpand_all(e)?);
+                out.push(macroexpand_all_impl(e, expand_intrinsics)?);
             }
             let _ = kw;
             Ok(with_host(|h| h.list_from(out)))
@@ -3966,7 +4043,7 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
             out.push(elems[0].clone());
             out.push(elems[1].clone()); // ARGLIST, untouched
             for e in &elems[2..] {
-                out.push(macroexpand_all(e)?);
+                out.push(macroexpand_all_impl(e, expand_intrinsics)?);
             }
             Ok(with_host(|h| h.list_from(out)))
         }
@@ -4002,7 +4079,7 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
                 // Non-nil ⇒ BODY had a `declare'; expand the rewritten form (its
                 // inner defun has the `declare' stripped, so this does not recurse).
                 if el_truthy(&replaced) {
-                    return macroexpand_all(&replaced);
+                    return macroexpand_all_impl(&replaced, expand_intrinsics);
                 }
             }
             let mut out = Vec::with_capacity(elems.len());
@@ -4010,14 +4087,14 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
             out.push(elems[1].clone()); // NAME, untouched
             out.push(elems[2].clone()); // ARGLIST, untouched
             for e in &elems[3..] {
-                out.push(macroexpand_all(e)?);
+                out.push(macroexpand_all_impl(e, expand_intrinsics)?);
             }
             Ok(with_host(|h| h.list_from(out)))
         }
         _ => {
             let mut out = Vec::with_capacity(elems.len());
             for e in &elems {
-                out.push(macroexpand_all(e)?);
+                out.push(macroexpand_all_impl(e, expand_intrinsics)?);
             }
             Ok(with_host(|h| h.list_from(out)))
         }

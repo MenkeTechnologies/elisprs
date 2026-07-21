@@ -9348,6 +9348,398 @@ in the European submenu in each of those two menus."
     (set-language-info-internal lang-env (car elt) (cdr elt)))
   (if (equal lang-env current-language-environment)
       (set-language-environment lang-env)))
+
+;;; ring.el --- handle rings of items  -*- lexical-binding: t -*-
+;; Faithful port of emacs-lisp/ring.el (Emacs 30.2).  A ring is a fixed-size
+;; circular buffer represented as the cons (HD LN . VEC): HD is the index of
+;; the oldest element in VEC, LN the current element count, VEC the storage.
+
+(defun ring-p (x)
+  "Return t if X is a ring; nil otherwise."
+  (and (consp x) (integerp (car x))
+       (consp (cdr x)) (integerp (cadr x))
+       (vectorp (cddr x))))
+
+(defun make-ring (size)
+  "Make a ring that can contain SIZE elements."
+  (cons 0 (cons 0 (make-vector size nil))))
+
+(defun ring-insert-at-beginning (ring item)
+  "Add to RING the item ITEM, at the front, as the oldest item."
+  (let* ((vec (cddr ring))
+         (veclen (length vec))
+         (hd (car ring))
+         (ln (cadr ring)))
+    (setq ln (min veclen (1+ ln))
+          hd (ring-minus1 hd veclen))
+    (aset vec hd item)
+    (setcar ring hd)
+    (setcar (cdr ring) ln)))
+
+(defun ring-plus1 (index veclen)
+  "Return INDEX+1, with wraparound."
+  (let ((new-index (1+ index)))
+    (if (= new-index veclen) 0 new-index)))
+
+(defun ring-minus1 (index veclen)
+  "Return INDEX-1, with wraparound."
+  (- (if (zerop index) veclen index) 1))
+
+(defun ring-length (ring)
+  "Return the number of elements in the RING."
+  (cadr ring))
+
+(defun ring-index (index head ringlen veclen)
+  "Convert nominal ring index INDEX to an internal index.
+The internal index refers to the items ordered from newest to oldest.
+HEAD is the index of the oldest element in the ring.
+RINGLEN is the number of elements currently in the ring.
+VECLEN is the size of the vector in the ring."
+  (setq index (mod index ringlen))
+  (mod (1- (+ head (- ringlen index))) veclen))
+
+(defun ring-empty-p (ring)
+  "Return t if RING is empty; nil otherwise."
+  (zerop (cadr ring)))
+
+(defun ring-size (ring)
+  "Return the size of RING, the maximum number of elements it can contain."
+  (length (cddr ring)))
+
+(defun ring-copy (ring)
+  "Return a copy of RING."
+  (let ((vec (cddr ring))
+	(hd  (car ring))
+	(ln  (cadr ring)))
+    (cons hd (cons ln (copy-sequence vec)))))
+
+(defun ring-insert (ring item)
+  "Insert onto ring RING the item ITEM, as the newest (last) item.
+If the ring is full, dump the oldest item to make room."
+  (let* ((vec (cddr ring))
+         (veclen (length vec))
+         (hd (car ring))
+         (ln (cadr ring)))
+    (prog1
+        (aset vec (mod (+ hd ln) veclen) item)
+      (if (= ln veclen)
+          (setcar ring (ring-plus1 hd veclen))
+        (setcar (cdr ring) (1+ ln))))))
+
+(defun ring-remove (ring &optional index)
+  "Remove an item from the RING.  Return the removed item.
+If optional INDEX is nil, remove the oldest item.  If it's
+numeric, remove the element indexed."
+  (if (ring-empty-p ring)
+      (error "Ring empty")
+    (let* ((hd (car ring))
+           (ln (cadr ring))
+           (vec (cddr ring))
+           (veclen (length vec))
+           (tl (mod (1- (+ hd ln)) veclen))
+           oldelt)
+      (when (null index)
+	(setq index (1- ln)))
+      (setq index (ring-index index hd ln veclen))
+      (setq oldelt (aref vec index))
+      (while (/= index tl)
+        (aset vec index (aref vec (ring-plus1 index veclen)))
+        (setq index (ring-plus1 index veclen)))
+      (aset vec tl nil)
+      (setcar (cdr ring) (1- ln))
+      oldelt)))
+
+(defun ring-ref (ring index)
+  "Return RING's INDEX element.
+INDEX = 0 is the most recently inserted; higher indices
+correspond to older elements.
+INDEX need not be <= the ring length; the appropriate modulo operation
+will be performed."
+  (if (ring-empty-p ring)
+      (error "Accessing an empty ring")
+    (let ((hd (car ring))
+	  (ln (cadr ring))
+	  (vec (cddr ring)))
+      (aref vec (ring-index index hd ln (length vec))))))
+
+(defun ring-elements (ring)
+  "Return a list of the elements of RING, in order, newest first."
+  (let ((start (car ring))
+	(size (ring-size ring))
+	(vect (cddr ring))
+	lst)
+    (dotimes (var (cadr ring))
+      (push (aref vect (mod (+ start var) size)) lst))
+    lst))
+
+(defun ring-member (ring item)
+  "Return index of ITEM if on RING, else nil.
+Comparison is done via `equal'.  The index is 0-based."
+  (catch 'found
+    (dotimes (ind (ring-length ring))
+      (when (equal item (ring-ref ring ind))
+	(throw 'found ind)))))
+
+(defun ring-next (ring item)
+  "Return the next item in the RING, after ITEM.
+Raise error if ITEM is not in the RING."
+  (let ((curr-index (ring-member ring item)))
+    (unless curr-index (error "Item is not in the ring: `%s'" item))
+    (ring-ref ring (ring-plus1 curr-index (ring-length ring)))))
+
+(defun ring-previous (ring item)
+  "Return the previous item in the RING, before ITEM.
+Raise error if ITEM is not in the RING."
+  (let ((curr-index (ring-member ring item)))
+    (unless curr-index (error "Item is not in the ring: `%s'" item))
+    (ring-ref ring (ring-minus1 curr-index (ring-length ring)))))
+
+(defun ring-extend (ring x)
+  "Increase the size of RING by X."
+  (when (and (integerp x) (> x 0))
+    (ring-resize ring (+ x (ring-size ring)))))
+
+(defun ring-resize (ring size)
+  "Set the size of RING to SIZE.
+If the new size is smaller, then the oldest items in the ring are
+discarded."
+  (when (integerp size)
+    (let ((length (ring-length ring))
+	  (new-vec (make-vector size nil)))
+      (if (= length 0)
+          (setcdr ring (cons 0 new-vec))
+        (let* ((hd (car ring))
+	       (old-size (ring-size ring))
+	       (old-vec (cddr ring))
+               (copy-length (min size length))
+               (copy-hd (mod (+ hd (- length copy-length)) length)))
+          (setcdr ring (cons copy-length new-vec))
+          (dotimes (j copy-length)
+	    (aset new-vec j (aref old-vec (mod (+ copy-hd j) old-size))))
+          (setcar ring 0))))))
+
+(defun ring-insert+extend (ring item &optional grow-p)
+  "Like `ring-insert', but if GROW-P is non-nil, then enlarge ring.
+Insert onto ring RING the item ITEM, as the newest (last) item.
+If the ring is full, behavior depends on GROW-P:
+  If GROW-P is non-nil, enlarge the ring to accommodate the new item.
+  If GROW-P is nil, dump the oldest item to make room for the new."
+  (and grow-p
+       (= (ring-length ring) (ring-size ring))
+       (ring-extend ring 1))
+  (ring-insert ring item))
+
+(defun ring-remove+insert+extend (ring item &optional grow-p)
+  "`ring-remove' ITEM from RING, then `ring-insert+extend' it.
+This ensures that there is only one ITEM on RING.
+
+If the RING is full, behavior depends on GROW-P:
+  If GROW-P is non-nil, enlarge the ring to accommodate the new ITEM.
+  If GROW-P is nil, dump the oldest item to make room for the new."
+  (let (ind)
+    (while (setq ind (ring-member ring item))
+      (ring-remove ring ind)))
+  (ring-insert+extend ring item grow-p))
+
+(defun ring-convert-sequence-to-ring (seq)
+  "Convert sequence SEQ to a ring.  Return the ring.
+If SEQ is already a ring, return it."
+  (if (ring-p seq)
+      seq
+    (let* ((size (length seq))
+           (ring (make-ring size)))
+      (dotimes (count size)
+        (when (or (ring-empty-p ring)
+		  (not (equal (ring-ref ring 0) (elt seq count))))
+	  (ring-insert-at-beginning ring (elt seq count))))
+      ring)))
+
+;;; text-property-search.el --- search for text properties  -*- lexical-binding: t -*-
+;; Faithful port of emacs-lisp/text-property-search.el (Emacs 30.2).
+
+(cl-defstruct (prop-match)
+  beginning end value)
+
+(defun text-property-search-forward (property &optional value predicate
+                                              not-current)
+  "Search for next region of text where PREDICATE returns non-nil for PROPERTY.
+PREDICATE is used to decide whether the value of PROPERTY at a given
+buffer position should be considered as a match for VALUE.
+VALUE defaults to nil if omitted.
+
+If PREDICATE is a function, it will be called with two arguments:
+VALUE and the value of PROPERTY at some buffer position.  The function
+should return non-nil if these two values are to be considered a match.
+
+Two special values of PREDICATE can also be used:
+If PREDICATE is t, that means the value of PROPERTY must `equal' VALUE
+to be considered a match.
+If PREDICATE is nil (which is the default), the value of PROPERTY will
+match if it is not `equal' to VALUE.  Furthermore, a nil PREDICATE
+means that the match region ends where the value changes.  For
+instance, this means that if you loop with
+
+  (while (setq prop (text-property-search-forward \\='face))
+    ...)
+
+you will get all the distinct regions with non-nil `face' values in
+the buffer, and the `prop' object will have the details about the
+match.  See the manual for more details and examples about how
+VALUE and PREDICATE interact.
+
+If NOT-CURRENT is non-nil, current buffer position is not examined for
+matches: the function will search for the first region that doesn't
+include point and has a value of PROPERTY that matches VALUE.
+
+If no matches can be found, return nil and don't move point.
+If found, move point to the end of the region and return a
+`prop-match' object describing the match.  To access the details
+of the match, use `prop-match-beginning' and `prop-match-end' for
+the buffer positions that limit the region, and `prop-match-value'
+for the value of PROPERTY in the region."
+  (interactive
+   (list
+    (let ((string (completing-read "Search for property: " obarray)))
+      (when (> (length string) 0)
+        (intern string obarray)))))
+  (cond
+   ((eobp)
+    nil)
+   ((and (text-property--match-p value (get-text-property (point) property)
+                                 predicate)
+         (not not-current))
+    (text-property--find-end-forward (point) property value predicate))
+   (t
+    (let ((origin (point))
+          (ended nil)
+          pos)
+      (while (not ended)
+        (setq pos (next-single-property-change (point) property))
+        (if (not pos)
+            (progn
+              (goto-char origin)
+              (setq ended t))
+          (goto-char pos)
+          (if (text-property--match-p value (get-text-property (point) property)
+                                      predicate)
+              (setq ended
+                    (text-property--find-end-forward
+                     (point) property value predicate))
+            (setq pos (next-single-property-change (point) property))
+            (unless pos
+              (goto-char origin)
+              (setq ended t)))))
+      (and (not (eq ended t))
+           ended)))))
+
+(defun text-property--find-end-forward (start property value predicate)
+  (let (end)
+    (if (and value
+             (null predicate))
+        (let ((ended nil))
+          (while (not ended)
+            (setq end (next-single-property-change (point) property))
+            (if (not end)
+                (progn
+                  (goto-char (point-max))
+                  (setq end (point)
+                        ended t))
+              (goto-char end)
+              (unless (text-property--match-p
+                       value (get-text-property (point) property) predicate)
+                (setq ended t)))))
+      (setq end (next-single-property-change (point) property nil (point-max)))
+      (goto-char end))
+    (make-prop-match :beginning start
+                     :end end
+                     :value (get-text-property start property))))
+
+(defun text-property-search-backward (property &optional value predicate
+                                               not-current)
+  "Search for previous region of text where PREDICATE returns non-nil for PROPERTY.
+
+Like `text-property-search-forward', which see, but searches backward,
+and if a matching region is found, place point at the start of the region."
+  (interactive
+   (list
+    (let ((string (completing-read "Search for property: " obarray)))
+      (when (> (length string) 0)
+        (intern string obarray)))))
+  (cond
+   ((bobp)
+    nil)
+   ((text-property--match-p
+     value (get-text-property (1- (point)) property)
+     predicate)
+    (let ((origin (point))
+          (match (text-property--find-end-backward
+                  (1- (point)) property value predicate)))
+      (if (and not-current
+               (equal (get-text-property (point) property)
+                      (get-text-property origin property)))
+          (text-property-search-backward property value predicate)
+        match)))
+   (t
+    (let ((origin (point))
+          (ended nil)
+          pos)
+      (while (not ended)
+        (setq pos (previous-single-property-change (point) property))
+        (if (not pos)
+            (progn
+              (goto-char origin)
+              (setq ended t))
+          (goto-char (1- pos))
+          (if (text-property--match-p value (get-text-property (point) property)
+                                      predicate)
+              (setq ended
+                    (text-property--find-end-backward
+                     (point) property value predicate))
+            (setq pos (previous-single-property-change (point) property))
+            (unless pos
+              (goto-char origin)
+              (setq ended t)))))
+      (and (not (eq ended t))
+           ended)))))
+
+(defun text-property--find-end-backward (start property value predicate)
+  (let (end)
+    (if (and value
+             (null predicate))
+        (let ((ended nil))
+          (while (not ended)
+            (setq end (previous-single-property-change (point) property))
+            (if (not end)
+                (progn
+                  (goto-char (point-min))
+                  (setq end (point)
+                        ended t))
+              (goto-char (1- end))
+              (unless (text-property--match-p
+                       value (get-text-property (point) property) predicate)
+                (goto-char end)
+                (setq ended t)))))
+      (setq end
+            (if (and (> (point) (point-min))
+                     (text-property--match-p
+                      value (get-text-property (1- (point)) property)
+                      predicate))
+                (previous-single-property-change (point)
+                                                 property nil (point-min))
+              (point)))
+      (goto-char end))
+    (make-prop-match :beginning end
+                     :end (1+ start)
+                     :value (get-text-property end property))))
+
+(defun text-property--match-p (value prop-value predicate)
+  (cond
+   ((eq predicate t)
+    (setq predicate #'equal))
+   ((eq predicate nil)
+    (setq predicate (lambda (val p-val)
+                      (not (equal val p-val))))))
+  (funcall predicate value prop-value))
 "#;
 
 /// Faithful port of emacs-lisp/nadvice.el (Emacs 30.2) — the modern light-weight
