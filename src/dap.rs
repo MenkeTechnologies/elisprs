@@ -18,7 +18,7 @@
 //! Single-threaded by necessity: the elisp object heap is a `thread_local!`
 //! (`host::with_host`), so a separate reader thread (as in zshrs) could not read
 //! the paused executor's variables. Instead the executor thread runs the program
-//! and, when a marker pauses, services DAP requests inline from [`Dap::pause_loop`]
+//! and, when a marker pauses, services DAP requests inline from `Dap::pause_loop`
 //! until the client resumes — so `stackTrace` / `scopes` / `variables` /
 //! `evaluate` all read the live, correct host. (Consequence vs. zshrs: an async
 //! `pause` is honored at the next statement marker rather than mid-statement.)
