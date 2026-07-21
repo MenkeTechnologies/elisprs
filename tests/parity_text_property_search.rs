@@ -7,7 +7,7 @@
 //!
 //! Fixture buffer (built by the `buf` macro): "AAA" + "BBB"(face bold) + "CCC"
 //! + "DDD"(face italic), so face=bold spans [4,7) and face=italic spans [10,13)
-//! in Emacs's 1-based buffer coordinates.
+//!   in Emacs's 1-based buffer coordinates.
 
 use elisprs::{eval_str, print, reset_host};
 

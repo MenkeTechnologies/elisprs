@@ -2193,7 +2193,7 @@ impl ElispHost {
                     // the bits LSB-first in `ceil(LEN/8)` bytes. The byte string
                     // uses print.c's rules: `"`/`\` are backslash-escaped, bytes
                     // >= 128 are `\OOO` octal, all others (incl. controls) are raw.
-                    let nbytes = (bits.len() + 7) / 8;
+                    let nbytes = bits.len().div_ceil(8);
                     let mut packed = vec![0u8; nbytes];
                     for (i, &b) in bits.iter().enumerate() {
                         if b {
