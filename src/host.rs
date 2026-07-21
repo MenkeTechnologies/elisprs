@@ -4347,7 +4347,7 @@ pub fn ext_dispatch(vm: &mut VM, id: u16, arg: u8) {
             // past the marker, so the marker's slot is `ip - 1`. Stack-neutral.
             let line = *vm.chunk.lines.get(vm.ip.saturating_sub(1)).unwrap_or(&0);
             if line != 0 {
-                crate::dap::check_line(line as u32);
+                crate::dap::check_line(line);
             }
         }
         _ => {}

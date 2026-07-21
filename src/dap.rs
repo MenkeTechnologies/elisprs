@@ -112,11 +112,9 @@ pub fn run_stdio() -> i32 {
     // program launched), then run the program in-process. `check_line` pauses
     // into `Dap::pause_loop` from within the run; nothing here holds the `DAP`
     // borrow across `run_program`, so that re-borrow is sound.
-    loop {
-        let msg = match with_dap(|d| d.read_msg()).flatten() {
-            Some(m) => m,
-            None => break, // EOF
-        };
+    // EOF (`read_msg` → None) ends the loop; the inner breaks handle disconnect
+    // and the run-then-terminate path.
+    while let Some(msg) = with_dap(|d| d.read_msg()).flatten() {
         let run_now = with_dap(|d| d.handle_toplevel(&msg)).unwrap_or(false);
         if with_dap(|d| d.disconnected).unwrap_or(true) {
             break;
