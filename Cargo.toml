@@ -11,6 +11,25 @@ documentation = "https://docs.rs/elisprs"
 readme = "README.md"
 keywords = ["emacs", "lisp", "elisp", "interpreter", "fusevm"]
 categories = ["command-line-utilities", "compilers"]
+# Keep the published crate lean: ship `src/`, `man/`, `completions/`,
+# README/LICENSE — nothing else. Everything below stays in git for
+# local/CI use but is omitted from `cargo package` / the crates.io
+# tarball. Mirrors strykelang's exclude set.
+exclude = [
+    "/.github/",
+    "/tests/",
+    "/examples/",
+    "/docs/",
+    "/editors/",
+    "/bench/",
+    "/benches/",
+    "/parity/",
+    "/scripts/",
+    "/vendor/",
+    "/tools/",
+    "/fuzz/",
+    "/BUGS.md",
+]
 
 [[bin]]
 name = "elisp"
