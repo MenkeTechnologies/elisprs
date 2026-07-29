@@ -158,8 +158,7 @@ pub fn report(src: &str) -> Result<Report, String> {
 fn closure_chunks(mark: usize) -> Vec<(String, Chunk)> {
     crate::host::with_host(|h| {
         // Symbol handle → name, for the closures reachable as a function cell.
-        let mut named_by: std::collections::HashMap<u32, String> =
-            std::collections::HashMap::new();
+        let mut named_by: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
         for obj in h.arena.iter() {
             if let crate::host::Obj::Symbol(s) = obj {
                 if let Some(fusevm::Value::Obj(id)) = s.function {
@@ -187,7 +186,6 @@ fn closure_chunks(mark: usize) -> Vec<(String, Chunk)> {
         out
     })
 }
-
 
 /// Report on one already-executed chunk, as a whole-program report. Used by
 /// tests that build a chunk by hand.
@@ -291,7 +289,6 @@ fn op_name(op: &Op) -> String {
     }
 }
 
-
 /// The counted loop this module's tests measure, in the frontend's own syntax.
 #[cfg(test)]
 const PROGRAM: &str = "(defun f (n)\n  (let ((tot 0) (i 0))\n    (while (< i n)\n      (setq tot (+ tot i))\n      (setq i (1+ i)))\n    tot))\n(f 200000)\n";
@@ -343,7 +340,10 @@ mod tests {
     fn the_loop_lives_in_a_chunk_other_than_main() {
         let report = report(PROGRAM).expect("runs");
         assert!(report.chunks.len() > 1, "{report}");
-        assert!(report.chunks[0].loops.is_empty(), "main has no loop: {report}");
+        assert!(
+            report.chunks[0].loops.is_empty(),
+            "main has no loop: {report}"
+        );
         assert!(
             report.chunks[1..].iter().any(|c| !c.loops.is_empty()),
             "{report}"
