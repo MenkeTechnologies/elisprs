@@ -212,6 +212,7 @@ The grid reflects the current state of the tree.
 | `elisp` CLI — file / `-e` / REPL | Working |
 | ERT test surface (`ert-deftest`/`should`/`should-error`) | Working (prelude) |
 | `--lsp` / `--dap` servers | Working |
+| Execution-tier report (`--tiers`) | Working |
 | elisp → `fusevm::Chunk` lowering + execution (`compiler.rs` / `host.rs`) | Working |
 | `--aot` / `--aot-exe` → native object + standalone executable via `fusevm::aot::compile_object` | Working |
 | `lexical-binding` (lexical + dynamic) | Working |

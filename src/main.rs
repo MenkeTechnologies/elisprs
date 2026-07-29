@@ -81,6 +81,9 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--disasm") {
         return finish(dump_target(&args).and_then(|f| disasm(&f)));
     }
+    if args.iter().any(|a| a == "--tiers") {
+        return finish(dump_target(&args).and_then(|f| tiers(&f)));
+    }
     if let Some(pos) = args.iter().position(|a| a == "-e" || a == "--eval") {
         let Some(expr) = args.get(pos + 1) else {
             eprintln!("elisp: -e requires an expression");
@@ -162,6 +165,16 @@ fn disasm(file: &str) -> Result<(), String> {
     let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
     let chunk = elisprs::compile_str(&src)?;
     println!("; elisp fusevm — main\n{}", chunk.disassemble());
+    Ok(())
+}
+
+/// `--tiers`: run the file, then report which fusevm execution tier took each
+/// of its chunks — asked of fusevm's own eligibility and cache predicates, so
+/// the answer comes from the compiler that would have done the work. The
+/// file's own output precedes the report.
+fn tiers(file: &str) -> Result<(), String> {
+    let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    println!("{}", elisprs::tiers::report(&src)?);
     Ok(())
 }
 
