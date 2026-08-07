@@ -457,7 +457,7 @@ impl Reader {
     /// Read a radix-prefixed integer: `#x1f` / `#b101` / `#o17` (and uppercase),
     /// or the general `#NNr…` form (e.g. `#16rFF`). An optional sign may follow
     /// the prefix.
-    fn read_radix(&mut self, _h: &mut ElispHost) -> Result<Value, String> {
+    fn read_radix(&mut self, h: &mut ElispHost) -> Result<Value, String> {
         self.pos += 1; // consume '#'
         let c = self.peek().ok_or("unterminated radix literal")?;
         let base: u32 = match c {
@@ -507,9 +507,12 @@ impl Reader {
             self.pos += 1;
         }
         let tok: String = self.chars[start..self.pos].iter().collect();
-        let n = i64::from_str_radix(&tok, base)
-            .map_err(|_| format!("invalid digits for base {base}: {tok}"))?;
-        Ok(Value::Int(sign * n))
+        // A radix literal is an integer of any width: `#xFFFFFFFFFFFFFFFF` is a
+        // bignum in Emacs, not a reader error, so parse into a `BigInt` and let
+        // `make_integer` decide whether it fits a fixnum.
+        let n = BigInt::parse_bytes(tok.as_bytes(), base)
+            .ok_or_else(|| format!("invalid digits for base {base}: {tok}"))?;
+        Ok(h.make_integer(n * sign))
     }
 
     /// Read a `#s(…)` literal: a hash-table (`#s(hash-table test … data (k v …))`)

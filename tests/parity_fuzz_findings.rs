@@ -938,3 +938,81 @@ fn string_trim_trims_right_first() {
     assert_eq!(eval("(string-trim \" a \")"), "\"a\"");
     assert_eq!(eval("(string-trim \"xax\" \"x\" \"x\")"), "\"a\"");
 }
+
+// ── round 6: the fuzz sweep's non-property findings ──
+
+#[test]
+fn ash_signals_overflow_past_integer_width() {
+    // Emacs bounds an integer at `integer-width` bits (65536) and signals
+    // `overflow-error` rather than building the number. Values from emacs 30.2.
+    assert_eq!(
+        eval("(condition-case e (ash 3 123456788) (error e))"),
+        "(overflow-error)"
+    );
+    assert_eq!(
+        eval("(condition-case e (ash 1 65536) (error e))"),
+        "(overflow-error)"
+    );
+    // Just inside the bound, and the cases the bound must not touch.
+    assert_eq!(eval("(= (ash 1 65535) (expt 2 65535))"), "t");
+    assert_eq!(eval("(ash 0 123456788)"), "0");
+    assert_eq!(eval("(ash 1 -3)"), "0");
+    assert_eq!(eval("(ash 1 100)"), "1267650600228229401496703205376");
+}
+
+#[test]
+fn a_replacement_backslash_must_introduce_a_valid_escape() {
+    // search.c allows only \& \N \\ \? after a backslash in replacement text.
+    assert_eq!(
+        eval(r#"(condition-case e (replace-regexp-in-string "a" "x\\" "ab") (error (cadr e)))"#),
+        "\"Invalid use of ‘\\\\’ in replacement text\""
+    );
+    assert_eq!(
+        eval(r#"(condition-case e (replace-regexp-in-string "a" "\\q" "ab") (error (cadr e)))"#),
+        "\"Invalid use of ‘\\\\’ in replacement text\""
+    );
+    // The valid ones still expand.
+    assert_eq!(
+        eval(r#"(replace-regexp-in-string "a" "x\\\\y" "ab")"#),
+        "\"x\\\\yb\""
+    );
+    assert_eq!(
+        eval(r#"(replace-regexp-in-string "\\(a\\)" "[\\1]" "ab")"#),
+        "\"[a]b\""
+    );
+    assert_eq!(
+        eval(r#"(replace-regexp-in-string "a" "\\&!" "ab")"#),
+        "\"a!b\""
+    );
+}
+
+#[test]
+fn take_requires_an_integer_and_seq_take_follows_the_sequence_type() {
+    // fns.c Ftake signals `integerp`; seq.el reaches it for a list and a
+    // comparison (number-or-marker-p) for every other sequence.
+    assert_eq!(
+        eval("(condition-case e (take 'car '(1 2)) (error e))"),
+        "(wrong-type-argument integerp car)"
+    );
+    assert_eq!(
+        eval("(condition-case e (seq-take nil 'car) (error e))"),
+        "(wrong-type-argument integerp car)"
+    );
+    assert_eq!(
+        eval("(condition-case e (seq-take '(1 2) 1.5) (error e))"),
+        "(wrong-type-argument integerp 1.5)"
+    );
+    assert_eq!(
+        eval("(condition-case e (seq-take \"abc\" 'x) (error e))"),
+        "(wrong-type-argument number-or-marker-p x)"
+    );
+}
+
+#[test]
+fn a_radix_literal_may_exceed_the_fixnum_range() {
+    assert_eq!(eval("#xFFFFFFFFFFFFFFFF"), "18446744073709551615");
+    assert_eq!(eval("#x-FFFFFFFFFFFFFFFF"), "-18446744073709551615");
+    assert_eq!(eval("#16rFF"), "255");
+    assert_eq!(eval("#b1111"), "15");
+    assert_eq!(eval("#o777"), "511");
+}

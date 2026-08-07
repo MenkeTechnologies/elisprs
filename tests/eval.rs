@@ -3207,9 +3207,53 @@ fn error_message_assert_propertize() {
         eval("(propertize \"hello\" 'face 'bold)"),
         "#(\"hello\" 0 5 (face bold))"
     );
-    // concat does not yet propagate the source string's text properties (Emacs
-    // would yield #("ab" 0 1 (x 1))); it returns the plain concatenation.
-    assert_eq!(eval("(concat (propertize \"a\" 'x 1) \"b\")"), "\"ab\"");
+    // Text properties follow the characters they are on: `concat`, `substring`,
+    // the case functions and a `%s` argument each carry them onto the result.
+    // Every value below is emacs 30.2's.
+    assert_eq!(
+        eval("(concat (propertize \"a\" 'x 1) \"b\")"),
+        "#(\"ab\" 0 1 (x 1))"
+    );
+    assert_eq!(
+        eval("(concat (propertize \"a\" 'p 1) (propertize \"b\" 'q 2))"),
+        "#(\"ab\" 0 1 (p 1) 1 2 (q 2))"
+    );
+    assert_eq!(
+        eval("(substring (propertize \"abcd\" 'face 'bold) 1 3)"),
+        "#(\"bc\" 0 2 (face bold))"
+    );
+    assert_eq!(
+        eval("(substring-no-properties (propertize \"ab\" 'p 1))"),
+        "\"ab\""
+    );
+    assert_eq!(
+        eval("(upcase (propertize \"ab\" 'p 1))"),
+        "#(\"AB\" 0 2 (p 1))"
+    );
+    assert_eq!(
+        eval("(capitalize (propertize \"ab cd\" 'p 1))"),
+        "#(\"Ab Cd\" 0 5 (p 1))"
+    );
+    assert_eq!(
+        eval("(format \"x%sy\" (propertize \"A\" 'p 1))"),
+        "#(\"xAy\" 1 2 (p 1))"
+    );
+    // Padding that FOLLOWS the argument is inside its interval; padding that
+    // precedes it is not.
+    assert_eq!(
+        eval("(format \"%-4s|\" (propertize \"ab\" 'p 1))"),
+        "#(\"ab  |\" 0 4 (p 1))"
+    );
+    assert_eq!(
+        eval("(format \"%4s|\" (propertize \"ab\" 'p 1))"),
+        "#(\"  ab|\" 2 4 (p 1))"
+    );
+    // A property whose value is nil is still an interval, and does not merge
+    // with the characters that have no properties at all.
+    assert_eq!(
+        eval("(concat (propertize \"ab\" 'p nil) \"c\")"),
+        "#(\"abc\" 0 2 (p nil))"
+    );
 }
 
 #[test]

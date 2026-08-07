@@ -1286,7 +1286,7 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
          (in-word (setq out (cons (downcase c) out)))
          (t (setq out (cons (upcase c) out))))
         (setq in-word wordc)))
-    (apply (function string) (reverse out)))))
+    (elisprs--carry-text-properties s (apply (function string) (reverse out))))))
 (defun string-trim-left (s &optional regexp)
   ;; Strip a leading match of REGEXP (default whitespace).
   (let ((re (concat "\\`\\(?:" (or regexp "[ \t\n\r]+") "\\)")))
@@ -1374,6 +1374,9 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
           ((<= n 0) lst)
           (t (setcdr (nthcdr (- len n 1) lst) nil) lst))))
 (defun take (n lst)
+  ;; fns.c Ftake: N must be an integer — a float or a symbol signals `integerp`,
+  ;; not the `number-or-marker-p` a comparison would give.
+  (unless (integerp n) (signal (quote wrong-type-argument) (list (quote integerp) n)))
   (let ((out nil))
     (while (and (> n 0) lst) (setq out (cons (car lst) out)) (setq lst (cdr lst)) (setq n (1- n)))
     (reverse out)))
@@ -1507,7 +1510,11 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 ;;; ---- seq.el (list-oriented) ----
 ;; seq-generic: coerce to a list, then restore SEQ's own type (vector/string).
 (defun seq-take (seq n)
-  (unless (number-or-marker-p n) (signal 'wrong-type-argument (list 'number-or-marker-p n)))
+  ;; seq.el: a list goes through `take`, whose N must be an integer; every other
+  ;; sequence reaches a comparison first, which signals number-or-marker-p.
+  ;; (seq-take nil 1.5) => integerp 1.5; (seq-take "abc" (quote x)) => number-or-marker-p x.
+  (unless (listp seq)
+    (unless (number-or-marker-p n) (signal (quote wrong-type-argument) (list (quote number-or-marker-p) n))))
   (seq-into (take n (append seq nil)) (seq--type-of seq)))
 (defun seq-drop (seq n)
   ;; seq.el: the list method is literally (nthcdr n list) -- so a non-integer

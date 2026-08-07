@@ -611,7 +611,7 @@ fn simple_case(cp: i64, upper: bool) -> i64 {
         cp
     }
 }
-fn case_fold(h: &ElispHost, a: &[Value], upper: bool) -> R {
+fn case_fold(h: &mut ElispHost, a: &[Value], upper: bool) -> R {
     match &a[0] {
         // casefiddle.c: a negative fixnum is not a character (char-or-string-p),
         // but one above the character range is returned UNCHANGED — Emacs treats
@@ -622,11 +622,22 @@ fn case_fold(h: &ElispHost, a: &[Value], upper: bool) -> R {
         )),
         Value::Int(c) if *c > 0x3F_FFFF => Ok(Value::Int(*c)),
         Value::Int(c) => Ok(Value::Int(simple_case(*c, upper))),
-        Value::Str(s) => Ok(Value::str(if upper {
-            s.to_uppercase()
-        } else {
-            s.to_lowercase()
-        })),
+        Value::Str(s) => {
+            // Case folding is character-for-character here, so the text
+            // properties land on the same characters they were on.
+            let folded = Value::str(if upper {
+                s.to_uppercase()
+            } else {
+                s.to_lowercase()
+            });
+            if let Value::Str(out) = &folded {
+                if out.chars().count() == s.chars().count() {
+                    let src = std::sync::Arc::clone(s);
+                    h.string_carry_all(out, &src);
+                }
+            }
+            Ok(folded)
+        }
         v => Err(format!(
             "wrong-type-argument: char-or-string-p {}",
             h.print(v, true)
@@ -1440,6 +1451,12 @@ fn concat_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // names its tail ((concat '(1 . 2)) => listp 2), and a non-sequence names
     // itself ((concat t) => sequencep t).
     let mut out = String::new();
+    // Where each argument's characters land in the result, so a string
+    // argument's text properties follow them (`Fconcat` copies intervals the
+    // same way). A `None` piece is that many property-less characters — the
+    // char-list and vector arguments, which carry none.
+    let mut pieces: Vec<(Option<std::sync::Arc<String>>, usize, usize)> = Vec::new();
+    let mut carried = 0usize;
     // A char code Emacs accepts (characterp: 0..=#x3FFFFF); codes valid in
     // Emacs but unrepresentable as a Rust char (surrogates, > #x10FFFF)
     // degrade to U+FFFD rather than mis-signalling characterp.
@@ -1460,7 +1477,12 @@ fn concat_fn(h: &mut ElispHost, a: &[Value]) -> R {
             continue;
         }
         match v {
-            Value::Str(s) => out.push_str(s),
+            Value::Str(s) => {
+                let n = s.chars().count();
+                pieces.push((Some(std::sync::Arc::clone(s)), 0, n));
+                carried += n;
+                out.push_str(s);
+            }
             _ => match h.obj(v) {
                 Some(Obj::Vector(items)) => {
                     for it in items.clone() {
@@ -1484,8 +1506,19 @@ fn concat_fn(h: &mut ElispHost, a: &[Value]) -> R {
                 }
             },
         }
+        // Whatever this argument contributed that was not a string is that many
+        // property-less characters, and the offsets after it depend on them.
+        let so_far = out.chars().count();
+        if so_far > carried {
+            pieces.push((None, 0, so_far - carried));
+            carried = so_far;
+        }
     }
-    Ok(Value::str(out))
+    let out = Value::str(out);
+    if let Value::Str(s) = &out {
+        h.string_carry_props(s, &pieces);
+    }
+    Ok(out)
 }
 /// A parsed `%`-directive: `%[-][0][width][.prec]CONV`.
 struct FmtSpec {
@@ -1674,11 +1707,31 @@ fn pad(body: String, spec: &FmtSpec) -> String {
     }
 }
 
+/// One run of a formatted result and where its text properties come from:
+/// `Some(source)` at a char offset, or `None` for characters that carry none.
+type FmtPiece = (Option<std::sync::Arc<String>>, usize, usize);
+
 fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
+    el_format_pieces(h, a).map(|(s, _)| s)
+}
+
+/// `format`, also reporting where each run of the result came from so the
+/// caller can carry text properties onto it. Emacs propagates two things: the
+/// properties of the format string's own literal text, and those of a `%s`
+/// argument, each onto the characters they produced. Padding carries none.
+fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>), String> {
     let fmt = match &a[0] {
         Value::Str(s) => s.to_string(),
         v => return Err(format!("wrong-type-argument: stringp {}", h.print(v, true))),
     };
+    // Runs of the result, in order. Everything but a `%s` argument's own
+    // characters carries no properties: the format string's literal text and
+    // the padding are `None` pieces. (Emacs also propagates the *format
+    // string's* properties onto its literal text; that half is not modelled —
+    // see BUGS.md.)
+    let mut pieces: Vec<FmtPiece> = Vec::new();
+    // How much of `out` is already accounted for by a piece.
+    let mut placed = 0usize;
     let mut out = String::new();
     let mut ai = 1;
     let mut chars = fmt.chars().peekable();
@@ -1797,6 +1850,13 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
                 _ => as_int_exact(h, arg).map_err(|_| BAD_TYPE.to_string()),
             }
         };
+        // A `%s` of a string argument reproduces that string's characters, so
+        // its properties belong on them. Truncation by a precision drops the
+        // tail but keeps the head's, which the offsets below already express.
+        let carries: Option<std::sync::Arc<String>> = match (conv, a.get(idx)) {
+            ('s', Some(Value::Str(s))) => Some(std::sync::Arc::clone(s)),
+            _ => None,
+        };
         let body = match conv {
             's' => {
                 let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
@@ -1902,12 +1962,50 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
         if field.is_none() {
             ai += 1;
         }
-        out.push_str(&pad(body, &spec));
+        // Literal format-string text since the last directive carries nothing.
+        let before = out.chars().count();
+        if before > placed {
+            pieces.push((None, 0, before - placed));
+        }
+        let body_len = body.chars().count();
+        let padded = pad(body, &spec);
+        out.push_str(&padded);
+        // `pad` adds spaces on one side. Emacs puts padding that follows the
+        // argument *inside* its interval — `(format "%-10s|" (propertize "ab"
+        // 'p 1))` is propertized over all ten columns — while padding that
+        // precedes it stays outside, so only the trailing kind carries.
+        let pad_len = padded.chars().count() - body_len;
+        if !spec.left && pad_len > 0 {
+            pieces.push((None, 0, pad_len));
+        }
+        pieces.push((carries.clone(), 0, body_len));
+        if spec.left && pad_len > 0 {
+            match (&carries, body_len) {
+                // The trailing padding continues the last character's plist.
+                (Some(src), n) if n > 0 => {
+                    for _ in 0..pad_len {
+                        pieces.push((Some(std::sync::Arc::clone(src)), n - 1, 1));
+                    }
+                }
+                _ => pieces.push((None, 0, pad_len)),
+            }
+        }
+        placed = out.chars().count();
     }
-    Ok(out)
+    let total = out.chars().count();
+    if total > placed {
+        pieces.push((None, 0, total - placed));
+    }
+    Ok((out, pieces))
 }
 fn format_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    el_format(h, a).map(Value::str)
+    let (s, pieces) = el_format_pieces(h, a)?;
+    let out = Value::str(s);
+    if let Value::Str(s) = &out {
+        let s = std::sync::Arc::clone(s);
+        h.string_carry_props(&s, &pieces);
+    }
+    Ok(out)
 }
 fn message_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let s = el_format(h, a)?;
@@ -2046,9 +2144,14 @@ fn substring_no_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
             h.print(&a[0], true)
         ));
     }
-    // `substring` on a string builds a fresh string value, which carries no
-    // text properties — exactly the copy this subr must return.
-    substring(h, a)
+    // `substring` carries the slice's text properties; this subr is exactly
+    // that slice without them.
+    let out = substring(h, a)?;
+    if let Value::Str(s) = &out {
+        let s = std::sync::Arc::clone(s);
+        h.string_clear_props(&s);
+    }
+    Ok(out)
 }
 fn substring(h: &mut ElispHost, a: &[Value]) -> R {
     // Emacs `substring` works on both strings and vectors (arrays), and checks
@@ -2117,9 +2220,17 @@ fn substring(h: &mut ElispHost, a: &[Value]) -> R {
         ));
     }
     match seq {
-        Seq::Str(c) => Ok(Value::str(
-            c[start as usize..end as usize].iter().collect::<String>(),
-        )),
+        Seq::Str(c) => {
+            let out = Value::str(c[start as usize..end as usize].iter().collect::<String>());
+            // The slice's characters keep the properties they had in the
+            // original, re-based to the new string's start.
+            if let (Value::Str(src), Value::Str(dst)) = (&a[0], &out) {
+                let src = std::sync::Arc::clone(src);
+                let dst = std::sync::Arc::clone(dst);
+                h.string_carry_props(&dst, &[(Some(src), start as usize, (end - start) as usize)]);
+            }
+            Ok(out)
+        }
         Seq::Vec(v) => Ok(h.alloc(Obj::Vector(v[start as usize..end as usize].to_vec()))),
     }
 }
@@ -2873,6 +2984,18 @@ fn lognot_fn(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// `(ash VALUE COUNT)` — arithmetic shift. A left shift is exact: Emacs's
 /// integers are unbounded, so `(ash 1 70)` is 2^70, not a wrapped fixnum.
+/// The `integer-width` bound in bits: how wide a bignum Emacs will build before
+/// signalling `overflow-error`. Defaults to 65536, as `emacs -Q` reports.
+fn integer_width(h: &ElispHost) -> u64 {
+    h.find_symbol("integer-width")
+        .and_then(|s| h.get_value(&s).ok())
+        .and_then(|v| match v {
+            Value::Int(n) if n > 0 => Some(n as u64),
+            _ => None,
+        })
+        .unwrap_or(65536)
+}
+
 fn ash_fn(h: &mut ElispHost, a: &[Value]) -> R {
     use num_traits::{Signed, ToPrimitive};
     let n = as_int_exact_p(h, &a[0], false)?;
@@ -2891,9 +3014,12 @@ fn ash_fn(h: &mut ElispHost, a: &[Value]) -> R {
         None => return Err("overflow-error".to_string()),
     };
     let r = if c >= 0 {
-        // A shift count that large would exhaust memory long before it completed;
-        // Emacs signals `overflow-error` rather than trying.
-        if c > 1 << 30 {
+        // Emacs bounds an integer at `integer-width` bits (65536 by default) and
+        // signals `overflow-error` for a result wider than that — rather than
+        // building the 15-megabyte number `(ash 3 123456788)` asks for. Zero
+        // shifts to zero at any count, so it is not bounded.
+        let width = integer_width(h);
+        if n.sign() != num_bigint::Sign::NoSign && n.bits().saturating_add(c as u64) > width {
             return Err("overflow-error".to_string());
         }
         n << (c as u64)
@@ -5785,6 +5911,26 @@ fn remove_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(Value::Undef)
 }
+/// `(elisprs--carry-text-properties SRC DST)` — DST with SRC's per-character
+/// text properties, when the two are the same length.
+///
+/// Emacs exposes no such function: its case and trimming primitives are written
+/// in C and copy intervals internally. The ones written in elisp here — mainly
+/// `capitalize`, which rebuilds its result character by character — need a way
+/// to say the same thing, so this is an elisprs-internal primitive rather than
+/// an Emacs one. Returns DST unchanged when the lengths differ or SRC has no
+/// properties.
+fn carry_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let (Value::Str(src), Value::Str(dst)) = (&a[0], &a[1]) else {
+        return Ok(a[1].clone());
+    };
+    if src.chars().count() == dst.chars().count() {
+        let src = std::sync::Arc::clone(src);
+        h.string_carry_all(dst, &src);
+    }
+    Ok(a[1].clone())
+}
+
 /// `(propertize STRING &rest PROPS)` — a fresh copy of STRING carrying PROPS.
 fn propertize_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let base = as_string(h, &a[0])?;
@@ -6082,19 +6228,28 @@ fn looking_at_p(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// Expand NEWTEXT's `\&` (whole match), `\N` (group N), and `\\` escapes using
 /// GT, an accessor returning the text of group N.
-fn expand_repl(newtext: &str, gt: &dyn Fn(usize) -> String) -> String {
+///
+/// A backslash before anything else — including the end of the string — is an
+/// error, not a character to drop: `search.c`'s `Freplace_match` signals
+/// `Invalid use of ‘\’ in replacement text` there, so `\q` and a trailing `\`
+/// both fail rather than quietly producing `q` and nothing.
+fn expand_repl(newtext: &str, gt: &dyn Fn(usize) -> String) -> Result<String, String> {
+    const BAD: &str = "error: Invalid use of ‘\\’ in replacement text";
     let chars: Vec<char> = newtext.chars().collect();
     let mut out = String::new();
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == '\\' && i + 1 < chars.len() {
-            let c = chars[i + 1];
-            if c == '&' {
-                out.push_str(&gt(0));
-            } else if c.is_ascii_digit() {
-                out.push_str(&gt(c as usize - '0' as usize));
-            } else {
-                out.push(c);
+        if chars[i] == '\\' {
+            let Some(&c) = chars.get(i + 1) else {
+                return Err(BAD.to_string());
+            };
+            match c {
+                '&' => out.push_str(&gt(0)),
+                '0'..='9' => out.push_str(&gt(c as usize - '0' as usize)),
+                // `\\` is a literal backslash and `\?` is a literal `?` (the
+                // latter only means something to `query-replace-regexp`).
+                '\\' | '?' => out.push(c),
+                _ => return Err(BAD.to_string()),
             }
             i += 2;
         } else {
@@ -6102,7 +6257,7 @@ fn expand_repl(newtext: &str, gt: &dyn Fn(usize) -> String) -> String {
             i += 1;
         }
     }
-    out
+    Ok(out)
 }
 /// `(replace-match NEWTEXT &optional FIXEDCASE LITERAL STRING SUBEXP)`. With a
 /// STRING argument, returns a new string with the last `string-match` of STRING
@@ -6150,7 +6305,7 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
         let rep = if literal {
             newtext
         } else {
-            expand_repl(&newtext, &gt)
+            expand_repl(&newtext, &gt)?
         };
         let rep = if fixedcase {
             rep
@@ -6180,7 +6335,7 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
     let rep = if literal {
         newtext
     } else {
-        expand_repl(&newtext, &gt)
+        expand_repl(&newtext, &gt)?
     };
     let rep = if fixedcase {
         rep
@@ -6826,6 +6981,12 @@ pub fn install(h: &mut ElispHost) {
         remove_text_properties_fn,
     );
     s("propertize", 1, None, propertize_fn);
+    s(
+        "elisprs--carry-text-properties",
+        2,
+        Some(2),
+        carry_text_properties_fn,
+    );
     s(
         "--insert-before-markers--",
         1,

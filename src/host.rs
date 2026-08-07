@@ -2889,6 +2889,11 @@ impl ElispHost {
             .and_then(|v| v.get(idx0).cloned())
             .unwrap_or(Value::Undef)
     }
+    /// Drop any per-char plists registered for string S, making it a plain
+    /// unpropertized string — what `substring-no-properties` returns.
+    pub fn string_clear_props(&mut self, s: &Arc<String>) {
+        self.string_props.remove(&(Arc::as_ptr(s) as usize));
+    }
     /// Install (replacing any existing) the per-char plists for string S.
     pub fn string_set_props_vec(&mut self, s: &Arc<String>, vec: Vec<Value>) {
         let key = Arc::as_ptr(s) as usize;
@@ -2900,6 +2905,48 @@ impl ElispHost {
         self.string_props_vec(s)
             .unwrap_or_else(|| vec![Value::Undef; s.chars().count()])
     }
+    /// Carry text properties onto a freshly-built string.
+    ///
+    /// `pieces` names, for each run of the result in order, the source string it
+    /// came from and the char index it starts at inside that source. A run whose
+    /// source has no properties contributes nils, and a result with no propertized
+    /// piece at all registers nothing — an unpropertized string must stay one, or
+    /// every `concat` would allocate a plist vector.
+    ///
+    /// This is what makes `(concat (propertize "a" 'face 'bold) "b")` keep the
+    /// face on its first character, the way Emacs's interval trees do: the
+    /// properties are per-character, so they follow the characters wherever a
+    /// builtin copies them.
+    pub fn string_carry_props(
+        &mut self,
+        out: &Arc<String>,
+        pieces: &[(Option<Arc<String>>, usize, usize)],
+    ) {
+        let mut vec: Vec<Value> = Vec::new();
+        let mut any = false;
+        for (src, start, len) in pieces {
+            match src.as_ref().and_then(|s| self.string_props_vec(s)) {
+                Some(props) => {
+                    any = true;
+                    for i in 0..*len {
+                        vec.push(props.get(start + i).cloned().unwrap_or(Value::Undef));
+                    }
+                }
+                None => vec.extend(std::iter::repeat_n(Value::Undef, *len)),
+            }
+        }
+        if any {
+            self.string_set_props_vec(out, vec);
+        }
+    }
+
+    /// The whole of `src` as one piece, for a builtin that transforms a string
+    /// character-for-character (`upcase`, `capitalize`) or copies it entire.
+    pub fn string_carry_all(&mut self, out: &Arc<String>, src: &Arc<String>) {
+        let len = src.chars().count();
+        self.string_carry_props(out, &[(Some(Arc::clone(src)), 0, len)]);
+    }
+
     /// `put-text-property` on string S over char indices `[s0, e0)`.
     pub fn string_put_prop(
         &mut self,
@@ -2963,6 +3010,14 @@ impl ElispHost {
     /// Structural plist equality (same key→value set, `eq` on values) — used to
     /// merge adjacent text-property intervals when printing a propertized string.
     fn plist_struct_eq(&self, a: &Value, b: &Value) -> bool {
+        // An empty plist is not the same interval as one that names a property
+        // whose value happens to be nil: `(propertize "ab" 'p nil)` followed by
+        // an unpropertized character prints as two runs, not one. The subset
+        // walk cannot see the difference — a key absent from a plist reads as
+        // nil — so the emptiness is compared first.
+        if el_truthy(a) != el_truthy(b) {
+            return false;
+        }
         self.plist_subset(a, b) && self.plist_subset(b, a)
     }
     /// The `#(...)` interval tail for a propertized string: maximal runs of chars

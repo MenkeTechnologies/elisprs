@@ -363,10 +363,12 @@ engine doesn't backtrack)~~ — ✅ FIXED: swapped the matching engine to
 
 ## Core semantics — wrong values (highest severity)
 
-### 1. No bignum support — silent integer overflow (⚠️ NOT a pure-frontend fix)
-- `(expt 2 100)` → Emacs `1267650600228229401496703205376`, elisprs `0`
-- `(* 1000000000000 1000000000000)` → Emacs `1000000000000000000000000`, elisprs `2003764205206896640`
-- Integer ops wrap i64 instead of promoting to bignum.
+### 1. ✅ FIXED — No bignum support — silent integer overflow
+- `(expt 2 100)` → `1267650600228229401496703205376`; `(* 1000000000000 1000000000000)`
+  → `1000000000000000000000000`; `#xFFFFFFFFFFFFFFFF` reads as a bignum.
+- Integers promote out of `i64` rather than wrapping. The feasibility note below is
+  kept because it is the reason the native-op fast path and the promotion coexist
+  the way they do.
 - **Feasibility (investigated):** fusevm executes `+`/`-`/`*` via native ops that
   **wrap silently** — `Op::Mul => self.arith_int_fast(i64::wrapping_mul, …)`
   (`fusevm vm.rs:1104`; the Cranelift JIT path does the same). elisprs lowers hot
@@ -533,10 +535,8 @@ parity bugs (they'd need `(require 'cl-lib)`).
 
 ## Critical — wrong values / silent miscomputation
 
-### R2-A. Arithmetic silently coerces non-numbers instead of signaling
-- `(+ 1 "a")` → Emacs signals `(wrong-type-argument number-or-marker-p "a")`, elisprs `1.0`
-- `(* 2 "x")` → Emacs signals, elisprs `0.0`; `(+ 1 'sym)` → elisprs `1.0`
-- Most dangerous: arithmetic on bad data never errors and returns silent wrong numbers.
+### R2-A. ✅ FIXED — Arithmetic silently coerces non-numbers instead of signaling
+- `(+ 1 "a")` → `(wrong-type-argument number-or-marker-p "a")`, as Emacs.
 
 ### R2-B. ✅ FIXED — `wrong-type-argument` error data is one string, not separate elements
 (host.rs `make_error_object`: for `wrong-type-argument`/`args-out-of-range` it re-reads the rendered
@@ -552,10 +552,8 @@ instead of `(… fixnump x)`; fixing needs threading `h` into those helpers — 
 - `(condition-case e (user-error "nope") (error e))` → Emacs `(user-error "nope")`,
   elisprs `(error "nope")` — the two conditions can't be distinguished.
 
-### R2-D. Float printer doesn't use exponent form for large / small magnitudes
-- `(prin1-to-string 1e20)` → Emacs `"1e+20"`, elisprs `"100000000000000000000.0"`
-- `1e15`→`"1e+15"` vs `"1000000000000000.0"`; `1.5e-10`→`"1.5e-10"` vs `"0.00000000015"`
-- Affects `prin1`, `number-to-string`, `format "%s"`. (Distinct from the inf/NaN entries.)
+### R2-D. ✅ FIXED — Float printer doesn'	 use exponent form for large / small magnitudes
+- `(prin1-to-string 1e20)` → `"1e+20"`; `1.5e-10` → `"1.5e-10"`.
 
 ## Macros / special forms
 
@@ -577,9 +575,8 @@ instead of `(… fixnump x)`; fixing needs threading `h` into those helpers — 
 
 ## Sequence / string semantics
 
-### R2-H. `mapcar` (and `seq-map`) reject vector/string sequences
-- `(mapcar #'1+ [1 2 3])` → Emacs `(2 3 4)`, elisprs `error: mapcar: not a list`
-- `(mapcar #'1+ "abc")` → Emacs `(98 99 100)`, elisprs errors. (Broader than #22.)
+### R2-H. ✅ FIXED — `mapcar` (and `seq-map`) reject vector/string sequences
+- `(mapcar #'+ [1 2 3])` → `(2 3 4)`; `(mapcar #'+ "abc")` → `(98 99 100)`. Both match.
 
 ### R2-I. ✅ FIXED — `seq-empty-p` wrong on the empty string
 (prelude: `(= 0 (length l))` so vectors/strings count too)
@@ -589,17 +586,17 @@ instead of `(… fixnump x)`; fixing needs threading `h` into those helpers — 
 (prelude: `(string-match-p "\\`[ \t\n\r]*\\'" s)`)
 - `(string-blank-p "  ")` → Emacs `0`, elisprs `t`
 
-### R2-K. `string-pad` 4-arg form (PADDING + START) unsupported
-- `(string-pad "ab" 5 ?* t)` → Emacs `"***ab"`, elisprs `error: wrong-number-of-arguments`
+### R2-K. ✅ FIXED — `string-pad` 4-arg form (PADDING + START)
+- `(string-pad "ab" 5 ?* t)` → `"***ab"`.
 
-### R2-L. `make-hash-table` print format diverges from Emacs 30
+### R2-L. ✅ FIXED — `make-hash-table` print format diverges from Emacs 30
 - `(make-hash-table)` → Emacs `#s(hash-table)`, elisprs `#s(hash-table size 0)`
 
-### R2-M. `assoc` TESTFN (3rd arg) unsupported
-- `(assoc 2 '((1 . 10) (2 . 20)) #'=)` → Emacs `(2 . 20)`, elisprs `error: wrong-number-of-arguments`
+### R2-M. ✅ FIXED — `assoc` TESTFN (3rd arg)
+- `(assoc 2 '((1 . 10) (2 . 20)) #'=)` → `(2 . 20)`.
 
-### R2-N. Emacs-30 `sort` keyword API (`:key`/`:lessp`) unsupported
-- `(sort '(3 1 2) :key #'- :lessp #'<)` → Emacs `(3 2 1)`, elisprs `error: void-function: :key`
+### R2-N. ✅ FIXED — Emacs-30 `sort` keyword API (`:key`/`:lessp`)
+- `(sort '(3 1 2) :key #'- :lessp #'<)` → `(3 2 1)`.
 
 ## Missing builtins / constants (present in bare `emacs -Q`, void in elisprs)
 
@@ -630,9 +627,9 @@ Third deep pass against the current binary. Ground truth = bare `emacs -Q --batc
 
 ## Behavioral — wrong values / wrong errors
 
-### R3-A. String/char `\` escapes: named-control, hex, and octal all wrong
-The reader's `unescape` only maps `n t r 0 e`; every other escape falls through to the
-literal letter, and multi-char numeric escapes aren't consumed.
+### R3-A. ✅ FIXED — String/char `\` escapes: named-control, hex, and octal all wrong
+`?\a` → 7, `?\x41` → 65, `"\x41"` → `"A"`, `(string-to-list "\x41\x42")` → `(65 66)`,
+`?\N{LATIN SMALL LETTER A}` → 97 — all match emacs 30.2. The original report follows.
 - `?\a`→Emacs `7`, elisprs `97`; likewise `?\b`/`?\f`/`?\v`/`?\s`/`?\d` give the ASCII
   of the letter instead of the control code
 - `?\x41`→Emacs `65`, elisprs `41`; `?\101` (octal)→`65` vs `1`
@@ -658,7 +655,7 @@ truncating lists/vectors with `...` for length and over-deep nesting for level)
 - `(let ((print-length 3)) (prin1-to-string '(1 2 3 4 5)))` → Emacs `"(1 2 3 ...)"`, elisprs `"(1 2 3 4 5)"`
 - `(let ((print-level 2)) (prin1-to-string '(1 (2 (3)))))` → Emacs `"(1 (2 ...))"`, elisprs full
 
-### R3-E. `format` `%x`/`%o` on negatives print two's-complement, not signed
+### R3-E. ✅ FIXED — `format` `%x`/`%o` on negatives print two's-complement, not signed
 - `(format "%x" -1)` → Emacs `"-1"`, elisprs `"ffffffffffffffff"`
 - `(format "%o" -8)` → Emacs `"-10"`, elisprs `"1777777777777777777770"`
 
@@ -679,17 +676,21 @@ truncating lists/vectors with `...` for length and over-deep nesting for level)
 (prelude: walk while `(consp (cdr l))` so the dotted tail stops the loop)
 - `(last '(1 2 . 3))` → Emacs `(2 . 3)`, elisprs `error: wrong-type-argument: listp 3`
 
-### R3-J. `char-equal` ignores `case-fold-search`
+### R3-J. ✅ FIXED — `char-equal` ignores `case-fold-search`
 - `(char-equal ?a ?A)` → Emacs `t` (case-fold defaults t in batch), elisprs `nil`
 
-### R3-K. `signal`/`condition-case` stringify the entire error DATA list
-- `(condition-case e (signal 'my-err '(a b)) (t (cdr e)))` → Emacs `(a b)`, elisprs `("(a b)")`
-- General form of R2-B/R2-C: any signalled DATA is collapsed to one printed string, so
-  every handler reading `(cdr e)` gets garbage — even user `signal`.
+### R3-K. ✅ MOSTLY FIXED — `signal`/`condition-case` stringify the entire error DATA list
+- `(condition-case e (signal 'my-err '(a b)) (t (cdr e)))` → `(a b)`, as Emacs.
+- **Residual:** the data a *builtin* signals is rendered to text at signal time, so a
+  printer variable bound around the failing call is baked into it:
+  `(let ((print-length 6)) (condition-case e (elt [1 2 3 4 5 6 7 8] 99) (error e)))`
+  keeps the abbreviated `[1 2 3 4 5 6 \...]` where Emacs holds the vector itself and
+  prints it later, unabbreviated. Errors would have to carry values, not strings.
 
-### R3-L. Hex reader rejects values above i64 range (hard error)
-- `#xFFFFFFFFFFFFFFFF` → Emacs `18446744073709551615`, elisprs `error: invalid digits for
-  base 16` (a reader error variant of the round-1 #1 bignum gap)
+### R3-L. ✅ FIXED — Hex reader rejects values above i64 range (hard error)
+(reader.rs `read_radix`: parses into a `BigInt` and hands it to `make_integer`, which
+picks fixnum or bignum — `#xFFFFFFFFFFFFFFFF` → `18446744073709551615`, and the
+negative and `#NNr` forms with it)
 
 ## Missing builtins — confirmed `emacs -Q` returns a value, void in elisprs
 
@@ -727,23 +728,23 @@ Fourth pass against the current binary. Ground truth = bare `emacs -Q --batch`;
 
 ## Behavioral — wrong values / wrong errors
 
-### R4-A. `letrec` is broken
+### R4-A. ✅ FIXED — `letrec` is broken
 - `(letrec ((a 1) (b (+ a 1))) (list a b))` → Emacs `(1 2)`, elisprs `error: …void: a`
 - `(letrec ((f (lambda (n) (if (= n 0) 1 (* n (funcall f (1- n))))))) (funcall f 5))` →
   Emacs `120`, elisprs `error: invalid-function`. Forward/self references don't resolve
   (`letrec` not in `src/prelude.rs`).
 
-### R4-B. `if-let` / `when-let` only bind the FIRST clause of a multi-binding list
+### R4-B. ✅ FIXED — `if-let` / `when-let` only bind the FIRST clause of a multi-binding list
 - `(if-let ((a 1) (b 2)) (+ a b) 'no)` → Emacs `3`, elisprs `error: …void: b`
 - `(if-let (a 1) a)` (single var-form) → Emacs `1`, elisprs `error: wrong-type-argument: listp a`
 - Macros at `src/prelude.rs:368-373` use only `(car binding)`. (Round 2's single nested-binding
   case passes; the multi-binding and short forms don't.)
 
-### R4-C. `if-let*` / `when-let*` / `and-let*` undefined
+### R4-C. ✅ FIXED — `if-let*` / `when-let*` / `and-let*` undefined
 - `(when-let* ((a 1) (b 2)) (+ a b))` → Emacs `3`, elisprs `error: void-function: b`
   (the `*` variants aren't defined, so `b` evaluates as a call)
 
-### R4-D. `seq-let` is broken
+### R4-D. ✅ FIXED — `seq-let` is broken
 - `(seq-let (a b) (list 1 2 3) (list a b))` → Emacs `(1 2)`, elisprs `error: …void: b`
   (also the vector-pattern form). Destructuring binder not implemented.
 
@@ -766,7 +767,7 @@ Fourth pass against the current binary. Ground truth = bare `emacs -Q --batch`;
   `print-quoted` defaults non-nil; two-element quote/function/backquote/unquote lists should
   print with reader sugar.
 
-### R4-H. `format` `%e` uses wrong exponent format and drops default precision
+### R4-H. ✅ FIXED — `format` `%e` uses wrong exponent format and drops default precision
 - `(format "%e" 31415.9)` → Emacs `"3.141590e+04"`, elisprs `"3.14159e4"`
 - `(format "%e" 1.0)` → Emacs `"1.000000e+00"`, elisprs `"1e0"`
 - Exponent lacks sign + 2-digit zero-pad; default 6-digit precision not applied. (Round-1 #17
@@ -1017,3 +1018,69 @@ Areas probed in round 4 that PASSED: `while-let`, `dlet` (was R3-missing — now
   machinery, buffer-local advice places) are omitted (NAMED in the port header). Verified vs Emacs
   30.2. Still absent: legacy `defadvice` (a separate ~3.3k-line `advice.el` `ad-*` subsystem, not
   nadvice — deferred rather than shimmed).
+
+## Round 6 — text properties, and what a wider fuzz sweep turned up
+
+The differential fuzzer against Emacs 30.2 (`scripts/fuzz_parity.sh`) run over eight
+seeds × 600 forms had six divergences; three of them were one gap.
+
+### R6-A. Text properties do not survive the functions that copy characters — ✅ FIXED
+`propertize` registered per-character plists and the printer emitted `#(…)` intervals,
+but every function that *built a new string* dropped them, which is most of the ways a
+propertized string is ever used.
+
+- `(concat (propertize "a" 'x 1) "b")` → Emacs `#("ab" 0 1 (x 1))`, elisprs `"ab"`
+- `(substring (propertize "abcd" 'face 'bold) 1 3)` → `#("bc" 0 2 (face bold))` vs `"bc"`
+- `(upcase (propertize "ab" 'p 1))`, `(capitalize …)` → properties lost
+- `(format "x%sy" (propertize "A" 'p 1))` → `#("xAy" 1 2 (p 1))` vs `"xAy"`
+
+Fixed by `PhpHost`-style piece mapping in the host (`ElispHost::string_carry_props`):
+each builder names, for every run of its result, the source string and offset the run
+came from, and the per-character plists follow. Wired into `concat` (per argument, with
+char-list and vector arguments contributing property-less runs), `substring` (re-based
+to the slice), `upcase`/`downcase` (character-for-character), `capitalize` (via the
+`elisprs--carry-text-properties` internal primitive, since it is written in elisp), and
+`format`'s `%s`. `substring-no-properties` explicitly drops them again.
+
+Padding follows Emacs: `(format "%-4s|" (propertize "ab" 'p 1))` is propertized over all
+four columns because padding that *follows* the argument is inside its interval, while
+`(format "%4s|" …)` leaves the leading spaces outside it.
+
+Also fixed a printer bug the work exposed: `(p nil)` and "no properties at all" were
+merged into one interval, because the plist-subset walk cannot tell a key whose value is
+nil from an absent key. `(concat (propertize "ab" 'p nil) "c")` now prints
+`#("abc" 0 2 (p nil))` as Emacs does.
+
+**Not modelled:** Emacs also propagates the *format string's own* text properties onto
+its literal characters. Only the `%s` argument's half is carried here.
+
+### R6-B. `(ash N HUGE)` builds the number instead of signalling — ✅ FIXED
+`(ash 3 123456788)` hung: the guard was `count > 2^30`, so a count of 1.2e8 was allowed
+and the shift attempted a 15-megabyte bignum. Emacs bounds an integer at `integer-width`
+bits (65536 by default) and signals `overflow-error` past it, which is now what happens —
+`(ash 1 65535)` still succeeds, `(ash 1 65536)` signals, and `(ash 0 ANY)` is 0.
+
+### R6-C. `replace-regexp-in-string` accepts invalid replacement escapes — ✅ FIXED
+`search.c` allows only `\&`, `\N`, `\\` and `\?` after a backslash in replacement text
+and signals `Invalid use of ‘\’ in replacement text` otherwise. Both bad cases were
+silently accepted: `(replace-regexp-in-string "a" "x\\" "ab")` produced `"x\\b"` and
+`(… "a" "\\q" "ab")` produced `"qb"`, where Emacs signals for each.
+
+### R6-D. `take` / `seq-take` signal the wrong type for a non-integer N — ✅ FIXED
+`(seq-take nil 'car)` gave `number-or-marker-p` where Emacs gives `integerp`, and
+`(seq-take '(1 2) 1.5)` returned the list instead of signalling. `take` now requires an
+integer (fns.c `Ftake`), and `seq-take` only pre-checks `number-or-marker-p` for the
+non-list sequences that reach a comparison first.
+
+### Still open after the sweep
+
+- **`hash-table-size`** stays void. Emacs 30 reports the table's allocated *capacity*
+  (`(make-hash-table)` → 0, two `puthash` later → 6), which is an artifact of its
+  hashing internals; elisprs stores entries in a `Vec` and has no such number, so
+  answering would mean inventing one.
+- **A closure's captured environment inside an error message.** `(dotimes (i 1)
+  (cl-reduce (lambda (x) …) nil))` reports the arity error with elisprs's expansion
+  environment (`((--dotimes-limit-- . 1) (i . 0))`) where Emacs shows `(t)`. The lambda
+  is the same one; only the env printed beside it differs.
+- **Printer variables baked into a builtin's error data** — see the residual note on
+  R3-K above.
