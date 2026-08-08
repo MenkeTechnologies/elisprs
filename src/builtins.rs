@@ -1300,7 +1300,18 @@ fn set_fn(h: &mut ElispHost, a: &[Value]) -> R {
     h.set_value(&a[0], a[1].clone())?;
     Ok(a[1].clone())
 }
+/// `(symbol-value SYMBOL)` — SYMBOL's dynamic value.
+///
+/// A keyword is its own value: `intern` seeds `:foo`'s value cell with `:foo` and
+/// makes it constant, so `(symbol-value :a)` is `:a`, never `void-variable`. The
+/// compiler already loads a keyword as a self-evaluating constant, so this is the
+/// only path that could reach the (empty) value cell.
 fn symbol_value(h: &mut ElispHost, a: &[Value]) -> R {
+    if let Some(name) = h.sym_name(&a[0]) {
+        if name.starts_with(':') {
+            return Ok(a[0].clone());
+        }
+    }
     h.get_value(&a[0])
 }
 /// `(makunbound SYMBOL)` — clear SYMBOL's value cell, returning SYMBOL.
@@ -1368,8 +1379,14 @@ fn terpri(h: &mut ElispHost, _a: &[Value]) -> R {
     h.emit("\n");
     Ok(Value::Bool(true))
 }
+/// `(print OBJECT &optional PRINTCHARFUN)` — `prin1` surrounded by newlines.
+/// print.c writes a newline BEFORE the object as well as after ("Output a
+/// newline, then OBJECT, then a newline"), which is what separates successive
+/// `print` calls; emitting only the trailing one made
+/// `(with-output-to-string (print 'a))` answer "a\n" instead of "\na\n".
 fn print_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let s = h.print_checked(&a[0], true)?;
+    h.emit("\n");
     h.emit(&s);
     h.emit("\n");
     Ok(a[0].clone())
@@ -3474,7 +3491,18 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
             Some(Obj::Record(_)) => "record",
             Some(Obj::BoolVector(_)) => "bool-vector",
             Some(Obj::Subr { .. }) => "subr",
-            Some(Obj::Closure { .. }) => "function",
+            // Emacs 30 renamed the interpreted-closure type: `(type-of (lambda ()))`
+            // is `interpreted-function` (it was `function` only up to Emacs 29).
+            // A macro is not a function object at all in Emacs — the function cell
+            // holds the cons `(macro . FUNCTION)` — so `type-of` answers `cons`,
+            // which is also what this printer already emits for one.
+            Some(Obj::Closure { is_macro, .. }) => {
+                if *is_macro {
+                    "cons"
+                } else {
+                    "interpreted-function"
+                }
+            }
             Some(Obj::HashTable { .. }) => "hash-table",
             Some(Obj::CharTable(_)) => "char-table",
             Some(Obj::Buffer(_)) => "buffer",

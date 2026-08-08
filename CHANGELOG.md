@@ -53,6 +53,99 @@ All notable changes to elisprs are documented here. The format follows
   whose value — or whose signalled error — differs. Everything below was found
   with it.
 
+### Fixed (Emacs parity — round 7, semantic areas the fuzz grammar does not generate)
+`scripts/fuzz_parity.sh` reported 1/1500 on its own corpus, so these came from
+hand-built differential probe corpora in the areas `scripts/fuzz/gen.el` never
+emitted: `print-circle`, binding forms, the error-condition system, macro
+definition order, and `cl-loop` clause shapes. The generator now emits all of
+them, so the fuzzer covers this ground from here on.
+
+- **`print-circle` did nothing, and a circular list hung the printer forever.**
+  There was no notion of shared structure: `(let ((print-circle t)) (prin1-to-string
+  (let ((y (list 1))) (list y y))))` printed `((1) (1))` instead of `(#1=(1) #1#)`,
+  and a circular cdr chain — `(setcdr (cdr x) x)` — spun in `print_list`'s
+  iterative walk appending to its output buffer until the process died (the
+  `PRINT_CIRCLE` depth guard only counts *nesting*, which a cdr chain never grows).
+  The printer now runs a reference-counting pre-pass when `print-circle` is
+  non-nil, labels every multiply-reachable cons/vector/record `#N=` on first print
+  and `#N#` afterwards, and walks cdr chains behind a Floyd tortoise so a cycle
+  terminates even with `print-circle` nil. `print-circle` is also a `defvar` now —
+  without it `let` bound it lexically and the Rust printer, which reads the value
+  cell, never saw it.
+- **`dolist` reused one binding for every iteration.** subr.el binds the variable
+  with a `let` *inside* the loop; elisprs hoisted it and `setq`'d it. Observable
+  under lexical binding: `(let (r) (dolist (x '(1 2 3) r) (push (lambda () x) r))
+  (mapcar #'funcall r))` answered `(nil nil nil)` instead of `(3 2 1)`, because
+  every closure captured the same cell.
+- **An `error` handler caught `quit`.** `condition-case` treated `error` as an
+  unconditional catch-all instead of consulting the signal's `error-conditions`
+  chain, and `define-error` had additionally given `quit` the parent `error`.
+  `(condition-case nil (signal 'quit nil) (error 'caught) (t 'top))` answered
+  `caught`; Emacs answers `top`. Only `t` is a catch-all.
+- **An `unwind-protect` cleanup that signalled was silently swallowed.** The
+  cleanup's result was discarded, so `(condition-case e (unwind-protect (error "in")
+  (error "cleanup")) (error (cadr e)))` answered `"in"` where Emacs answers
+  `"cleanup"` — and every failure inside a cleanup form vanished.
+- **A macro was unusable in the form that defined it.** `(progn (defmacro m …)
+  (m 1))` failed with "macro called as a function": macro expansion walked the
+  whole `progn` before the `defmacro` had run. `defmacro` siblings are now
+  installed during expansion, which is what Emacs's byte-compiler does and what
+  its interpreter gets for free by evaluating `progn` forms one at a time.
+- **`cl-loop`: `while`/`until` tested the previous iteration.** They were folded
+  into the `while` test, which runs *before* the `for` clause steps its variable —
+  so on the first pass the variable was still nil and `(cl-loop for i in '(1 2 3)
+  while (< i 3) collect i)` signalled `wrong-type-argument number-or-marker-p nil`.
+  They are now emitted where they appear, exiting through a separate tag so the
+  accumulator and `finally` still produce the loop's value.
+- **`cl-loop`: `downfrom … to` never ran.** `to` was always `<=`, so
+  `(cl-loop for i downfrom 3 to 1 collect i)` answered nil instead of `(3 2 1)`.
+  `to` now takes its direction from the iteration.
+- **`type-of` used the pre-Emacs-30 function type names.** `(type-of (lambda ()))`
+  is `interpreted-function`, and a macro's function cell is a cons, not a function.
+- **`print` omitted its leading newline.** print.c brackets the object with
+  newlines; `(with-output-to-string (print 'a))` answered `"a\n"`, not `"\na\n"`.
+- **`(symbol-value :keyword)` signalled `void-variable`.** A keyword is its own
+  value.
+- **`cl-letf` on a plain symbol read the symbol before binding it**, so
+  `(cl-letf* ((x 1)) x)` signalled `void-variable x`. Symbol places now become an
+  ordinary `let`, as in cl-macs.el.
+- **`cl-incf`/`cl-decf` expanded through `setf`**, printing
+  `(progn (setq x (+ x 1)))` where cl-lib.el gives `(setq x (1+ x))`. A duplicate
+  `cl-decf` definition that shadowed the first was also removed.
+- Added `cl-psetq` and `substitute-command-keys` (the quote-translation half —
+  `\\[COMMAND]` needs interactive keymaps, a NAMED limitation).
+
+The widened generator then found these on its first run (none in code this round
+had touched — they are simply shapes the corpus never produced before):
+
+- **`error-message-string` printed a non-error car as if it named a condition.**
+  `(error-message-string nil)` answered `"nil"` and `(error-message-string '(t nil))`
+  answered `"t: nil"`; Emacs answers `"peculiar error"` and `"peculiar error: nil"`.
+- **`seq-into` silently accepted an unknown type name**, handing the input back
+  where seq.el signals `Not a sequence type name: foo`.
+- **`cl-rem`/`cl-mod` rejected floats.** cl-lib.el defines them as the remainder
+  half of `cl-truncate`/`cl-floor`, so `(cl-rem 7.5 2)` is `1.5`; routing them
+  through the integer-only `%`/`mod` signalled `wrong-type-argument
+  integer-or-marker-p 7.5`.
+- **`last` with a count signalled on an improper list.** It measured with `length`,
+  which has none to give: `(last (cons "z" 1.5) 7)` errored where Emacs answers
+  `("z" . 1.5)`. It measures with `safe-length` now.
+
+A 51-form lexical-scoping sweep then found two more, both in the macro layer (the
+underlying environment model is sound — `let`/`let*` freshness, non-leaking, and
+binding restoration across `unwind-protect` / `catch`-`throw` all already matched):
+
+- **`dotimes` shared one binding across iterations**, exactly like `dolist`:
+  `(let (fs) (dotimes (i 3) (push (lambda () i) fs)) (mapcar #'funcall (nreverse fs)))`
+  answered `(3 3 3)` instead of `(0 1 2)` — and `3` is the *post-loop* count, not
+  even the last iteration's value. Ported subr.el's expansion, which runs the body
+  inside `(let ((VAR counter)) …)` against a separate uninterned counter.
+- **A nested `cl-flet` corrupted its own binding list.** The call-site rewriter
+  descended into the inner form's bindings and rewrote the binding head, so
+  `(cl-flet ((f (n) (* n 2))) (cl-flet ((f (n) (+ n 1))) (f 5)))` failed with
+  "malformed lambda list". It now skips a nested `cl-flet`/`cl-flet*`/`cl-labels`
+  binding list and shadows the names it binds for that form's body.
+
 ### Fixed (correctness)
 - **The script cache could shadow a builtin.** A cache hit skips the prelude and
   re-imports a serialized heap image, which used to re-intern *every* symbol it

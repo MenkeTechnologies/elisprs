@@ -1084,3 +1084,217 @@ non-list sequences that reach a comparison first.
   is the same one; only the env printed beside it differs.
 - **Printer variables baked into a builtin's error data** — see the residual note on
   R3-K above.
+
+---
+
+## Round 7 — the areas the fuzz grammar never generated
+
+`scripts/fuzz_parity.sh -n 1500 -s 1` reported **1/1500**: the generated corpus was
+mined out. The gaps below came from hand-built differential probe corpora covering
+what `scripts/fuzz/gen.el` does not emit — `print-circle`, binding forms, the
+error-condition system, macro definition order, `cl-loop` clause shapes. The
+generator now emits all of them, so this ground is fuzzed from here on.
+
+### R7-A. `print-circle` did nothing, and a circular list hung the printer — ✅ FIXED
+The printer had no notion of shared structure, and — worse — no way to stop.
+
+- `(let ((print-circle t)) (prin1-to-string (let ((y (list 1))) (list y y))))`
+  → Emacs `"(#1=(1) #1#)"`, elisprs `"((1) (1))"`
+- `(let ((print-circle t)) (prin1-to-string (let ((x (list 1 2))) (setcdr (cdr x) x) x)))`
+  → Emacs `"#1=(1 2 . #1#)"`, elisprs **hung forever**
+
+The hang is the important half: the `PRINT_CIRCLE` = 200 depth guard counts
+*nesting*, and `print_list` walks the cdr chain in an iterative loop, which never
+grows depth — so a circular cdr appended to the output buffer until the process
+died. Under an untimed harness that is indistinguishable from a stall.
+
+Fixed with a reference-counting pre-pass (`ElispHost::scan_shared`) that runs only
+when `print-circle` is non-nil and records every arena id reachable more than once;
+those objects print `#N=` on first appearance and `#N#` thereafter, in conses,
+vectors and records alike, including a shared/circular *tail* (`#1=(1 2 . #1#)`).
+`print-circle` also had to become a `defvar` — without one, `let` bound it
+lexically and the Rust printer, which reads the value cell, never saw it.
+
+**Still open:** with `print-circle` **nil**, Emacs prints a ` . #N` marker from its
+own cycle detector — `(1 2 . #2)` for a period-2 cycle, `(1 2 3 4 1 2 3 4 1 2 . #6)`
+for period 4. The marker sequence (0, 2, 2, 6, 6, 6, 6 for periods 1–7) is a Brent-
+style tortoise schedule that could not be reproduced from behavior alone, and no
+`print.c` is vendored in this repo to port from. elisprs now detects the cycle with
+a Floyd tortoise and takes print.c's *other* branch — `error "Apparently circular
+structure being printed"`. It terminates, which beats hanging, but it is a NAMED
+divergence until the real schedule can be ported.
+
+### R7-B. `dolist` reused one binding for every iteration — ✅ FIXED
+subr.el binds the variable with a `let` *inside* the loop; elisprs hoisted it into
+the enclosing `let` and `setq`'d it each pass. Invisible until a closure escapes:
+
+- `(let (r) (dolist (x '(1 2 3) r) (push (lambda () x) r)) (mapcar #'funcall r))`
+  → Emacs `(3 2 1)`, elisprs `(nil nil nil)` — every closure shared one cell.
+
+### R7-C. An `error` handler caught `quit` — ✅ FIXED
+`condition-case` matched a handler named `error` unconditionally instead of
+consulting the signal's `error-conditions`, and `define-error` had separately given
+`quit` the default parent `error` (data.c seeds it with `(quit)` alone).
+
+- `(condition-case nil (signal 'quit nil) (error 'caught) (t 'top))`
+  → Emacs `top`, elisprs `caught`
+
+Only `t` is a catch-all. `error` now matches a signal whose chain contains `error`,
+plus the internal Rust-string errors that carry no `define-error` registration.
+
+### R7-D. An `unwind-protect` cleanup that signalled was swallowed — ✅ FIXED
+The cleanup's result was discarded (`let _ =`), so a failure inside a cleanup form
+vanished and the body's error propagated in its place.
+
+- `(condition-case e (unwind-protect (error "in") (error "cleanup")) (error (cadr e)))`
+  → Emacs `"cleanup"`, elisprs `"in"`
+
+### R7-E. A macro was unusable in the form that defined it — ✅ FIXED
+- `(progn (defmacro m (a b) (list 'list a b)) (m 1 2))`
+  → Emacs `(1 2)`, elisprs `error "macro called as a function"`
+
+Expansion walked the whole `progn` before the `defmacro` had run, so the use site
+compiled as a function call. `defmacro` siblings are now installed *during*
+expansion — what Emacs's byte-compiler does explicitly, and what its interpreter
+gets for free by evaluating `progn` forms one at a time.
+
+### R7-F. `cl-loop` `while`/`until` tested the previous iteration — ✅ FIXED
+They were folded into the `while` test, which runs *before* the `for` clause steps
+its variable — so on the first pass the variable was still nil.
+
+- `(cl-loop for i in '(1 2 3) while (< i 3) collect i)`
+  → Emacs `(1 2)`, elisprs `wrong-type-argument number-or-marker-p nil`
+
+They now emit where they appear and exit through a separate `--cl-loop-end--` tag,
+because a while/until exit is a *normal* termination: the accumulator and `finally`
+still have to produce the value (`… while (< i 3) collect i finally return 'fin`
+is `fin`, not the collected list).
+
+### R7-G. `cl-loop` `downfrom … to` never ran — ✅ FIXED
+`to` was unconditionally `<=`, so the guard was `(<= 3 1)`.
+
+- `(cl-loop for i downfrom 3 to 1 collect i)` → Emacs `(3 2 1)`, elisprs `nil`
+
+### R7-H. Smaller confirmed divergences — ✅ FIXED
+- `(type-of (lambda ()))` → `interpreted-function` (Emacs 30 renamed it), and a
+  macro's function cell is a `(macro . FUNCTION)` cons, so `type-of` says `cons`.
+- `(with-output-to-string (print 'a))` → `"\na\n"`: print.c writes a newline
+  *before* the object as well as after, which is what separates successive `print`s.
+- `(symbol-value :a)` → `:a`; a keyword is its own value, not `void-variable`.
+- `(cl-letf* ((x 1)) x)` → `1`; a plain-symbol place must become an ordinary `let`
+  (cl-macs.el does this), since saving the old value first *reads* an unbound `x`.
+- `(macroexpand '(cl-incf x))` → `(setq x (1+ x))`, not `(progn (setq x (+ x 1)))`.
+  A duplicate `cl-decf` definition shadowing the first was removed at the same time.
+- `cl-psetq` and `substitute-command-keys` were void.
+
+### R7-I. What the widened generator found on its first run — partly ✅ FIXED
+Re-running `scripts/fuzz_parity.sh -n 1500 -s 1` with the new clause shapes took
+the count from **1/1500** (the old grammar, mined out) to **14/1500** — all of them
+in functions this round had not touched, i.e. shapes the corpus had never produced.
+Four are fixed, taking it to **11/1500**; regenerating the *pre-change* corpus from
+`HEAD:scripts/fuzz/gen.el` still gives exactly **1/1500**, so nothing regressed.
+
+Fixed:
+
+- `(error-message-string nil)` → Emacs `"peculiar error"`, elisprs `"nil"`; and
+  `(error-message-string '(t nil))` → `"peculiar error: nil"` vs `"t: nil"`. A car
+  with no `error-conditions` chain does not name a condition.
+- `(seq-into "ab" 'foo)` → Emacs signals `Not a sequence type name: foo`; elisprs
+  handed the string back.
+- `(cl-rem 7.5 2)` → Emacs `1.5`, elisprs `wrong-type-argument integer-or-marker-p`.
+  cl-lib.el builds `cl-rem`/`cl-mod` from `cl-truncate`/`cl-floor`, so they take
+  floats; `%`/`mod` do not.
+- `(last (cons "z" 1.5) 7)` → Emacs `("z" . 1.5)`, elisprs `wrong-type-argument
+  listp 1.5` — it measured the list with `length`, which an improper list has none
+  of. `safe-length` now.
+
+Still open from that run (all error-data shape, both engines signal or both
+return; none is a wrong *value* in the ordinary case):
+
+- `cl-gcd`/`cl-lcm`/`cl-adjoin` name a different predicate in the
+  `wrong-type-argument` data than Emacs does (`numberp` vs `number-or-marker-p`,
+  `sequencep` vs `listp`), because a different internal check is reached first.
+- `compare-strings` and `seq-position` accept a bad START/index where Emacs
+  signals `wrong-type-argument integerp`.
+- `cl-some`/`format` report the *second* wrong argument where Emacs reports the
+  first, an argument-evaluation-order artifact.
+
+### R7-J. Loop-variable capture and nested `cl-flet` scoping — ✅ FIXED
+A cross-frontend sweep flagged "one environment per call frame, no block scopes"
+(closures made in a loop all sharing one binding). elisprs's **core environment
+model is not affected**: `let`/`let*` create a fresh binding on every execution,
+a binding does not leak past its body, and `unwind-protect` / `catch`-`throw`
+crossing a `let` all restore correctly — 46 of 51 probes matched Emacs on the
+first run, and the failures were confined to the MACRO layer, where a desugaring
+had hoisted the loop variable out of the loop.
+
+- `(let ((fs '())) (dotimes (i 3) (push (lambda () i) fs)) (mapcar #'funcall (nreverse fs)))`
+  → Emacs `(0 1 2)`, elisprs `(3 3 3)` — the classic signature, and note it leaked
+  the *post-loop* value, not even the last iteration's. Same defect and same fix
+  as R7-B: subr.el runs the body inside `(let ((VAR counter)) …)`.
+- `(cl-flet ((f (n) (* n 2))) (cl-flet ((f (n) (+ n 1))) (f 5)))` → Emacs `6`,
+  elisprs `error "malformed lambda list"`. The call-site rewriter descended into
+  the nested form's BINDING LIST and rewrote the binding's own head to
+  `(funcall G_outer (n) …)`. It now skips a nested `cl-flet`/`cl-flet*`/`cl-labels`
+  binding list and drops the names it binds from the alist for its body
+  (`cl-labels` binding bodies see the inner names, `cl-flet` bodies do not).
+
+`cl-loop`'s `for` variable is hoisted in **Emacs too**, so `(cl-loop for i from 0
+below 3 do (push (lambda () i) fs))` agrees with Emacs without change — matching
+Emacs is the contract, not an idealized per-iteration rule.
+
+**Not applicable: thrown values across a coroutine boundary.** elisprs has no
+coroutine machinery — `iter-defun`, `iter-yield`, `generator.el`, `corosensei` and
+`GenContext` have zero occurrences in `src/` or `Cargo.toml`. Non-local exits are
+plain Rust `Err` returns through `--catch--`/`--unwind--`/`--condition-case--`
+intrinsics that take lambda thunks (`host.rs`), with the error object carried in
+the host's `pending_error`/`pending_throw` slots; there is no context swap that
+could strand them.
+
+### R7-K. Closures always capture lexically, even under `lexical-binding` nil — OPEN
+Probing the same forms through `(eval FORM nil)` (dynamic binding) found one
+precise, systematic gap: 14 of 17 probes matched, and all three failures are the
+same cause — a `lambda` captures its free variables lexically regardless of the
+binding mode.
+
+- `(eval '(funcall (let ((x 1)) (lambda () x))) nil)` → Emacs `void-variable x`
+  (the binding is gone by call time), elisprs `1`.
+- `(eval '(let (fs) (dotimes (i 3) (push (lambda () i) fs)) …) nil)` → Emacs
+  `void-variable i`, elisprs `(0 1 2)`.
+
+`eval`'s LEXICAL argument does control the starting *environment* (`(eval 'x t)`
+correctly signals `void-variable` rather than leaking the caller's scope), and
+`let`/`let*`/`setq`/`defun` all behave identically under both modes. Only closure
+*creation* ignores the mode. Closing it means a dynamic closure kind in
+`compiler.rs`, with free variables resolved at call time instead of captured —
+substrate work, not a prelude change, so it is named rather than half-done.
+`(defvar lexical-binding nil)` in the prelude already documents that this
+milestone binds dynamically.
+
+### Still open after round 7
+
+- **`(prin1-to-string '`(a ,b ,@c))`** → Emacs `` "`(a ,b ,@c)" ``, elisprs
+  `"(cons 'a (cons b (append c nil)))"`. The reader desugars backquote eagerly, so
+  the backquote form is gone before anything can print it. Emacs's reader builds
+  `` (` (a (, b) (,@ c))) `` and leaves the expansion to the `` ` `` macro; matching
+  it means moving expansion out of `reader.rs` into a macro, which changes what
+  every quoted-backquote datum in the prelude looks like — too broad to land here.
+- **`(macroexpand '(setf (car x) 1))`** → Emacs `(let* ((v x)) (setcar v 1))`,
+  elisprs `(progn (setcar x 1))`. Emacs routes every place through `gv-letplace`,
+  which binds a temporary; elisprs's `setf` substitutes the place form directly.
+  The two agree on every value and on evaluation count for the places `setf`
+  supports — only the printed expansion differs — so this is shape, not semantics.
+- **`(type-of (symbol-function 'when))`** → Emacs `cons`, elisprs `symbol`.
+  `when`/`unless` are compiler intrinsics here with no function cell at all; the
+  `macroexpand` family already consults `expand_intrinsic_macro` to compensate, but
+  `symbol-function` has nothing to return.
+- **`hash-table-size`** stays void, for the reason already recorded above: Emacs
+  reports allocated capacity (`:size 10` → 10; five entries in a `:size 1` table →
+  24), an artifact of its hashing internals that elisprs's `Vec` has no analogue
+  for. Answering would mean inventing a number.
+- **Deep recursion overflows the Rust stack.** `(cl-labels ((go (n acc) (if (= n 0)
+  acc (go (1- n) (+ acc n))))) (go 100 0))` aborts with `fatal runtime error: stack
+  overflow`; it survives at depth 60 and dies by 80, while Emacs handles 100
+  comfortably. Each elisp frame costs several native frames, so this is a
+  substrate-level fix (a growable stack, or trampolining `run_closure`), not a
+  prelude one.

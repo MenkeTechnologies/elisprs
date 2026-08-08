@@ -18,7 +18,7 @@ use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
@@ -445,6 +445,14 @@ pub struct ElispHost {
     /// `error "Apparently circular structure being printed"`. `Cell` so the
     /// `&self` printer can record it. Reset at the top of every `print` call.
     pub(crate) print_overflow: Cell<bool>,
+    /// `print-circle` label table for ONE print call: arena id → label number, `0`
+    /// meaning "needs a label but has not been printed yet". Populated by
+    /// [`ElispHost::scan_shared`] before printing when `print-circle` is non-nil,
+    /// empty otherwise (so the zero-cost path is a single `is_empty` check).
+    /// `RefCell` because the printer runs on `&self`.
+    pub(crate) print_labels: RefCell<HashMap<u32, usize>>,
+    /// Next unused `#N=` label number for the print call in progress.
+    pub(crate) print_next_label: Cell<usize>,
     /// The global buffer registry. Index 0 is the default buffer (`*scratch*`).
     /// Slots are never removed — `kill-buffer` marks a buffer dead (`name: None`)
     /// so its index (and any live buffer object referencing it) stays valid.
@@ -627,6 +635,8 @@ impl ElispHost {
             match_data: None,
             output_capture: Vec::new(),
             print_overflow: Cell::new(false),
+            print_labels: RefCell::new(HashMap::new()),
+            print_next_label: Cell::new(1),
             buffers: vec![EditBuffer {
                 name: Some("*scratch*".to_string()),
                 self_obj: Value::Undef,
@@ -2034,7 +2044,77 @@ impl ElispHost {
     // ── printing ──
     pub fn print(&self, v: &Value, readable: bool) -> String {
         self.print_overflow.set(false);
+        self.print_labels.borrow_mut().clear();
+        self.print_next_label.set(1);
+        // `print-circle` is opt-in: only then does the printer pay for the
+        // reference-counting pre-pass that finds the objects needing `#N=` labels.
+        if self.print_flag("print-circle") {
+            let mut seen = HashSet::new();
+            let mut shared = HashSet::new();
+            self.scan_shared(v, &mut seen, &mut shared);
+            let mut labels = self.print_labels.borrow_mut();
+            for id in shared {
+                labels.insert(id, 0);
+            }
+        }
         self.print_inner(v, readable, 0)
+    }
+
+    /// Walk the object graph recording every arena id reached more than once —
+    /// those are exactly the objects `print-circle` has to label. Recursion stops
+    /// at an already-seen id, so a cycle terminates instead of spinning; cdr
+    /// chains iterate rather than recurse so a long list cannot overflow the Rust
+    /// stack.
+    ///
+    /// Only conses, vectors and records are labellable here: they are the
+    /// containers whose sharing `#N=`/`#N#` is observable when reading the output
+    /// back.
+    fn scan_shared(&self, v: &Value, seen: &mut HashSet<u32>, shared: &mut HashSet<u32>) {
+        let mut cur = v.clone();
+        loop {
+            let Value::Obj(id) = cur else { return };
+            match self.arena.get(id as usize) {
+                Some(Obj::Cons(car, cdr)) => {
+                    if !seen.insert(id) {
+                        shared.insert(id);
+                        return;
+                    }
+                    self.scan_shared(car, seen, shared);
+                    cur = cdr.clone();
+                }
+                Some(Obj::Vector(items)) | Some(Obj::Record(items)) => {
+                    if !seen.insert(id) {
+                        shared.insert(id);
+                        return;
+                    }
+                    for e in items {
+                        self.scan_shared(e, seen, shared);
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// The `#N=` / `#N#` prefix for OBJ, or None when it needs no label.
+    ///
+    /// Returns `Some(Err(text))` when the object was already printed — the caller
+    /// emits `text` (`#N#`) INSTEAD of the object — and `Some(Ok(text))` on the
+    /// first visit, where `text` (`#N=`) is a prefix and the object still prints
+    /// in full.
+    #[allow(clippy::result_large_err)]
+    fn circle_label(&self, v: &Value) -> Option<Result<String, String>> {
+        let Value::Obj(id) = v else { return None };
+        let mut labels = self.print_labels.borrow_mut();
+        let slot = labels.get_mut(id)?;
+        if *slot != 0 {
+            return Some(Err(format!("#{slot}#")));
+        }
+        let n = self.print_next_label.get();
+        self.print_next_label.set(n + 1);
+        *slot = n;
+        Some(Ok(format!("#{n}=")))
     }
 
     /// Like `print`, but returns Emacs's `error "Apparently circular structure
@@ -2102,6 +2182,27 @@ impl ElispHost {
             self.print_overflow.set(true);
             return String::new();
         }
+        // `print-circle' labelling. The table is empty unless the variable is on,
+        // so this costs one `is_empty' on the default path.
+        if !self.print_labels.borrow().is_empty() {
+            match self.circle_label(v) {
+                // Already printed once: emit the back-reference INSTEAD of
+                // re-printing (this is what terminates a circular structure).
+                Some(Err(backref)) => return backref,
+                Some(Ok(prefix)) => {
+                    return format!("{prefix}{}", self.print_body(v, readable, depth))
+                }
+                None => {}
+            }
+        }
+        self.print_body(v, readable, depth)
+    }
+
+    /// `print_inner` minus the depth guard and the `print-circle` labelling — the
+    /// actual per-type rendering. Split out so a labelled object can emit its
+    /// `#N=` prefix and then print its body without re-entering the label check
+    /// (which would see the label already assigned and emit `#N#` forever).
+    fn print_body(&self, v: &Value, readable: bool, depth: usize) -> String {
         match v {
             Value::Undef => "nil".to_string(),
             Value::Bool(true) => "t".to_string(),
@@ -2338,10 +2439,17 @@ impl ElispHost {
             }
         }
         let limit = self.print_limit("print-length");
+        let labelling = !self.print_labels.borrow().is_empty();
         let mut out = String::from("(");
         let mut cur = v.clone();
         let mut first = true;
         let mut count = 0usize;
+        // Tortoise for the `print-circle' nil case: the cdr chain is walked
+        // ITERATIVELY, so the `PRINT_CIRCLE` depth guard above never fires on it
+        // and a circular cdr spun here forever, appending to `out` until the
+        // process died. Floyd's tortoise advances one cons per two of the hare's,
+        // so a cycle of any length is caught in linear time.
+        let mut tortoise = v.clone();
         while let Some(Obj::Cons(a, d)) = self.obj(&cur) {
             if !first {
                 out.push(' ');
@@ -2359,7 +2467,35 @@ impl ElispHost {
                 // is the one-element list `(1)`, never a dotted pair).
                 Value::Undef | Value::Bool(false) => break,
                 Value::Obj(id) if matches!(self.arena.get(id as usize), Some(Obj::Cons(..))) => {
+                    // A shared/circular tail prints as a dotted `#N#` back-reference
+                    // (`#1=(1 2 . #1#)`) — the tail is a labelled object, so it must
+                    // go through `print_inner` rather than continuing this loop.
+                    if labelling && self.print_labels.borrow().contains_key(&id) {
+                        out.push_str(" . ");
+                        out.push_str(&self.print_inner(&next, readable, nd));
+                        break;
+                    }
                     cur = next;
+                    if !labelling {
+                        if count.is_multiple_of(2) {
+                            if let Some(Obj::Cons(_, td)) = self.obj(&tortoise) {
+                                tortoise = td.clone();
+                            }
+                        }
+                        if let (Value::Obj(h), Value::Obj(t)) = (&cur, &tortoise) {
+                            if h == t {
+                                // Circular with `print-circle' off. Emacs prints a
+                                // ` . #N` marker from its own cycle detector; we
+                                // cannot reproduce that N, so take the other branch
+                                // print.c has for unprintable circularity and let
+                                // `print_checked` signal "Apparently circular
+                                // structure being printed". Terminating wrong beats
+                                // not terminating.
+                                self.print_overflow.set(true);
+                                break;
+                            }
+                        }
+                    }
                 }
                 _ => {
                     out.push_str(" . ");
@@ -4149,11 +4285,41 @@ fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, 
         _ => {
             let mut out = Vec::with_capacity(elems.len());
             for e in &elems {
-                out.push(macroexpand_all_impl(e, expand_intrinsics)?);
+                let expanded = macroexpand_all_impl(e, expand_intrinsics)?;
+                // A `defmacro' among sibling forms has to take effect BEFORE its
+                // siblings are expanded, or a macro defined and used in the same
+                // enclosing form is unusable: expansion of `(progn (defmacro m …)
+                // (m 1))' reached `(m 1)' while `m' still had no function cell, so
+                // it compiled as a call and failed at run time with "macro called
+                // as a function". Emacs's interpreter never sees this because it
+                // evaluates `progn' forms one at a time, and its byte-compiler
+                // evaluates `defmacro' at compile time for exactly this reason.
+                //
+                // The form is already fully expanded, so compiling it here cannot
+                // re-enter expansion. Running it only writes the macro's function
+                // cell — the enclosing form still contains the `defmacro', which
+                // installs the identical definition again when it runs.
+                if is_defmacro_form(e) {
+                    if let Ok(chunk) = with_host(|h| crate::compiler::compile_top(h, &expanded)) {
+                        let _ = run_chunk(chunk);
+                    }
+                }
+                out.push(expanded);
             }
             Ok(with_host(|h| h.list_from(out)))
         }
     }
+}
+
+/// True when FORM is literally `(defmacro NAME ARGLIST …)`.
+fn is_defmacro_form(form: &Value) -> bool {
+    with_host(|h| {
+        let Some(Obj::Cons(head, _)) = h.obj(form) else {
+            return false;
+        };
+        let head = head.clone();
+        h.sym_name(&head).as_deref() == Some("defmacro")
+    })
 }
 
 /// `(catch TAG THUNK)` — run the thunk; if a `throw` to a matching tag unwinds
@@ -4344,12 +4510,19 @@ fn intrinsic_unwind(args: &[Value]) -> Result<Value, String> {
     let cleanup = args.get(1).cloned().unwrap_or(Value::Undef);
     let r = call_function(&body, &[]);
     let saved = with_host(|h| h.pending_throw.take());
-    let _ = call_function(&cleanup, &[]);
+    let cleanup_r = call_function(&cleanup, &[]);
     with_host(|h| {
         if h.pending_throw.is_none() {
             h.pending_throw = saved;
         }
     });
+    // A cleanup that itself signals SUPERSEDES whatever the body was doing —
+    // eval.c runs the unwind handler outside the body's protection, so its error
+    // propagates and the body's in-flight error is dropped. Discarding it here
+    // (`let _ =`) made `(condition-case e (unwind-protect (error "in")
+    // (error "cleanup")) (error (cadr e)))` answer "in" where Emacs answers
+    // "cleanup", and silently swallowed every failure inside a cleanup form.
+    cleanup_r?;
     r
 }
 
@@ -4447,8 +4620,23 @@ fn intrinsic_condition_case(args: &[Value]) -> Result<Value, String> {
                         .map(|items| items.iter().filter_map(|x| h.sym_name(x)).collect())
                         .unwrap_or_default(),
                 });
+                // An `error' handler is NOT a catch-all: it matches only signals
+                // whose `error-conditions' chain actually contains `error'. `quit'
+                // is the case that proves it — data.c seeds it with conditions
+                // (quit), so `(condition-case nil (signal 'quit nil) (error 'c)
+                // (t 'top))' answers `top' in Emacs. Treating `error' as
+                // unconditional answered `c'. Only `t' is the real catch-all.
+                //
+                // When the chain is empty the signal came from an internal Rust
+                // error string with no `define-error' registration; those are all
+                // ordinary errors, so `error' still matches them.
+                let derives_from_error =
+                    signal_conditions.is_empty() || signal_conditions.iter().any(|c| c == "error");
                 if conds.iter().any(|c| {
-                    c == "error" || c == "t" || *c == esym || signal_conditions.contains(c)
+                    (c == "error" && derives_from_error)
+                        || c == "t"
+                        || *c == esym
+                        || signal_conditions.contains(c)
                 }) {
                     let depth = with_host(|h| {
                         let d = h.specdepth();

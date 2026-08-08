@@ -109,7 +109,11 @@ pub const PRELUDE: &str = r#"
    ((or (null n) (= n 1))
     (while (consp (cdr l)) (setq l (cdr l)))
     l)
-   (t (nthcdr (max 0 (- (length l) n)) l))))
+   ;; `safe-length', not `length': an improper list has no `length' (it signals
+   ;; `wrong-type-argument listp TAIL'), so `(last (cons "z" 1.5) 7)' errored
+   ;; where Emacs answers the whole improper list, `("z" . 1.5)'. The two agree
+   ;; on every proper list.
+   (t (nthcdr (max 0 (- (safe-length l) n)) l))))
 (defun make-list (n x)
   (unless (and (integerp n) (>= n 0) (<= n most-positive-fixnum))
     (signal 'wrong-type-argument (list 'wholenump n)))
@@ -670,6 +674,10 @@ pub const PRELUDE: &str = r#"
 (defvar print-escape-newlines nil)
 (defvar print-escape-control-characters nil)
 (defvar print-quoted t)
+;; Without this `defvar' a `(let ((print-circle t)) …)' binds a LEXICAL `print-circle'
+;; that the Rust printer — which reads the symbol's dynamic value cell — never sees,
+;; so shared structure printed unlabelled and a circular list had nothing to stop it.
+(defvar print-circle nil)
 (defvar gensym-counter 0)
 (defun gensym (&optional prefix)
   (let ((n gensym-counter))
@@ -716,31 +724,56 @@ pub const PRELUDE: &str = r#"
                     (t (error "setf: unsupported place: %S" place))))
                `(setq ,place ,val))))
         (if rest `(progn ,exp (setf ,@rest)) exp)))))
+;; subr.el: `(car-safe (prog1 PLACE (setq PLACE (cdr PLACE))))'. The `car-safe'
+;; is load-bearing, not decoration — `(pop x)' on a non-list yields nil in Emacs
+;; instead of signalling `wrong-type-argument', which is what a plain `car' does.
 (defmacro pop (place)
-  (list (quote prog1) (list (quote car) place)
-        (if (symbolp place)
-            (list (quote setq) place (list (quote cdr) place))
-          (list (quote setf) place (list (quote cdr) place)))))
+  (list (quote car-safe)
+        (list (quote prog1) place
+              (if (symbolp place)
+                  (list (quote setq) place (list (quote cdr) place))
+                (list (quote setf) place (list (quote cdr) place))))))
 (defmacro dolist (spec &rest body)
-  ;; (dolist (VAR LIST [RESULT]) BODY...) — RESULT (with VAR bound to nil) is the
-  ;; value of the form; nil if omitted.
-  (let ((var (car spec)) (lst (cadr spec)) (result (car (cddr spec))))
-    `(let ((,var nil) (--dolist-tail-- ,lst))
-       (while --dolist-tail--
-         (setq ,var (car --dolist-tail--))
-         ,@body
-         (setq --dolist-tail-- (cdr --dolist-tail--)))
-       (setq ,var nil)
-       ,result)))
+  ;; (dolist (VAR LIST [RESULT]) BODY...) — RESULT is the value of the form; nil
+  ;; if omitted.
+  ;;
+  ;; subr.el binds VAR with a `let' INSIDE the loop, so each iteration gets a
+  ;; FRESH binding. That is observable under lexical binding: a closure made in
+  ;; the body captures that iteration's value, so
+  ;;   (let (r) (dolist (x '(1 2 3) r) (push (lambda () x) r)) (mapcar #'funcall r))
+  ;; is (3 2 1) in Emacs. Hoisting VAR into the enclosing `let' and `setq'ing it
+  ;; per iteration — what this used to do — gives every closure the same cell, so
+  ;; the same form answered (nil nil nil).
+  ;;
+  ;; The tail variable is uninterned (`make-symbol') exactly as in subr.el, so a
+  ;; body that itself mentions a variable named `tail' is not captured by it.
+  (let ((var (car spec)) (lst (cadr spec)) (result (cddr spec))
+        (tail (make-symbol "tail")))
+    `(let ((,tail ,lst))
+       (while ,tail
+         (let ((,var (car ,tail)))
+           ,@body
+           (setq ,tail (cdr ,tail))))
+       ,@result)))
 (defmacro dotimes (spec &rest body)
   ;; (dotimes (VAR COUNT [RESULT]) BODY...) — RESULT (with VAR bound to COUNT) is
   ;; the value of the form; nil if omitted.
-  (let ((var (car spec)) (cnt (cadr spec)) (result (car (cddr spec))))
-    `(let ((,var 0) (--dotimes-limit-- ,cnt))
-       (while (< ,var --dotimes-limit--)
-         ,@body
-         (setq ,var (1+ ,var)))
-       ,result)))
+  ;;
+  ;; Same shape as `dolist', and for the same reason: subr.el runs the body inside
+  ;; `(let ((VAR counter)) …)', so each iteration gets a FRESH binding and the
+  ;; counter it steps is a separate uninterned variable. Hoisting VAR into the
+  ;; enclosing `let' and `setq'ing it gave every closure made in the body the same
+  ;; cell, so
+  ;;   (let (fs) (dotimes (i 3) (push (lambda () i) fs)) (mapcar #'funcall (nreverse fs)))
+  ;; answered (3 3 3) instead of Emacs's (0 1 2) — and it leaked the *post-loop*
+  ;; value, not even the last iteration's.
+  (let ((var (car spec)) (cnt (cadr spec)) (result (cddr spec))
+        (upper (make-symbol "upper-bound")) (counter (make-symbol "counter")))
+    `(let ((,upper ,cnt) (,counter 0))
+       (while (< ,counter ,upper)
+         (let ((,var ,counter)) ,@body)
+         (setq ,counter (1+ ,counter)))
+       ,@(if result `((let ((,var ,counter)) ,@result))))))
 
 ;;; ---- error handling ----
 (defmacro ignore-errors (&rest body) `(condition-case nil (progn ,@body) (error nil)))
@@ -1084,8 +1117,12 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
   (let* ((d (or y 1)) (q (truncate x d))) (list q (- x (* q d)))))
 (defun cl-round (x &optional y)
   (let* ((d (or y 1)) (q (round x d))) (list q (- x (* q d)))))
-(defun cl-mod (x y) (mod x y))
-(defun cl-rem (x y) (% x y))
+;; cl-lib.el defines these as the remainder half of `cl-floor'/`cl-truncate', so
+;; they accept FLOATS: `(cl-rem 7.5 2)' is 1.5 and `(cl-mod -7.5 2)' is 0.5.
+;; Routing them through `mod'/`%' — which are integer-only in elisp — signalled
+;; `wrong-type-argument integer-or-marker-p 7.5' on every float.
+(defun cl-mod (x y) (nth 1 (cl-floor x y)))
+(defun cl-rem (x y) (nth 1 (cl-truncate x y)))
 (defun cl-gcd (&rest ns)
   (let ((g 0))
     (dolist (n ns) (setq g (cl--gcd2 g (abs n))))
@@ -1578,7 +1615,9 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
     (cond ((eq type 'list) l)
           ((eq type 'vector) (apply (function vector) l))
           ((eq type 'string) (apply (function string) l))
-          (t seq))))
+          ;; seq.el signals for an unrecognized TYPE rather than handing the input
+          ;; back — returning SEQ unchanged silently accepted `(seq-into s 'foo)'.
+          (t (error "Not a sequence type name: %S" type)))))
 (defun seq-difference (a b &optional testfn)
   (seq-filter (lambda (x) (not (seq-contains-p b x testfn))) a))
 (defun seq-intersection (a b &optional testfn)
@@ -2090,6 +2129,12 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 ;; #'NAME in BODY into `funcall'/refs of a let-bound lambda. cl-labels also walks
 ;; the function bodies (so they can recurse / call each other) and binds via
 ;; setq so the lambdas capture the (by-reference) gensym vars.
+;; Drop NAMES from ALIST — the local-function bindings a nested binding form
+;; shadows for the extent of its body.
+(defun cl-flet--shadow (alist names)
+  (let ((out nil))
+    (dolist (a alist) (unless (memq (car a) names) (setq out (cons a out))))
+    (reverse out)))
 (defun cl-flet--walk (form alist)
   (cond
    ((not (consp form)) form)
@@ -2097,6 +2142,25 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
    ((eq (car form) 'function)
     (let ((a (assq (car (cdr form)) alist)))
       (if a (cdr a) form)))
+   ;; A nested cl-flet/cl-flet*/cl-labels rebinds function names. Two things must
+   ;; happen that the generic descent got wrong:
+   ;;   1. its BINDING LIST is not a list of call sites. `(cl-flet ((f (n) …)) …)'
+   ;;      nested inside an outer `cl-flet' binding `f' had its own binding head
+   ;;      rewritten to `(funcall G_outer (n) …)', which then failed to compile
+   ;;      with "malformed lambda list".
+   ;;   2. the names it binds SHADOW ours inside it, so calls in its body must be
+   ;;      left for the nested form's own walk to rewrite.
+   ;; A `cl-flet' binding's body sees the OUTER functions (the new names are not
+   ;; in scope yet); a `cl-labels' binding's body sees the inner ones, so it can
+   ;; recurse.
+   ((memq (car form) '(cl-flet cl-flet* cl-labels))
+    (let* ((binds (car (cdr form)))
+           (names (mapcar (function car) binds))
+           (inner (cl-flet--shadow alist names))
+           (bind-scope (if (eq (car form) 'cl-labels) inner alist)))
+      (cons (car form)
+            (cons (mapcar (lambda (b) (cons (car b) (cl-flet--walk (cdr b) bind-scope))) binds)
+                  (cl-flet--walk (cdr (cdr form)) inner)))))
    ((and (symbolp (car form)) (assq (car form) alist))
     (cons 'funcall (cons (cdr (assq (car form) alist)) (cl-flet--walk (cdr form) alist))))
    (t (cons (cl-flet--walk (car form) alist) (cl-flet--walk (cdr form) alist)))))
@@ -2188,15 +2252,29 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 (defmacro cl-letf (bindings &rest body)
   ;; Temporarily set generalized places, restoring them on exit. Each binding is
   ;; (PLACE [VALUE]); with no VALUE the place is just saved and restored.
-  (let ((olds (mapcar (lambda (_b) (make-symbol "old")) bindings)) (saves nil) (sets nil) (restores nil))
-    (cl-mapcar (lambda (b o)
-                 (setq saves (cons (list o (car b)) saves))
-                 (when (cdr b) (setq sets (cons (list 'setf (car b) (car (cdr b))) sets)))
-                 (setq restores (cons (list 'setf (car b) o) restores)))
-               bindings olds)
-    `(let ,(reverse saves)
-       (unwind-protect (progn ,@(reverse sets) ,@body)
-         ,@(reverse restores)))))
+  ;;
+  ;; cl-macs.el special-cases a PLAIN SYMBOL place to an ordinary `let' binding,
+  ;; and that case has to stay a `let': saving the old value first means READING
+  ;; the symbol, so `(cl-letf ((x 1)) x)' on an unbound `x' signalled
+  ;; `void-variable x' instead of answering 1. Symbol places are split out here
+  ;; and bound directly; only generalized places take the save/set/restore path.
+  (let ((simple nil) (general nil))
+    (dolist (b bindings)
+      (if (symbolp (car b)) (setq simple (cons b simple)) (setq general (cons b general))))
+    (setq simple (reverse simple) general (reverse general))
+    (let ((olds (mapcar (lambda (_b) (make-symbol "old")) general))
+          (saves nil) (sets nil) (restores nil))
+      (cl-mapcar (lambda (b o)
+                   (setq saves (cons (list o (car b)) saves))
+                   (when (cdr b) (setq sets (cons (list 'setf (car b) (car (cdr b))) sets)))
+                   (setq restores (cons (list 'setf (car b) o) restores)))
+                 general olds)
+      (let ((core (if general
+                      `(let ,(reverse saves)
+                         (unwind-protect (progn ,@(reverse sets) ,@body)
+                           ,@(reverse restores)))
+                    `(progn ,@body))))
+        (if simple `(let ,simple ,core) core)))))
 (defmacro cl-letf* (bindings &rest body)
   ;; Sequential cl-letf: each binding's place is set before the next is saved.
   (if (null bindings)
@@ -2218,8 +2296,17 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
     acc))
 
 ;;; ---- more cl-lib / seq / subr-x / functional ----
-(defmacro cl-incf (place &rest amt) `(setf ,place (+ ,place ,(if amt (car amt) 1))))
-(defmacro cl-decf (place &rest amt) `(setf ,place (- ,place ,(if amt (car amt) 1))))
+;; cl-lib.el: a plain-variable place goes straight to `setq', and an omitted
+;; increment uses `1+'/`1-' rather than `(+ PLACE 1)'. Routing everything through
+;; `setf' printed `(progn (setq x (+ x 1)))' where Emacs prints `(setq x (1+ x))'.
+(defmacro cl-incf (place &rest amt)
+  (if (symbolp place)
+      (list 'setq place (if amt (list '+ place (car amt)) (list '1+ place)))
+    `(setf ,place (+ ,place ,(if amt (car amt) 1)))))
+(defmacro cl-decf (place &rest amt)
+  (if (symbolp place)
+      (list 'setq place (if amt (list '- place (car amt)) (list '1- place)))
+    `(setf ,place (- ,place ,(if amt (car amt) 1)))))
 ;; cl-callf: (cl-callf FUNC PLACE ARGS...) -> (setf PLACE (FUNC PLACE ARGS...)).
 ;; cl-callf2 puts a fixed ARG1 before PLACE in the call.
 (defmacro cl-callf (func place &rest args)
@@ -2236,6 +2323,9 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
         (setq sets (cons (list 'setf (car ps) tv) sets))
         (setq ps (cddr ps))))
     `(let ,(reverse binds) ,@(reverse sets) nil)))
+;; cl-psetq is cl-psetf restricted to variables; cl-lib.el defines it as the same
+;; expander, so forward to it rather than duplicating the parallel-assign logic.
+(defmacro cl-psetq (&rest pairs) `(cl-psetf ,@pairs))
 ;; cl-rotatef: rotate place values left (last gets the first's old value).
 (defmacro cl-rotatef (&rest places)
   (if (cdr places)
@@ -2486,7 +2576,14 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (defun format-message (fmt &rest args)
   ;; Curve-quote the format string (default `text-quoting-style' is 'curve):
   ;; grave accent => left single quote, apostrophe => right single quote.
-  (apply (function format) (string-replace "'" "’" (string-replace "`" "‘" fmt)) args))
+  (apply (function format) (substitute-command-keys fmt) args))
+;; `substitute-command-keys' without a keymap database: the key-substitution
+;; constructs need `where-is-internal' (no interactive keymaps here), but the
+;; quote translation half is what callers and `format-message' actually rely on,
+;; and it is exactly the default `text-quoting-style' of `curve'.
+;; NAMED limitation: \\[COMMAND] / \\{MAP} / \\<MAP> are passed through unchanged.
+(defun substitute-command-keys (string &optional _no-face _include-menus)
+  (string-replace "'" "’" (string-replace "`" "‘" string)))
 (defun cl--digitp (c) (and (>= c ?0) (<= c ?9)))
 ;; value<: a canonical total order within a type (numbers/strings/symbols/lists/
 ;; vectors); cross-type comparison signals an error, like Emacs 30.
@@ -2572,6 +2669,14 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
      ;; `error'/`user-error' carry their message string as the sole datum.
      ((and (memq sym '(error user-error)) (stringp (car data))) (car data))
      (msg (if data (concat msg ": " (mapconcat render data ", ")) msg))
+     ;; print.c: a car that is not a symbol carrying an `error-conditions' chain
+     ;; is not an error symbol at all, and Emacs renders it "peculiar error"
+     ;; (plus the data) rather than printing the car. `(error-message-string nil)'
+     ;; used to answer "nil" and `(error-message-string '(t nil))' answered
+     ;; "t: nil".
+     ((or (null sym) (not (symbolp sym)) (null (get sym 'error-conditions)))
+      (if data (concat "peculiar error: " (mapconcat render data ", "))
+        "peculiar error"))
      ((null data) (symbol-name sym))
      (t (concat (symbol-name sym) ": " (mapconcat render data ", "))))))
 (defun seq-group-by (fn seq)
@@ -2637,6 +2742,13 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (put 'error 'error-conditions '(error))
 (define-error 'user-error "")
 (define-error 'quit "Quit" nil)
+;; `quit' is NOT an `error': data.c seeds it with `error-conditions' = (quit)
+;; alone, which is why `(condition-case nil (signal 'quit nil) (error 'caught))'
+;; does not catch it while a `t' handler does. `define-error' defaults a nil
+;; PARENT to `error', so the chain has to be overridden here (same shape as the
+;; `error' seed above).
+(put 'quit 'error-conditions '(quit))
+(define-error 'minibuffer-quit "Quit" 'quit)
 (define-error 'args-out-of-range "Args out of range")
 (define-error 'arith-error "Arithmetic error")
 (define-error 'type-mismatch "Types do not match")
@@ -3980,7 +4092,13 @@ If all LST elements are zeros or LST is nil, return zero."
             (setq down (or (equal sub "downfrom") (member limk '("downto" "above"))))
             (setq binds (cons (list var start) binds))
             (when limk
-              (let ((cnd (cond ((member limk '("to" "upto")) (list '<= var lim))
+              ;; `to' takes its direction from the iteration, so `downfrom 3 to 1'
+              ;; terminates at `(>= var 1)'. Testing `(<= 3 1)' made the loop body
+              ;; never run and the whole form answer nil. `upto'/`below' are
+              ;; explicitly upward and `downto'/`above' explicitly downward, so only
+              ;; the neutral `to' consults DOWN.
+              (let ((cnd (cond ((equal limk "to") (if down (list '>= var lim) (list '<= var lim)))
+                               ((equal limk "upto") (list '<= var lim))
                                ((equal limk "below") (list '< var lim))
                                ((equal limk "downto") (list '>= var lim))
                                ((equal limk "above") (list '> var lim)))))
@@ -4038,12 +4156,22 @@ If all LST elements are zeros or LST is nil, return zero."
               (setq test (if (eq test t) cnd (list 'and test cnd))))
             (setq steps (cons (list 'setq rv (list '1- rv)) steps))
             (setq c (nthcdr 2 c))))
-         ((equal kw "while")
-          (setq test (if (eq test t) (nth 1 c) (list 'and test (nth 1 c))))
-          (setq c (nthcdr 2 c)))
-         ((equal kw "until")
-          (let ((cnd (list 'not (nth 1 c))))
-            (setq test (if (eq test t) cnd (list 'and test cnd))))
+         ;; while/until terminate the loop AT THE POINT THEY APPEAR, not at the top
+         ;; of the next iteration. Folding them into TEST (which runs before the
+         ;; `for' clause has stepped its variable) tested the PREVIOUS iteration's
+         ;; value — and on the very first pass the variable is still nil, so
+         ;; `(cl-loop for i in '(1 2 3) while (< i 3) collect i)' signalled
+         ;; `wrong-type-argument number-or-marker-p nil' instead of answering (1 2).
+         ;;
+         ;; They go into `pre' instead, in clause order, so they see the value the
+         ;; preceding `for' just installed. The exit throws to the inner
+         ;; `--cl-loop-end--' tag rather than the outer `--cl-loop--' one because a
+         ;; while/until exit is a NORMAL termination: `finally' and the accumulator
+         ;; result still have to be produced (Emacs answers (:fin) for
+         ;; `... while (< i 3) collect i finally return (list :fin)').
+         ((member kw '("while" "until"))
+          (let ((cnd (if (equal kw "while") (nth 1 c) (list 'not (nth 1 c)))))
+            (setq pre (cons (list 'unless cnd (list 'throw ''--cl-loop-end-- nil)) pre)))
           (setq c (nthcdr 2 c)))
          ;; with VAR = VAL [and VAR2 = VAL2 ...]
          ((equal kw "with")
@@ -4138,8 +4266,14 @@ If all LST elements are zeros or LST is nil, return zero."
       `(cl-block ,loop-name
          (let* (,@(reverse binds) (--clacc-- ,init))
            ,@initial
+           ;; Two tags, two meanings: `--cl-loop--' is an ABNORMAL exit
+           ;; (return/always/never/thereis) whose thrown value IS the loop's value,
+           ;; so it skips RESULT; `--cl-loop-end--' is the NORMAL termination a
+           ;; while/until clause performs, so it lands just before RESULT and the
+           ;; accumulator / `finally' forms still run.
            (catch '--cl-loop--
-             (while ,test ,@(reverse pre) ,@(reverse body) ,@(reverse steps))
+             (catch '--cl-loop-end--
+               (while ,test ,@(reverse pre) ,@(reverse body) ,@(reverse steps)))
              ,result))))))
 
 ;; The predicate symbol for a `cl-typecase' type name (integer->integerp, etc.).

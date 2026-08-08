@@ -197,6 +197,22 @@
     (char-to-string char) (string-width str) (string-reverse str)
     ;; printing
     (prin1-to-string any) (prin1-to-string any bool) (format-message str any)
+    ;; error objects: the symbol, its condition chain and its rendered message are
+    ;; as much of the contract as any return value
+    (error-message-string list) (type-of any)
+    ;; sequence/list corners the call table did not reach
+    (last list small) (nthcdr int list) (take small list) (ntake small freshlist)
+    (seq-take-while fn seq) (seq-drop-while fn seq) (seq-map-indexed fn seq)
+    (seq-mapn fn seq seq) (seq-split list small) (seq-keep fn list)
+    (seq-positions list any) (seq-into seq sym) (seq-first seq) (seq-rest seq)
+    (cl-remove-if-not fn list) (cl-set-difference list list) (cl-union list list)
+    (cl-intersection list list) (cl-list* any any list) (cl-ldiff list list)
+    (cl-signum num) (cl-gcd int int) (cl-lcm int int) (cl-floor num num)
+    (cl-round num num) (cl-mod num num) (cl-rem num num) (cl-adjoin any list)
+    ;; string corners
+    (compare-strings str any any str any any) (string-version-lessp str str)
+    (string-pad str small char) (string-pad str small char bool)
+    (assoc-string any list bool) (split-string str re bool str)
     ;; predicates
     (consp any) (listp any) (atom any) (null any) (not any) (stringp any) (symbolp any)
     (vectorp any) (arrayp any) (sequencep any) (functionp any) (booleanp any)
@@ -310,9 +326,84 @@
      ((fz-chance 14)
       (list 'let (list (list (fz-pick '(print-escape-newlines
                                         print-escape-control-characters
-                                        print-quoted))
+                                        print-quoted print-circle))
                             t))
             (list 'prin1-to-string (fz-expr d))))
+     ;; Shared and circular structure under `print-circle'. Built by mutation
+     ;; (`setcdr'/`setcar' on a freshly consed list) because that is the only way
+     ;; to make a cycle, and printed rather than returned — `drive.el' would
+     ;; itself have to print a cycle otherwise. Bounded: the list is 2 conses.
+     ((fz-chance 10)
+      (list 'let (list (list 'print-circle (fz-pick '(t nil))))
+            (list 'prin1-to-string
+                  (fz-pick
+                   (list
+                    ;; circular through the cdr / through the car
+                    '(let ((x (list 1 2))) (setcdr (cdr x) x) x)
+                    '(let ((x (list 1 2))) (setcar x x) x)
+                    ;; shared but acyclic, in a list / in a vector
+                    '(let ((y (list 1 2))) (list y y))
+                    '(let ((y (list 1 2))) (vector y y))
+                    '(let ((y (list 1))) (list y (list y) y)))))))
+     ;; Error handling: the signalled symbol, its condition chain, the handler
+     ;; that catches it, and the interaction with `unwind-protect' are all part of
+     ;; the contract. A `t' handler keeps every generated form catchable, so an
+     ;; uncaught non-`error' signal can never kill the driver mid-corpus.
+     ((fz-chance 14)
+      (let ((sig (fz-pick '(error quit arith-error wrong-type-argument
+                            args-out-of-range void-function end-of-file
+                            user-error cl-assertion-failed)))
+            (handler (fz-pick '(error quit arith-error wrong-type-argument t))))
+        (list 'condition-case 'e
+              (list 'signal (list 'quote sig) (list 'quote (fz-pick '(nil (1) ("x" 2)))))
+              (list handler (fz-pick '(e '(caught) (car e) (cdr e))))
+              (list t ''fellthrough))))
+     ((fz-chance 12)
+      ;; unwind-protect: does the cleanup run, and does a cleanup that itself
+      ;; signals supersede the body?
+      (list 'let (list (list 'n 0))
+            (list 'list
+                  (list 'condition-case 'e
+                        (list 'unwind-protect (fz-expr d)
+                              (fz-pick (list '(setq n 1) '(error "cleanup") '(setq n (1+ n)))))
+                        (list 'error '(cadr e))
+                        (list t ''other))
+                  'n)))
+     ((fz-chance 12)
+      ;; catch/throw crossing a loop and an unwind-protect.
+      (list 'catch (list 'quote 'tag)
+            (list (fz-pick '(dolist dotimes))
+                  (if (fz-chance 50) (list 'i (fz-atom 'small)) (list 'i ''(1 2 3)))
+                  (list 'unwind-protect
+                        (list 'when (list 'equal 'i (fz-atom 'small))
+                              (list 'throw (list 'quote 'tag) 'i))
+                        nil))))
+     ;; cl-loop clause shapes. `while'/`until'/`downfrom' and the accumulator vs
+     ;; abnormal-exit distinction are their own parity surface.
+     ((fz-chance 14)
+      (let ((lim (fz-atom 'small)))
+        (fz-pick
+         (list
+          (list 'cl-loop 'for 'i 'from 1 'to 4 'collect 'i)
+          (list 'cl-loop 'for 'i 'downfrom 4 'to lim 'collect 'i)
+          (list 'cl-loop 'for 'i 'downfrom 4 'above lim 'collect 'i)
+          (list 'cl-loop 'for 'i 'in ''(1 2 3 4) 'while (list '< 'i lim) 'collect 'i)
+          (list 'cl-loop 'for 'i 'in ''(1 2 3 4) 'until (list '> 'i lim) 'collect 'i)
+          (list 'cl-loop 'for 'i 'in ''(1 2 3 4) 'while (list '< 'i lim)
+                'collect 'i 'finally 'return ''fin)
+          (list 'cl-loop 'for 'i 'from 1 'to 4 'do (list 'when (list '> 'i lim)
+                                                         (list 'cl-return 'i)))
+          (list 'cl-loop 'for 'i 'from 1 'to 4 'when (list '= 'i lim) 'return 'i)
+          (list 'cl-loop 'for 'i 'from 1 'to 4 'always (list '< 'i lim))
+          (list 'cl-loop 'for 'i 'from 1 'to 4 'never (list '> 'i lim))
+          (list 'cl-loop 'for 'i 'from 1 'to 4 'thereis (list 'and (list '= 'i lim) ''yes))
+          (list 'cl-loop 'for 'i 'from 1 'to 4 'sum 'i)))))
+     ;; A macro defined and used in the same enclosing form: the expander has to
+     ;; install it before it reaches the use site.
+     ((fz-chance 8)
+      (list 'progn
+            (list 'defmacro 'fzgm '(a) (list 'list '(quote list) 'a 'a))
+            (list 'fzgm (fz-atom (fz-pick '(int str sym))))))
      ((fz-chance 30) (list 'dotimes (list 'i (fz-atom 'small)) (fz-expr d)))
      (t (list 'progn (fz-expr d) (fz-expr d))))))
 
