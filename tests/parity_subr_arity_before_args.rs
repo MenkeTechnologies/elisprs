@@ -180,6 +180,50 @@ fn defalias_to_a_subr_resolves_through_the_alias_chain() {
     );
 }
 
+/// A symbol already pointed at a subr, then pointed at a **narrower** one before
+/// the call: the cell live when the call compiled would have accepted the count,
+/// so only the run-time verdict can catch it. Found by `scripts/fuzz_parity.sh`
+/// once the generator learned to emit these (7/1500 forms).
+///
+/// Emacs 30.2: `0` for both.
+#[test]
+fn a_symbol_retargeted_at_a_narrower_subr_is_still_caught() {
+    assert_eq!(
+        eval(
+            "(progn (fset 'fzwa (symbol-function 'cons)) \
+               (let ((n 0)) \
+                 (fset 'fzwa (symbol-function 'cdr)) \
+                 (ignore-errors (fzwa 1 (setq n 9))) \
+                 n))"
+        ),
+        "0"
+    );
+    assert_eq!(
+        eval(
+            "(progn (defalias 'fzwa 'cons) \
+               (let ((n 0)) (defalias 'fzwa 'cdr) (ignore-errors (fzwa 1 (setq n 9))) n))"
+        ),
+        "0"
+    );
+}
+
+/// …and retargeted at a *lambda* it must go back to evaluating its arguments,
+/// even though the symbol is on the "has named a subr" list.
+///
+/// Emacs 30.2: `((9 2) 9)`.
+#[test]
+fn a_symbol_retargeted_from_a_subr_to_a_lambda_evaluates_its_arguments() {
+    assert_eq!(
+        eval(
+            "(progn (fset 'fzwa (symbol-function 'car)) \
+               (let ((n 0)) \
+                 (fset 'fzwa (lambda (a b) (list a b))) \
+                 (list (fzwa (setq n 9) 2) n)))"
+        ),
+        "((9 2) 9)"
+    );
+}
+
 /// A `MANY`-arity subr takes any count, so the guard must never fire for one.
 ///
 /// Emacs 30.2: `10`, `(1 2 3 4 5)`.

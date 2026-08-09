@@ -591,6 +591,16 @@ pub struct ElispHost {
     /// `proceed` protocol. Fired from [`call_function`]. Runtime-only (never
     /// serialized). See [`crate::intercepts`].
     pub(crate) intercepts: Vec<crate::intercepts::Intercept>,
+    /// Symbols that elisp-level `fset`/`defalias` has pointed at a **subr**.
+    ///
+    /// Such a symbol has shown it can change what kind of function it names, so
+    /// a later call to it gets the pre-argument arity guard even when the cell
+    /// live at compile time would accept the count: the next `fset` can retarget
+    /// it at a narrower subr before the call runs, and Emacs checks the cell
+    /// that is live at the call. Only the `fset` subr records here — `defun`
+    /// lowers to the `FSET` op and `defsubr` installs the builtins, so neither
+    /// puts an ordinary definition in this set. Runtime-only (never serialized).
+    pub(crate) subr_aliased: std::collections::HashSet<u32>,
     /// Re-entrancy guard for the intercept layer: set while an advice body (or a
     /// proceeded original) runs so nested function calls dispatch normally instead
     /// of re-triggering intercepts (prevents infinite recursion when advice calls
@@ -767,6 +777,7 @@ impl ElispHost {
             string_props: HashMap::new(),
             oclosure_meta: HashMap::new(),
             intercepts: Vec::new(),
+            subr_aliased: std::collections::HashSet::new(),
             intercept_active: false,
             intercept_current: None,
             intercept_proceeded: false,
@@ -2223,6 +2234,22 @@ impl ElispHost {
             }
         }
         FnKind::Other
+    }
+
+    /// Record that elisp-level `fset`/`defalias` pointed `sym` at a subr. See
+    /// [`Self::subr_aliased`].
+    pub fn note_subr_alias(&mut self, sym: &Value, def: &Value) {
+        if matches!(self.fn_kind(def), FnKind::Subr(..)) {
+            if let Some(id) = self.sym_handle(sym) {
+                self.subr_aliased.insert(id);
+            }
+        }
+    }
+
+    /// Whether `sym` has ever been `fset` to a subr. See [`Self::subr_aliased`].
+    pub fn is_subr_aliased(&self, sym: &Value) -> bool {
+        self.sym_handle(sym)
+            .is_some_and(|id| self.subr_aliased.contains(&id))
     }
 
     /// Resolve a function designator (symbol → function cell, following aliases;

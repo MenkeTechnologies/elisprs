@@ -1463,6 +1463,9 @@ fn makunbound(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(fset SYMBOL DEFINITION)` — set SYMBOL's function cell, returning DEFINITION.
 fn fset(h: &mut ElispHost, a: &[Value]) -> R {
     h.set_function_value(&a[0], a[1].clone())?;
+    // A symbol pointed at a subr can be pointed at a *narrower* one before its
+    // next call, so calls to it need the pre-argument arity guard from here on.
+    h.note_subr_alias(&a[0], &a[1]);
     Ok(a[1].clone())
 }
 /// `(fboundp SYMBOL)` — non-nil if SYMBOL has a function definition.

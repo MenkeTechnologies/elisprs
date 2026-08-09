@@ -457,6 +457,49 @@
      ((fz-chance 30) (list 'dotimes (list 'i (fz-atom 'small)) (fz-expr d)))
      (t (list 'progn (fz-expr d) (fz-expr d))))))
 
+(defun fz-arity-form ()
+  "A wrong-arity call whose surplus (or sole) argument has a side effect.
+
+WHEN the arity is checked is a parity surface of its own, and it is invisible
+in both the value and the signalled error -- those already agree.  Emacs checks
+a SUBR's arity in `eval_sub''s argument-count switch, before any argument form
+runs, so `n' stays 0; a CLOSURE's arguments are evaluated into a vector before
+`funcall_lambda' compares counts, so `n' becomes 9.  Only reading `n' afterwards
+separates the two.
+
+Reaching the callee through `fset'/`defalias' covers the case where it is not
+statically visible at the call site at all -- which is exactly where a
+compile-time-only arity check silently does nothing.  The indirection always
+goes on `fzwa', never on the real subr: `(fset 'car ...)' would leak into every
+later form in the corpus."
+  (let* ((spec (fz-pick '((car 2) (cdr 2) (cons 1) (cons 3) (nth 1)
+                          (point 1) (length 2) (symbol-name 2) (1+ 2))))
+         (fn (nth 0 spec))
+         (argc (nth 1 spec))
+         (args (let ((acc (list (list 'setq 'n 9))) (i 1))
+                 (while (< i argc) (push 1 acc) (setq i (1+ i)))
+                 acc)))
+    (cond
+     ((fz-chance 40)
+      (list 'let '((n 0)) (list 'ignore-errors (cons fn args)) 'n))
+     ((fz-chance 25)
+      (list 'let '((n 0))
+            (list 'defalias ''fzwa (list 'quote fn))
+            (list 'ignore-errors (cons 'fzwa args))
+            'n))
+     ((fz-chance 25)
+      (list 'let '((n 0))
+            (list 'fset ''fzwa (list 'symbol-function (list 'quote fn)))
+            (list 'ignore-errors (cons 'fzwa args))
+            'n))
+     ;; The closure control: the same shape must still evaluate its arguments,
+     ;; so a check that over-fires shows up here as `0'.
+     (t
+      (list 'let '((n 0))
+            (list 'defun 'fzwc '(a) 'a)
+            (list 'ignore-errors (cons 'fzwc args))
+            'n)))))
+
 (defun fz-expr (depth)
   "A random expression with at most DEPTH levels of nesting."
   (cond
@@ -464,6 +507,7 @@
    ((fz-chance 22) (fz-leaf (fz-pick '(any any list vec str))))
    ((fz-chance 12) (fz-control depth))
    ((fz-chance 8) (fz-format-form depth))
+   ((fz-chance 6) (fz-arity-form))
    (t (fz-build (fz-pick fz-calls) (1- depth)))))
 
 ;;; ── main ─────────────────────────────────────────────────────────────────────

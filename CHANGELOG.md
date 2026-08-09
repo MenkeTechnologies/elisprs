@@ -20,8 +20,12 @@ All notable changes to elisprs are documented here. The format follows
   retarget a symbol between compilation and the call in both directions:
   pointing `car` at a two-argument lambda keeps `(car 1 2)` legal, and
   `(fset 'myfn (symbol-function 'car))` then `(myfn 1 2)` signals without
-  evaluating either argument. Verified across the interpreter, a warm bytecode
-  cache and `--aot-exe` (caught and uncaught). `cache::SHARD_FORMAT_VERSION`
+  evaluating either argument. A symbol `fset` has pointed at a subr once is
+  recorded and always carries the guard afterwards, so retargeting it at a
+  *narrower* subr — `(fset 'f (symbol-function 'cons))` then
+  `(fset 'f (symbol-function 'cdr))` — is caught even though the cell live when
+  the call compiled accepted the count. Verified across the interpreter, a warm
+  bytecode cache and `--aot-exe` (caught and uncaught). `cache::SHARD_FORMAT_VERSION`
   6 → 7, since a v6 chunk carries no guard and would otherwise keep serving the
   old behaviour from a warm cache.
 

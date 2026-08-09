@@ -197,17 +197,25 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
 /// - the symbol already names a closure — Emacs evaluates a closure's arguments
 ///   before checking its arity too, so the guard would never fire.
 ///
-/// It is emitted when the call is already wrong against the live cell, and when
-/// the symbol names nothing yet — a forward reference, or a symbol that `fset`
-/// will point at a subr. That second case is not hypothetical: after
+/// It is emitted in three cases: when the call is already wrong against the live
+/// cell; when the symbol names nothing yet — a forward reference, or a symbol
+/// that `fset` will point at a subr; and when `fset` has already pointed the
+/// symbol at a subr once, since it can be pointed at a *narrower* one before the
+/// call runs.
+///
+/// Neither of the last two is hypothetical. After
 /// `(fset 'f (symbol-function 'car))`, Emacs signals on `(f 1 2)` without
-/// evaluating either argument, and `f` is unbound when the call compiles.
+/// evaluating either argument, and `f` is unbound when the call compiles; and a
+/// second `(fset 'f (symbol-function 'cdr))` narrows a cell that was wide enough
+/// when it did.
 fn needs_arity_guard(h: &ElispHost, head: &Value, argc: usize) -> bool {
     if !matches!(h.obj(head), Some(Obj::Symbol(_))) {
         return false;
     }
     let kind = h.fn_kind(head);
-    matches!(kind, FnKind::Vacant) || kind.rejects_before_args(argc)
+    matches!(kind, FnKind::Vacant)
+        || kind.rejects_before_args(argc)
+        || h.is_subr_aliased(head)
 }
 
 /// Lower a call to a native fusevm op sequence when the operator is a core

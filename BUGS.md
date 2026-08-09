@@ -2004,9 +2004,10 @@ captured environment on the path it exists to wave through.
 The compiler decides only whether emitting the op can ever pay, which keeps it
 off the two shapes that make up almost every call: a symbol that already names a
 subr accepting the count, and a symbol that already names a closure. It is
-emitted when the call is already wrong against the live cell, and when the symbol
-names nothing yet. Verified from `--dump-bytecode`: a loop over `cons`, `car`,
-`1+` and `<` emits extension ops `{0, 1, 2, 3}` and no `11` at all.
+emitted when the call is already wrong against the live cell, when the symbol
+names nothing yet, and when `fset` has already pointed the symbol at a subr once
+(see R12-B). Verified from `--dump-bytecode`: a loop over `cons`, `car`, `1+` and
+`<` emits extension ops `{0, 1, 2, 3}` and no `11` at all.
 
 An AOP intercept fronts the callee, so the underlying subr's arity is not the
 arity being called; the op leaves those to `CALL`.
@@ -2025,9 +2026,56 @@ error caught, and `--aot-exe` with it uncaught (which still reports and exits 1
 rather than the silent 0 that path used to give) — each byte-identical to
 `emacs --batch`.
 
-Covered by `tests/parity_subr_arity_before_args.rs` (10 tests). Seven of its
-cases fail against the pre-fix binary; the other three are the regression guards
-for closures, `fset` widening and `funcall`, which passed before and still do.
+Covered by `tests/parity_subr_arity_before_args.rs` (12 tests, two of them added
+by R12-B). Seven of its cases fail against the pre-fix binary; the rest are the
+regression guards for closures, `fset` widening and `funcall`, which passed
+before and still do.
+
+### R12-B. The generator could not express the bug — harness widened, then a second gap fell out
+
+Worth recording on its own, because the clean number was meaningless.
+`scripts/fuzz/gen.el` emitted **no wrong-arity calls at all** — `grep -c` for one
+was `0`, and every `setq` in the file was the PRNG's own plumbing or a loop
+counter. Round 11's `1500/1500` therefore said nothing about R12-A: *when* the
+arity is checked is invisible in both the value and the signalled error, which
+already agreed, so the only observable is a side effect in an argument, and no
+generated form had one.
+
+`fz-arity-form` now emits `(let ((n 0)) (ignore-errors (SUBR … (setq n 9))) n)`
+in four flavours — the subr called directly, through `defalias`, through `fset`,
+and a closure control that must still return `9`. It is reached from `fz-expr`
+(6%), not from `fz-control`, where it was buried behind enough preceding clauses
+to land once in 1500. The indirections always go on `fzwa`, never on a real subr:
+`(fset 'car …)` would leak into every later form in the corpus.
+
+Reach on seed 1 / 1500 forms: 80 arity forms — 33 direct, 14 `defalias`, 7
+`fset`, 26 closure controls — and the same corpus scores **44/1500 divergences
+against the pre-fix binary**.
+
+Against the R12-A fix it still reported **7/1500**, all one shape:
+
+```elisp
+(let ((n 0)) (defalias 'fzwa 'cons)          ; an earlier form; fzwa := a 2-arg subr
+  …)
+(let ((n 0)) (defalias 'fzwa 'cdr)           ; this form retargets it narrower
+  (ignore-errors (fzwa 1 (setq n 9))) n)     ; Emacs 0, was 9
+```
+
+When that call compiled, `fzwa` still named `cons`, which accepts two arguments,
+so no guard was emitted; the `defalias` narrowing it to `cdr` runs inside the
+same form, after compilation. The unit tests missed it because `reset_host` gives
+each one a fresh host where `fzwa` names nothing.
+
+Closed by `ElispHost::subr_aliased`: the `fset` subr records any symbol it points
+at a subr, and calls to a recorded symbol always carry the guard. Only the `fset`
+subr records — `defun` lowers to the `FSET` op and `defsubr` installs the
+builtins, so neither `car` nor an ordinary user function ever enters the set, and
+the hot path stays guard-free. Retargeting a recorded symbol back at a *lambda*
+correctly goes back to evaluating the arguments:
+`(progn (fset 'fzwa (symbol-function 'car)) (let ((n 0)) (fset 'fzwa (lambda (a b) (list a b))) (list (fzwa (setq n 9) 2) n)))`
+is `((9 2) 9)` under both.
+
+The widened corpus is now **1500/1500**.
 
 ### Still open after round 12
 
@@ -2052,9 +2100,10 @@ for closures, `fset` widening and `funcall`, which passed before and still do.
   `(wrong-number-of-arguments #[(a) (a) nil] 2)` in Emacs and
   `(error "wrong-number-of-arguments")` here. `compile_call` dispatches the
   special forms by name and never counts their operands.
-- **A symbol that named a closure (or a wide-enough subr) when it compiled, then
-  retargeted by `fset` at a *narrower* subr, still evaluates its arguments** —
-  the one shape `CHECK_ARITY` is not emitted for. Emitting it everywhere would
-  put a function-cell resolution in front of every call in the language to buy a
-  case that needs a symbol to change what kind of thing it names between
-  compilation and the call.
+- **A symbol that named a *closure* when it compiled, then retargeted by `fset`
+  at a subr that rejects the count, still evaluates its arguments** — the one
+  shape `CHECK_ARITY` is still not emitted for. R12-B closed the subr→subr half
+  of this (a symbol that has ever named a subr is recorded and always guarded);
+  the closure→subr half would need every call to a user function to carry the
+  guard, which is most calls in most programs. Not reproduced by the fuzzer —
+  `fz-arity-form` only installs subrs on `fzwa`.
