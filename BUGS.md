@@ -2284,6 +2284,42 @@ one needs no reference Emacs at all and found the widest class below.
   it *does* know are wrong under `with-syntax-table`. Closing it means resolving
   `\sC` against the live table where the regexp is compiled, not in the
   translator.
+- **A closure still prints the environment it captured** — round 11's
+  "Re-verified as already fixed" is wrong, and the fuzzer found it again at seed
+  777 (form #1591). The re-verification used `(lambda (x) x)` with nothing in
+  scope to capture, which cannot show the bug. With an enclosing binding:
+
+  ```
+  $ cat c.el
+  (princ (format "%S\n" (let ((q 5)) (condition-case e (funcall (lambda (x) (list x x)) 1 2) (error e)))))
+  $ emacs -Q --batch -l c.el
+  (wrong-number-of-arguments #[(x) ((list x x)) nil] 2)
+  $ elisp c.el
+  (wrong-number-of-arguments #[(x) ((list x x)) ((q . 5))] 2)
+  ```
+
+  (and `(t)` on the Emacs side when the same form is run through
+  `(eval FORM t)` rather than loaded from a file without a `lexical-binding`
+  cookie — elisprs prints `((q . 5))` either way). Emacs prunes a closure's
+  captured environment to the free variables of its BODY; `(lambda (x) (list x
+  x))` has none, so it captures nothing. elisprs keeps every binding that was in
+  scope. Unchanged substrate reason from round 9: pruning needs a free-variable
+  analysis in `compiler.rs`.
+- **`format`'s `%Ns` width and `%.Ns` precision count characters, not display
+  columns.** Emacs measures both with the string's display width, so a TAB is 8
+  columns, a control character is 2 (`^G`), a raw byte is 4 (`\200`) and a
+  double-width character is 2:
+
+  ```
+  $ emacs -Q --batch --eval '(prin1 (list (format "%.3s" "\tXY") (format "%.3s" "中XY") (format "%.3s" "中中") (format "%5s" "a\tb")))'
+  ("" "中X" "中" "a\tb")
+  $ elisp -e '(prin1 (list (format "%.3s" "\tXY") (format "%.3s" "中XY") (format "%.3s" "中中") (format "%5s" "a\tb")))'
+  ("\tXY" "中XY" "中中" "  a\tb")
+  ```
+
+  Found by the fuzzer at seed 777 (form #1737). Closing it needs Emacs's
+  character-width model (`char-width-table`, tab stops, the `^C`/`\NNN`
+  display forms), which elisprs does not have.
 - Unchanged from rounds 9, 10, 11 and 12, for the reasons already recorded there:
   reader-level backquote preservation, `setf`'s gv expansion shape,
   `hash-table-size`, `aset` on a string, the warm-cache `make-symbol` re-intern,
