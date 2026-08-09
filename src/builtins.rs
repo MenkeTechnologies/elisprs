@@ -1056,7 +1056,12 @@ fn aset(h: &mut ElispHost, a: &[Value]) -> R {
             _ => {}
         }
     }
-    Err("wrong-type-argument: arrayp".to_string())
+    // Emacs names the offending object: `(aset 5 0 1)` is
+    // `(wrong-type-argument arrayp 5)`, never a bare `(wrong-type-argument arrayp)`.
+    Err(format!(
+        "wrong-type-argument: arrayp {}",
+        h.print(&a[0], true)
+    ))
 }
 /// `(fillarray ARRAY ITEM)` — set every element of vector ARRAY to ITEM, in
 /// place. (Strings are immutable here, so only vectors are supported.)
@@ -1326,7 +1331,9 @@ fn fset(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// `(fboundp SYMBOL)` — non-nil if SYMBOL has a function definition.
 fn fboundp(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(h.resolve_function(&a[0]).is_ok()))
+    Ok(nil_or(
+        h.resolve_function(&a[0]).is_ok() || h.introspect_function_cell(&a[0]).is_some(),
+    ))
 }
 /// `(indirect-function OBJECT)` — follow symbol→function-cell aliases to the final
 /// function object (a subr/closure), or nil if undefined.
@@ -1334,8 +1341,8 @@ fn indirect_function(h: &mut ElispHost, a: &[Value]) -> R {
     let mut cur = a[0].clone();
     for _ in 0..64 {
         match h.obj(&cur) {
-            Some(Obj::Symbol(s)) => match &s.function {
-                Some(def) => cur = def.clone(),
+            Some(Obj::Symbol(_)) => match h.introspect_function_cell(&cur) {
+                Some(def) => cur = def,
                 None => return Ok(Value::Undef),
             },
             _ => return Ok(cur),
@@ -3641,7 +3648,14 @@ fn char_equal(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// `(symbol-function SYMBOL)` — the symbol's function-cell value, or nil.
 fn symbol_function(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(h.function_cell(&a[0]).unwrap_or(Value::Undef))
+    Ok(h.introspect_function_cell(&a[0]).unwrap_or(Value::Undef))
+}
+/// `(--set-intrinsic-macro-cell SYM CELL)` — record the `(macro . FUNCTION)` an
+/// intrinsically-lowered macro reports through `symbol-function` / `fboundp` /
+/// `indirect-function`. Called once from the prelude; not an Emacs function.
+fn set_intrinsic_macro_cell(h: &mut ElispHost, a: &[Value]) -> R {
+    h.set_intrinsic_macro_cell(&a[0], a[1].clone());
+    Ok(a[0].clone())
 }
 /// `(intern-soft NAME)` — the interned symbol named NAME, or nil if none exists.
 fn intern_soft(h: &mut ElispHost, a: &[Value]) -> R {
@@ -4706,29 +4720,67 @@ fn read_from_string(h: &mut ElispHost, a: &[Value]) -> R {
     let (form, end) = crate::reader::read_one(h, &limited, from as usize)?;
     Ok(h.cons(form, Value::Int(end as i64)))
 }
+/// fns.c `validate_subarray`, as `Fcompare_strings` calls it: resolve FROM/TO
+/// against a sequence of `size` elements.
+///
+/// A nil bound takes its default (0 / `size`); a negative one counts from the
+/// end; **anything else is `(wrong-type-argument integerp BOUND)`** — which is
+/// the whole point of porting it, since elisprs previously defaulted a
+/// non-integer bound silently and answered a comparison where Emacs signals.
+/// A resolved range outside `0 <= from <= to <= size` is
+/// `args_out_of_range_3`: `(args-out-of-range ARRAY FROM TO)`.
+///
+/// `Fcompare_strings` first clamps a too-large *positive* END down to `size`
+/// "for backward compatibility", so only a negative or start-crossing bound can
+/// reach the range error through it. The clamped value is what the error data
+/// reports, exactly as in C.
+fn validate_subarray(
+    h: &ElispHost,
+    array: &Value,
+    from: &Value,
+    to: Option<&Value>,
+    size: usize,
+) -> Result<(usize, usize), String> {
+    let to = to.cloned().unwrap_or(Value::Undef);
+    // The END clamp happens in Fcompare_strings, before validate_subarray.
+    let to = match to {
+        Value::Int(n) if n > size as i64 => Value::Int(size as i64),
+        other => other,
+    };
+    let resolve = |v: &Value, default: i64| -> Result<i64, String> {
+        match v {
+            Value::Int(n) => Ok(if *n < 0 { n + size as i64 } else { *n }),
+            _ if is_nil(v) => Ok(default),
+            _ => Err(format!(
+                "wrong-type-argument: integerp {}",
+                h.print(v, true)
+            )),
+        }
+    };
+    let f = resolve(from, 0)?;
+    let t = resolve(&to, size as i64)?;
+    if !(0 <= f && f <= t && t <= size as i64) {
+        return Err(format!(
+            "args-out-of-range: {} {} {}",
+            h.print(array, true),
+            h.print(from, true),
+            h.print(&to, true)
+        ));
+    }
+    Ok((f as usize, t as usize))
+}
+
 /// `(compare-strings S1 START1 END1 S2 START2 END2 &optional IGNORE-CASE)` —
 /// `t` if the substrings are equal, else a signed 1-based index of the first
 /// mismatch (negative when S1 sorts before S2), per Emacs.
 fn compare_strings(h: &mut ElispHost, a: &[Value]) -> R {
     let s1: Vec<char> = as_string(h, &a[0])?.chars().collect();
     let s2: Vec<char> = as_string(h, &a[3])?.chars().collect();
-    let bound = |v: &Value, default: usize| -> usize {
-        match v {
-            Value::Int(n) => (*n).max(0) as usize,
-            _ => default,
-        }
-    };
-    let (start1, end1) = (
-        bound(&a[1], 0),
-        bound(a.get(2).unwrap_or(&Value::Undef), s1.len()).min(s1.len()),
-    );
-    let (start2, end2) = (
-        bound(&a[4], 0),
-        bound(a.get(5).unwrap_or(&Value::Undef), s2.len()).min(s2.len()),
-    );
+    let (start1, end1) = validate_subarray(h, &a[0], &a[1], a.get(2), s1.len())?;
+    let (start2, end2) = validate_subarray(h, &a[3], &a[4], a.get(5), s2.len())?;
     let ignore_case = a.get(6).is_some_and(|v| !is_nil(v));
-    let sub1 = &s1[start1.min(end1)..end1];
-    let sub2 = &s2[start2.min(end2)..end2];
+    let sub1 = &s1[start1..end1];
+    let sub2 = &s2[start2..end2];
     let fold = |c: char| {
         if ignore_case {
             c.to_lowercase().next().unwrap_or(c)
@@ -7172,6 +7224,12 @@ pub fn install(h: &mut ElispHost) {
     s("abs", 1, Some(1), abs_fn);
     s("logcount", 1, Some(1), logcount_fn);
     s("symbol-function", 1, Some(1), symbol_function);
+    s(
+        "--set-intrinsic-macro-cell",
+        2,
+        Some(2),
+        set_intrinsic_macro_cell,
+    );
     s("intern-soft", 1, Some(2), intern_soft);
     s("subrp", 1, Some(1), subrp);
     s("macrop", 1, Some(1), macrop);

@@ -45,4 +45,16 @@ pub unsafe extern "C" fn fusevm_aot_register_builtins(vm: *mut VM) {
     });
     vm.set_extension_handler(Box::new(crate::host::ext_dispatch));
     vm.set_extension_wide_handler(Box::new(crate::host::ext_dispatch_wide));
+    // The same numeric contract `run_chunk` installs on the interpreted VM. Both
+    // are required, and leaving them off is silent: fusevm's native int ops wrap,
+    // so an AOT binary answered `(* 1000000000000 1000000000000)` =>
+    // 2003764205206896640 and `(+ 9223372036854775807 1)` => 1.0 where the
+    // interpreter (and Emacs) promote to a bignum. `set_fixnum_range` additionally
+    // makes a result that merely leaves Emacs's 62-bit fixnum range — still an
+    // `i64` — promote, which is what `bignump`/`fixnump` report on.
+    vm.set_numeric_hook(std::sync::Arc::new(crate::host::numeric_hook));
+    vm.set_fixnum_range(
+        crate::host::MOST_NEGATIVE_FIXNUM,
+        crate::host::MOST_POSITIVE_FIXNUM,
+    );
 }

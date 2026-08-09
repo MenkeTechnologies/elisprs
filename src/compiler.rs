@@ -323,6 +323,9 @@ fn compile_lambda(
         body: Rc::new(body),
         is_macro,
         env: None,
+        // A template carries no mode; `instantiate_closure` stamps the mode
+        // in force where the `lambda` is evaluated.
+        dynamic: false,
         src,
     });
     load_const(b, template);
@@ -353,6 +356,9 @@ fn compile_defun(
         body: Rc::new(body),
         is_macro,
         env: None,
+        // A template carries no mode; `instantiate_closure` stamps the mode
+        // in force where the `lambda` is evaluated.
+        dynamic: false,
         src,
     });
     load_const(b, name); // symbol

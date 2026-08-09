@@ -14,6 +14,13 @@ use std::process::ExitCode;
 mod repl;
 
 fn main() -> ExitCode {
+    // Everything — including the host's thread-locals — lives on the deep-stack
+    // thread; see `elisprs::INTERP_STACK_BYTES` for why the platform default is
+    // not enough.
+    elisprs::with_interpreter_stack(run)
+}
+
+fn run() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--version" || a == "-V") {

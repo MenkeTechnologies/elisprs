@@ -3986,9 +3986,16 @@ fn format_error_uses_error_message_string() {
     reset_host();
     let _ = eval_str(""); // load prelude
                           // Internal "condition: data" strings render like Emacs's error-message-string.
+                          // print.c runs the `error-message' property through
+                          // `substitute-command-keys', so the apostrophe comes back as a
+                          // RIGHT SINGLE QUOTATION MARK — verified against ground truth:
+                          //   $ emacs --batch -Q --eval "(prin1 (error-message-string '(void-variable foo)))"
+                          //   "Symbol’s value as variable is void: foo"
+                          // The straight-quote expectation this line used to carry was the
+                          // pre-port elisprs value, which diverged from Emacs.
     assert_eq!(
         elisprs::format_error("void-variable: foo"),
-        "Symbol's value as variable is void: foo"
+        "Symbol\u{2019}s value as variable is void: foo"
     );
     assert_eq!(
         elisprs::format_error("wrong-type-argument: listp 5"),

@@ -594,10 +594,24 @@ pub const PRELUDE: &str = r#"
     (nreverse r)))
 (defun cl-stable-sort (seq pred &rest keys) (apply 'cl-sort seq pred keys))
 (defun cl-delete-duplicates (seq &rest keys) (apply 'cl-remove-duplicates seq keys))
-(defun cl-adjoin (item list &rest keys)
-  (let ((test (cl--getkey keys :test 'eql)) (key (cl--getkey keys :key 'identity)))
-    (if (seq-some (lambda (x) (funcall test (funcall key item) (funcall key x))) list)
-        list (cons item list))))
+;; cl-lib.el's `cl-adjoin', verbatim. The two fast paths are not an
+;; optimization detail — they are the contract, because `memq'/`member' walk the
+;; list themselves: with no keys and a non-numeric ITEM the walk is `memq', so
+;; `(cl-adjoin "" t)' is `(wrong-type-argument listp t)' where a `seq-some'
+;; paraphrase reported `sequencep'.
+(defun cl-adjoin (cl-item cl-list &rest cl-keys)
+  (cond ((or (equal cl-keys '(:test eq))
+             (and (null cl-keys) (not (numberp cl-item))))
+         (if (memq cl-item cl-list) cl-list (cons cl-item cl-list)))
+        ((or (equal cl-keys '(:test equal)) (null cl-keys))
+         (if (member cl-item cl-list) cl-list (cons cl-item cl-list)))
+        (t (apply 'cl--adjoin cl-item cl-list cl-keys))))
+;; cl-seq.el: the keyword path runs the ITEM through :key, then `cl-member'.
+(defun cl--adjoin (cl-item cl-list &rest cl-keys)
+  (let ((key (cl--getkey cl-keys :key 'identity)))
+    (if (apply 'cl-member (funcall key cl-item) cl-list cl-keys)
+        cl-list
+      (cons cl-item cl-list))))
 ;; Faithful ports of Emacs `cl-union'/`cl-intersection'/`cl-set-difference'
 ;; (cl-seq.el). They honor :test (default `eql') and :key, and reproduce the
 ;; length-swap + memq/numberp fast path that determines element order. Without
@@ -687,14 +701,67 @@ pub const PRELUDE: &str = r#"
 
 ;;; ---- control macros ----
 (defmacro prog2 (a b &rest body) (list (quote progn) a (cons (quote prog1) (cons b body))))
-(defmacro incf (place &rest amt) `(setf ,place (+ ,place ,(if amt (car amt) 1))))
-(defmacro decf (place &rest amt) `(setf ,place (- ,place ,(if amt (car amt) 1))))
+;; ---- read-modify-write places (push/pop/incf/decf/cl-callf) ----
+;;
+;; Every one of these mentions PLACE at least twice: once to read it, once to
+;; write it. Substituting the place FORM at each mention re-evaluates its
+;; subforms, which Emacs never does — gv.el binds them with `gv-letplace' before
+;; building either half. The divergence is a wrong *number of side effects*:
+;;
+;;   (let ((n 0) (l (list 1 2))) (cl-incf (car (progn (setq n (1+ n)) l))) n)
+;;     => 1 in Emacs, was 2 here
+;;   (let ((n 0) (l (list 1 2 3))) (pop (cdr (progn (setq n (1+ n)) l))) n)
+;;     => 1 in Emacs, was 3 here (`pop' mentions the place three times)
+;;
+;; `setf--place-once' rebuilds PLACE over temporaries, and every macro below
+;; goes through it — one implementation of the rule, not five.
+(defun setf--copyable-p (x)
+  ;; `macroexp-copyable-p', inlined because these macros are defined long before
+  ;; macroexp.el is: a symbol or a constant costs nothing to duplicate; anything
+  ;; else (a call) must be bound.
+  (not (and (consp x) (not (memq (car x) (quote (quote function)))))))
+(defun setf--bind1 (form)
+  ;; (BINDINGS . REF) for one subform: no binding at all when it is copyable.
+  (if (setf--copyable-p form) (cons nil form)
+    (let ((tmp (make-symbol "v"))) (cons (list (list tmp form)) tmp))))
+(defun setf--place-once (place)
+  ;; (BINDINGS . PLACE') where PLACE' names each of PLACE's subforms once.
+  ;;
+  ;; A *symbol* subform is deliberately left as itself, exactly as gv.el does:
+  ;; re-reading a variable has no side effect, and some setters assign to the
+  ;; subform itself — `(setf (nthcdr 0 l) v)' is `(setq l v)' — which a
+  ;; temporary would silently redirect away from the caller's variable.
+  (if (not (consp place)) (cons nil place)
+    (let ((binds nil) (args nil) (rest (cdr place)) (b nil))
+      (while rest
+        (setq b (setf--bind1 (car rest)))
+        (setq binds (append binds (car b)))
+        (setq args (cons (cdr b) args))
+        (setq rest (cdr rest)))
+      (cons binds (cons (car place) (nreverse args))))))
+(defun setf--rmw (place newval)
+  ;; Code setting PLACE to (funcall NEWVAL GETTER), evaluating PLACE's subforms
+  ;; exactly once. NEWVAL is a function of the getter form.
+  (if (symbolp place)
+      (list (quote setq) place (funcall newval place))
+    (let* ((b (setf--place-once place)) (p (cdr b)))
+      (list (quote let*) (car b) (list (quote setf) p (funcall newval p))))))
+(defmacro incf (place &rest amt)
+  (setf--rmw place (lambda (g) (list (quote +) g (if amt (car amt) 1)))))
+(defmacro decf (place &rest amt)
+  (setf--rmw place (lambda (g) (list (quote -) g (if amt (car amt) 1)))))
 ;; push: cons X onto PLACE. A plain variable uses setq; a generalized place
-;; (e.g. (cdr l), (nth 1 l), (gethash k h)) goes through setf.
+;; (e.g. (cdr l), (nth 1 l), (gethash k h)) goes through setf. X is bound first,
+;; so it is evaluated before the place's subforms — subr.el's `macroexp-let2' on
+;; NEWELT wraps the `gv-letplace' the same way round.
 (defmacro push (x place)
   (if (symbolp place)
       (list (quote setq) place (list (quote cons) x place))
-    (list (quote setf) place (list (quote cons) x place))))
+    (let* ((xb (setf--bind1 x))
+           (b (setf--place-once place))
+           (p (cdr b)))
+      (list (quote let*) (append (car xb) (car b))
+            (list (quote setf) p (list (quote cons) (cdr xb) p))))))
 ;; setf: assign to a generalized place. Supports a plain variable and the
 ;; common cons/sequence/hash/symbol places; multiple place/value pairs expand
 ;; left-to-right.
@@ -728,11 +795,13 @@ pub const PRELUDE: &str = r#"
 ;; is load-bearing, not decoration — `(pop x)' on a non-list yields nil in Emacs
 ;; instead of signalling `wrong-type-argument', which is what a plain `car' does.
 (defmacro pop (place)
-  (list (quote car-safe)
-        (list (quote prog1) place
-              (if (symbolp place)
-                  (list (quote setq) place (list (quote cdr) place))
-                (list (quote setf) place (list (quote cdr) place))))))
+  (if (symbolp place)
+      (list (quote car-safe)
+            (list (quote prog1) place (list (quote setq) place (list (quote cdr) place))))
+    (let* ((b (setf--place-once place)) (p (cdr b)))
+      (list (quote let*) (car b)
+            (list (quote car-safe)
+                  (list (quote prog1) p (list (quote setf) p (list (quote cdr) p))))))))
 (defmacro dolist (spec &rest body)
   ;; (dolist (VAR LIST [RESULT]) BODY...) — RESULT is the value of the form; nil
   ;; if omitted.
@@ -1109,32 +1178,62 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
     (/= (% n 2) 0)))
 ;; Two-value division: each returns (QUOTIENT REMAINDER) where the remainder is
 ;; X - QUOTIENT*Y, matching the single-value floor/ceiling/truncate/round builtins.
-(defun cl-floor (x &optional y)
-  (let* ((d (or y 1)) (q (floor x d))) (list q (- x (* q d)))))
-(defun cl-ceiling (x &optional y)
-  (let* ((d (or y 1)) (q (ceiling x d))) (list q (- x (* q d)))))
-(defun cl-truncate (x &optional y)
-  (let* ((d (or y 1)) (q (truncate x d))) (list q (- x (* q d)))))
-(defun cl-round (x &optional y)
-  (let* ((d (or y 1)) (q (round x d))) (list q (- x (* q d)))))
-;; cl-lib.el defines these as the remainder half of `cl-floor'/`cl-truncate', so
-;; they accept FLOATS: `(cl-rem 7.5 2)' is 1.5 and `(cl-mod -7.5 2)' is 0.5.
-;; Routing them through `mod'/`%' — which are integer-only in elisp — signalled
+;; cl-extra.el's two-value division family, ported verbatim. The exact
+;; expressions matter, not just the values: which argument each one touches
+;; first is what names the offender in a `wrong-type-argument'. `cl-truncate'
+;; tests `(>= y 0)' before dividing, so `(cl-rem 1.0e+INF '(1 2))' is
+;; `(wrong-type-argument number-or-marker-p (1 2))' and never the `integerp'
+;; that a division-first implementation reaches.
+;;
+;; They also accept FLOATS, because they are the remainder half of `cl-floor' /
+;; `cl-truncate': `(cl-rem 7.5 2)' is 1.5 and `(cl-mod -7.5 2)' is 0.5. Routing
+;; them through `mod'/`%' — integer-only in elisp — signalled
 ;; `wrong-type-argument integer-or-marker-p 7.5' on every float.
+(defun cl-floor (x &optional y)
+  (let ((q (floor x y)))
+    (list q (- x (if y (* y q) q)))))
+(defun cl-ceiling (x &optional y)
+  (let ((res (cl-floor x y)))
+    (if (= (car (cdr res)) 0) res
+      (list (1+ (car res)) (- (car (cdr res)) (or y 1))))))
+(defun cl-truncate (x &optional y)
+  (if (eq (>= x 0) (or (null y) (>= y 0)))
+      (cl-floor x y) (cl-ceiling x y)))
+(defun cl-round (x &optional y)
+  (if y
+      (if (and (integerp x) (integerp y))
+          (let* ((hy (/ y 2))
+                 (res (cl-floor (+ x hy) y)))
+            (if (and (= (car (cdr res)) 0)
+                     (= (+ hy hy) y)
+                     (/= (% (car res) 2) 0))
+                (list (1- (car res)) hy)
+              (list (car res) (- (car (cdr res)) hy))))
+        (let ((q (round (/ x y))))
+          (list q (- x (* q y)))))
+    (if (integerp x) (list x 0)
+      (let ((q (round x)))
+        (list q (- x q))))))
 (defun cl-mod (x y) (nth 1 (cl-floor x y)))
 (defun cl-rem (x y) (nth 1 (cl-truncate x y)))
-(defun cl-gcd (&rest ns)
-  (let ((g 0))
-    (dolist (n ns) (setq g (cl--gcd2 g (abs n))))
-    g))
-(defun cl--gcd2 (a b) (while (/= b 0) (let ((r (% a b))) (setq a b b r))) a)
-(defun cl-lcm (&rest ns)
-  (let ((l 1))
-    (catch 'zero
-      (dolist (n ns)
-        (if (= n 0) (throw 'zero 0)
-          (setq l (/ (* l (abs n)) (cl--gcd2 l (abs n))))))
-      l)))
+;; The Euclid loops, verbatim. `(% a (setq a b))' reads the OLD `a' and then
+;; rebinds it in the same expression, which is why `(cl-lcm "" 65535)' reports
+;; `integer-or-marker-p ""' from `%' — an `abs'-first paraphrase reported
+;; `number-or-marker-p' instead. `(/= b 0)' likewise tests B before touching A,
+;; so `(cl-gcd 100 'car)' names `car' under `number-or-marker-p'.
+(defun cl-gcd (&rest args)
+  (let ((a (or (pop args) 0)))
+    (dolist (b args)
+      (while (/= b 0)
+        (setq b (% a (setq a b)))))
+    (abs a)))
+(defun cl-lcm (&rest args)
+  (if (memq 0 args)
+      0
+    (let ((a (or (pop args) 1)))
+      (dolist (b args)
+        (setq a (* (/ a (cl-gcd a b)) b)))
+      (abs a))))
 (defun cl-parse-integer (string &rest keys)
   (string-to-number (string-trim string) (or (plist-get keys :radix) 10)))
 (defun cl-coerce (object type)
@@ -1862,8 +1961,15 @@ TYPE nil maps for side effects only and returns nil."
 (defmacro cl-dolist (spec &rest body) `(cl-block nil (dolist ,spec ,@body)))
 (defmacro cl-dotimes (spec &rest body) `(cl-block nil (dotimes ,spec ,@body)))
 (defmacro cl-pushnew (x place &rest _keys)
-  ;; Add X to the front of PLACE unless already present (by eql).
-  `(if (memql ,x ,place) ,place (setf ,place (cons ,x ,place))))
+  ;; Add X to the front of PLACE unless already present (by eql). The place is
+  ;; mentioned three times, so its subforms go through `setf--place-once' first.
+  (let* ((xb (setf--bind1 x))
+         (b (setf--place-once place))
+         (p (cdr b))
+         (xv (cdr xb)))
+    (list 'let* (append (car xb) (car b))
+          (list 'if (list 'memql xv p) p
+                (list 'setf p (list 'cons xv p))))))
 ;;; ---- help.el usage/docstring helpers (help-add-fundoc-usage &c) ----
 ;; Faithful ports from lisp/help.el (30.2). cl-defgeneric/cl-defmethod expansion
 ;; in cl-generic.el calls `help-add-fundoc-usage' to append the "(fn ARGS)" line
@@ -2299,20 +2405,23 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 ;; cl-lib.el: a plain-variable place goes straight to `setq', and an omitted
 ;; increment uses `1+'/`1-' rather than `(+ PLACE 1)'. Routing everything through
 ;; `setf' printed `(progn (setq x (+ x 1)))' where Emacs prints `(setq x (1+ x))'.
+;; cl-macs.el emits `1+'/`1-' for the no-DELTA symbol case, which is what
+;; `(macroexpand '(cl-incf x))' => `(setq x (1+ x))' pins. Every other case goes
+;; through `setf--rmw', so the place's subforms are evaluated once.
 (defmacro cl-incf (place &rest amt)
   (if (symbolp place)
       (list 'setq place (if amt (list '+ place (car amt)) (list '1+ place)))
-    `(setf ,place (+ ,place ,(if amt (car amt) 1)))))
+    (setf--rmw place (lambda (g) (list '+ g (if amt (car amt) 1))))))
 (defmacro cl-decf (place &rest amt)
   (if (symbolp place)
       (list 'setq place (if amt (list '- place (car amt)) (list '1- place)))
-    `(setf ,place (- ,place ,(if amt (car amt) 1)))))
+    (setf--rmw place (lambda (g) (list '- g (if amt (car amt) 1))))))
 ;; cl-callf: (cl-callf FUNC PLACE ARGS...) -> (setf PLACE (FUNC PLACE ARGS...)).
 ;; cl-callf2 puts a fixed ARG1 before PLACE in the call.
 (defmacro cl-callf (func place &rest args)
-  (list 'setf place (cons func (cons place args))))
+  (setf--rmw place (lambda (g) (cons func (cons g args)))))
 (defmacro cl-callf2 (func arg1 place &rest args)
-  (list 'setf place (cons func (cons arg1 (cons place args)))))
+  (setf--rmw place (lambda (g) (cons func (cons arg1 (cons g args))))))
 (defmacro cl-locally (&rest body) (cons 'progn body))
 ;; cl-psetf: evaluate all values first, then assign all places (parallel setf).
 (defmacro cl-psetf (&rest pairs)
@@ -2583,7 +2692,10 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 ;; and it is exactly the default `text-quoting-style' of `curve'.
 ;; NAMED limitation: \\[COMMAND] / \\{MAP} / \\<MAP> are passed through unchanged.
 (defun substitute-command-keys (string &optional _no-face _include-menus)
-  (string-replace "'" "’" (string-replace "`" "‘" string)))
+  ;; A nil STRING comes back as nil, never as an error: `print_error_message'
+  ;; funnels `(get ERRNAME 'error-message)' through here unconditionally, and an
+  ;; unregistered error symbol has none.
+  (and string (string-replace "'" "’" (string-replace "`" "‘" string))))
 (defun cl--digitp (c) (and (>= c ?0) (<= c ?9)))
 ;; value<: a canonical total order within a type (numbers/strings/symbols/lists/
 ;; vectors); cross-type comparison signals an error, like Emacs 30.
@@ -2658,27 +2770,56 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 ;; substring-no-properties is a native subr (builtins.rs): it is a C subr in
 ;; Emacs, so `#'substring-no-properties` must print `#<subr …>`, and the subr
 ;; checks `stringp` before the indices.
-;; The human-readable message for an error object (ERROR-SYMBOL . DATA).
+;; The human-readable message for an error object (ERROR-SYMBOL . DATA) — a
+;; statement-for-statement port of print.c `print_error_message', because every
+;; corner of it is observable and none of it follows from the happy path:
+;;
+;;   * ERRNAME is `(car ERR)', so a non-list ERR is `(wrong-type-argument listp ERR)'.
+;;   * The `error' symbol is special-cased BEFORE any property lookup: DATA
+;;     becomes `(cdr ERR)' and the MESSAGE is its car, so `(error 1 2)' has the
+;;     non-string message 1 and reads "peculiar error: 2".
+;;   * Every other ERRNAME goes through `get', whose CHECK_SYMBOL is what makes
+;;     `(error-message-string '(1 2))' signal `(wrong-type-argument symbolp 1)'.
+;;   * TAIL is `cdr-safe', and the loop runs while TAIL is a cons — a dotted tail
+;;     is dropped, never an error: `(error-message-string '(foo 1 . 2))' is
+;;     "peculiar error: 1".
+;;   * A non-string message prints "peculiar error"; an EMPTY message suppresses
+;;     the separator entirely, so `(error-message-string '(error "" 1 2))' is
+;;     "1, 2" and not ": 1, 2".
+;;   * For a `file-error' condition the FIRST datum becomes the message and the
+;;     rest print with `princ' — as do `end-of-file' and `user-error' data,
+;;     which is the whole difference between `(user-error "a" "b")' => "a, b"
+;;     and a *child* of user-error with the same data => "\"a\", \"b\"".
 (defun error-message-string (err)
-  (let* ((sym (car err)) (data (cdr err)) (msg (get sym 'error-message))
-         ;; Data is printed readably (prin1), except the file-error family,
-         ;; which shows its strings verbatim.
-         (filey (memq 'file-error (get sym 'error-conditions)))
-         (render (lambda (x) (if (and filey (stringp x)) x (format "%S" x)))))
+  (let ((errname (car err)) (errmsg nil) (file-error nil)
+        (data err) (tail nil) (out "") (sep ": "))
+    (if (eq errname 'error)
+        (progn
+          (setq data (cdr err))
+          (unless (consp data) (setq data nil))
+          (setq errmsg (car data) file-error nil))
+      (setq errmsg (get errname 'error-message))
+      ;; The substitution result replaces ERRMSG only when it is non-nil.
+      (let ((subs (substitute-command-keys errmsg)))
+        (when subs (setq errmsg subs)))
+      (setq file-error (memq 'file-error (get errname 'error-conditions))))
+    (setq tail (cdr-safe data))
+    (when (and file-error (consp tail))
+      (setq errmsg (car tail) tail (cdr tail)))
     (cond
-     ;; `error'/`user-error' carry their message string as the sole datum.
-     ((and (memq sym '(error user-error)) (stringp (car data))) (car data))
-     (msg (if data (concat msg ": " (mapconcat render data ", ")) msg))
-     ;; print.c: a car that is not a symbol carrying an `error-conditions' chain
-     ;; is not an error symbol at all, and Emacs renders it "peculiar error"
-     ;; (plus the data) rather than printing the car. `(error-message-string nil)'
-     ;; used to answer "nil" and `(error-message-string '(t nil))' answered
-     ;; "t: nil".
-     ((or (null sym) (not (symbolp sym)) (null (get sym 'error-conditions)))
-      (if data (concat "peculiar error: " (mapconcat render data ", "))
-        "peculiar error"))
-     ((null data) (symbol-name sym))
-     (t (concat (symbol-name sym) ": " (mapconcat render data ", "))))))
+     ((not (stringp errmsg)) (setq out "peculiar error"))
+     ((> (length errmsg) 0) (setq out errmsg))
+     (t (setq sep nil)))
+    (let ((princy (or file-error
+                      (eq errname 'end-of-file)
+                      (eq errname 'user-error))))
+      (while (consp tail)
+        (when sep (setq out (concat out sep)))
+        (setq sep ", ")
+        (let ((obj (car tail)))
+          (setq out (concat out (if princy (format "%s" obj) (prin1-to-string obj)))))
+        (setq tail (cdr tail))))
+    out))
 (defun seq-group-by (fn seq)
   ;; Faithful port of Emacs `seq-group-by' (seq.el): fold over the REVERSED
   ;; sequence, prepending newly-seen keys and pushing each element onto its
@@ -2716,14 +2857,39 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 ;; Symbol property lists, backed by a hash table (we have no per-symbol plist
 ;; slot). Enough for `get`/`put`/`define-error` and the error-condition system.
 (defvar symbol-plist--table (make-hash-table :test 'eq))
+;; Fget/Fput/Fsymbol_plist/Fsetplist all open with CHECK_SYMBOL, so a non-symbol
+;; is `(wrong-type-argument symbolp X)' and never a quiet nil. That check is the
+;; whole reason `(error-message-string '(1 2))' signals: print_error_message asks
+;; `(get ERRNAME 'error-conditions)' before it can decide anything about ERRNAME.
+(defun symbol-plist--check (sym)
+  (unless (symbolp sym) (signal 'wrong-type-argument (list 'symbolp sym))))
 (defun put (sym prop val)
+  (symbol-plist--check sym)
   (puthash sym (plist-put (gethash sym symbol-plist--table) prop val) symbol-plist--table)
   val)
-(defun get (sym prop) (plist-get (gethash sym symbol-plist--table) prop))
-(defun symbol-plist (sym) (gethash sym symbol-plist--table))
-(defun setplist (sym plist) (puthash sym plist symbol-plist--table) plist)
-;; Function properties share the symbol plist table.
-(defun function-get (f prop &optional _autoload) (get f prop))
+(defun get (sym prop)
+  (symbol-plist--check sym)
+  (plist-get (gethash sym symbol-plist--table) prop))
+(defun symbol-plist (sym)
+  (symbol-plist--check sym)
+  (gethash sym symbol-plist--table))
+(defun setplist (sym plist)
+  (symbol-plist--check sym)
+  (puthash sym plist symbol-plist--table) plist)
+;; Function properties share the symbol plist table. subr.el's `function-get'
+;; walks the function-cell alias chain and its `(symbolp f)' guard is what keeps
+;; a non-symbol from reaching `get' — `(function-get 1 'x)' is nil, not an error.
+(defun function-get (f prop &optional autoload)
+  (let ((val nil))
+    (while (and (symbolp f)
+                (null (setq val (get f prop)))
+                (fboundp f))
+      (let ((fundef (symbol-function f)))
+        (if (and autoload (autoloadp fundef)
+                 (not (equal fundef (autoload-do-load fundef f))))
+            nil
+          (setq f fundef))))
+    val))
 (defun function-put (f prop value) (put f prop value))
 (defun define-symbol-prop (symbol prop value) (put symbol prop value))
 ;; `record'/`make-record' are `Obj::Record' primitives (see builtins.rs); a record
@@ -2762,6 +2928,50 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (define-error 'cyclic-variable-indirection "Cyclic variable indirection")
 (define-error 'cl-assertion-failed "Assertion failed")
 (define-error 'end-of-file "End of file during parsing")
+;; The rest of the data.c/fileio.c seed table, verbatim (messages and parents as
+;; `emacs -Q' reports them). Without these an unregistered symbol has no
+;; `error-conditions' chain, so `error-message-string' called it a "peculiar
+;; error" and `condition-case' could not dispatch a `file-error' handler onto
+;; `file-missing' or an `arith-error' handler onto `overflow-error'. The
+;; `file-error' family also selects print.c's concatenating branch, where the
+;; first datum becomes the message and string data print unquoted.
+(define-error 'file-error "File error")
+(define-error 'file-missing "File is missing" 'file-error)
+(define-error 'file-already-exists "File already exists" 'file-error)
+(define-error 'file-date-error "Cannot set file date" 'file-error)
+(define-error 'file-notify-error "File notification error" 'file-error)
+(define-error 'permission-denied "Cannot access file or directory" 'file-error)
+(define-error 'remote-file-error "Remote file error" 'file-error)
+(define-error 'range-error "Arithmetic range error" 'arith-error)
+(define-error 'overflow-error "Arithmetic overflow error" 'range-error)
+(define-error 'search-failed "Search failed")
+(define-error 'scan-error "Scan error")
+(define-error 'circular-list "List contains a loop")
+(define-error 'buffer-read-only "Buffer is read-only")
+(define-error 'text-read-only "Text is read-only" 'buffer-read-only)
+(define-error 'beginning-of-buffer "Beginning of buffer")
+(define-error 'end-of-buffer "End of buffer")
+(define-error 'no-catch "No catch for tag")
+(define-error 'invalid-read-syntax "Invalid read syntax")
+(define-error 'setting-constant "Attempt to set a constant symbol")
+(define-error 'recursion-error "Excessive recursive calling error")
+(define-error 'excessive-lisp-nesting "Lisp nesting exceeds `max-lisp-eval-depth'" 'recursion-error)
+;; eval.c's recursion guard. Reached before the native stack is, so runaway
+;; recursion signals `(excessive-lisp-nesting DEPTH)' — which `condition-case'
+;; can catch — instead of aborting the process on a stack overflow.
+(defvar max-lisp-eval-depth 1600)
+;; `when'/`unless' are lowered by the compiler (compiler.rs `compile_when'), so
+;; they own no function cell — but in Emacs they are ordinary subr.el macros, and
+;; introspection sees that: `(type-of (symbol-function 'when))' is `cons', not
+;; `symbol'. Register the same `(macro . FUNCTION)' pair the byte-compiler would
+;; have produced, for `symbol-function' / `fboundp' / `indirect-function' only.
+;; The bodies are subr.el's:
+;;   (defmacro when   (cond &rest body) (list 'if cond (cons 'progn body)))
+;;   (defmacro unless (cond &rest body) (cons 'if (cons cond (cons nil body))))
+(--set-intrinsic-macro-cell
+ 'when (cons 'macro (lambda (cond &rest body) (list 'if cond (cons 'progn body)))))
+(--set-intrinsic-macro-cell
+ 'unless (cons 'macro (lambda (cond &rest body) (cons 'if (cons cond (cons nil body))))))
 (defun add-to-list (var elt &optional append compare-fn)
   ;; Add ELT to VAR's list unless already present (COMPARE-FN, default `equal');
   ;; prepend by default, or append to the end when APPEND is non-nil.

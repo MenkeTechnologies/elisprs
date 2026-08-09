@@ -24,6 +24,39 @@ pub mod tiers;
 pub use fusevm::Value;
 pub use host::{reset_host, run_chunk, with_host};
 
+/// Native stack an elisp evaluation needs.
+///
+/// One elisp call frame costs several native frames — `call_function` →
+/// `run_closure` → `run_chunk` → `VM::run` → `ext_dispatch` → `call_function` —
+/// and an unoptimized build's frames are large, so the platform defaults (8 MiB
+/// on the macOS main thread, 2 MiB for a spawned thread, which is also what the
+/// test harness gives a test) ran out at roughly 70 elisp frames while Emacs
+/// allows `max-lisp-eval-depth` = 1600. This is address space, not committed
+/// memory: pages are backed only as they are touched.
+///
+/// The depth limit itself is enforced in elisp terms (`max-lisp-eval-depth`, in
+/// [`host`]), so runaway recursion signals `excessive-lisp-nesting` and can be
+/// caught; this stack only has to be big enough to reach that limit first.
+pub const INTERP_STACK_BYTES: usize = 1 << 29; // 512 MiB
+
+/// Run `f` on a thread with [`INTERP_STACK_BYTES`] of stack.
+///
+/// The host is a thread-local, so `f` gets a fresh interpreter — everything an
+/// evaluation touches must run inside this call, not around it.
+pub fn with_interpreter_stack<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("elisprs-interp".to_string())
+        .stack_size(INTERP_STACK_BYTES)
+        .spawn(f)
+        .expect("spawn interpreter thread")
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
 /// Read, lower, and run a source string on fusevm; return the last value.
 pub fn eval_str(src: &str) -> Result<Value, String> {
     load_prelude();

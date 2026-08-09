@@ -82,6 +82,9 @@ pub enum SerObj {
         /// whose body cannot run.
         #[serde(default)]
         env: Vec<(u32, Value)>,
+        /// Dynamic-binding closure — see [`Obj::Closure::dynamic`].
+        #[serde(default)]
+        dynamic: bool,
     },
     Bignum(BigInt),
 }
@@ -231,6 +234,12 @@ pub enum Obj {
         is_macro: bool,
         /// Captured lexical environment (`None` for a template / dynamic macro).
         env: Lex,
+        /// Dynamic-binding closure (`lexical-binding` nil): it captures nothing,
+        /// binds its parameters on the specstack, and runs its body in dynamic
+        /// mode, so every free variable resolves through the symbols' value cells
+        /// at *call* time. Emacs prints such a function with a `nil` environment
+        /// (`#[(y) (x) nil]`) where a lexical one with no captures prints `(t)`.
+        dynamic: bool,
         /// The closure's *source*: its arglist and its body forms, kept so it can
         /// print the way Emacs prints an interpreted closure —
         /// `#[(x) ((list x x)) (t)]` — rather than as an opaque `#<closure>`.
@@ -401,6 +410,8 @@ pub enum Resolved {
         body: Rc<Chunk>,
         is_macro: bool,
         env: Lex,
+        /// Dynamic-binding function — see [`Obj::Closure::dynamic`].
+        dynamic: bool,
     },
 }
 
@@ -420,6 +431,24 @@ pub struct ElispHost {
     specstack: Vec<SpecEntry>,
     /// Current lexical environment (the chain of `let`/closure frames).
     lex: Lex,
+    /// Whether the code now running was evaluated with `lexical-binding` nil.
+    /// Emacs picks the binding mode per *evaluated form* — `eval`'s LEXICAL
+    /// argument, or the file-local variable a file was loaded with — so this is a
+    /// dynamic-extent flag, saved and restored around `eval` and around every call
+    /// into a closure that remembers the mode it was made in.
+    ///
+    /// While set: `let`/`let*`/parameter bindings all go on the specstack (every
+    /// symbol behaves as if `defvar`'d), and a `lambda` captures nothing. Default
+    /// `false` — elisprs's own prelude and every file it loads are lexical.
+    pub(crate) dynamic_binding: bool,
+    /// Elisp call depth (`run_closure` nesting), bounded by `max-lisp-eval-depth`.
+    pub(crate) eval_depth: usize,
+    /// Arena handle of `max-lisp-eval-depth`, resolved once on first use so the
+    /// per-call limit check is an array index rather than an obarray lookup.
+    max_depth_sym: Option<u32>,
+    /// `(macro . FUNCTION)` stand-ins for the macros the compiler lowers as
+    /// intrinsics — see [`ElispHost::introspect_function_cell`].
+    intrinsic_macro_cells: HashMap<u32, Value>,
     /// Per-scope unwind info: (saved lexical env, specstack depth at entry).
     frame_stack: Vec<(Lex, usize)>,
     pub(crate) error: Option<String>,
@@ -627,6 +656,10 @@ impl ElispHost {
             builtin_count: 0,
             specstack: Vec::new(),
             lex: None,
+            dynamic_binding: false,
+            eval_depth: 0,
+            max_depth_sym: None,
+            intrinsic_macro_cells: HashMap::new(),
             frame_stack: Vec::new(),
             error: None,
             pending_throw: None,
@@ -1265,6 +1298,32 @@ impl ElispHost {
             _ => None,
         }
     }
+    /// The function cell **as introspection sees it**: the real cell, or — for a
+    /// compiler intrinsic that Emacs implements as an ordinary macro — the
+    /// registered `(macro . FUNCTION)` stand-in.
+    ///
+    /// `when`/`unless` are lowered by name in `compiler.rs`, so they have no
+    /// function cell at all and `(type-of (symbol-function 'when))` answered
+    /// `symbol` where Emacs answers `cons`. The stand-in is deliberately kept
+    /// OUT of the symbol's real function cell: putting it there would make
+    /// `resolve_function` — and therefore `macroexpand_1` on the compile path —
+    /// treat every `when` in the prelude as a macro call to run, losing the
+    /// dedicated `compile_when` lowering. The expansion the stand-in produces is
+    /// the same `subr.el` one [`expand_intrinsic_macro`] already reproduces.
+    pub fn introspect_function_cell(&self, sym: &Value) -> Option<Value> {
+        if let Some(cell) = self.function_cell(sym) {
+            return Some(cell);
+        }
+        self.sym_handle(sym)
+            .and_then(|id| self.intrinsic_macro_cells.get(&id))
+            .cloned()
+    }
+    /// Register the `(macro . FUNCTION)` stand-in for a compiler intrinsic.
+    pub fn set_intrinsic_macro_cell(&mut self, sym: &Value, cell: Value) {
+        if let Some(id) = self.sym_handle(sym) {
+            self.intrinsic_macro_cells.insert(id, cell);
+        }
+    }
     /// Look up an already-interned symbol by name without creating one
     /// (`intern-soft`); returns `None` if absent.
     pub fn find_symbol(&self, name: &str) -> Option<Value> {
@@ -1396,8 +1455,12 @@ impl ElispHost {
     }
     /// Bind `id` to `val` in the current scope — lexically, unless the symbol is
     /// special (`defvar`'d), in which case dynamically (saved on the specstack).
+    ///
+    /// Under `lexical-binding` nil ([`Self::dynamic_binding`]) *every* symbol takes
+    /// the dynamic path, which is what makes a `lambda` made in that mode see the
+    /// caller's bindings and not its birthplace's.
     pub fn bind_here(&mut self, id: u32, val: Value) {
-        if self.is_special(id) {
+        if self.dynamic_binding || self.is_special(id) {
             let _ = self.specbind(&Value::Obj(id), val);
         } else {
             // Cons a fresh single-binding node onto the lexical chain. A later
@@ -1416,8 +1479,63 @@ impl ElispHost {
             self.bind_here(id, val);
         }
     }
+    /// Enter one elisp call frame, or `Err` with Emacs's `excessive-lisp-nesting`
+    /// when `max-lisp-eval-depth` is already reached.
+    ///
+    /// Emacs's eval.c raises this *before* the native stack runs out, so runaway
+    /// recursion is a catchable signal — `(condition-case e … (error e))` yields
+    /// `(excessive-lisp-nesting 1601)`. elisprs previously had no limit at all
+    /// and simply aborted the process with `fatal runtime error: stack
+    /// overflow`, which nothing can catch and which loses the rest of the
+    /// session. The limit is read from the variable on every call so a `let`
+    /// around it takes effect (it is `defvar`'d, so the binding is on the
+    /// specstack and lives in the global value cell — an array index, not a
+    /// scope walk).
+    pub fn enter_eval_frame(&mut self) -> Result<(), String> {
+        let sym = match self.max_depth_sym {
+            Some(s) => s,
+            None => {
+                let s = self.intern("max-lisp-eval-depth");
+                let h = self.sym_handle(&s);
+                self.max_depth_sym = h;
+                match h {
+                    Some(h) => h,
+                    None => {
+                        self.eval_depth += 1;
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        let limit = match &self.arena[sym as usize] {
+            Obj::Symbol(s) => match s.value {
+                // eval.c clamps the variable up to a floor of 100, so a smaller
+                // value cannot lock the session out of running anything:
+                // `(let ((max-lisp-eval-depth 5)) …)` still signals at 101.
+                Some(Value::Int(n)) => (n.max(100)) as usize,
+                _ => usize::MAX,
+            },
+            _ => usize::MAX,
+        };
+        if self.eval_depth >= limit {
+            return Err(format!("excessive-lisp-nesting: {}", self.eval_depth + 1));
+        }
+        self.eval_depth += 1;
+        Ok(())
+    }
+    /// Leave one elisp call frame (paired with [`Self::enter_eval_frame`]).
+    pub fn leave_eval_frame(&mut self) {
+        self.eval_depth = self.eval_depth.saturating_sub(1);
+    }
+
     /// Instantiate a closure from a compile-time template, capturing the current
     /// lexical environment. Templates are stored with `env: None`.
+    ///
+    /// Under dynamic binding (`lexical-binding` nil — see [`Self::dynamic_binding`])
+    /// nothing is captured: Emacs's `eval` returns the `lambda` form itself, whose
+    /// free variables are looked up in the symbols' value cells when it is *called*.
+    /// The instance records the mode so its body and parameters run dynamically too,
+    /// however far from the `eval` it is finally funcalled.
     pub fn instantiate_closure(&mut self, template: &Value) -> Value {
         if let Some(Obj::Closure {
             params,
@@ -1429,12 +1547,14 @@ impl ElispHost {
         {
             let (params, body, is_macro, src) =
                 (params.clone(), body.clone(), *is_macro, src.clone());
-            let env = self.lex.clone();
+            let dynamic = self.dynamic_binding;
+            let env = if dynamic { None } else { self.lex.clone() };
             return self.alloc(Obj::Closure {
                 params,
                 body,
                 is_macro,
                 env,
+                dynamic,
                 src,
             });
         }
@@ -1521,19 +1641,21 @@ impl ElispHost {
         };
         let slots = self.oclosure_meta.get(&id)?.slots.clone();
         let ty = self.oclosure_meta.get(&id)?.ty;
-        let (params, body, is_macro, base_env, csrc) = match self.obj(src) {
+        let (params, body, is_macro, base_env, csrc, dynamic) = match self.obj(src) {
             Some(Obj::Closure {
                 params,
                 body,
                 is_macro,
                 env,
                 src: csrc,
+                dynamic,
             }) => (
                 params.clone(),
                 body.clone(),
                 *is_macro,
                 env.clone(),
                 csrc.clone(),
+                *dynamic,
             ),
             _ => return None,
         };
@@ -1564,6 +1686,7 @@ impl ElispHost {
             body,
             is_macro,
             env,
+            dynamic,
             src: csrc,
         });
         if let Value::Obj(nid) = newv {
@@ -1623,6 +1746,7 @@ impl ElispHost {
                     body,
                     is_macro,
                     env,
+                    dynamic,
                     ..
                 } => SerObj::Closure {
                     required: params.required.clone(),
@@ -1631,6 +1755,7 @@ impl ElispHost {
                     body: (**body).clone(),
                     is_macro: *is_macro,
                     env: self.flatten_lex(env),
+                    dynamic: *dynamic,
                 },
                 // No Subr ever lives in the user range (only `install` makes them).
                 Obj::Subr { .. } => SerObj::Symbol {
@@ -1767,6 +1892,7 @@ impl ElispHost {
                 body,
                 is_macro,
                 env,
+                dynamic,
                 ..
             } => SerObj::Closure {
                 required: params.required.clone(),
@@ -1775,6 +1901,7 @@ impl ElispHost {
                 body: (**body).clone(),
                 is_macro: *is_macro,
                 env: self.flatten_lex(env),
+                dynamic: *dynamic,
             },
             // Runtime-only objects (and subrs, which `install` recreates): a
             // placeholder keeps the arena indices aligned.
@@ -1917,6 +2044,7 @@ impl ElispHost {
                     body,
                     is_macro,
                     env,
+                    dynamic,
                 } => Obj::Closure {
                     params: Rc::new(Params {
                         required,
@@ -1927,6 +2055,7 @@ impl ElispHost {
                     body: Rc::new(body),
                     is_macro,
                     env: self.rebuild_lex(env),
+                    dynamic,
                 },
             };
             self.arena.push(obj);
@@ -2007,6 +2136,7 @@ impl ElispHost {
                     body,
                     is_macro,
                     env,
+                    dynamic,
                     ..
                 }) => {
                     return Ok(Resolved::Closure {
@@ -2014,6 +2144,7 @@ impl ElispHost {
                         body: body.clone(),
                         is_macro: *is_macro,
                         env: env.clone(),
+                        dynamic: *dynamic,
                     })
                 }
                 Some(Obj::Symbol(s)) => match &s.function {
@@ -2355,19 +2486,29 @@ impl ElispHost {
                 }
                 Some(Obj::Subr { name, .. }) => format!("#<subr {name}>"),
                 Some(Obj::Closure {
-                    is_macro, env, src, ..
+                    is_macro,
+                    env,
+                    src,
+                    dynamic,
+                    ..
                 }) => {
                     // Emacs: `#[ARGLIST BODY ENV]` for an interpreted closure, where
                     // ENV is the captured lexical alist — newest binding first — or
                     // `(t)` when nothing is captured. A macro is that, consed onto
-                    // `macro`.
+                    // `macro`. A dynamically-bound function captures nothing at all
+                    // and prints `nil` there — `(eval '(let ((x 1)) (lambda (y) x))
+                    // nil)` is `#[(y) (x) nil]`, never `#[(y) (x) (t)]`.
                     let arglist = self.print_inner(&src.arglist, readable, depth + 1);
                     let body: Vec<String> = src
                         .body
                         .iter()
                         .map(|f| self.print_inner(f, readable, depth + 1))
                         .collect();
-                    let captures = self.captured_alist(env, readable, depth + 1);
+                    let captures = if *dynamic {
+                        "nil".to_string()
+                    } else {
+                        self.captured_alist(env, readable, depth + 1)
+                    };
                     let closure = format!("#[{arglist} ({}) {captures}]", body.join(" "));
                     if *is_macro {
                         format!("(macro . {closure})")
@@ -3385,6 +3526,8 @@ impl ElispHost {
                 | "wrong-number-of-arguments"
                 | "wrong-length-argument"
                 | "invalid-function"
+                // `(excessive-lisp-nesting DEPTH)` — DEPTH is the integer, not "1601".
+                | "excessive-lisp-nesting"
         ) {
             if let Some(data) = self.read_all_forms(&msg) {
                 let s = self.intern(&sym);
@@ -3658,7 +3801,16 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 // keyword form is non-destructive unless `:in-place t`.
                 let mut in_place;
                 if args.len() == 2 && !is_kw(&args[1]) {
-                    pred = Some(with_host(|h| h.function_designator(&args[1])));
+                    // A nil PRED is not a function to call — Emacs 30's `sort`
+                    // documents PREDICATE as defaulting to `value<`, and passing
+                    // nil explicitly takes that default: `(sort '(3 1 2) nil)` is
+                    // `(1 2 3)`, and `(sort '(t "010") nil)` is value<'s
+                    // `(type-mismatch "010" t)`, never `void-function nil`.
+                    if !el_truthy(&args[1]) {
+                        pred = None;
+                    } else {
+                        pred = Some(with_host(|h| h.function_designator(&args[1])));
+                    }
                     in_place = true;
                 } else {
                     in_place = false;
@@ -3668,8 +3820,13 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                         let val = args.get(idx + 1).cloned().unwrap_or(Value::Undef);
                         let truthy = !matches!(val, Value::Undef | Value::Bool(false));
                         match kw.as_str() {
+                            // As above: `:lessp nil` selects the `value<` default.
                             ":lessp" | ":predicate" => {
-                                pred = Some(with_host(|h| h.function_designator(&val)))
+                                pred = if truthy {
+                                    Some(with_host(|h| h.function_designator(&val)))
+                                } else {
+                                    None
+                                }
                             }
                             ":key" => {
                                 if truthy {
@@ -3790,9 +3947,19 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 // environment". Running the chunk in the live scope chain instead
                 // leaked every binding the caller happened to hold, and any closure
                 // FORM created captured (and printed) them.
+                //
+                // A nil (or omitted) LEXICAL selects *dynamic* binding for FORM:
+                // `let` binds value cells, and a `lambda` captures nothing, so
+                // `(eval '(funcall (let ((x 1)) (lambda () x))) nil)` is
+                // `void-variable x` — the binding is gone by the time it is called.
+                let lexical = args.get(1).is_some_and(el_truthy);
                 let saved = with_host(|h| h.take_lex());
+                let prev_mode = with_host(|h| std::mem::replace(&mut h.dynamic_binding, !lexical));
                 let out = run_chunk(chunk);
-                with_host(|h| h.restore_lex(saved));
+                with_host(|h| {
+                    h.restore_lex(saved);
+                    h.dynamic_binding = prev_mode;
+                });
                 return out;
             }
             // The macro-expansion functions run macro expanders (re-entrant).
@@ -3916,6 +4083,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             body,
             is_macro,
             env,
+            dynamic,
         } => {
             if is_macro {
                 return Err("macro called as a function (use it in a macro position)".to_string());
@@ -3926,7 +4094,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             if args.len() < params.required.len() || (params.rest.is_none() && args.len() > max) {
                 return Err(with_host(|h| h.signal_wrong_nargs(&callee, args.len())));
             }
-            run_closure(&params, &body, env, args)
+            run_closure(&params, &body, env, dynamic, args)
         }
     }
 }
@@ -3953,7 +4121,16 @@ fn value_lt(a: &Value, b: &Value) -> Result<bool, String> {
     }
     match (with_host(|h| h.sym_name(a)), with_host(|h| h.sym_name(b))) {
         (Some(x), Some(y)) => Ok(x < y),
-        _ => Err("value<: unsupported comparison".into()),
+        // Everything else — lists, vectors, and every cross-type pair — is the
+        // prelude's `value<`, which already carries Emacs 30's class rules and
+        // its `(type-mismatch A B)` signal. Duplicating them here would be a
+        // second implementation of the same order, and it was the reason a
+        // default-predicate `sort` reported "value<: unsupported comparison"
+        // where Emacs signals `(type-mismatch "010" t)`.
+        _ => {
+            let f = with_host(|h| h.intern("value<"));
+            Ok(el_truthy(&call_function(&f, &[a.clone(), b.clone()])?))
+        }
     }
 }
 
@@ -4045,25 +4222,44 @@ fn merge_sort_by(items: &mut Vec<(Value, Value)>, pred: Option<&Value>) -> Resul
 /// the params, run the body on a nested fusevm VM, then close the scope. Used by
 /// both function application and macro expansion (where `args` are the
 /// unevaluated argument forms). Holds no host borrow across the nested run.
+/// Call a closure: open a scope over its captured environment, bind the
+/// parameters, run the body, then unwind.
+///
+/// `dynamic` is the closure's binding mode ([`Obj::Closure::dynamic`]). It is
+/// installed for the duration of the call, so a function made under
+/// `lexical-binding` nil binds its parameters — and every `let` its body runs —
+/// on the specstack, and any `lambda` that body creates is dynamic in turn. The
+/// previous mode is restored on every exit path, including a signalled error.
 fn run_closure(
     params: &Rc<Params>,
     body: &Rc<Chunk>,
     env: Lex,
+    dynamic: bool,
     args: &[Value],
 ) -> Result<Value, String> {
+    with_host(|h| h.enter_eval_frame())?;
     let entry = with_host(|h| h.scope_depth());
+    let prev_mode = with_host(|h| std::mem::replace(&mut h.dynamic_binding, dynamic));
     let setup = with_host(|h| {
         h.open_scope_in(env.clone());
         h.bind_params_into_scope(params, args)
     });
     if let Err(e) = setup {
-        with_host(|h| h.unwind_scopes_to(entry));
+        with_host(|h| {
+            h.unwind_scopes_to(entry);
+            h.dynamic_binding = prev_mode;
+            h.leave_eval_frame();
+        });
         return Err(e);
     }
     let result = run_chunk((**body).clone());
     // Unwind to the entry depth (not just one scope): a `throw`/error out of an
     // inner `let` inside the body leaks scopes that this restores.
-    with_host(|h| h.unwind_scopes_to(entry));
+    with_host(|h| {
+        h.unwind_scopes_to(entry);
+        h.dynamic_binding = prev_mode;
+        h.leave_eval_frame();
+    });
     result
 }
 
@@ -4081,12 +4277,15 @@ pub fn macroexpand_1(form: &Value) -> Result<Option<Value>, String> {
                 body,
                 is_macro: true,
                 env,
-            }) => Some((params, body, env, elems[1..].to_vec())),
+                dynamic,
+            }) => Some((params, body, env, dynamic, elems[1..].to_vec())),
             _ => None,
         }
     });
     match info {
-        Some((params, body, env, args)) => Ok(Some(run_closure(&params, &body, env, &args)?)),
+        Some((params, body, env, dynamic, args)) => {
+            Ok(Some(run_closure(&params, &body, env, dynamic, &args)?))
+        }
         None => Ok(None),
     }
 }
@@ -4817,7 +5016,7 @@ pub fn bigint_to_f64(i: &BigInt) -> f64 {
 ///
 /// Everything else — fixnum arithmetic in range, all float arithmetic — never
 /// reaches here and stays on the VM's (and the JIT's) fast path.
-fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
+pub(crate) fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     with_host(|h| {
         // `(+ 1 (point-marker))` — a marker is a number in arithmetic position.
         let coerce = |h: &ElispHost, v: &Value| -> Option<Num> {

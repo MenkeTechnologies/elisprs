@@ -1251,7 +1251,7 @@ intrinsics that take lambda thunks (`host.rs`), with the error object carried in
 the host's `pending_error`/`pending_throw` slots; there is no context swap that
 could strand them.
 
-### R7-K. Closures always capture lexically, even under `lexical-binding` nil — OPEN
+### R7-K. Closures always capture lexically, even under `lexical-binding` nil — ✅ FIXED in round 8 (R8-A)
 Probing the same forms through `(eval FORM nil)` (dynamic binding) found one
 precise, systematic gap: 14 of 17 probes matched, and all three failures are the
 same cause — a `lambda` captures its free variables lexically regardless of the
@@ -1272,6 +1272,11 @@ substrate work, not a prelude change, so it is named rather than half-done.
 milestone binds dynamically.
 
 ### Still open after round 7
+
+> Superseded by round 8 below: the `setf` entry was only half right (its
+> *semantic* half is fixed — see R8-C), and the `type-of` and deep-recursion
+> entries are fixed (R8-G, R8-D). Only the backquote and `hash-table-size`
+> entries survive. Kept as written for the record.
 
 - **`(prin1-to-string '`(a ,b ,@c))`** → Emacs `` "`(a ,b ,@c)" ``, elisprs
   `"(cons 'a (cons b (append c nil)))"`. The reader desugars backquote eagerly, so
@@ -1298,3 +1303,210 @@ milestone binds dynamically.
   comfortably. Each elisp frame costs several native frames, so this is a
   substrate-level fix (a growable stack, or trampolining `run_closure`), not a
   prelude one.
+
+---
+
+## Round 8 — dynamic binding, generalized places, and the AOT numeric contract
+
+Round 7 left `scripts/fuzz_parity.sh -n 1500 -s 1` at **11/1500** on the widened
+generator and named four open items. All eleven generator divergences are closed
+and the corpus is at **1500/1500**; four of the five named items are closed too.
+
+### R8-A. Closures captured lexically even under `lexical-binding` nil — ✅ FIXED
+
+The round-7 entry (R7-K) measured this as "14 of 17 probes match". That
+understated it, because the probes were run in one mode. Evaluating the SAME
+corpus twice — `(eval FORM t)` and `(eval FORM nil)` — separates the columns:
+
+| | before | after |
+|---|---|---|
+| `lexical=t` | 45/45 | 45/45 |
+| `lexical=nil` | **35/45** | 45/45 |
+
+Ten of the 45 forms have a mode-dependent answer in Emacs, and those ten were
+*exactly* the ten failures: the engine answered every form as though it were
+lexical, so the `t` column could never fail and matching it proved nothing.
+
+There is now a dynamic closure kind. `Obj::Closure` carries a `dynamic` flag
+(`host.rs`); `ElispHost::dynamic_binding` is a dynamic-extent mode that `eval`
+installs from its LEXICAL argument and `run_closure` re-installs for the duration
+of every call, so the mode travels with the function rather than with the `eval`
+that made it. Under it, `bind_here` puts *every* symbol on the specstack and
+`instantiate_closure` captures nothing.
+
+- `(eval '(funcall (let ((x 1)) (lambda () x))) nil)` → `(void-variable x)`; with
+  `t` it is `1`. LEXICAL omitted defaults to nil, as in Emacs.
+- `(eval '(let (fs) (dotimes (i 3) (push (lambda () i) fs)) …) nil)` →
+  `(void-variable i)`.
+- A dynamic function prints a **`nil`** environment where a lexical one with
+  nothing captured prints `(t)`: `(eval '(let ((x 1)) (lambda (y) x)) nil)` is
+  `#[(y) (x) nil]`. That is the only way to tell the two apart from Lisp, so the
+  printer distinguishes them.
+- Parameters bind dynamically, so a callee sees them:
+  `(progn (defun g () x) (funcall (eval '(lambda (x) (g)) nil) 7))` → `7`, while
+  the same with `t` is `(void-variable x)`.
+
+The default stays lexical — elisprs's own prelude and every file it loads are
+lexical, and nothing but `eval` with a nil LEXICAL enters the mode.
+
+### R8-B. The AOT runtime installed no numeric contract at all — ✅ FIXED
+
+`fusevm_aot_register_builtins` (`src/aot_runtime.rs`) set the extension handlers
+and nothing else — no `set_numeric_hook`, no `set_fixnum_range` — while
+`run_chunk` sets both on the interpreted VM. An AOT-compiled program therefore
+ran fusevm's native `i64` ops with no promotion path. Reproduced end-to-end
+through elisprs's own `--aot` on real arithmetic at `most-positive-fixnum`
+(same source, three engines):
+
+| form | emacs 30.2 | interpreted | AOT (before) |
+|---|---|---|---|
+| `(+ most-positive-fixnum 1)` | `2305843009213693952` | same | same |
+| `(bignump (+ most-positive-fixnum 1))` | `t` | `t` | **`nil`** |
+| `(fixnump (+ most-positive-fixnum 1))` | `nil` | `nil` | **`t`** |
+| `(* 4611686018427387903 4611686018427387903)` | `21267647932558653957237540927630737409` | same | **`0.0`** |
+| `(+ 9223372036854775807 1)` | `9223372036854775808` | same | **`1.0`** |
+| `(* 1000000000000 1000000000000)` | `1000000000000000000000000` | same | **`2003764205206896640`** |
+
+The `bignump`/`fixnump` rows are the sharp ones: no `i64` overflow is involved at
+all, so they fail on the missing *range* alone. After the fix the AOT binary
+matches Emacs on every row, and on a second 13-form probe covering the 2^31
+boundary and hot loops (where a trace is compiled). `tests/aot_numeric_contract.rs`
+pins it by driving the registration hook directly, so it needs no `cc`.
+
+Two notes, because they bound the claim:
+
+- The fix is entirely inside elisprs. fusevm is a shared VM with many dependents
+  and was not touched.
+- `elisp --aot-exe` still fails to link on macOS: the `sysinfo` dependency needs
+  `-framework IOKit`, which `aot.rs`'s link line omits. The measurements above
+  were taken by linking the `--aot` object by hand with that flag added. Not
+  fixed here, and unrelated to the numeric contract.
+
+### R8-C. Read-modify-write places evaluated their subforms more than once — ✅ FIXED
+
+Round 7 recorded the `setf` gv gap as "shape, not semantics", asserting the two
+"agree on every value and on evaluation count". That is true of `setf` itself and
+false of every macro built on it. `push`/`pop`/`incf`/`decf`/`cl-incf`/`cl-decf`/
+`cl-callf`/`cl-callf2`/`cl-pushnew` mention the place two or three times, and
+substituting the place FORM at each mention re-ran its subforms:
+
+- `(let ((n 0) (l (list 1 2))) (cl-incf (car (progn (setq n (1+ n)) l))) n)`
+  → Emacs `1`, elisprs `2`
+- `(let ((n 0) (l (list 1 2 3))) (pop (cdr (progn (setq n (1+ n)) l))) n)`
+  → Emacs `1`, elisprs `3`
+
+A wrong number of side effects, not a wrong printed expansion. All nine macros
+now go through one helper (`setf--place-once`) that rebinds each non-copyable
+subform to a temporary, mirroring what `gv-letplace` does. A *symbol* subform is
+deliberately left alone, exactly as gv.el does: re-reading a variable has no
+side effect, and some setters assign to the subform itself — `(setf (nthcdr 0 l) v)`
+is `(setq l v)` — which a temporary would redirect away from the caller.
+
+`setf`'s own printed expansion still differs from Emacs's (`(progn (setcar x 1))`
+vs `(let* ((v x)) (setcar v 1))`); that part really is shape, and rewriting
+`setf--expand` onto `gv-get` is left for its own change.
+
+### R8-D. Deep recursion aborted the process — ✅ FIXED
+
+`(cl-labels ((go (n acc) …)) (go 100 0))` died with `fatal runtime error: stack
+overflow`. Two independent causes, both now addressed:
+
+- **No limit existed.** Emacs's eval.c raises `excessive-lisp-nesting` *before*
+  the native stack runs out, so runaway recursion is catchable. `run_closure`
+  now counts frames against `max-lisp-eval-depth` (defvar'd at 1600, clamped up
+  to a floor of 100 exactly as eval.c does), and
+  `(condition-case e (letrec ((f (lambda () (funcall f)))) (funcall f)) (error e))`
+  answers `(excessive-lisp-nesting 1601)` — Emacs's value.
+- **The stack was the platform default.** Each elisp frame costs several native
+  frames. Everything now runs on a thread with `elisprs::INTERP_STACK_BYTES`
+  (512 MiB of *address space*; pages are backed only as touched). Depth went from
+  dying by 80 to completing at 3000. The constant lives in `lib.rs` so the binary
+  and the tests share one definition — a cargo test thread's default 2 MiB is
+  smaller than what the old ceiling had.
+
+### R8-E. The eleven generator divergences — ✅ ALL FIXED
+
+`scripts/fuzz_parity.sh -n 1500 -s 1`: **11/1500 → 1500/1500**. Four causes:
+
+- **`error-message-string` is now print.c's `print_error_message`, ported
+  statement for statement** (4 of the 11). Every corner is observable: the
+  `error` symbol is special-cased *before* any property lookup, so
+  `(error-message-string '(error 1 2))` is `"peculiar error: 2"`; every other
+  ERRNAME goes through `get`, whose `CHECK_SYMBOL` is what makes
+  `(error-message-string '(1 2))` signal `(wrong-type-argument symbolp 1)`; the
+  data walk is `cdr-safe` + "while CONSP", so a dotted tail is dropped rather
+  than signalled; an EMPTY message suppresses the separator
+  (`'(error "" 1 2)` → `"1, 2"`); and `file-error`, `end-of-file` and
+  `user-error` print their data with `princ`, which is the whole difference
+  between `(user-error "a" "b")` → `"a, b"` and a *child* of user-error with the
+  same data → `"\"a\", \"b\""`. Along the way `get`/`put`/`symbol-plist`/
+  `setplist` gained the `CHECK_SYMBOL` they were missing, `function-get` became
+  subr.el's symbolp-guarded loop, and the twenty standard error symbols
+  data.c/fileio.c seeds (the whole `file-error` family, `range-error`,
+  `overflow-error`, `no-catch`, …) are registered, so `condition-case` can
+  dispatch a `file-error` handler onto `file-missing`.
+- **`compare-strings` now runs fns.c's `validate_subarray`** (3 of the 11). A
+  non-integer START/END is `(wrong-type-argument integerp BOUND)`; elisprs
+  silently defaulted it and answered a comparison. Negative bounds count from the
+  end, an out-of-range pair is `args_out_of_range_3`, and a too-large positive
+  END is clamped first, "for backward compatibility", exactly as in C.
+- **`cl-gcd`/`cl-lcm`/`cl-floor`/`cl-ceiling`/`cl-truncate`/`cl-round`/`cl-mod`/
+  `cl-rem`/`cl-adjoin` are cl-extra.el's and cl-lib.el's definitions verbatim**
+  (4 of the 11). The exact expressions matter, not just the values: `cl-gcd`'s
+  `(/= b 0)` tests B before touching A, so `(cl-gcd 100 'car)` names `car` under
+  `number-or-marker-p`; `(% a (setq a b))` reads the OLD `a`, so
+  `(cl-lcm "" 65535)` reports `integer-or-marker-p`; `cl-truncate` tests
+  `(>= y 0)` before dividing, so `(cl-rem 1.0e+INF '(1 2))` names the list under
+  `number-or-marker-p`; and `cl-adjoin`'s no-keys path is literally `memq`, so
+  `(cl-adjoin "" t)` is `(wrong-type-argument listp t)` where a `seq-some`
+  paraphrase said `sequencep`.
+- The eleventh was `seq-position`, which was `compare-strings` underneath.
+
+### R8-F. `sort` with a nil PREDICATE — ✅ FIXED
+
+The one divergence the *old* generator still produced. Emacs 30 documents
+PREDICATE as defaulting to `value<`, and passing nil takes that default;
+elisprs funcalled it. `(sort '(3 1 2) nil)` → `(1 2 3)`, `:lessp nil` likewise,
+and `(sort '(t "010") nil)` → `(type-mismatch "010" t)`. The Rust default-order
+helper now delegates its non-numeric/non-string cases to the prelude's `value<`
+rather than carrying a second, weaker copy of the same order.
+
+### R8-G. `type-of` of an intrinsic's function cell — ✅ FIXED
+
+`when`/`unless` are lowered by name in `compiler.rs` and own no function cell, so
+`(type-of (symbol-function 'when))` answered `symbol` where Emacs answers `cons`.
+They now register the `(macro . FUNCTION)` pair subr.el defines, consulted by
+`symbol-function` / `fboundp` / `indirect-function` only. It is deliberately kept
+OUT of the real function cell: putting it there would make `resolve_function` —
+and therefore `macroexpand_1` on the compile path — treat every `when` in the
+prelude as a macro call to run, losing the `compile_when` lowering.
+
+### Still open after round 8
+
+- **Reader-level backquote preservation** — unchanged from round 7, and for the
+  same reason: `pcase`'s backquote patterns are specified against the reader's
+  eager expansion, so moving expansion into a macro changes what every
+  quoted-backquote datum in the prelude looks like. Too broad to land beside this
+  round's work.
+- **`setf`'s own gv expansion shape** — see R8-C. The *semantic* half is fixed;
+  the printed expansion still differs.
+- **`hash-table-size`** stays void — Emacs reports allocated capacity, which
+  elisprs's `Vec` has no analogue for. Answering would mean inventing a number.
+- **`print-circle` nil's ` . #N` marker** — the Brent-style schedule
+  (0, 2, 2, 6, 6, 6, 6 for periods 1–7) could not be derived from behavior and no
+  `print.c` is vendored to port it from. elisprs terminates with a named
+  divergence instead of hanging, which is the right trade.
+- **`aset` on a string** is `(wrong-type-argument arrayp …)`; Emacs mutates in
+  place (`(let ((s (copy-sequence "abc"))) (aset s 1 ?z) s)` → `"azc"`). elisprs
+  strings are `fusevm::Value::Str(Arc<String>)` — an immutable value, not a heap
+  object with identity — so in-place mutation would only affect the one `Value`
+  that happened to be aset, not every holder. Same constraint `fillarray` already
+  records. Substrate work. The error data was fixed to name the offender.
+- **A warm script cache can re-intern a `make-symbol` result.** Running the fuzz
+  corpus warms the cache for `drive.el`; a later run of the *same* driver then
+  finds `(intern-soft "a,b,,c")` non-nil, because the corpus contains
+  `(make-symbol "a,b,,c")` and the heap image claims the name back on import.
+  Pre-existing (the `interned` flag added in the round-1 cache fix covers the
+  prelude's uninterned symbols but not one created at runtime by the script
+  itself). It makes fuzz counts cache-state-dependent, so the numbers above were
+  all taken with `ELISPRS_CACHE=0` and a cleared shard.
