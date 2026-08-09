@@ -1510,3 +1510,266 @@ prelude as a macro call to run, losing the `compile_when` lowering.
   prelude's uninterned symbols but not one created at runtime by the script
   itself). It makes fuzz counts cache-state-dependent, so the numbers above were
   all taken with `ELISPRS_CACHE=0` and a cleared shard.
+
+---
+
+## Round 9 — cycles in the printer, and the classes the fuzzer could not reach
+
+Round 8 ended with `scripts/fuzz_parity.sh -n 1500 -s 1` at **1500/1500** and five
+named items. Two of those five were already closed by round 8 itself and are
+re-verified below; the `print-circle` nil marker is closed; and re-running the
+*same* widened generator with **fresh seeds** found 25 divergences the seed-1
+corpus never produced — 19 of which are closed here.
+
+### Regression control
+
+The point of the control is that the widened generator finds new SHAPES rather
+than regressions, so the corpora from every generator generation are re-scored
+before and after. Corpora regenerated at `-n 1500 -s 1` from
+`scripts/fuzz/gen.el` as of `6e000a3dad` (pre-widening), `899a868908` (round 7's
+widening) and `HEAD`:
+
+| generator | before this round | after this round |
+|---|---|---|
+| `6e000a3dad` (old) | 1500/1500 | 1500/1500 |
+| `899a868908` (round 7 widened) | 1500/1500 | 1500/1500 |
+| `HEAD` (round 8 widened) | 1500/1500 | 1500/1500 |
+
+Note for anyone reading round 8's numbers: the old generator's historical score
+of **1/1500** was its state *before* round 8. R8-F closed that one divergence
+(`sort` with a nil PREDICATE), so the old corpus has scored 0 since then. The
+number to preserve going forward is **0**, not 1.
+
+Fresh seeds on the round-8 generator, `-n 1500` each:
+
+| seed | before | after |
+|---|---|---|
+| 2 | 8 | 2 |
+| 7 | 2 | 1 |
+| 42 | 4 | 1 |
+| 2026 | 6 | 1 |
+| 31337 | 5 | 1 |
+| **total** | **25** | **6** |
+
+A corpus at 100% means the current seeds are exhausted, not that the frontend is
+correct. Every seed above is new work, on an unchanged grammar.
+
+### R9-A. `print-circle` nil printed no ` . #N` marker — ✅ FIXED
+
+Round 8 left this open because "the Brent-style schedule (0, 2, 2, 6, 6, 6, 6 for
+periods 1–7) could not be derived from behavior and no `print.c` is vendored".
+It is derivable — from the algorithm, not from the seven cases. Emacs 30.2's
+`print.c` carries a Brent teleporting tortoise inside its `PE_list` continuation
+(`tortoise`, step countdown `n`, step period `m`, `tortoise_idx`), and the marker
+prints `tortoise_idx`: the tortoise's position at its LAST TELEPORT, not the
+cycle's period. The teleport takes precedence over the equality test, so the
+index can only ever be 2^k − 2 — which is what generates 0, 2, 2, 6, 6, 6, 6 for
+periods 1–7 without anyone choosing those numbers.
+
+`print_list` (`src/host.rs:2646`) is now that state machine. Fitting seven
+constants would not have survived the check that mattered: the marker's index is
+only half the output, and how far the list unrolls before it depends on the
+leading non-cycle prefix as well as the period. Verified over a 6×13 grid of
+(prefix 0,1,2,3,5,8) × (period 1..13) — 78 shapes, byte-identical:
+
+```
+rho=0  lam=1   (0 . #0)
+rho=0  lam=4   (0 1 2 3 0 1 2 3 0 1 . #6)
+rho=3  lam=1   (-3 -2 -1 0 0 0 0 . #6)
+rho=8  lam=13  (-8 -7 -6 -5 -4 -3 -2 -1 0 1 2 3 4 5 6 7 8 9 10 11 12 0 1 2 3 4 5 . #14)
+```
+
+### R9-B. …and no `#N` back-reference either — ✅ FIXED
+
+The same `NILP (Vprint_circle)` block in print.c has a second half nobody had
+noticed was missing: `being_printed[]`, the chain of objects open at every
+shallower depth, scanned with `BASE_EQ` to print `#I` — no dot, no trailing `#`.
+That is what terminates a cycle closing through a CAR, or through a vector,
+record or hash-table slot, rather than through the cdr chain. elisprs signalled
+"Apparently circular structure being printed" for all of them.
+
+`ElispHost::print_being` (`src/host.rs:497`), scanned in `print_inner`
+(`src/host.rs:2388`).
+
+| form | emacs 30.2 | elisprs before | after |
+|---|---|---|---|
+| `(let ((x (list 1))) (setcar x x) x)` | `(#0)` | *signalled* | `(#0)` |
+| `(let ((v (vector 1 2))) (aset v 0 v) v)` | `[#0 2]` | *signalled* | `[#0 2]` |
+| `(let ((r (record 'foo 1))) (aset r 1 r) r)` | `#s(foo #0)` | *signalled* | `#s(foo #0)` |
+| `(let ((h (make-hash-table))) (puthash 'k h h) h)` | `#s(hash-table data (k #0))` | *signalled* | same |
+| `(let ((a (list 1 2 3))) (setcar (nthcdr 2 a) a) a)` | `(1 2 #0)` | *signalled* | `(1 2 #0)` |
+
+### R9-C. The `PRINT_CIRCLE` ceiling fired under `print-circle` t — ✅ FIXED
+
+Both mechanisms above sit inside `if (NILP (Vprint_circle))`, and so does the
+depth ceiling that raises "Apparently circular structure being printed". With the
+label table on there is no ceiling: every container that can close a cycle
+carries a `#N=` instead. elisprs applied it unconditionally, so a deep but
+perfectly finite structure signalled where Emacs prints it.
+
+- `(let ((print-circle t)) (prin1-to-string DEEP-250))` → Emacs prints
+  `((((((((((((((((((((…`; elisprs signalled. Now prints.
+- With `print-circle` nil the ceiling still applies and still signals, unchanged.
+
+Termination under `print-circle` t therefore rests entirely on the candidate set,
+so `print_preprocess` now covers every container the printer recurses into —
+cons, vector, record, char-table, closure, hash-table — matching
+`PRINT_CIRCLE_CANDIDATE_P`.
+
+### R9-D. `print-level` truncated vectors and records — ✅ FIXED
+
+print.c tests `Vprint_level` in exactly ONE place: `case Lisp_Cons`. Only a list
+is ever replaced by `...`. A vector or record still costs a level (`print_depth++`
+runs for every object) but can never be truncated itself. elisprs checked it in
+the vector and record branches too.
+
+| form (`print-level` 2) | emacs 30.2 | elisprs before |
+|---|---|---|
+| `[[[[1]]]]` | `[[[[1]]]]` | `[[...]]` |
+| `#s(a #s(b #s(c #s(d 1))))` | unchanged | `#s(a #s(b ...))` |
+| `(([[(1)]]))` | `(([[...]]))` | `((...))` |
+| `(1 [2 (3 [4 (5)])])` (level 3) | `(1 [2 (3 [4 ...])])` | `(1 [2 (3 ...)])` |
+
+### R9-E. `print-circle` numbered its labels in the wrong ORDER — ✅ FIXED
+
+Found by a 400-trial randomized differential over circular/shared object graphs
+(4 printer modes each), not by the form fuzzer. The `#N=` number is assigned in
+print.c's `print_preprocess`, at the moment an object is met for the SECOND time
+in a car-before-cdr DFS — **not** when it is finally printed. elisprs numbered on
+first print. The two orders differ whenever the object printed first is
+met-twice later than one printed after it:
+
+- Emacs: `([#2=#s(r #s(r 0)) [#1=(9 . 9) #s(r 3)]] #1# (#2# 3))`
+- elisprs before: `([#1=#s(r #s(r 0)) [#2=(9 . 9) #s(r 3)]] #2# (#1# 3))`
+
+`print_preprocess` (`src/host.rs:2239`) is now print.c's explicit-stack DFS, and
+`print_labels` carries `Vprint_number_table`'s own status encoding (`0` = `Qt`,
+`-N` = assigned-not-printed, `N` = printed), read by `circle_label`
+(`src/host.rs:2316`).
+
+**Randomized differential, 400 trials × 4 modes (`print-circle` nil / t,
+`print-length` 4, `print-level` 3) = 1600 lines per seed:**
+
+| stage | divergent lines |
+|---|---|
+| before | 768 (all `print-level`) |
+| after R9-D | 112 (all label ordering) |
+| after R9-E | **0** |
+
+Re-run on four further seeds (7, 4242, 99991, 31337): **0 / 6400**.
+
+### R9-F. `nthcdr` rejected a bignum index and HUNG on a circular list — ✅ FIXED
+
+The sharper half is the hang: `(nthcdr 4611686018427387903 CYCLE)` counted down
+one cdr at a time and never returned. fns.c `Fnthcdr` handles both cases and is
+now ported to Rust (`src/builtins.rs:747`); the elisp definition it replaces is
+gone (`src/prelude.rs:95`), and `nth` is again literally `Fcar (Fnthcdr …)`.
+
+- **Bignum N.** `CHECK_INTEGER` accepts one, so `(nth (floor 1.5e+300) '(a))` is
+  `nil`, where elisprs answered `(wrong-type-argument integerp 15000000…0240)`.
+  A negative bignum returns LIST untouched.
+- **Circular LIST.** Brent's tortoise, then the remaining count reduced modulo
+  the distance the hare travelled since the last teleport. That distance is always
+  a multiple of the true period — both pointers sit on the same cell when they
+  meet — which is why the answer does not depend on the tortoise's schedule, and
+  is the reason a faithful port did not need C's exact two-level countdown.
+
+`(let ((l (number-sequence 0 6))) (setcdr (nthcdr 6 l) l) (car (nthcdr 300 l)))`
+→ `6`; at 301 → `0`; with a 3-cell prefix and a bignum index → `3`. All Emacs's.
+
+### R9-G. `split-string` ignored TRIM entirely — ✅ FIXED
+
+Three divergences in one function, now a port of subr.el's `split-string`
+including its `push-one` closure (`src/builtins.rs:2397`):
+
+- **TRIM was never applied and never type-checked.**
+  `(split-string "abc" "b" nil 97)` must be `(wrong-type-argument stringp 97)`.
+- **The default SEPARATORS were Rust's `split_whitespace`**, which is
+  Unicode-aware; subr.el's are the six ASCII characters in
+  `split-string-default-separators`, which was also simply missing as a variable
+  (`src/prelude.rs:29`). `(split-string "a\u{a0}b")` is ONE element in Emacs.
+- **Reproducing the index walk reproduces its sharp edge:** a leading TRIM whose
+  match runs past the end of the segment leaves `this-start > this-end`, and
+  `substring` then signals — `(split-string "aXb" "X" nil "a.")` is
+  `(args-out-of-range "aXb" 2 1)`, not `("a" "b")`.
+
+### R9-H. Emacs's `[:class:]` names stopped at ASCII — ✅ MOSTLY FIXED
+
+`(string-match "[[:alpha:]]" "Ü")` was nil where Emacs answers 0: the `regex`
+crate's POSIX classes are ASCII-only and were being copied through verbatim.
+Each class is now re-expressed as the Unicode property the Elisp manual's "Char
+Classes" node names (`posix_class`, `src/regexp.rs:275`).
+
+Measured over 72 codepoints × 17 classes × both `case-fold-search` settings
+(2448 probes) against Emacs 30.2:
+
+| class | before | after | | class | before | after |
+|---|---|---|---|---|---|---|
+| alpha | 59 | **0** | | punct | 62 | 28 |
+| alnum | 61 | **0** | | word | 81 | 18 |
+| cntrl | 2 | **0** | | space | 18 | 8 |
+| blank | 10 | **0** | | upper | 24 | 3 |
+| ascii | 1 | 1 | | lower | 26 | 4 |
+| nonascii | 161 | 1 | | graph | 131 | 131 |
+| multibyte | 168 | 1 | | print | 141 | 141 |
+| unibyte | 233 | 1 | | **total** | **1064** | **337** |
+
+What is closed is closed exactly; what is left is left for a stated reason, below.
+
+### R9-I. Re-verified as already fixed in round 8
+
+The task brief listed these as open; they were closed by round 8 and are
+confirmed against Emacs 30.2 here rather than taken on trust.
+
+- **Deep recursion.** `(cl-labels ((go (n acc) …)) (go 100 0))` → `5050` in both;
+  at 3000 under a raised `max-lisp-eval-depth` → `4501500` in both; and
+  `(condition-case e (letrec ((f (lambda () (funcall f)))) (funcall f)) (error e))`
+  → `(excessive-lisp-nesting 1601)` in both. No abort.
+- **`(type-of (symbol-function 'when))`** → `cons` in both, likewise `unless`.
+
+### Still open after round 9
+
+- **`string-version-lessp`'s ORDERING** (2 of the 6 remaining fuzz divergences).
+  The type contract is fixed (R9-I's sibling, `src/prelude.rs:2740`), but the
+  comparison is still an ad-hoc paraphrase where `Fstring_version_lessp` calls
+  gnulib's `filenvercmp`. `(string-version-lessp "quote\"d" "  padded  ")` is `t`
+  in Emacs and `nil` here. Closing it means porting `filevercmp` — a separate
+  change with its own algorithm to be faithful to, not a patch to the paraphrase.
+- **`[:graph:]` and `[:print:]`.** The manual defines both by COMPLEMENT ("any
+  character except whitespace, control characters, surrogates, and unassigned
+  codepoints"), and a complement is not expressible as character-class BODY text.
+  `[[^…]…]` needs nested classes, which fancy-regex's parser rejects outright
+  ("error parsing pattern"). Reaching them means translating the whole `[...]`
+  alternative rather than one member of it.
+- **`[:space:]`, `[:punct:]`, `[:word:]`.** Improved but still approximations, and
+  they cannot be finished with a Unicode property at all: in Emacs these three
+  read the SYNTAX TABLE, so the answer depends on the major mode —
+  `(string-match "[[:space:]]" "\n")` is nil in fundamental-mode and 0 in
+  text-mode. elisprs has no syntax table to consult.
+- **`[:upper:]`/`[:lower:]`, and the four byte-width classes under
+  `case-fold-search`.** The residue is Emacs's CASE TABLES: `\p{Uppercase}`
+  accepts `U+1D400` (MATHEMATICAL BOLD CAPITAL A) where Emacs does not, because
+  Emacs's test is "downcasing changes the character". The one fold-only mismatch
+  in `[:ascii:]` and friends is the same root: `compile_cf` applies `(?i)` to the
+  whole pattern, so the crate folds `U+017F` (ſ) into an ASCII class and Emacs
+  does not.
+- **`seq-mapn`'s argument-error order** — `(seq-mapn #'string-to-number "-4.5"
+  (cons 2 10))` is `(wrong-type-argument stringp 45)` in Emacs and
+  `(wrong-type-argument listp 10)` here: the two walk their sequences in a
+  different order before the first bad element is reached.
+- **`cl-rem` / `cl-floor` at the float boundary** — `(cl-rem 1.5e+300 (mod 1e-10 …))`
+  is `-1.0e+INF` in Emacs and `(overflow-error)` here; `(cl-floor 4611686018427387903 0.5)`
+  is `(9223372036854775806 0.0)` vs `(9223372036854775807 0.0)`. Both are one
+  rounding step inside the `cl-truncate` chain, not a contract difference.
+- **A closure prints the environment it captured, and Emacs prints `(t)`** —
+  `(dotimes (i 3) … (lambda (x) (list x x)))` reports
+  `#[(x) ((list x x)) ((i . 0) (counter . 0) (upper-bound . 3))]` where Emacs says
+  `#[(x) ((list x x)) (t)]`. Two things at once: Emacs captures nothing here, and
+  elisprs's `dotimes` leaks its OWN internal variable names (`counter`,
+  `upper-bound`) into the visible environment. Closing it means pruning a
+  closure's captured environment to the free variables of its body — substrate
+  work in `compiler.rs`, not a prelude change.
+- Unchanged from round 8, for the reasons already recorded there:
+  reader-level backquote preservation, `setf`'s own gv expansion SHAPE,
+  `hash-table-size`, `aset` on a string, and the warm-cache `make-symbol`
+  re-intern.

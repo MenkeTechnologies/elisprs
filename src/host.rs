@@ -18,7 +18,7 @@ use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
@@ -474,14 +474,33 @@ pub struct ElispHost {
     /// `error "Apparently circular structure being printed"`. `Cell` so the
     /// `&self` printer can record it. Reset at the top of every `print` call.
     pub(crate) print_overflow: Cell<bool>,
-    /// `print-circle` label table for ONE print call: arena id → label number, `0`
-    /// meaning "needs a label but has not been printed yet". Populated by
-    /// [`ElispHost::scan_shared`] before printing when `print-circle` is non-nil,
-    /// empty otherwise (so the zero-cost path is a single `is_empty` check).
-    /// `RefCell` because the printer runs on `&self`.
-    pub(crate) print_labels: RefCell<HashMap<u32, usize>>,
-    /// Next unused `#N=` label number for the print call in progress.
+    /// `print-circle` label table for ONE print call: arena id → print.c's status
+    /// field, using the same encoding `Vprint_number_table` does. `0` is `Qt`
+    /// ("candidate, seen once, no label"); `-N` is "label N assigned by
+    /// [`ElispHost::print_preprocess`], not yet printed"; `N` is "already printed
+    /// as `#N=`, so print `#N#`". Populated before printing when `print-circle` is
+    /// non-nil, empty otherwise. `RefCell` because the printer runs on `&self`.
+    pub(crate) print_labels: RefCell<HashMap<u32, i64>>,
+    /// print.c `print_number_index`: the next unused `#N=` label. Assigned during
+    /// [`ElispHost::print_preprocess`], not while printing.
     pub(crate) print_next_label: Cell<usize>,
+    /// print.c `being_printed[PRINT_CIRCLE]`: the chain of objects currently open,
+    /// indexed by print nesting depth. With `print-circle` nil, print.c scans
+    /// `being_printed[0 .. print_depth)` for `BASE_EQ (obj, …)` and emits `#I`
+    /// instead of recursing — that is how a self-referencing *car* (or vector,
+    /// record or hash-table slot) terminates: `(let ((x (list 1))) (setcar x x) x)`
+    /// prints `(#0)`. Only an aggregate can occupy an index below the current
+    /// depth (print.c writes a scalar's slot and decrements `print_depth` again
+    /// immediately), and every elisprs aggregate is a `Value::Obj`, so the slot
+    /// holds an arena id and `None` stands for "not a heap object" — comparing ids
+    /// is `BASE_EQ` restricted to the cases that can ever match.
+    pub(crate) print_being: RefCell<Vec<Option<u32>>>,
+    /// `Vprint_circle` sampled once at the top of a `print` call. print.c re-reads
+    /// the global at every object; caching it keeps the per-object cost to a `Cell`
+    /// read while preserving the branch it selects — the `being_printed` scan *and*
+    /// the `PRINT_CIRCLE` depth ceiling live inside `if (NILP (Vprint_circle))`, so
+    /// with the label table on a 250-deep nest prints instead of signalling.
+    pub(crate) print_circle_on: Cell<bool>,
     /// The global buffer registry. Index 0 is the default buffer (`*scratch*`).
     /// Slots are never removed — `kill-buffer` marks a buffer dead (`name: None`)
     /// so its index (and any live buffer object referencing it) stays valid.
@@ -670,6 +689,8 @@ impl ElispHost {
             print_overflow: Cell::new(false),
             print_labels: RefCell::new(HashMap::new()),
             print_next_label: Cell::new(1),
+            print_being: RefCell::new(Vec::new()),
+            print_circle_on: Cell::new(false),
             buffers: vec![EditBuffer {
                 name: Some("*scratch*".to_string()),
                 self_obj: Value::Undef,
@@ -2176,76 +2197,134 @@ impl ElispHost {
     pub fn print(&self, v: &Value, readable: bool) -> String {
         self.print_overflow.set(false);
         self.print_labels.borrow_mut().clear();
+        self.print_being.borrow_mut().clear();
         self.print_next_label.set(1);
         // `print-circle` is opt-in: only then does the printer pay for the
         // reference-counting pre-pass that finds the objects needing `#N=` labels.
-        if self.print_flag("print-circle") {
-            let mut seen = HashSet::new();
-            let mut shared = HashSet::new();
-            self.scan_shared(v, &mut seen, &mut shared);
-            let mut labels = self.print_labels.borrow_mut();
-            for id in shared {
-                labels.insert(id, 0);
-            }
+        self.print_circle_on.set(self.print_flag("print-circle"));
+        if self.print_circle_on.get() {
+            self.print_next_label.set(1);
+            self.print_preprocess(v);
         }
         self.print_inner(v, readable, 0)
     }
 
-    /// Walk the object graph recording every arena id reached more than once —
-    /// those are exactly the objects `print-circle` has to label. Recursion stops
-    /// at an already-seen id, so a cycle terminates instead of spinning; cdr
-    /// chains iterate rather than recurse so a long list cannot overflow the Rust
-    /// stack.
+    /// print.c `print_preprocess`: fill the label table from the structure of V.
     ///
-    /// Only conses, vectors and records are labellable here: they are the
-    /// containers whose sharing `#N=`/`#N#` is observable when reading the output
-    /// back.
-    fn scan_shared(&self, v: &Value, seen: &mut HashSet<u32>, shared: &mut HashSet<u32>) {
-        let mut cur = v.clone();
+    /// The label NUMBER is assigned here, at the moment an object is met for the
+    /// SECOND time in this traversal — not when it is finally printed. The two
+    /// orders differ, and the difference is observable: in
+    /// `(let ((print-circle t)) (prin1-to-string ROOT))` over a graph where the
+    /// vector element printed first is met-twice later than a cons printed after
+    /// it, Emacs answers `([#2=#s(r …) [#1=(9 . 9) …]] #1# (#2# 3))` — `#2` before
+    /// `#1` in the output. Numbering at print time gets the labels backwards.
+    ///
+    /// Traversal is print.c's explicit-stack DFS: for a cons, push the CDR (unless
+    /// nil) and continue into the CAR; for a vector-like, push every element and
+    /// take them left to right. An object met again is neither renumbered nor
+    /// re-descended, so a cycle terminates.
+    ///
+    /// The table doubles as print.c's status field: `0` is `Qt` ("seen once, no
+    /// label"), `-N` is "label N assigned, not yet printed", `N` is "already
+    /// printed as `#N=`".
+    ///
+    /// Candidates are the containers `PRINT_CIRCLE_CANDIDATE_P` accepts that
+    /// elisprs's printer actually recurses into — cons, vector, record,
+    /// char-table, closure, hash-table. That is also what makes a cycle safe under
+    /// `print-circle` t: the depth ceiling does NOT run in that mode (Emacs prints
+    /// a 250-deep nest fine), so termination rests entirely on every container
+    /// that can close a cycle being labellable. Strings are candidates in print.c
+    /// but not here: an elisprs string is a `Value::Str(Arc<String>)` with no
+    /// object identity to share, the same constraint `aset`-on-a-string records.
+    fn print_preprocess(&self, v: &Value) {
+        let mut stack: Vec<Value> = Vec::new();
+        let mut obj = v.clone();
         loop {
-            let Value::Obj(id) = cur else { return };
-            match self.arena.get(id as usize) {
-                Some(Obj::Cons(car, cdr)) => {
-                    if !seen.insert(id) {
-                        shared.insert(id);
-                        return;
+            if let Value::Obj(id) = obj {
+                // Children in print order; `None` for a non-candidate.
+                let children: Option<Vec<Value>> = match self.arena.get(id as usize) {
+                    Some(Obj::Cons(car, cdr)) => {
+                        // print.c: `if (!NILP (XCDR (obj))) push (XCDR (obj));
+                        //           obj = XCAR (obj); continue;`
+                        let mut kids = vec![car.clone()];
+                        if el_truthy(cdr) {
+                            kids.push(cdr.clone());
+                        }
+                        Some(kids)
                     }
-                    self.scan_shared(car, seen, shared);
-                    cur = cdr.clone();
+                    Some(Obj::Vector(items)) | Some(Obj::Record(items)) => Some(items.clone()),
+                    Some(Obj::CharTable(t)) => {
+                        Some(vec![t.default.clone(), t.parent.clone(), t.subtype.clone()])
+                    }
+                    Some(Obj::Closure { src, .. }) => {
+                        let mut kids = vec![src.arglist.clone()];
+                        kids.extend(src.body.iter().cloned());
+                        Some(kids)
+                    }
+                    Some(Obj::HashTable { entries, .. }) => {
+                        let mut kids = Vec::with_capacity(entries.len() * 2);
+                        for (k, val) in entries {
+                            kids.push(k.clone());
+                            kids.push(val.clone());
+                        }
+                        Some(kids)
+                    }
+                    _ => None,
+                };
+                if let Some(kids) = children {
+                    let mut labels = self.print_labels.borrow_mut();
+                    match labels.get(&id).copied() {
+                        // `Qt`: OBJ appears more than once. Number it now.
+                        Some(0) => {
+                            let n = self.print_next_label.get();
+                            self.print_next_label.set(n + 1);
+                            labels.insert(id, -(n as i64));
+                        }
+                        // Already numbered — print.c's `if (SYMBOLP (num))` is false,
+                        // so no new index and no descent.
+                        Some(_) => {}
+                        None => {
+                            labels.insert(id, 0);
+                            drop(labels);
+                            // Pushed in reverse so `pop` yields them left to right,
+                            // which is what print.c's array entry does; anything a
+                            // child pushes lands above its siblings, so each subtree
+                            // completes before the next sibling — a plain DFS.
+                            stack.extend(kids.into_iter().rev());
+                        }
+                    }
                 }
-                Some(Obj::Vector(items)) | Some(Obj::Record(items)) => {
-                    if !seen.insert(id) {
-                        shared.insert(id);
-                        return;
-                    }
-                    for e in items {
-                        self.scan_shared(e, seen, shared);
-                    }
-                    return;
-                }
-                _ => return,
+            }
+            match stack.pop() {
+                Some(next) => obj = next,
+                None => break,
             }
         }
     }
 
-    /// The `#N=` / `#N#` prefix for OBJ, or None when it needs no label.
+    /// The `#N=` / `#N#` prefix for OBJ, or None when it needs no label — print.c
+    /// `print_object`'s `PRINT_CIRCLE_CANDIDATE_P` arm.
     ///
     /// Returns `Some(Err(text))` when the object was already printed — the caller
     /// emits `text` (`#N#`) INSTEAD of the object — and `Some(Ok(text))` on the
     /// first visit, where `text` (`#N=`) is a prefix and the object still prints
-    /// in full.
+    /// in full. A `0` slot is print.c's `Qt`: a candidate that turned out not to be
+    /// shared, which prints with no label at all.
     #[allow(clippy::result_large_err)]
     fn circle_label(&self, v: &Value) -> Option<Result<String, String>> {
         let Value::Obj(id) = v else { return None };
         let mut labels = self.print_labels.borrow_mut();
         let slot = labels.get_mut(id)?;
-        if *slot != 0 {
-            return Some(Err(format!("#{slot}#")));
+        match (*slot).cmp(&0) {
+            std::cmp::Ordering::Equal => None,
+            // Negative: "hasn't been printed yet" — emit `#N=` and flip the sign.
+            std::cmp::Ordering::Less => {
+                let n = -*slot;
+                *slot = n;
+                Some(Ok(format!("#{n}=")))
+            }
+            std::cmp::Ordering::Greater => Some(Err(format!("#{slot}#"))),
         }
-        let n = self.print_next_label.get();
-        self.print_next_label.set(n + 1);
-        *slot = n;
-        Some(Ok(format!("#{n}=")))
     }
 
     /// Like `print`, but returns Emacs's `error "Apparently circular structure
@@ -2305,17 +2384,11 @@ impl ElispHost {
     }
 
     fn print_inner(&self, v: &Value, readable: bool, depth: usize) -> String {
-        // Faithful to print.c `PRINT_CIRCLE` = 200: with `print-circle` nil,
-        // any object nested this deep aborts printing with "Apparently circular
-        // structure being printed". Stop recursing here (both to match Emacs and
-        // to keep the Rust call stack bounded) and flag it for `print_checked`.
-        if depth >= PRINT_CIRCLE {
-            self.print_overflow.set(true);
-            return String::new();
-        }
-        // `print-circle' labelling. The table is empty unless the variable is on,
-        // so this costs one `is_empty' on the default path.
-        if !self.print_labels.borrow().is_empty() {
+        // print.c `print_object`'s prologue, in its own order: the whole
+        // `being_printed` mechanism (and the `PRINT_CIRCLE` ceiling that guards it)
+        // is the `NILP (Vprint_circle)` arm, and the `#N=`/`#N#` label table is the
+        // other. They are alternatives, never both.
+        if self.print_circle_on.get() {
             match self.circle_label(v) {
                 // Already printed once: emit the back-reference INSTEAD of
                 // re-printing (this is what terminates a circular structure).
@@ -2325,6 +2398,35 @@ impl ElispHost {
                 }
                 None => {}
             }
+        } else {
+            // `if (print_depth >= PRINT_CIRCLE) error ("Apparently circular
+            // structure being printed");` — stop recursing (both to match Emacs and
+            // to keep the Rust call stack bounded) and flag it for `print_checked`.
+            if depth >= PRINT_CIRCLE {
+                self.print_overflow.set(true);
+                return String::new();
+            }
+            // `for (int i = 0; i < print_depth; i++) if (BASE_EQ (obj,
+            // being_printed[i])) → "#i"`. An object that is its own ancestor prints
+            // as the index of the enclosing copy rather than recursing forever.
+            let id = match v {
+                Value::Obj(id) => Some(*id),
+                _ => None,
+            };
+            if id.is_some() {
+                let being = self.print_being.borrow();
+                for (i, slot) in being.iter().take(depth).enumerate() {
+                    if *slot == id {
+                        return format!("#{i}");
+                    }
+                }
+            }
+            // `being_printed[print_depth] = obj;`
+            let mut being = self.print_being.borrow_mut();
+            if being.len() <= depth {
+                being.resize(depth + 1, None);
+            }
+            being[depth] = id;
         }
         self.print_body(v, readable, depth)
     }
@@ -2396,24 +2498,18 @@ impl ElispHost {
                 }
                 Some(Obj::Cons(..)) => self.print_list(v, readable, depth),
                 Some(Obj::Vector(items)) => {
-                    // print-level: a vector one level too deep prints `...`.
-                    if self
-                        .print_limit("print-level")
-                        .is_some_and(|lvl| depth + 1 > lvl)
-                    {
-                        return "...".to_string();
-                    }
+                    // NO `print-level` check: print.c tests `Vprint_level` in exactly
+                    // one place — `case Lisp_Cons` — so only a LIST is ever replaced
+                    // by `...`. A vector still costs a level (`print_depth++` runs
+                    // for every object), it just cannot be truncated itself:
+                    // `(let ((print-level 2)) [[[[1]]]])` prints in full, while the
+                    // list one level down in `(([[(1)]]))` becomes `...`.
                     let parts = self.print_seq(items, readable, depth + 1);
                     format!("[{}]", parts.join(" "))
                 }
                 Some(Obj::Record(items)) => {
-                    // print-level: a record one level too deep prints `...`.
-                    if self
-                        .print_limit("print-level")
-                        .is_some_and(|lvl| depth + 1 > lvl)
-                    {
-                        return "...".to_string();
-                    }
+                    // No `print-level` check, for the same reason as `Obj::Vector`
+                    // above: print.c truncates only conses.
                     // Emacs record syntax `#s(SLOT0 SLOT1 …)` — slot 0 is the type
                     // symbol, printed like any other slot (so a cl-defstruct
                     // instance reads back as `#s(NAME …)`).
@@ -2579,64 +2675,85 @@ impl ElispHost {
                 }
             }
         }
-        let limit = self.print_limit("print-length");
-        let labelling = !self.print_labels.borrow().is_empty();
+        // print.c pushes a `PE_list` continuation carrying `last`, `maxlen` and a
+        // BRENT cycle detector (`tortoise`, step countdown `n`, step period `m`,
+        // `tortoise_idx`), then prints the head's car and re-enters the loop. The
+        // state is per-list, so a nested list gets its own detector, exactly as a
+        // separate stack entry does in C.
+        let print_length = self.print_limit("print-length");
+        // `if (print_length == 0) print_c_string ("...)")` — before the car.
+        if print_length == Some(0) {
+            return "(...)".to_string();
+        }
+        let mut maxlen: i64 = print_length.map_or(i64::MAX, |n| n as i64);
         let mut out = String::from("(");
-        let mut cur = v.clone();
-        let mut first = true;
-        let mut count = 0usize;
-        // Tortoise for the `print-circle' nil case: the cdr chain is walked
-        // ITERATIVELY, so the `PRINT_CIRCLE` depth guard above never fires on it
-        // and a circular cdr spun here forever, appending to `out` until the
-        // process died. Floyd's tortoise advances one cons per two of the hare's,
-        // so a cycle of any length is caught in linear time.
-        let mut tortoise = v.clone();
-        while let Some(Obj::Cons(a, d)) = self.obj(&cur) {
-            if !first {
-                out.push(' ');
-            }
-            first = false;
-            if limit.is_some_and(|lim| count >= lim) {
-                out.push_str("...");
-                break;
-            }
-            out.push_str(&self.print_inner(a, readable, nd));
-            count += 1;
-            let next = d.clone();
-            match next {
-                // Both nil representations terminate the list (a `(1 . nil)` cdr
-                // is the one-element list `(1)`, never a dotted pair).
+        let Some(Obj::Cons(car0, _)) = self.obj(v) else {
+            return "()".to_string();
+        };
+        out.push_str(&self.print_inner(car0, readable, nd));
+        let mut last = v.clone();
+        let mut tortoise = match v {
+            Value::Obj(id) => *id,
+            _ => return "()".to_string(),
+        };
+        let (mut n, mut m, mut tortoise_idx): (i64, i64, i64) = (2, 2, 0);
+        // `Lisp_Object next = XCDR (e->u.list.last);` — `last` always holds the
+        // cons whose cdr the continuation is about to inspect.
+        while let Some(Obj::Cons(_, cdr)) = self.obj(&last) {
+            let next = cdr.clone();
+            match &next {
+                // Both nil representations end the list (a `(1 . nil)` cdr is the
+                // one-element list `(1)`, never a dotted pair).
                 Value::Undef | Value::Bool(false) => break,
-                Value::Obj(id) if matches!(self.arena.get(id as usize), Some(Obj::Cons(..))) => {
+                Value::Obj(id) if matches!(self.arena.get(*id as usize), Some(Obj::Cons(..))) => {
                     // A shared/circular tail prints as a dotted `#N#` back-reference
                     // (`#1=(1 2 . #1#)`) — the tail is a labelled object, so it must
                     // go through `print_inner` rather than continuing this loop.
-                    if labelling && self.print_labels.borrow().contains_key(&id) {
+                    // print.c checks this BEFORE the space, and before the tortoise.
+                    // print.c: `if (!(NILP (num) || EQ (num, Qt)))` — only a
+                    // NUMBERED tail takes the dotted branch. A `0` slot is `Qt`, a
+                    // candidate that turned out unshared, and continues the list.
+                    if self.print_circle_on.get()
+                        && self
+                            .print_labels
+                            .borrow()
+                            .get(id)
+                            .is_some_and(|slot| *slot != 0)
+                    {
                         out.push_str(" . ");
                         out.push_str(&self.print_inner(&next, readable, nd));
                         break;
                     }
-                    cur = next;
-                    if !labelling {
-                        if count.is_multiple_of(2) {
-                            if let Some(Obj::Cons(_, td)) = self.obj(&tortoise) {
-                                tortoise = td.clone();
-                            }
-                        }
-                        if let (Value::Obj(h), Value::Obj(t)) = (&cur, &tortoise) {
-                            if h == t {
-                                // Circular with `print-circle' off. Emacs prints a
-                                // ` . #N` marker from its own cycle detector; we
-                                // cannot reproduce that N, so take the other branch
-                                // print.c has for unprintable circularity and let
-                                // `print_checked` signal "Apparently circular
-                                // structure being printed". Terminating wrong beats
-                                // not terminating.
-                                self.print_overflow.set(true);
-                                break;
-                            }
-                        }
+                    out.push(' ');
+                    maxlen -= 1;
+                    if maxlen <= 0 {
+                        out.push_str("...");
+                        break;
                     }
+                    last = next.clone();
+                    n -= 1;
+                    if n == 0 {
+                        // "Double tortoise update period and teleport it." The
+                        // teleport TAKES PRECEDENCE over the equality test, which is
+                        // why the reported index only ever takes the values
+                        // 0, 2, 6, 14, 30, … (2^k - 2) — it is the tortoise's
+                        // position at the last teleport, not the cycle's period.
+                        tortoise_idx += m;
+                        m <<= 1;
+                        n = m;
+                        tortoise = *id;
+                    } else if tortoise == *id {
+                        // print.c's own comment: "This #N tail index is somewhat
+                        // ambiguous; see bug#55395." The `)` is part of C's format
+                        // string; here the shared `out.push(')')` below supplies it.
+                        out.push_str(". #");
+                        out.push_str(&tortoise_idx.to_string());
+                        break;
+                    }
+                    let Some(Obj::Cons(a, _)) = self.obj(&last) else {
+                        break;
+                    };
+                    out.push_str(&self.print_inner(a, readable, nd));
                 }
                 _ => {
                     out.push_str(" . ");

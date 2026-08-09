@@ -21,6 +21,12 @@ pub const PRELUDE: &str = r#"
 
 ;; Regexp matching folds case unless this is let-bound to nil (Emacs default t).
 (defvar case-fold-search t)
+;; subr.el's default SEPARATORS for `split-string'. Space, formfeed, tab,
+;; newline, carriage return, vertical tab -- ASCII only, deliberately not
+;; "whitespace" in the Unicode sense. The Rust subr carries the same literal
+;; (`SPLIT_STRING_DEFAULT_SEPARATORS' in src/builtins.rs); this defvar exists so
+;; Lisp can read and rebind it, as subr.el's does.
+(defvar split-string-default-separators "[ \f\t\n\r\v]+")
 
 ;;; ---- build/system identity (C-level vars from emacs.c, verified against
 ;;; ---- GNU Emacs 30.2) ----
@@ -86,18 +92,11 @@ pub const PRELUDE: &str = r#"
 (defun wholenump (x) (natnump x))
 
 ;;; ---- list construction / access ----
-(defun nthcdr (n l)
-  ;; Emacs signals on a non-integer index (a float is rejected even when it
-  ;; is integer-valued): (nthcdr 1.5 '(a b c)) => wrong-type-argument integerp.
-  (unless (integerp n) (signal 'wrong-type-argument (list 'integerp n)))
-  ;; Fnthcdr walks conses only; running off a dotted tail with steps remaining
-  ;; is CHECK_LIST_END naming the WHOLE list: (nthcdr 2 '(1 . 2)) =>
-  ;; (wrong-type-argument listp (1 . 2)), while (nthcdr 1 '(1 . 2)) => 2.
-  (let ((whole l))
-    (while (and (> n 0) (consp l)) (setq l (cdr l)) (setq n (1- n)))
-    (when (and (> n 0) l)
-      (signal 'wrong-type-argument (list 'listp whole)))
-    l))
+;; `nthcdr' is a Rust subr (src/builtins.rs `nthcdr_fn'), ported from fns.c
+;; `Fnthcdr'. The elisp definition it replaces counted N down in a `while' loop,
+;; which neither accepted a bignum N nor terminated on a circular LIST —
+;; (nthcdr 4611686018427387903 CYCLE) spun forever where Emacs answers in
+;; constant time via Brent's tortoise plus a modulo reduction.
 (defun last (l &optional n)
   ;; The last N cons cells of L (default 1): (last '(1 2 3) 2) => (2 3).
   ;; Guard on consp so an improper tail stops the walk instead of erroring:
@@ -1709,14 +1708,15 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
     (while (and seq (null res)) (if (funcall test (car seq) elt) (setq res i)) (setq seq (cdr seq)) (setq i (1+ i)))
     res))
 (defun seq-into (seq type)
-  ;; Coerce SEQ (list/vector/string) to a list first so any input type converts.
-  (let ((l (append seq nil)))
-    (cond ((eq type 'list) l)
-          ((eq type 'vector) (apply (function vector) l))
-          ((eq type 'string) (apply (function string) l))
-          ;; seq.el signals for an unrecognized TYPE rather than handing the input
-          ;; back — returning SEQ unchanged silently accepted `(seq-into s 'foo)'.
-          (t (error "Not a sequence type name: %S" type)))))
+  ;; seq.el dispatches on TYPE with a `pcase' FIRST and only then touches
+  ;; SEQUENCE (each arm calls its own `seq--into-*'), so an unknown TYPE is
+  ;; reported even when SEQ is not a sequence at all:
+  ;; (seq-into 0 'foo) => (error "Not a sequence type name: foo"), NOT
+  ;; (wrong-type-argument sequencep 0). Coercing SEQ up front reversed that.
+  (cond ((eq type 'vector) (apply (function vector) (append seq nil)))
+        ((eq type 'string) (apply (function string) (append seq nil)))
+        ((eq type 'list) (append seq nil))
+        (t (error "Not a sequence type name: %S" type))))
 (defun seq-difference (a b &optional testfn)
   (seq-filter (lambda (x) (not (seq-contains-p b x testfn))) a))
 (defun seq-intersection (a b &optional testfn)
@@ -1743,7 +1743,20 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
         (setq out (cons (seq-into (take n l) type) out))
         (setq l (nthcdr n l)))
       (reverse out))))
-(defun seq-split (seq n) (seq-partition seq n))
+(defun seq-split (sequence length)
+  ;; NOT an alias for `seq-partition': seq.el gives `seq-split' its own body, and
+  ;; the guard is the opposite one. `seq-partition' returns nil for N < 1;
+  ;; `seq-split' SIGNALS -- (seq-split '("a") 0) is
+  ;; (error "Sub-sequence length must be larger than zero").
+  (when (< length 1)
+    (error "Sub-sequence length must be larger than zero"))
+  (let ((result nil) (seq-length (length sequence)) (start 0))
+    (while (< start seq-length)
+      (setq result
+            (cons (seq-subseq sequence start
+                              (setq start (min seq-length (+ start length))))
+                  result)))
+    (nreverse result)))
 (defun seq-set-equal-p (seq1 seq2 &optional testfn)
   (and (seq-every-p (lambda (x) (seq-contains-p seq2 x testfn)) seq1)
        (seq-every-p (lambda (x) (seq-contains-p seq1 x testfn)) seq2)))
@@ -2726,6 +2739,15 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
      (t (signal (quote type-mismatch) (list a b))))))
 (defun string-version-lessp (s1 s2)
   ;; Like `string-lessp' but compare embedded decimal runs numerically.
+  ;; fns.c `Fstring_version_lessp' takes SYMBOLP first and uses the print name,
+  ;; then CHECK_STRINGs both operands -- so `t' and `car' are legal arguments
+  ;; ((string-version-lessp "ab" t) => t, comparing "ab" against "t"), while a
+  ;; number is (wrong-type-argument stringp 0), not `sequencep'. Reading the
+  ;; operands with `length'/`aref' alone reported `sequencep' for both.
+  (if (symbolp s1) (setq s1 (symbol-name s1)))
+  (if (symbolp s2) (setq s2 (symbol-name s2)))
+  (unless (stringp s1) (signal 'wrong-type-argument (list 'stringp s1)))
+  (unless (stringp s2) (signal 'wrong-type-argument (list 'stringp s2)))
   (let ((i 0) (j 0) (n1 (length s1)) (n2 (length s2)) (res nil) (done nil))
     (while (not done)
       (cond

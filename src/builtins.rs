@@ -5,6 +5,7 @@
 use crate::host::{bigint_to_f64, CharTable, ElispHost, MatchData, Num, Obj, Resolved};
 use fusevm::Value;
 use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 
 type R = Result<Value, String>;
 
@@ -714,31 +715,149 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
         )),
     }
 }
-fn nth_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    // `(nth n list)` = `(car (nthcdr n list))`: walk the cons spine n times, then
-    // take the car. Improper lists are fine (`(nth 0 '(a . 1))` => a). N must
-    // be an integer — a float or other type signals `integerp`.
-    let n = as_integer(h, &a[0])?;
-    let mut cur = a[1].clone();
-    let mut i = 0;
-    while i < n {
-        let next = match h.obj(&cur) {
-            Some(Obj::Cons(_, d)) => d.clone(),
-            _ if is_nil(&cur) => return Ok(Value::Undef),
-            // Fnthcdr running off a dotted tail mid-walk is CHECK_LIST_END
-            // naming the WHOLE list: (nth 2 '(1 . 2)) => listp (1 . 2). Only
-            // the final Fcar (below) names the tail value itself: (nth 1
-            // '(1 . 2)) => listp 2.
-            _ => {
-                return Err(format!(
-                    "wrong-type-argument: listp {}",
-                    h.print(&a[1], true)
-                ))
-            }
-        };
-        cur = next;
-        i += 1;
+/// fns.c `CHECK_LIST_END (x, y)`: `CHECK_TYPE (NILP (x), Qlistp, y)` — a nil tail
+/// is a proper end, anything else names the WHOLE list under `listp`.
+fn check_list_end(h: &ElispHost, tail: &Value, list: &Value) -> Result<(), String> {
+    if is_nil(tail) {
+        Ok(())
+    } else {
+        Err(format!(
+            "wrong-type-argument: listp {}",
+            h.print(list, true)
+        ))
     }
+}
+
+/// fns.c `Fnthcdr`, ported. Take cdr N times on LIST and return the result.
+///
+/// The two things a naive `while (> n 0)` loop gets wrong, both of which Emacs
+/// handles here and both of which the fuzzer reached:
+///
+/// - **N may be a bignum.** `CHECK_INTEGER` accepts one, so
+///   `(nth (floor 1.5e+300) '(a))` is `nil`, not `(wrong-type-argument integerp …)`.
+///   A negative bignum returns LIST untouched; a positive one is walked with
+///   `EMACS_INT_MAX` substituted, and the substitution error is undone below.
+/// - **LIST may be circular.** Counting down 4611686018427387903 cdrs of a
+///   three-element cycle never terminates. Emacs runs Brent's teleporting
+///   tortoise, then reduces the remaining count modulo the distance the hare
+///   travelled since the last teleport. That distance is always a MULTIPLE of the
+///   true cycle period (both pointers sit on the same cell when they meet), so
+///   reducing by it lands on the same cell the full walk would have — which is why
+///   the answer does not depend on the tortoise's schedule.
+fn nthcdr_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let list = a[1].clone();
+    let mut tail = list.clone();
+    // `CHECK_INTEGER (n)`: a bignum passes, a float does not — `(nthcdr 1.5 '(a))`
+    // is `(wrong-type-argument integerp 1.5)` even though 1.5 has no fraction bits
+    // to spare.
+    if !h.is_integer(&a[0]) {
+        return Err(format!(
+            "wrong-type-argument: integerp {}",
+            h.print(&a[0], true)
+        ));
+    }
+    // "A huge but in-range EMACS_INT that can be substituted for a positive
+    // bignum while counting down."
+    const LARGE_NUM: i64 = i64::MAX;
+    // fns.c `SMALL_LIST_LEN_MAX`: below this, skip circularity and quit checking.
+    const SMALL_LIST_LEN_MAX: i64 = 127;
+    let bignum: Option<BigInt> = match h.obj(&a[0]) {
+        Some(Obj::Bignum(b)) => Some(b.clone()),
+        _ => None,
+    };
+    let mut num: i64 = match (&a[0], &bignum) {
+        (Value::Int(n), _) => {
+            let mut num = *n;
+            if num <= SMALL_LIST_LEN_MAX {
+                while num > 0 {
+                    match h.obj(&tail) {
+                        Some(Obj::Cons(_, d)) => tail = d.clone(),
+                        _ => {
+                            check_list_end(h, &tail, &list)?;
+                            return Ok(Value::Undef);
+                        }
+                    }
+                    num -= 1;
+                }
+                return Ok(tail);
+            }
+            num
+        }
+        (_, Some(b)) => {
+            if b.sign() == num_bigint::Sign::Minus {
+                return Ok(tail);
+            }
+            LARGE_NUM
+        }
+        // `is_integer` already accepted it, so this arm is unreachable.
+        _ => return Ok(tail),
+    };
+
+    // `FOR_EACH_TAIL_SAFE (tail)` with the body of Fnthcdr. The C two-level
+    // countdown (an `unsigned short` q plus an `intptr_t` n, both refilled from a
+    // doubling `max`) is one i64 counter here; it is the same total period.
+    let mut tortoise = tail.clone();
+    let mut tortoise_num = num;
+    let mut saved_tail = tail.clone();
+    let mut period: i64 = 2;
+    let mut countdown: i64 = 2;
+    while let Some(Obj::Cons(_, d)) = h.obj(&tail) {
+        // "If the tortoise just jumped (which is rare), update TORTOISE_NUM."
+        if value_eq_obj(&tail, &tortoise) {
+            tortoise_num = num;
+        }
+        saved_tail = d.clone();
+        num -= 1;
+        if num == 0 {
+            return Ok(saved_tail);
+        }
+        tail = saved_tail.clone();
+        countdown -= 1;
+        if countdown == 0 {
+            // Teleport; no cycle test on the step that teleports.
+            period <<= 1;
+            countdown = period;
+            tortoise = tail.clone();
+        } else if value_eq_obj(&tail, &tortoise) {
+            break;
+        }
+    }
+
+    tail = saved_tail;
+    if !matches!(h.obj(&tail), Some(Obj::Cons(..))) {
+        check_list_end(h, &tail, &list)?;
+        return Ok(Value::Undef);
+    }
+
+    // TAIL is part of a cycle. Reduce NUM modulo the cycle length.
+    let cycle_length = tortoise_num - num;
+    if let Some(b) = &bignum {
+        // Undo the LARGE_NUM substitution: add (N - LARGE_NUM) mod CYCLE_LENGTH.
+        let m = BigInt::from(cycle_length);
+        let r = (b % &m).to_i64().unwrap_or(0);
+        num += r;
+        num += cycle_length - LARGE_NUM % cycle_length;
+    }
+    num = num.rem_euclid(cycle_length);
+    while num > 0 {
+        match h.obj(&tail) {
+            Some(Obj::Cons(_, d)) => tail = d.clone(),
+            _ => break,
+        }
+        num -= 1;
+    }
+    Ok(tail)
+}
+
+/// `BASE_EQ` for the two cases a list walk can produce: two heap handles, or two
+/// identical immediates. Enough for cycle detection, where only conses can match.
+fn value_eq_obj(a: &Value, b: &Value) -> bool {
+    matches!((a, b), (Value::Obj(x), Value::Obj(y)) if x == y)
+}
+
+fn nth_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    // fns.c: `Fnth` is literally `Fcar (Fnthcdr (n, list))`.
+    let cur = nthcdr_fn(h, a)?;
     match h.obj(&cur) {
         Some(Obj::Cons(car, _)) => Ok(car.clone()),
         _ if is_nil(&cur) => Ok(Value::Undef),
@@ -2258,51 +2377,137 @@ fn substring(h: &mut ElispHost, a: &[Value]) -> R {
         Seq::Vec(v) => Ok(h.alloc(Obj::Vector(v[start as usize..end as usize].to_vec()))),
     }
 }
+/// subr.el `split-string-default-separators` — space, formfeed, tab, newline,
+/// carriage return and vertical tab, and nothing else. Notably NOT "Unicode
+/// whitespace": `(split-string "a\u{a0}b")` is `("a\u{a0}b")` in Emacs, one
+/// element, because a no-break space is not in this class.
+pub(crate) const SPLIT_STRING_DEFAULT_SEPARATORS: &str = "[ \u{c}\t\n\r\u{b}]+";
+
+/// subr.el `split-string`, ported including its `push-one` closure.
+///
+/// The previous implementation split with `Regex::split` and dropped TRIM on the
+/// floor, which is three separate divergences: TRIM was never applied, never
+/// type-checked (`(split-string "abc" "b" nil 97)` must be
+/// `(wrong-type-argument stringp 97)`), and the default-separator path used
+/// Rust's Unicode-aware `split_whitespace` instead of the ASCII-only regexp
+/// above. Reproducing subr.el's index walk also reproduces its one sharp edge: a
+/// leading TRIM whose match runs past the end of the segment leaves
+/// `this-start > this-end`, and `substring` then signals
+/// `(args-out-of-range "aXb" 2 1)` rather than silently yielding "".
 fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
-    // With the default separators (whitespace) OMIT-NULLS is implicitly on; with
-    // an explicit SEPARATORS it defaults off unless the 3rd arg is non-nil.
-    let default_seps = a.len() < 2 || is_nil(&a[1]);
-    // subr.el splits via `(string-match SEPARATORS STRING …)`, which type-checks
-    // the regexp before the string: (split-string [1 2] 97) is `stringp 97`.
-    let explicit_sep = if default_seps {
-        None
+    // `(keep-nulls (not (if separators omit-nulls t)))` — with the default
+    // separators OMIT-NULLS is implicitly on; with an explicit SEPARATORS it is
+    // off unless the 3rd argument says otherwise.
+    let has_seps = a.len() > 1 && !is_nil(&a[1]);
+    let keep_nulls = has_seps && a.get(2).is_none_or(is_nil);
+    // `(rexp (or separators split-string-default-separators))`. `string-match`
+    // type-checks the regexp before the string, so a bad SEPARATORS is reported
+    // before a bad STRING: (split-string [1 2] 97) is `stringp 97`.
+    let rexp = if has_seps {
+        as_string(h, &a[1])?
     } else {
-        Some(as_string(h, &a[1])?)
+        SPLIT_STRING_DEFAULT_SEPARATORS.to_string()
     };
-    let s = as_string(h, &a[0])?;
-    let omit_nulls = default_seps || a.get(2).is_some_and(|v| !is_nil(v));
-    let mut parts: Vec<String> = if default_seps {
-        s.split_whitespace().map(|w| w.to_string()).collect()
-    } else {
-        let sep = explicit_sep.unwrap();
-        if sep.is_empty() {
-            // An empty separator regexp matches at every position, including
-            // before the first character and after the last, so Emacs yields a
-            // leading and a trailing "" — (split-string "a1b" "") is
-            // ("" "a" "1" "b" ""). They drop out under OMIT-NULLS.
-            if s.is_empty() {
-                vec![String::new()]
-            } else {
-                let mut out = vec![String::new()];
-                out.extend(s.chars().map(|c| c.to_string()));
-                out.push(String::new());
-                out
+    let string = as_string(h, &a[0])?;
+    let cf = case_fold_search(h);
+    let re = compile_cf(&rexp, cf)?;
+    // TRIM is only ever touched inside `push-one`, i.e. after STRING and
+    // SEPARATORS have both been accepted.
+    let trim = match a.get(3) {
+        Some(v) if !is_nil(v) => Some(as_string(h, v)?),
+        _ => None,
+    };
+    let trim_re = match &trim {
+        Some(t) => Some((
+            compile_cf(t, cf)?,
+            // `(concat trim "\\'")` — anchored at the end of the SUBSTRING.
+            compile_cf(&format!("{t}\\'"), cf)?,
+        )),
+        None => None,
+    };
+
+    let chars: Vec<char> = string.chars().collect();
+    let len = chars.len();
+    let mut out: Vec<String> = Vec::new();
+    // `substring`'s args-out-of-range names the string itself; render it now, as
+    // `push-one` below borrows `out` and cannot also hold the host.
+    let string_readable = h.print(&Value::str(string.clone()), true);
+
+    // `push-one`: trim both ends of [this_start, this_end) and keep what is left.
+    let mut push_one = |this_start: usize, this_end: usize| -> Result<(), String> {
+        let mut this_start = this_start;
+        if let Some((head_re, tail_re)) = &trim_re {
+            // "Discard the trim from start of this substring." The match is taken
+            // against the WHOLE string from this-start, and only counts when it
+            // begins exactly there — so a context-sensitive TRIM like "\\<a\\>"
+            // sees the characters before the segment, as in Emacs.
+            if let Some(sp) = run_match(head_re, &string, this_start) {
+                if let Some((b, e)) = sp[0] {
+                    if b == this_start {
+                        this_start = e;
+                    }
+                }
             }
-        } else {
-            // SEPARATORS is a regexp in Emacs, not a literal string, and the
-            // split honors `case-fold-search` (default t) exactly as the
-            // `string-match` loop in subr.el does.
-            let re = compile_cf(&sep, case_fold_search(h))?;
-            re.split(&s)
-                .filter_map(|w| w.ok())
-                .map(|w| w.to_string())
-                .collect()
+            if keep_nulls || this_start < this_end {
+                if this_start > this_end {
+                    return Err(format!(
+                        "args-out-of-range: {} {this_start} {this_end}",
+                        string_readable
+                    ));
+                }
+                let mut this: String = chars[this_start..this_end].iter().collect();
+                // "Discard the trim from end of this substring."
+                if let Some(sp) = run_match(tail_re, &this, 0) {
+                    if let Some((b, _)) = sp[0] {
+                        let n = this.chars().count();
+                        if b < n {
+                            this = this.chars().take(b).collect();
+                        }
+                    }
+                }
+                // "Trimming could make it empty; check again."
+                if keep_nulls || !this.is_empty() {
+                    out.push(this);
+                }
+            }
+            return Ok(());
         }
+        if keep_nulls || this_start < this_end {
+            out.push(chars[this_start..this_end].iter().collect());
+        }
+        Ok(())
     };
-    if omit_nulls {
-        parts.retain(|w| !w.is_empty());
+
+    let mut start = 0usize;
+    let mut notfirst = false;
+    let mut match_begin = 0usize;
+    loop {
+        // `(if (and notfirst (= start (match-beginning 0)) (< start (length string)))
+        //      (1+ start) start)` — step past a zero-width separator match.
+        let from = if notfirst && start == match_begin && start < len {
+            start + 1
+        } else {
+            start
+        };
+        let Some(spans) = run_match(&re, &string, from) else {
+            break;
+        };
+        let Some((mb, me)) = spans[0] else { break };
+        // `string-match` has already run (and set the match data) before the
+        // `(< start (length string))` conjunct is tested, so MATCH_BEGIN updates
+        // even on the iteration that ends the loop.
+        match_begin = mb;
+        if start >= len {
+            break;
+        }
+        notfirst = true;
+        let (this_start, this_end) = (start, mb);
+        start = me;
+        push_one(this_start, this_end)?;
     }
-    Ok(h.list_from(parts.into_iter().map(Value::str).collect()))
+    // "Handle the substring at the end of STRING."
+    push_one(start, len)?;
+    Ok(h.list_from(out.into_iter().map(Value::str).collect()))
 }
 /// The `(length V)` the Lisp definitions of `string-prefix-p`/`string-suffix-p`
 /// take before any string check — with `length`'s own `sequencep`/`listp`
@@ -6830,6 +7035,7 @@ pub fn install(h: &mut ElispHost) {
     s("reverse", 1, Some(1), reverse_fn);
     s("length", 1, Some(1), length_fn);
     s("nth", 2, Some(2), nth_fn);
+    s("nthcdr", 2, Some(2), nthcdr_fn);
     // c[ad]+r combinators (3-level completers + cl-lib 2-level aliases)
     s("caadr", 1, Some(1), caadr);
     s("cadar", 1, Some(1), cadar);

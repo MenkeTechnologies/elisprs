@@ -247,6 +247,53 @@ fn valid_brace_body(body: &str) -> bool {
     }
 }
 
+/// Emacs's `[:class:]` names, as class BODY text for the `regex` crate.
+///
+/// The `regex` crate's own POSIX classes are ASCII-only, so copying `[:alpha:]`
+/// through left `(string-match "[[:alpha:]]" "Ü")` at nil where Emacs answers 0.
+/// Emacs's classes are defined over the whole character set (Elisp manual,
+/// "Char Classes"), so each one is re-expressed as the Unicode property the
+/// manual names. `None` keeps the `regex` crate's own definition, which for
+/// `digit`/`xdigit` already agrees with Emacs char for char.
+///
+/// `upper`/`lower` need no special handling for `case-fold-search`: the manual
+/// says a non-nil `case-fold-search` makes `[:upper:]` match lower case too, and
+/// `compile_cf` already compiles under `(?i)` in exactly that case, which applies
+/// Unicode case folding to these classes and produces the same set.
+///
+/// NOT closed here, and left at the crate's ASCII-only definition on purpose:
+/// `graph` and `print`. The manual defines both by COMPLEMENT ("any character
+/// except whitespace, control characters, surrogates, and unassigned
+/// codepoints"), and a complement is not expressible as class body text —
+/// `[[^…]…]` needs nested classes, which fancy-regex's parser rejects
+/// ("error parsing pattern"). Reaching them means either translating the whole
+/// alternative rather than one member, or a different engine.
+/// `space`/`punct`/`word` are improved but still approximations: in Emacs those
+/// three read the SYNTAX TABLE, not a Unicode property, so their answer depends
+/// on the major mode — `(string-match "[[:space:]]" "\n")` is nil in
+/// fundamental-mode and 0 in text-mode. elisprs has no syntax table to consult.
+fn posix_class(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "alpha" => r"\p{Alphabetic}\p{M}",
+        "alnum" => r"\p{Alphabetic}\p{M}\p{Nd}",
+        "space" => r"\p{White_Space}",
+        "upper" => r"\p{Uppercase}",
+        "lower" => r"\p{Lowercase}",
+        "punct" => r"\p{P}\p{S}",
+        "word" => r"\p{Alphabetic}\p{Nd}\p{M}",
+        "blank" => "\t\\p{Zs}",
+        // "any ASCII control character (ASCII codes 0 to 31)" — DEL is NOT one,
+        // and the `regex` crate's own `[:cntrl:]` includes it.
+        "cntrl" => r"\x00-\x1F",
+        // "matches any ASCII character (codes 0-127)" / its complement. These two
+        // and the byte-width pair below were not classes the `regex` crate knows
+        // at all.
+        "ascii" | "unibyte" => "[:ascii:]",
+        "nonascii" | "multibyte" => "[:^ascii:]",
+        _ => return None,
+    })
+}
+
 /// Copy a `[...]` character alternative from `it` into `out`, leading `[`
 /// already consumed. Handles a `^` negation and a `]` that appears first (or
 /// first-after-`^`) as a literal, matching elisp/POSIX rules.
@@ -278,14 +325,22 @@ fn copy_class(
                 out.push_str("\\\\");
                 buf.push('\\');
             }
-            // POSIX class `[:alpha:]` — copy through its closing `:]`.
+            // POSIX class `[:alpha:]`.
             '[' if it.peek() == Some(&':') => {
-                out.push('[');
+                let mut name = String::new();
+                let mut raw = String::from("[");
                 for n in it.by_ref() {
-                    out.push(n);
+                    raw.push(n);
                     if n == ']' {
                         break;
                     }
+                    if n != ':' {
+                        name.push(n);
+                    }
+                }
+                match posix_class(&name) {
+                    Some(repl) => out.push_str(repl),
+                    None => out.push_str(&raw),
                 }
             }
             // A bare `[` is an ordinary member in elisp/POSIX bracket expressions
