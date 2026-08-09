@@ -1030,7 +1030,7 @@ impl ElispHost {
             Some(Obj::Symbol(s)) => Some(s.name.clone()),
             _ => match v {
                 Value::Bool(true) => Some("t".to_string()),
-                Value::Undef => Some("nil".to_string()),
+                _ if el_nil(v) => Some("nil".to_string()),
                 _ => None,
             },
         }
@@ -1051,8 +1051,10 @@ impl ElispHost {
         let mut out = Vec::new();
         let mut cur = v.clone();
         loop {
+            if el_nil(&cur) {
+                return Some(out);
+            }
             match &cur {
-                Value::Undef => return Some(out),
                 Value::Obj(id) => match self.arena.get(*id as usize) {
                     Some(Obj::Cons(a, d)) => {
                         out.push(a.clone());
@@ -1303,9 +1305,12 @@ impl ElispHost {
                 _ => Err("not a symbol".to_string()),
             };
         }
+        // `nil` and `t` are self-evaluating symbols; `nil` arrives either as
+        // `Undef` (a literal) or as `Bool(false)` (a comparison that answered
+        // false), and both are the same symbol.
         match v {
             Value::Bool(true) => Ok(Value::Bool(true)),
-            Value::Undef => Ok(Value::Undef),
+            _ if el_nil(v) => Ok(Value::Undef),
             _ => Err("not a symbol".to_string()),
         }
     }
@@ -1326,9 +1331,12 @@ impl ElispHost {
                 _ => Err("not a symbol".to_string()),
             };
         }
+        // `nil` and `t` are self-evaluating symbols; `nil` arrives either as
+        // `Undef` (a literal) or as `Bool(false)` (a comparison that answered
+        // false), and both are the same symbol.
         match v {
             Value::Bool(true) => Ok(Value::Bool(true)),
-            Value::Undef => Ok(Value::Undef),
+            _ if el_nil(v) => Ok(Value::Undef),
             _ => Err("not a symbol".to_string()),
         }
     }
@@ -3857,9 +3865,22 @@ fn ensure_float_syntax(s: String) -> String {
     }
 }
 
-/// elisp truthiness: only `nil` (fusevm `Undef`) is false.
+/// True when V is elisp `nil`.
+///
+/// `nil` has two spellings on the VM. A literal `nil` compiles to fusevm
+/// `Undef`, but every op that answers a boolean — `Op::NumLt` and the rest of
+/// the comparisons the compiler lowers `<`/`=`/`>` to — answers
+/// `Value::Bool(false)`. Both are elisp's one `nil`, so every place that accepts
+/// `nil` has to accept both spellings: `(length (= 5 42))` is `0` in Emacs, and
+/// treating only `Undef` as the empty list made it `(wrong-type-argument
+/// sequencep nil)` — an error naming the very value it refused to recognise.
+pub fn el_nil(v: &Value) -> bool {
+    matches!(v, Value::Undef | Value::Bool(false))
+}
+
+/// elisp truthiness: only `nil` is false.
 pub fn el_truthy(v: &Value) -> bool {
-    !matches!(v, Value::Undef | Value::Bool(false))
+    !el_nil(v)
 }
 
 /// Render a symbol name the way `prin1` does: with `\` escapes so it reads back

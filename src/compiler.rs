@@ -213,9 +213,7 @@ fn needs_arity_guard(h: &ElispHost, head: &Value, argc: usize) -> bool {
         return false;
     }
     let kind = h.fn_kind(head);
-    matches!(kind, FnKind::Vacant)
-        || kind.rejects_before_args(argc)
-        || h.is_subr_aliased(head)
+    matches!(kind, FnKind::Vacant) || kind.rejects_before_args(argc) || h.is_subr_aliased(head)
 }
 
 /// Lower a call to a native fusevm op sequence when the operator is a core

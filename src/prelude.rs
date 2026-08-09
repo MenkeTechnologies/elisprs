@@ -423,8 +423,7 @@ pub const PRELUDE: &str = r#"
         (key (cl--getkey keys :key 'identity))
         (from-end (cl--getkey keys :from-end nil))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil)))
-    (cl--remove-by (lambda (x) (if pred (funcall pred (funcall key x))
-                                 (null (funcall key x))))
+    (cl--remove-by (lambda (x) (cl--if-test pred (funcall key x)))
                    seq start end count from-end)))
 (defun cl-remove-if-not (pred seq &rest keys)
   ;; A nil PRED takes the same cl--check-test item-eql fallback as
@@ -442,18 +441,37 @@ pub const PRELUDE: &str = r#"
 ;; still signals, because `(car t)' does. Vectors and strings still convert.
 (defun cl--search-seq (seq) (if (listp seq) seq (append seq nil)))
 
+;; The predicate test every cl-seq `*-if' entry point performs.
+;;
+;; cl-seq.el has no `*-if' loop of its own: `cl-find-if' is
+;; `(apply #'cl-find nil SEQ :if PRED KEYS)', and the loop then runs
+;; `cl--check-test-nokey', whose cond is
+;;
+;;   (cond (cl-test  (eq (not (funcall cl-test ITEM X)) cl-test-not))
+;;         (cl-if    (eq (not (funcall cl-if X)) cl-if-not))
+;;         (t        (eql ITEM X)))
+;;
+;; With a nil PRED the `cl-if' clause is not taken, so the cond falls through to
+;; `(eql ITEM X)' — and ITEM is the nil the `*-if' wrapper passed.  Every `*-if'
+;; function therefore degenerates to "match the nil elements" rather than
+;; calling nil: `(cl-position-if nil '(1 nil 2))' is 1, not `void-function nil'.
+;; `:if-not' takes the same route (cl--parsing-keywords moves its value into
+;; `cl-if', so a nil there also leaves both unset).
+(defun cl--if-test (pred x) (if pred (funcall pred x) (null x)))
+
 (defun cl-find-if (pred seq &rest keys)
   (let ((key (cl--getkey keys :key 'identity))
         (from-end (cl--getkey keys :from-end nil))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
         (lst (cl--search-seq seq)) (i 0) (r nil) (found nil))
     (while (and lst (or from-end (not found)))
-      (when (and (cl--in-bounds i start end) (funcall pred (funcall key (car lst))))
+      (when (and (cl--in-bounds i start end) (cl--if-test pred (funcall key (car lst))))
         (setq r (car lst) found t))
       (setq i (1+ i) lst (cdr lst)))
     r))
 (defun cl-find-if-not (pred seq &rest keys)
-  (apply 'cl-find-if (lambda (x) (not (funcall pred x))) seq keys))
+  (if pred (apply 'cl-find-if (lambda (x) (not (funcall pred x))) seq keys)
+    (apply 'cl-find-if nil seq keys)))
 (defun cl-sort (seq pred &rest keys)
   ;; Faithful cl-seq.el: a non-list SEQ is sorted as a list and written back
   ;; (cl-replace); a string round-trips through vconcat/concat. The
@@ -578,22 +596,50 @@ pub const PRELUDE: &str = r#"
           (t tree))))
 (defun cl-sublis (alist tree &rest keys)
   ;; Substitute per ALIST of (OLD . NEW) throughout TREE, honoring :test,
-  ;; :test-not and :key against each node (including cons cells).
+  ;; :test-not, :if, :if-not and :key against each node (including cons cells).
+  ;; `:if'/`:if-not' are how `cl-subst-if' and `cl-subst-if-not' reach here.
   (let ((test (cl--getkey keys :test nil))
         (test-not (cl--getkey keys :test-not nil))
+        (if-fn (cl--getkey keys :if nil))
+        (if-not (cl--getkey keys :if-not nil))
         (key (cl--getkey keys :key 'identity)))
-    (cl--sublis-rec alist tree test test-not key)))
-(defun cl--sublis-rec (alist tree test test-not key)
+    (cl--sublis-rec alist tree test test-not if-fn if-not key)))
+;; cl--check-test-nokey's cond in full — :test / :test-not first, then the
+;; :if / :if-not predicate, then the implicit `eql' against the alist key.
+(defun cl--sublis-match (test test-not if-fn if-not item x)
+  (cond (test (funcall test item x))
+        (test-not (not (funcall test-not item x)))
+        (if-fn (funcall if-fn x))
+        (if-not (not (funcall if-not x)))
+        (t (eql item x))))
+(defun cl--sublis-rec (alist tree test test-not if-fn if-not key)
   (let ((keyed (funcall key tree)) (p alist) (hit nil))
     (while (and p (not hit))
-      (if (cl--seq-match test test-not (car (car p)) keyed)
+      (if (cl--sublis-match test test-not if-fn if-not (car (car p)) keyed)
           (setq hit p)
         (setq p (cdr p))))
     (if hit (cdr (car hit))
       (if (consp tree)
-          (cons (cl--sublis-rec alist (car tree) test test-not key)
-                (cl--sublis-rec alist (cdr tree) test test-not key))
+          (cons (cl--sublis-rec alist (car tree) test test-not if-fn if-not key)
+                (cl--sublis-rec alist (cdr tree) test test-not if-fn if-not key))
         tree))))
+(defun cl-nsublis (alist tree &rest keys)
+  ;; elisprs rebuilds the tree rather than mutating it; the return value is
+  ;; what callers rely on, and cl-seq.el's destructive form returns the same.
+  (apply 'cl-sublis alist tree keys))
+;; cl-subst-if / cl-subst-if-not (cl-seq.el): substitute NEW for every TREE node
+;; the predicate accepts.  Both route through `cl-sublis' with the one-entry
+;; alist ((nil . NEW)) — which is why a nil PREDICATE replaces the nil nodes,
+;; the list's own terminating nil included: `(cl-subst-if 9 nil '(1 nil 2))' is
+;; `(1 9 2 . 9)'.
+(defun cl-subst-if (new pred tree &rest keys)
+  (apply 'cl-sublis (list (cons nil new)) tree :if pred keys))
+(defun cl-subst-if-not (new pred tree &rest keys)
+  (apply 'cl-sublis (list (cons nil new)) tree :if-not pred keys))
+(defun cl-nsubst-if (new pred tree &rest keys)
+  (apply 'cl-nsublis (list (cons nil new)) tree :if pred keys))
+(defun cl-nsubst-if-not (new pred tree &rest keys)
+  (apply 'cl-nsublis (list (cons nil new)) tree :if-not pred keys))
 ;; NOTE: `push'/`dolist' are defined later in this file, so these helpers use
 ;; explicit `while'/`setq'/`cons' loops to stay valid at load time.
 (defun cl-maplist (fn list)
@@ -1846,24 +1892,26 @@ TYPE nil maps for side effects only and returns nil."
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
         (lst (append seq nil)) (i 0) (n 0))
     (while lst
-      (when (and (cl--in-bounds i start end) (funcall pred (funcall key (car lst))))
+      (when (and (cl--in-bounds i start end) (cl--if-test pred (funcall key (car lst))))
         (setq n (1+ n)))
       (setq i (1+ i) lst (cdr lst)))
     n))
 (defun cl-count-if-not (pred seq &rest keys)
-  (apply 'cl-count-if (lambda (x) (not (funcall pred x))) seq keys))
+  (if pred (apply 'cl-count-if (lambda (x) (not (funcall pred x))) seq keys)
+    (apply 'cl-count-if nil seq keys)))
 (defun cl-position-if (pred seq &rest keys)
   (let ((key (cl--getkey keys :key 'identity))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
         (from-end (cl--getkey keys :from-end nil))
         (lst (cl--search-seq seq)) (i 0) (r nil))
     (while (and lst (or from-end (not r)))
-      (when (and (cl--in-bounds i start end) (funcall pred (funcall key (car lst))))
+      (when (and (cl--in-bounds i start end) (cl--if-test pred (funcall key (car lst))))
         (setq r i))
       (setq i (1+ i) lst (cdr lst)))
     r))
 (defun cl-position-if-not (pred seq &rest keys)
-  (apply 'cl-position-if (lambda (x) (not (funcall pred x))) seq keys))
+  (if pred (apply 'cl-position-if (lambda (x) (not (funcall pred x))) seq keys)
+    (apply 'cl-position-if nil seq keys)))
 (defun cl-find (item seq &rest keys)
   (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
         (key (cl--getkey keys :key 'identity)) (from-end (cl--getkey keys :from-end nil))
@@ -2515,19 +2563,21 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 (defun cl-member-if (pred lst &rest keys)
   (let ((key (cl--getkey keys :key 'identity)) (r nil))
     (while (and lst (not r))
-      (if (funcall pred (funcall key (car lst))) (setq r lst) (setq lst (cdr lst))))
+      (if (cl--if-test pred (funcall key (car lst))) (setq r lst) (setq lst (cdr lst))))
     r))
 (defun cl-member-if-not (pred lst &rest keys)
-  (apply 'cl-member-if (lambda (x) (not (funcall pred x))) lst keys))
+  (if pred (apply 'cl-member-if (lambda (x) (not (funcall pred x))) lst keys)
+    (apply 'cl-member-if nil lst keys)))
 (defun cl-assoc-if (pred alist &rest keys)
   (let ((key (cl--getkey keys :key 'identity)) (r nil))
     (while (and alist (not r))
       (let ((pair (car alist)))
-        (if (and (consp pair) (funcall pred (funcall key (car pair))))
+        (if (and (consp pair) (cl--if-test pred (funcall key (car pair))))
             (setq r pair) (setq alist (cdr alist)))))
     r))
 (defun cl-assoc-if-not (pred alist &rest keys)
-  (apply 'cl-assoc-if (lambda (x) (not (funcall pred x))) alist keys))
+  (if pred (apply 'cl-assoc-if (lambda (x) (not (funcall pred x))) alist keys)
+    (apply 'cl-assoc-if nil alist keys)))
 (defun cl-rassoc (item alist &rest keys)
   (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
         (key (cl--getkey keys :key 'identity)) (r nil))
@@ -2540,11 +2590,12 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
   (let ((key (cl--getkey keys :key 'identity)) (r nil))
     (while (and alist (not r))
       (let ((pair (car alist)))
-        (if (and (consp pair) (funcall pred (funcall key (cdr pair))))
+        (if (and (consp pair) (cl--if-test pred (funcall key (cdr pair))))
             (setq r pair) (setq alist (cdr alist)))))
     r))
 (defun cl-rassoc-if-not (pred alist &rest keys)
-  (apply 'cl-rassoc-if (lambda (x) (not (funcall pred x))) alist keys))
+  (if pred (apply 'cl-rassoc-if (lambda (x) (not (funcall pred x))) alist keys)
+    (apply 'cl-rassoc-if nil alist keys)))
 ;; Element-match predicate honoring :test / :test-not (default `eql'), mirroring
 ;; cl--check-test-nokey in cl-seq.el. X is the already-:key-extracted value; the
 ;; test is called (funcall TEST item x) — item first, element second.
@@ -2599,10 +2650,11 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
   (let ((key (cl--getkey keys :key 'identity)) (count (cl--getkey keys :count nil))
         (from-end (cl--getkey keys :from-end nil))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil)))
-    (cl--subst-by (lambda (x) (funcall pred (funcall key x)))
+    (cl--subst-by (lambda (x) (cl--if-test pred (funcall key x)))
                   new seq start end count from-end)))
 (defun cl-substitute-if-not (new pred seq &rest keys)
-  (apply 'cl-substitute-if new (lambda (x) (not (funcall pred x))) seq keys))
+  (if pred (apply 'cl-substitute-if new (lambda (x) (not (funcall pred x))) seq keys)
+    (apply 'cl-substitute-if new nil seq keys)))
 ;; Destructive substitution: elisprs rebuilds the sequence, so these match the
 ;; non-destructive forms (the return value is what callers rely on).
 (defun cl-nsubstitute (new old seq &rest keys) (apply 'cl-substitute new old seq keys))
@@ -7248,11 +7300,19 @@ DESCRIPTOR's first char names the class, the second the matching char
 Return nil if SYNTAX is nil."
   (and syntax (logand (car syntax) 65535)))
 
-;; The standard syntax table, built once to mirror syntax.c `init_syntax_once'.
-;; ASCII entries reproduce the binary's `standard-syntax-table' exactly; all
-;; chars >= 128 default to word class (Emacs's dominant default), with U+00A0
-;; (no-break space) set to whitespace.  Full Unicode punctuation/whitespace
-;; categorization beyond that is not modeled (NAMED boundary).
+;; The standard syntax table, built once to mirror syntax.c `init_syntax_once'
+;; plus the Latin-1 block of lisp/international/characters.el.
+;;
+;; ASCII entries reproduce the binary's `standard-syntax-table' exactly.  So does
+;; the Latin-1 supplement (U+0080-U+00FF): syntax.c defaults every character at
+;; or above U+0080 to word, characters.el then gives the Latin-1 punctuation and
+;; symbols `.'/`_' classes, and the two lists below are that result, verified
+;; character by character against Emacs 30.2.  It is not a rule anyone can
+;; re-derive from Unicode's general categories -- U+00A5 YEN SIGN keeps word
+;; syntax while U+00A2..U+00A4 (the same Sc category) do not, and U+00B2/B3/B9
+;; keep it while U+00BC..U+00BE (the same No category) do not -- so it is carried
+;; as data.  Above U+00FF the word default still stands (NAMED boundary: the full
+;; Unicode categorization needs the uni-*.el property tables).
 (defvar --standard-syntax-table-- nil
   "The standard syntax table (see `standard-syntax-table').")
 
@@ -7264,23 +7324,32 @@ Return nil if SYNTAX is nil."
         (symbol (string-to-syntax "_")))
     ;; Word everywhere by default (letters, digits, most non-ASCII).
     (set-char-table-range tbl t word)
-    ;; Control chars 0..31 and DEL are SYMBOL constituents, not punctuation:
-    ;; `(char-syntax 1)' is 95 (`_') in Emacs 30.2, and so is `(char-syntax 127)'.
-    (set-char-table-range tbl '(0 . 31) symbol)
-    (aset tbl 127 symbol)
-    ;; ... except tab, formfeed, space and U+00A0, which are whitespace. `?\r' is
-    ;; deliberately NOT in this list -- Emacs leaves carriage return a symbol
-    ;; constituent (`(char-syntax ?\r)' => 95), unlike the other C0 whitespace.
-    (dolist (c '(?\t ?\f ?\s 160)) (aset tbl c space))
-    ;; Newline is COMMENT-END (`>', class 12 => `(char-syntax ?\n)' = 62), not
-    ;; whitespace. This is what makes `\s-' -- whitespace syntax -- fail to match
-    ;; a newline: `(string-match "\\s-" "\n")' is nil in Emacs. Classing it as
-    ;; whitespace made every `\s-' silently match across line boundaries.
-    (aset tbl ?\n (string-to-syntax ">"))
+    ;; Control chars 0..31 and DEL are PUNCTUATION here, and `?\n'/`?\r' are
+    ;; whitespace -- syntax.c `init_syntax_once' sets exactly that, and
+    ;;   emacs -Q --batch --eval '(with-syntax-table (standard-syntax-table) \
+    ;;                              (prin1 (list (char-syntax 1) (char-syntax ?\n) \
+    ;;                                           (char-syntax ?\r) (char-syntax 127))))'
+    ;;   => (46 32 32 46)
+    ;; confirms it on 30.2.  The `_'/`>' classes those characters are usually
+    ;; SEEN with -- `(char-syntax 1)' => 95, `(char-syntax ?\n)' => 62 -- come
+    ;; from the *buffer's* table, not this one: `emacs -Q --batch' starts in
+    ;; `*scratch*' under `lisp-interaction-mode', whose table reclassifies every
+    ;; non-alphanumeric ASCII.  That is installed below as the initial buffer's
+    ;; table; putting it here instead would make `(standard-syntax-table)' wrong
+    ;; for all 31 of those characters.
+    (set-char-table-range tbl '(0 . 31) punct)
+    (dolist (c '(?\t ?\n ?\f ?\r ?\s 160)) (aset tbl c space))
+    (aset tbl 127 punct)
     ;; ASCII punctuation.
     (dolist (c '(?! ?# ?' ?, ?. ?: ?\; ?? ?@ ?^ ?` ?~)) (aset tbl c punct))
     ;; ASCII symbol constituents.
     (dolist (c '(?& ?* ?+ ?- ?/ ?< ?= ?> ?_ ?|)) (aset tbl c symbol))
+    ;; Latin-1 supplement: ¡ § « » ¿ are punctuation, ...
+    (dolist (c '(161 167 171 187 191)) (aset tbl c punct))
+    ;; ... and the currency/modifier/math/other symbols are symbol constituents.
+    (dolist (c '(162 163 164 166 168 169 170 172 173 174 175 176 177
+                 180 182 183 184 186 188 189 190 215 247))
+      (aset tbl c symbol))
     ;; String quote and escape.
     (aset tbl ?\" (string-to-syntax "\""))
     (aset tbl ?\\ (string-to-syntax "\\"))
@@ -7430,6 +7499,22 @@ over the one current buffer's syntax-table slot.)"
     (modify-syntax-entry ?@ "_" table)
     table)
   "Syntax table used in `emacs-lisp-mode'.")
+
+;; `emacs -Q --batch' starts in `*scratch*', and `initial-major-mode' puts that
+;; buffer in `lisp-interaction-mode' -- a `define-derived-mode' child of
+;; `emacs-lisp-mode', so it inherits that mode's syntax table.  Every
+;; `char-syntax' / `\sC' answer a batch script sees therefore comes from the
+;; elisp table, not from `standard-syntax-table':
+;;
+;;   emacs -Q --batch --eval '(prin1 (list (char-syntax ?\;) (char-syntax ?.) \
+;;                                         (char-syntax ?$) (char-syntax ?{)))'
+;;   => (60 95 95 95)
+;;
+;; where the standard table answers (46 46 119 40).  Install it as the initial
+;; buffer's table so those agree.  The mode CHAIN itself (`prog-mode' ->
+;; `lisp-data-mode' -> `emacs-lisp-mode' -> `lisp-interaction-mode') is not
+;; ported, so `major-mode' stays `fundamental-mode'; only the table is modeled.
+(set-syntax-table emacs-lisp-mode-syntax-table)
 
 ;; Abbrev table placeholder (boundary: the abbrev/obarray subsystem is not
 ;; modeled).  An abbrev table is a plain vector here rather than a real obarray.

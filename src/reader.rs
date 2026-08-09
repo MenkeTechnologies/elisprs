@@ -6,7 +6,7 @@
 //! (incl. `1+`, `<=`, `:keywords`), `'quote`, `#'function`, `?c` char literals,
 //! `;` comments, backquote/unquote (`` ` `` `,` `,@`), and dotted pairs (`a . b`).
 
-use crate::host::{ElispHost, Obj};
+use crate::host::{el_truthy, ElispHost, Obj};
 use fusevm::Value;
 use num_bigint::BigInt;
 
@@ -167,13 +167,10 @@ impl Reader {
             }
             // #&N"…" — a bool-vector literal.
             '#' if self.peek_at(1) == Some('&') => self.read_bool_vector(h),
-            // #("string" …intervals) — read the string, dropping text properties.
+            // #("string" START END PLIST …) — a string with text-property intervals.
             '#' if self.peek_at(1) == Some('(') => {
                 self.pos += 1;
-                let lst = self.read_list(h)?;
-                Ok(h.list_vec(&lst)
-                    .and_then(|v| v.into_iter().next())
-                    .unwrap_or(Value::Undef))
+                self.read_propertized_string(h)
             }
             '#' if matches!(
                 self.peek_at(1),
@@ -558,6 +555,51 @@ impl Reader {
         }
     }
 
+    /// Read a `#("STRING" START END PLIST …)` propertized-string literal.
+    /// `self.pos` is at the `(`.
+    ///
+    /// Port of lread.c `read1`'s `#(` arm: read the string, then read triples
+    /// until the closing paren, applying each with `Fset_text_properties`. A
+    /// first element that is not a string — including `#()` — is
+    /// `invalid-read-syntax "#"`, and a trailing group of one or two elements is
+    /// `invalid-read-syntax "Invalid string property list"`. Both diagnostics are
+    /// lread.c's own text.
+    ///
+    /// The properties matter beyond `read`: `make_error_object` reconstructs a
+    /// condition's DATA by re-reading the printed message, so dropping them here
+    /// made `(car (propertize "foo" 'a 1))` report
+    /// `(wrong-type-argument listp "foo")` where Emacs reports
+    /// `(wrong-type-argument listp #("foo" 0 3 (a 1)))`.
+    fn read_propertized_string(&mut self, h: &mut ElispHost) -> Result<Value, String> {
+        let lst = self.read_list(h)?;
+        let items = h
+            .list_vec(&lst)
+            .ok_or_else(|| "invalid-read-syntax: #".to_string())?;
+        let Some(Value::Str(s)) = items.first().cloned() else {
+            return Err("invalid-read-syntax: #".to_string());
+        };
+        let len = s.chars().count() as i64;
+        let mut rest = &items[1..];
+        while !rest.is_empty() {
+            if rest.len() < 3 {
+                return Err("invalid-read-syntax: Invalid string property list".to_string());
+            }
+            let (beg, end) = (int_or_marker(h, &rest[0])?, int_or_marker(h, &rest[1])?);
+            let plist = validate_plist(h, &rest[2])?;
+            rest = &rest[3..];
+            // textprop.c `validate_interval_range`: an inverted range is swapped
+            // before the bounds check, and the check reports the *swapped* pair.
+            let (lo, hi) = if beg > end { (end, beg) } else { (beg, end) };
+            if !(0 <= lo && lo <= hi && hi <= len) {
+                return Err(format!("args-out-of-range: {lo} {hi}"));
+            }
+            if lo != hi {
+                h.string_set_props(&s, lo as usize, hi as usize, &plist);
+            }
+        }
+        Ok(Value::Str(s))
+    }
+
     /// Read a `#&N"PACKED"` bool-vector literal: N is the bit count, PACKED a
     /// unibyte string of `ceil(N/8)` bytes holding the bits LSB-first. `self.pos`
     /// is at the leading `#`.
@@ -622,6 +664,43 @@ impl Reader {
             Ok(classify(h, &tok))
         }
     }
+}
+
+/// `CHECK_FIXNUM_COERCE_MARKER`: an interval bound is an integer or a marker,
+/// and anything else is `(wrong-type-argument integer-or-marker-p X)`.
+fn int_or_marker(h: &ElispHost, v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Int(n) => Ok(*n),
+        _ => match h.marker_position(v) {
+            Some(p) => Ok(p as i64),
+            None => Err(format!(
+                "wrong-type-argument: integer-or-marker-p {}",
+                h.print(v, true)
+            )),
+        },
+    }
+}
+
+/// textprop.c `validate_plist`: nil and an even-length list pass through, an
+/// odd-length list is `error "Odd length text property list"`, and a non-list is
+/// wrapped as the single pair `(PLIST nil)`.
+fn validate_plist(h: &mut ElispHost, v: &Value) -> Result<Value, String> {
+    if !el_truthy(v) {
+        return Ok(Value::Undef);
+    }
+    if matches!(h.obj(v), Some(Obj::Cons(..))) {
+        let mut tail = v.clone();
+        while let Some(Obj::Cons(_, d)) = h.obj(&tail) {
+            let d = d.clone();
+            let Some(Obj::Cons(_, d2)) = h.obj(&d) else {
+                return Err("error: Odd length text property list".to_string());
+            };
+            tail = d2.clone();
+        }
+        return Ok(v.clone());
+    }
+    let nil = h.cons(Value::Undef, Value::Undef);
+    Ok(h.cons(v.clone(), nil))
 }
 
 fn quoted(h: &mut ElispHost, head: &str, form: Value) -> Value {

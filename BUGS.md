@@ -2107,3 +2107,186 @@ The widened corpus is now **1500/1500**.
   the closure→subr half would need every call to a user function to carry the
   guard, which is most calls in most programs. Not reproduced by the fuzzer —
   `fz-arity-form` only installs subrs on `fzwa`.
+
+---
+
+## Round 13 — the propertized-string read syntax, cl-seq's `*-if` contract, and nil's two spellings
+
+Sources this round: `scripts/fuzz_parity.sh` at two fresh seeds (777 × 3,000
+forms and 424242 × 5,000 forms, depth 4–5), hand-built probe corpora, and a
+*self-consistency* sweep — call every bound function once with a literal `nil`
+and once with `(= 5 42)` and report any pair of answers that differs. The last
+one needs no reference Emacs at all and found the widest class below.
+
+- **`#("TEXT" START END PLIST …)` read as a bare string** — ✅ FIXED
+  (`src/reader.rs:170`, `src/reader.rs:573`). The reader consumed the intervals
+  and threw them away, so `(read "#(\"foo\" 0 3 (a 1))")` answered `"foo"` where
+  Emacs answers `#("foo" 0 3 (a 1))`, and `(get-text-property 0 'a …)` was `nil`.
+  It is lread.c's `#(` arm now: read the string, then read triples until `)`,
+  applying each with `Fset_text_properties`. That brings textprop.c's contract
+  with it — `validate_interval_range` swaps an inverted range before the bounds
+  check and reports the *swapped* pair (`#("foo" 2 1 (a 1))` → `#("foo" 1 2 (a
+  1))`, `#("foo" -1 3 …)` → `(args-out-of-range -1 3)`), a bound that is not an
+  integer or marker is `(wrong-type-argument integer-or-marker-p 3.5)`, and
+  `validate_plist` signals `(error "Odd length text property list")` for an
+  odd-length list and wraps a non-list as the single pair `(PLIST nil)`
+  (`#("foo" 0 3 5)` → `#("foo" 0 3 (5 nil))`). A later triple *sets* rather than
+  merges, so `#("foo" 0 3 (a 1) 0 1 (b 2))` reads as
+  `#("foo" 0 1 (b 2) 1 3 (a 1))`. Both diagnostics are lread.c's own text:
+  a non-string first element (`#()`, `#(1 2 3)`) is `(invalid-read-syntax "#")`
+  and a trailing group of one or two elements is
+  `(invalid-read-syntax "Invalid string property list")`.
+- **Error DATA lost a string's text properties** — ✅ FIXED, as a consequence of
+  the above. `make_error_object` (`src/host.rs:3617`) rebuilds a condition's DATA
+  by *re-reading* the rendered message, so a reader that could not read `#(…)`
+  produced data whose offending value had been stripped:
+  `(car (propertize "foo" 'a 1))` was `(wrong-type-argument listp "foo")` against
+  Emacs's `(wrong-type-argument listp #("foo" 0 3 (a 1)))`. Same for
+  `(elt (propertize "abc" 'a 1) 9)` and `(aref (vector (propertize "foo" 'a 1)) 5)`.
+  This is what the fuzzer surfaced at seed 777; the reader was the root.
+- **A nil PREDICATE crashed every cl-seq `*-if` function** — ✅ FIXED
+  (`src/prelude.rs:460` `cl--if-test`, and its 16 call sites). cl-seq.el has no
+  `*-if` loop of its own: `cl-find-if` is `(apply #'cl-find nil SEQ :if PRED
+  KEYS)`, and `cl--check-test-nokey`'s cond only calls `cl-if` when it is
+  non-nil, falling through to `(eql ITEM X)` — with the nil ITEM the wrapper
+  passed — when it is not. So a nil predicate matches the *nil elements*:
+  `(cl-position-if nil '(1 nil 2))` is `1`, `(cl-count-if nil '(1 nil 2 nil))` is
+  `2`, `(cl-member-if nil '(1 nil 2))` is `(nil 2)`. elisprs funcalled it and
+  answered `(void-function nil)` in all of `cl-position-if`, `cl-find-if`,
+  `cl-count-if`, `cl-member-if`, `cl-assoc-if`, `cl-rassoc-if`,
+  `cl-substitute-if` and every `-if-not` sibling. `:if-not` takes the same route
+  (`cl--parsing-keywords` moves its value into `cl-if`, so a nil there also
+  leaves both unset) — which is why `(cl-position-if-not nil '(1 nil 2))` is also
+  `1` and not `0`. `cl-remove-if` already had the fallback, with a comment
+  naming this exact rule; the rest did not.
+- **`cl-subst-if` / `cl-subst-if-not` / `cl-nsubst-if` / `cl-nsubst-if-not` /
+  `cl-nsublis` were void** — ✅ FIXED (`src/prelude.rs:597`). Added as cl-seq.el
+  defines them: `cl-sublis` over the one-entry alist `((nil . NEW))` with the
+  predicate as `:if` / `:if-not`. That is why a nil predicate replaces the list's
+  own terminating nil — `(cl-subst-if 9 nil '(1 nil 2))` is `(1 9 2 . 9)` — and
+  why a real predicate matches cons nodes too, so
+  `(cl-subst-if-not 9 #'numberp '(1 nil 2))` collapses to `9`. `cl-sublis` now
+  reads `:if` / `:if-not` alongside `:test` / `:test-not` / `:key`.
+- **`nil` has two spellings on the VM and half the runtime knew one** — ✅ FIXED
+  (`src/host.rs:3763` `el_nil`, `src/host.rs:982` `list_vec`,
+  `src/host.rs:960` `sym_name`, `src/host.rs:1245`/`1271` the value cells,
+  `src/builtins.rs:671` `length`, `src/builtins.rs:4896` `bare-symbol-p`). A
+  literal `nil` compiles to fusevm `Undef`; every op that answers a boolean —
+  the comparisons the compiler lowers `<`/`=`/`>` to — answers
+  `Value::Bool(false)`. Both are elisp's one `nil`, and treating only `Undef` as
+  the empty list made `(length (= 5 42))` signal
+  `(wrong-type-argument sequencep nil)`: an error naming the very value it
+  refused to recognise. Emacs answers `0`. The same gap hit `reverse`, `mapcar`,
+  `mapc`, `mapcan`, `mapconcat`, `sort`, `apply`, `butlast`, `nbutlast`,
+  `delete-dups`, `string-join`, `seq-empty-p`, `cl-list-length`, `copy-alist`,
+  `symbol-name`, `symbol-value`, `default-toplevel-value`, `run-hooks`,
+  `run-hook-with-args`, `bare-symbol-p` and `assoc-string` — the last of which is
+  the round-10 open item "`(assoc-string nil LIST)` is `nil` in Emacs and
+  `(wrong-type-argument symbolp nil)` here", whose real trigger was a *computed*
+  nil, not a literal one. The self-consistency sweep now reports 0 functions
+  whose answer depends on which spelling it is handed.
+- **The syntax tables were each other's** — ✅ FIXED (`src/prelude.rs:7327`,
+  `src/prelude.rs:7503`). Round 11's R11-C read `(char-syntax C)` in the batch
+  `*scratch*` buffer and wrote those answers into `standard-syntax-table`. The
+  two are different tables, and the differential says so:
+
+  ```
+  $ emacs -Q --batch --eval '(prin1 (list (char-syntax 1) (char-syntax ?\n) (char-syntax ?\r) (char-syntax 127) (char-syntax ?\;)))'
+  (95 62 95 95 60)
+  $ emacs -Q --batch --eval '(with-syntax-table (standard-syntax-table) (prin1 (list (char-syntax 1) (char-syntax ?\n) (char-syntax ?\r) (char-syntax 127) (char-syntax ?\;))))'
+  (46 32 32 46 46)
+  ```
+
+  The first list is `lisp-interaction-mode`'s table — `emacs -Q --batch` starts
+  in `*scratch*`, and `initial-major-mode` puts it in that mode. The second is
+  syntax.c `init_syntax_once`'s, which is what `standard-syntax-table` must
+  return. R11-C moved the first list's values into the second table: it took
+  `(char-syntax C)` from 75 wrong characters to 16 and `standard-syntax-table`
+  from 28 wrong to 31. The root cause is one table short, not one table wrong —
+  `standard-syntax-table` is restored to syntax.c's, and the *initial buffer*
+  now gets `emacs-lisp-mode-syntax-table`, which the prelude already built.
+  Measured over all 256 characters of `(char-syntax C)` and of
+  `(with-syntax-table (standard-syntax-table) (char-syntax C))`:
+
+  | table | base | after round 11 | now |
+  |---|---|---|---|
+  | current buffer | 75 wrong | 16 wrong | **0** |
+  | `standard-syntax-table` | 28 wrong | 31 wrong | **0** |
+
+  R11-D's `\s-` result is unaffected — it is a fixed character set in
+  `src/regexp.rs`, not a table read — and still matches Emacs for
+  `\n \r \v \t \f`, space, U+00A0 and a letter in both polarities.
+- **`standard-syntax-table` called the whole Latin-1 supplement word** — ✅ FIXED
+  (`src/prelude.rs:7347`), and the 28 wrong characters in the table above are
+  these. syntax.c defaults every character at or above U+0080 to word and
+  lisp/international/characters.el's Latin-1 block then reclassifies the
+  punctuation and the symbols, so `(char-syntax ?¡)` is `?.` (46) and
+  `(char-syntax ?±)` is `?_` (95) in Emacs where both were `?w` (119) here. It is
+  carried as data, not as a rule: the classification is not re-derivable from
+  Unicode's general categories — U+00A5 YEN SIGN keeps word syntax while
+  U+00A2–U+00A4 (the same `Sc` category) do not, and U+00B2/B3/B9 keep it while
+  U+00BC–U+00BE (the same `No` category) do not.
+
+### Still open after round 13
+
+- **fusevm's block JIT coerces `t` in arithmetic** — SUBSTRATE, not fixable in
+  elisprs. Once a block has been JIT-compiled, `(- t)` answers `-1`, `(+ t 1)`
+  answers `2`, `(* t 2)` answers `2` and `(1+ t)` answers `2`, where Emacs
+  signals `(wrong-type-argument number-or-marker-p t)` every time. It reproduces
+  from the second evaluation of the same form:
+
+  ```
+  $ cat neg.el
+  (princ (format "1: %S\n" (condition-case e (- t) (error e))))
+  (princ (format "2: %S\n" (condition-case e (- t) (error e))))
+  $ emacs -Q --batch -l neg.el
+  1: (wrong-type-argument number-or-marker-p t)
+  2: (wrong-type-argument number-or-marker-p t)
+  $ elisp neg.el
+  1: (wrong-type-argument number-or-marker-p t)
+  2: -1
+  ```
+
+  The interpreter is correct (run 1); the JIT is not. The cause is in the
+  vendored crate: `fusevm-0.17.0/src/vm.rs:1010` and `src/jit.rs:5971` classify
+  `Value::Bool` as an `Int` slot (`*b as i64`) when they decide whether native
+  code may run, so `slots_all_numeric` stays true for a frame holding `t` and
+  the compiled trace does integer arithmetic on it. A `Value::Str` or a
+  `Value::Obj` correctly blocks the trace, which is why `(- "a")` and `(- 'sym)`
+  keep signalling. Strict numeric mode (a `NumericHook` installed) must not treat
+  `Bool` as numeric; that is a one-line change in fusevm, and elisprs must not
+  make it. The host-side alternatives are both unacceptable: stop lowering
+  arithmetic to native ops (surrenders the JIT on the hot path) or stop
+  representing `t` as `Value::Bool` (a 70-site change that also has to re-wrap
+  every comparison result the VM produces).
+- **`kill-buffer` can leave point past the buffer end, and the next
+  `buffer-substring` panics.** After the current buffer is killed, point is not
+  re-clamped to the successor buffer, so `(point)` can be `2` in an empty buffer;
+  `buffer_substring_core` (`src/builtins.rs:5998`) then slices `text[1..1]` of a
+  zero-length vector and the process aborts with a Rust panic instead of
+  signalling. Found by the self-consistency sweep, not by a parity diff — Emacs
+  never lets point leave `[begv, zv]`. The fix belongs in the buffer subsystem
+  (clamp point on every buffer switch), not in the slice.
+- **`(seq-elt (cons 1 2) 5)`** is `(wrong-type-argument listp 2)` in Emacs and
+  `(wrong-type-argument listp (1 . 2))` here — but *only* because Emacs's seq.el
+  is byte-compiled and the `Belt` bytecode has an inline cons walk whose final
+  `CAR` names the tail, while `Felt` (what interpreted code and elisprs both run)
+  is `Fcar (Fnthcdr …)` and `nthcdr_impl` names the whole list. Interpreted
+  Emacs agrees with elisprs: `(elt (cons 1 2) 5)` is
+  `(wrong-type-argument listp (1 . 2))` on both. Same root as the arity item
+  above — elisprs has no "this callee was byte-compiled" distinction.
+- **`\s_`, `\s<` and `\s>` do not read the syntax table.** `(string-match "\\s_"
+  "-")` and `(string-match "\\s<" ";")` are `0` in Emacs and `nil` here, and
+  `(string-match "\\s>" "\n")` likewise. `translate_escape` (`src/regexp.rs:208`)
+  maps `\sC` per class with a hardcoded set and falls back to the whitespace set
+  for every class it does not know; it is a pure string translator with no access
+  to the host, so it cannot consult `(syntax-table)`. That also means the classes
+  it *does* know are wrong under `with-syntax-table`. Closing it means resolving
+  `\sC` against the live table where the regexp is compiled, not in the
+  translator.
+- Unchanged from rounds 9, 10, 11 and 12, for the reasons already recorded there:
+  reader-level backquote preservation, `setf`'s gv expansion shape,
+  `hash-table-size`, `aset` on a string, the warm-cache `make-symbol` re-intern,
+  an empty-name uninterned symbol printing over-escaped, a void function's
+  arguments still being evaluated, special forms and macros not checking arity,
+  and the silent AOT run whose constants are not reconstructible.

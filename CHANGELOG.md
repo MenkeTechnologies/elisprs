@@ -121,6 +121,67 @@ All notable changes to elisprs are documented here. The format follows
   translates to the standard table's whitespace set `[\t\x0C\x{A0} ]`, and `\S-`
   to its complement.
 
+### Fixed (Emacs parity — round 13, propertized-string read syntax, cl-seq `*-if`, nil's two spellings, Latin-1 syntax)
+Found by `scripts/fuzz_parity.sh` (seeds 777 and 424242, 3,000 and 5,000 forms),
+by hand-built probe corpora, and by a self-consistency sweep that calls every
+bound function with a literal `nil` and with `(= 5 42)` and reports any answer
+that differs. Every expectation was byte-verified against `emacs -Q --batch` 30.2.
+
+- **`#("TEXT" START END PLIST …)` was read as a bare string.** The reader
+  consumed the intervals and dropped them, so a propertized literal lost every
+  property it was written with and `(read "#(\"foo\" 0 3 (a 1))")` answered
+  `"foo"`. It is now lread.c's `#(` arm: the string, then triples applied with
+  `Fset_text_properties` — including `validate_interval_range`'s range swap and
+  bounds check and `validate_plist`'s odd-length error and non-list wrapping —
+  with lread.c's own `invalid-read-syntax "#"` / `"Invalid string property list"`
+  diagnostics.
+- **Error DATA lost a string's text properties.** `make_error_object` rebuilds a
+  condition's data by re-reading the rendered message, so the reader gap above
+  made `(car (propertize "foo" 'a 1))` report `(wrong-type-argument listp "foo")`
+  where Emacs reports `(wrong-type-argument listp #("foo" 0 3 (a 1)))`. Same for
+  `args-out-of-range` on `aref` / `elt`.
+- **A nil predicate crashed every cl-seq `*-if` function.** cl-seq.el's `*-if`
+  wrappers pass their predicate through as `:if`, and `cl--check-test-nokey`
+  falls through to `(eql ITEM X)` — with the implicit nil ITEM — when it is nil,
+  so `(cl-position-if nil '(1 nil 2))` is `1` in Emacs and was `(void-function
+  nil)` here. Fixed across `cl-position-if`, `cl-find-if`, `cl-count-if`,
+  `cl-member-if`, `cl-assoc-if`, `cl-rassoc-if`, `cl-substitute-if`, their
+  `-if-not` siblings, and `cl-remove-if` / `cl-remove-if-not` / `cl-delete-if` /
+  `cl-delete-if-not`.
+- **`cl-subst-if`, `cl-subst-if-not`, `cl-nsubst-if`, `cl-nsubst-if-not` and
+  `cl-nsublis` were missing.** Added as cl-seq.el defines them — `cl-sublis` over
+  the one-entry alist `((nil . NEW))` with the predicate as `:if` / `:if-not`,
+  which is why `(cl-subst-if 9 nil '(1 nil 2))` is `(1 9 2 . 9)`. `cl-sublis` now
+  honours `:if` / `:if-not` as well as `:test` / `:test-not` / `:key`.
+- **`nil` has two VM spellings and half the runtime only knew one.** A literal
+  `nil` compiles to fusevm `Undef`, but a comparison that answers false produces
+  `Value::Bool(false)`; both are elisp's one `nil`. Treating only `Undef` as the
+  empty list made `(length (= 5 42))` signal `(wrong-type-argument sequencep nil)`
+  — an error naming the very value it refused to recognise — and did the same for
+  `reverse`, `mapcar`, `mapc`, `mapcan`, `mapconcat`, `sort`, `apply`, `butlast`,
+  `nbutlast`, `delete-dups`, `string-join`, `seq-empty-p`, `cl-list-length`,
+  `symbol-name`, `symbol-value`, `default-toplevel-value`, `run-hooks`,
+  `run-hook-with-args`, `bare-symbol-p` and `assoc-string`. There is now one
+  `el_nil` predicate and `list_vec` / `sym_name` / `length` / the symbol-value
+  cells use it.
+- **`standard-syntax-table` and the current buffer's table were each other's.**
+  Round 11 read `(char-syntax C)` in the batch `*scratch*` buffer and wrote those
+  answers into `standard-syntax-table`, but those are two different tables:
+  `emacs -Q --batch` starts in `lisp-interaction-mode`, whose table answers
+  `(95 62 95 95 60)` for `(char-syntax 1)`/`?\n`/`?\r`/`127`/`?\;` while
+  `(with-syntax-table (standard-syntax-table) …)` answers `(46 32 32 46 46)`.
+  `standard-syntax-table` is restored to syntax.c `init_syntax_once`'s, and the
+  initial buffer now gets the `emacs-lisp-mode-syntax-table` the prelude already
+  builds. Over all 256 characters, `(char-syntax C)` goes from 16 wrong to 0 and
+  `(with-syntax-table (standard-syntax-table) (char-syntax C))` from 31 to 0.
+  Round 11's `\s-` fix is unaffected — it is a fixed character set in
+  `src/regexp.rs`, not a table read.
+- **`standard-syntax-table` called the whole Latin-1 supplement word.**
+  syntax.c defaults everything at or above U+0080 to word and characters.el's
+  Latin-1 block then reclassifies its punctuation and symbols, so `(char-syntax
+  ?¡)` is `?.` and `(char-syntax ?±)` is `?_` in Emacs where both were `?w` here.
+  U+0080–U+00FF now matches Emacs 30.2 character for character.
+
 ### Fixed (Emacs parity — round 8, exact arithmetic, argument order, filevercmp, non-finite floats)
 Found by `scripts/fuzz_parity.sh` plus hand-built probe corpora, and verified by
 byte-diffing stdout, stderr and exit status against `emacs -Q --batch` 30.2 on

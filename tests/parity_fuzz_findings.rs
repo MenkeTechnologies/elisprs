@@ -1025,7 +1025,10 @@ fn a_radix_literal_may_exceed_the_fixnum_range() {
 #[test]
 fn rounding_with_a_divisor_is_exact_and_promotes() {
     assert_eq!(eval("(floor 1.0e30 3)"), "333333333333333339961541612885");
-    assert_eq!(eval("(truncate 1.0e30 3)"), "333333333333333339961541612885");
+    assert_eq!(
+        eval("(truncate 1.0e30 3)"),
+        "333333333333333339961541612885"
+    );
     assert_eq!(eval("(ceiling 1.0e30 3)"), "333333333333333339961541612886");
     assert_eq!(eval("(round 1.0e30 3)"), "333333333333333339961541612885");
     assert_eq!(eval("(floor -1.0e30 3)"), "-333333333333333339961541612886");
@@ -1064,9 +1067,18 @@ fn rounding_with_a_divisor_is_exact_and_promotes() {
 /// as it evaluated and skipped the rest.
 #[test]
 fn nary_arithmetic_evaluates_all_arguments_first() {
-    assert_eq!(eval("(let ((n 0)) (ignore-errors (* 1 t (setq n 9))) n)"), "9");
-    assert_eq!(eval("(let ((n 0)) (ignore-errors (+ 1 t (setq n 9))) n)"), "9");
-    assert_eq!(eval("(let ((n 0)) (ignore-errors (- 1 t (setq n 9))) n)"), "9");
+    assert_eq!(
+        eval("(let ((n 0)) (ignore-errors (* 1 t (setq n 9))) n)"),
+        "9"
+    );
+    assert_eq!(
+        eval("(let ((n 0)) (ignore-errors (+ 1 t (setq n 9))) n)"),
+        "9"
+    );
+    assert_eq!(
+        eval("(let ((n 0)) (ignore-errors (- 1 t (setq n 9))) n)"),
+        "9"
+    );
     assert_eq!(
         eval("(condition-case e (* 1 t (error \"boom\")) (error e))"),
         "(error \"boom\")"
@@ -1111,7 +1123,10 @@ fn string_version_lessp_is_filevercmp() {
     // Digit runs still compare numerically, and file suffixes are cut first.
     assert_eq!(eval("(string-version-lessp \"foo2\" \"foo10\")"), "t");
     assert_eq!(eval("(string-version-lessp \"foo10\" \"foo2\")"), "nil");
-    assert_eq!(eval("(string-version-lessp \"foo2.png\" \"foo12.png\")"), "t");
+    assert_eq!(
+        eval("(string-version-lessp \"foo2.png\" \"foo12.png\")"),
+        "t"
+    );
     assert_eq!(eval("(string-version-lessp \"1.2\" \"1.10\")"), "t");
     assert_eq!(eval("(string-version-lessp \"\" \"a\")"), "t");
     assert_eq!(eval("(string-version-lessp \"a\" \"\")"), "nil");

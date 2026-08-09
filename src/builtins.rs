@@ -669,9 +669,13 @@ fn upcase_fn(h: &mut ElispHost, a: &[Value]) -> R {
     case_fold(h, a, true)
 }
 fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    // nil is the empty list in either of its two VM spellings (`Undef` for a
+    // literal, `Bool(false)` for a comparison that answered false).
+    if is_nil(&a[0]) {
+        return Ok(Value::Int(0));
+    }
     match &a[0] {
         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-        Value::Undef => Ok(Value::Int(0)),
         // A symbol, a number, t … are not sequences: Emacs signals rather than
         // answering 0. (`safe-length` is the one that answers 0.)
         Value::Bool(_) | Value::Int(_) | Value::Float(_) => Err(format!(
@@ -4894,7 +4898,8 @@ fn load_average(h: &mut ElispHost, a: &[Value]) -> R {
 /// exactly `symbolp` (nil and t count as symbols).
 fn bare_symbol_p(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(
-        matches!(a[0], Value::Bool(true) | Value::Undef)
+        matches!(a[0], Value::Bool(true))
+            || is_nil(&a[0])
             || matches!(h.obj(&a[0]), Some(Obj::Symbol(_))),
     ))
 }

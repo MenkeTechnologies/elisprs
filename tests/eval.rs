@@ -2990,8 +2990,14 @@ fn hash_table_and_record_read_syntax() {
     assert_eq!(eval("(type-of (read \"#s(foo 1 2)\"))"), "foo");
     assert_eq!(eval("(recordp (read \"#s(pt 3 4)\"))"), "t");
     assert_eq!(eval("(aref (read \"#s(pt 3 4)\") 1)"), "3");
-    // #("str" …) drops text properties → the bare string.
-    assert_eq!(eval("(read \"#(\\\"ab\\\" 0 1 (face bold))\")"), "\"ab\"");
+    // #("str" START END PLIST) reads the intervals too. This used to expect the
+    // bare string, pinning the reader's old property-dropping behavior; Emacs
+    // 30.2 answers #("ab" 0 1 (face bold)) --
+    //   emacs -Q --batch --eval '(prin1 (read "#(\"ab\" 0 1 (face bold))"))'
+    assert_eq!(
+        eval("(read \"#(\\\"ab\\\" 0 1 (face bold))\")"),
+        "#(\"ab\" 0 1 (face bold))"
+    );
 }
 
 #[test]
