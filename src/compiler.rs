@@ -16,7 +16,7 @@
 //! Not yet lowered (next milestone): macro expansion, backquote, and the
 //! nonlocal-exit forms (catch/throw/condition-case/unwind-protect).
 
-use crate::host::{ops, ElispHost, Obj};
+use crate::host::{ops, ElispHost, FnKind, Obj};
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::rc::Rc;
 
@@ -159,22 +159,55 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
                 .and_then(|e| e.first())
                 .map(|f| h.sym_name(f).as_deref() == Some("lambda"))
                 .unwrap_or(false);
+            let argc = elems.len() - 1;
+            if argc > u8::MAX as usize {
+                return Err("too many arguments".to_string());
+            }
+            // Emacs checks a subr's arity before it evaluates the argument
+            // forms, so the guard has to precede the argument code.
+            if !head_is_lambda && needs_arity_guard(h, &head, argc) {
+                load_const(b, head.clone());
+                b.emit(Op::Extended(ops::CHECK_ARITY, argc as u8), 0);
+            }
             if head_is_lambda {
                 compile_lambda(h, b, &head_elems.unwrap(), false)?;
             } else {
                 load_const(b, head);
             }
-            let argc = elems.len() - 1;
             for arg in &elems[1..] {
                 compile_form(h, b, arg)?;
-            }
-            if argc > u8::MAX as usize {
-                return Err("too many arguments".to_string());
             }
             b.emit(Op::Extended(ops::CALL, argc as u8), 0);
         }
     }
     Ok(())
+}
+
+/// Whether a call to `head` with `argc` arguments should carry the
+/// pre-argument arity guard (`CHECK_ARITY`).
+///
+/// The guard's *verdict* is always retaken at run time — `fset`/`defalias` can
+/// retarget the symbol after this compiles, and Emacs honours the cell that is
+/// live at the call, not the one that was live at compile time. All that is
+/// decided here is whether emitting it can ever pay, which keeps it off the two
+/// shapes that make up almost every call:
+///
+/// - the symbol already names a subr that accepts `argc` — there is nothing to
+///   signal unless it is later retargeted at a *narrower* subr;
+/// - the symbol already names a closure — Emacs evaluates a closure's arguments
+///   before checking its arity too, so the guard would never fire.
+///
+/// It is emitted when the call is already wrong against the live cell, and when
+/// the symbol names nothing yet — a forward reference, or a symbol that `fset`
+/// will point at a subr. That second case is not hypothetical: after
+/// `(fset 'f (symbol-function 'car))`, Emacs signals on `(f 1 2)` without
+/// evaluating either argument, and `f` is unbound when the call compiles.
+fn needs_arity_guard(h: &ElispHost, head: &Value, argc: usize) -> bool {
+    if !matches!(h.obj(head), Some(Obj::Symbol(_))) {
+        return false;
+    }
+    let kind = h.fn_kind(head);
+    matches!(kind, FnKind::Vacant) || kind.rejects_before_args(argc)
 }
 
 /// Lower a call to a native fusevm op sequence when the operator is a core

@@ -5,6 +5,26 @@ All notable changes to elisprs are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A subr's arity is checked before its arguments are evaluated.** `compile_call`
+  emitted the argument code ahead of the `CALL` op and arity was enforced in
+  `call_function`, so a wrong-arity call to a builtin ran its arguments' side
+  effects first: `(let ((x 0) (y 0)) (ignore-errors (car (setq x 1) (setq y 2))) (list x y))`
+  was `(1 2)` where Emacs 30.2 gives `(0 0)`, and
+  `(condition-case e (car (error "inner") 2) (error e))` returned the argument's
+  own error instead of `(wrong-number-of-arguments car 2)`. A `CHECK_ARITY`
+  extension op now precedes the argument code; it resolves the live function cell
+  and signals only when that cell holds a subr rejecting the count. The rule is
+  subr-only — Emacs evaluates a *closure's* arguments before checking its arity
+  too — and the verdict is taken at run time, so `fset` and `defalias` still
+  retarget a symbol between compilation and the call in both directions:
+  pointing `car` at a two-argument lambda keeps `(car 1 2)` legal, and
+  `(fset 'myfn (symbol-function 'car))` then `(myfn 1 2)` signals without
+  evaluating either argument. Verified across the interpreter, a warm bytecode
+  cache and `--aot-exe` (caught and uncaught). `cache::SHARD_FORMAT_VERSION`
+  6 → 7, since a v6 chunk carries no guard and would otherwise keep serving the
+  old behaviour from a warm cache.
+
 ### Added
 - **Real `record` type (`Obj::Record`).** Records (and every `cl-defstruct`
   instance) were `cl-struct-NAME`-tagged vectors, so `(aref (record 'foo 1 2) 0)`

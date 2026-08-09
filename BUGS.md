@@ -1935,15 +1935,126 @@ across line boundaries. It now translates to the standard table's whitespace set
 
 ### Still open after round 11
 
-- **A fixed-arity subr's arity is checked after its arguments are evaluated** —
-  `(let ((n 0)) (ignore-errors (nth 1 t (setq n 9))) n)` is `0` in Emacs and `9`
-  here; same for `car` with a surplus argument. The signalled error
-  (`wrong-number-of-arguments`) already matches; only the surplus argument's side
-  effects differ. `compile_call` emits the argument expressions before the `CALL`
-  extension op, and arity is enforced in `call_function` once the arguments are
-  already on the stack. Closing it needs an arity check emitted *before* the
-  argument code — cheaply, only for the calls a static read can already see are
-  wrong, since the function cell can be redefined between compile and call.
 - **An empty-name uninterned symbol prints over-escaped** — `(make-symbol "")` is
   `##` in Emacs and `\#\#` here. Found by the fuzzer (seed 7, form #1633); present
   identically on the pre-round-11 tree, so it is not a regression.
+
+## Round 12 — a subr's arity is checked before its arguments run
+
+### R12-A. A fixed-arity subr's arity was checked after its arguments were evaluated — ✅ FIXED
+
+Carried over from round 11. `compile_call` emitted the argument expressions ahead
+of the `CALL` extension op and arity was enforced in `call_function`, by which
+point every argument had already run:
+
+| form | Emacs 30.2 | was |
+|---|---|---|
+| `(let ((n 0)) (ignore-errors (nth 1 t (setq n 9))) n)` | `0` | `9` |
+| `(let ((x 0) (y 0)) (ignore-errors (car (setq x 1) (setq y 2))) (list x y))` | `(0 0)` | `(1 2)` |
+| `(let ((n 0)) (ignore-errors (cons (setq n 1))) n)` | `0` | `1` |
+| `(let ((n 0)) (ignore-errors (point (setq n 3))) n)` | `0` | `3` |
+| `(condition-case e (car (error "inner") 2) (error e))` | `(wrong-number-of-arguments car 2)` | `(error "inner")` |
+
+That last row is the sharpest one: the arity error is raised so early that an
+argument which would itself signal never gets the chance to.
+
+**The rule is narrower than "arity is checked first", and round 11's prescription
+for closing it was wrong on both halves.** Measured against `GNU Emacs 30.2`:
+
+- It holds for **subrs only**. `eval_sub` reads `XSUBR (fun)->max_args` and
+  signals straight from the argument-count switch; a closure instead reaches
+  `funcall_lambda` only after its arguments have been evaluated into a vector. So
+  with `(defun f1 (a) a)`, `(f1 (setq x 1) (setq y 2))` leaves `x` and `y` set to
+  `1` and `2` — **in Emacs too**. A guard that fired for closures would be a new
+  bug, not a fix.
+- The verdict has to be taken at **run time**, not compile time. Round 11
+  proposed emitting the check "only for the calls a static read can already see
+  are wrong". That misses the cases where the callee is not statically visible at
+  all, and those are real:
+
+  | form | Emacs 30.2 |
+  |---|---|
+  | `(let ((x 0) (y 0)) (fset 'myfn (symbol-function 'car)) (ignore-errors (myfn (setq x 1) (setq y 2))) (list x y))` | `(0 0)` |
+  | `(progn (fset 'myfn (symbol-function 'car)) (condition-case e (myfn 1 2) (error e)))` | `(wrong-number-of-arguments myfn 2)` |
+  | `(let ((x 0) (y 0)) (defalias 'mycar 'car) (ignore-errors (mycar (setq x 1) (setq y 2))) (list x y))` | `(0 0)` |
+
+  `myfn` and `mycar` name nothing when the call compiles. Note also that the
+  error names the symbol **as the caller wrote it** — `myfn`, not `car` — which
+  elisprs already got right.
+
+  The redefinition has to keep working in the other direction as well: pointing
+  `car` at a two-argument lambda makes `(car 1 2)` legal, and Emacs then
+  evaluates both arguments —
+  `(let ((x 0) (y 0)) (fset 'car (lambda (a b) (list 'mycar a b))) (let ((r (car (setq x 1) (setq y 2)))) (list r x y)))`
+  is `((mycar 1 2) 1 2)`.
+
+**The fix.** A `CHECK_ARITY` extension op (`ops::CHECK_ARITY`, id 11) is emitted
+ahead of the argument code; it pops the head symbol, resolves the live function
+cell through the same alias chain `resolve_function` walks, and signals only when
+that cell holds a subr whose arity rejects the count. A closure, a macro or an
+empty cell falls straight through, so the argument code runs exactly as before.
+Because the resolution happens in the op and not in the compiler, `fset` and
+`defalias` between compile and call are honoured either way.
+
+`ElispHost::fn_kind` → `FnKind` is the shared probe, used by the compiler and the
+op so the two can never disagree about what counts as a subr. It is deliberately
+cheaper than `resolve_function`: it clones no closure body, parameter list or
+captured environment on the path it exists to wave through.
+
+The compiler decides only whether emitting the op can ever pay, which keeps it
+off the two shapes that make up almost every call: a symbol that already names a
+subr accepting the count, and a symbol that already names a closure. It is
+emitted when the call is already wrong against the live cell, and when the symbol
+names nothing yet. Verified from `--dump-bytecode`: a loop over `cons`, `car`,
+`1+` and `<` emits extension ops `{0, 1, 2, 3}` and no `11` at all.
+
+An AOP intercept fronts the callee, so the underlying subr's arity is not the
+arity being called; the op leaves those to `CALL`.
+
+`cache::SHARD_FORMAT_VERSION` 6 → 7. No serialized struct changed shape, which is
+exactly why the bump was needed: a v6 shard still decodes cleanly, but a v6 chunk
+carries no guard, so a warm cache would have gone on serving the old behaviour.
+Measured — the pre-fix binary warms the cache under schema key
+`0.1.8-4442f3f3fc…` and prints `x=1 y=2`; the new binary reads that same file,
+rejects the shard at `header_ok` (which compares `format_version`), recompiles,
+and prints `x=0 y=0`. The schema key is identical across the two, so it would not
+have invalidated anything on its own.
+
+All four paths check out — interpreter cold, cache-warm, `--aot-exe` with the
+error caught, and `--aot-exe` with it uncaught (which still reports and exits 1
+rather than the silent 0 that path used to give) — each byte-identical to
+`emacs --batch`.
+
+Covered by `tests/parity_subr_arity_before_args.rs` (10 tests). Seven of its
+cases fail against the pre-fix binary; the other three are the regression guards
+for closures, `fset` widening and `funcall`, which passed before and still do.
+
+### Still open after round 12
+
+- **A void function's arguments are still evaluated** — the same
+  resolve-before-evaluate ordering, one step earlier in `eval_sub`:
+  `(let ((x 0)) (ignore-errors (nosuchfn (setq x 1))) x)` is `0` in Emacs and `1`
+  here. Both engines signal `(void-function nosuchfn)`; only the argument's side
+  effect differs. `CHECK_ARITY` deliberately does not cover it — an empty
+  function cell also reaches the inline Rust FFI fallback in `call_function`, so
+  signalling early here would have to be reconciled with that first.
+- **A wrong-arity call to a *closure* names the symbol, not the closure** —
+  `(progn (defun f1 (a) a) (condition-case e (f1 1 2) (error e)))` is
+  `(wrong-number-of-arguments #[(a) (a) nil] 2)` in Emacs and
+  `(wrong-number-of-arguments f1 2)` here. Only the first datum differs, and only
+  for closures — the subr rows above are already right. Unrelated to the argument
+  ordering fixed in R12-A; it is `call_function` passing the callee as written
+  where Emacs passes the resolved closure.
+- **Special forms and macros do not check arity at all** — `(eval '(setq zz) t)`
+  and `(eval '(if) t)` are `(wrong-number-of-arguments setq 1)` and
+  `(wrong-number-of-arguments if 0)` in Emacs, and both `nil` here;
+  `(defmacro m1 (a) a)` then `(eval '(m1 1 2) t)` is
+  `(wrong-number-of-arguments #[(a) (a) nil] 2)` in Emacs and
+  `(error "wrong-number-of-arguments")` here. `compile_call` dispatches the
+  special forms by name and never counts their operands.
+- **A symbol that named a closure (or a wide-enough subr) when it compiled, then
+  retargeted by `fset` at a *narrower* subr, still evaluates its arguments** —
+  the one shape `CHECK_ARITY` is not emitted for. Emitting it everywhere would
+  put a function-cell resolution in front of every call in the language to buy a
+  case that needs a symbol to change what kind of thing it names between
+  compilation and the call.

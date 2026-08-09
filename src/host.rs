@@ -131,6 +131,7 @@ pub mod ops {
     pub const SCOPE_OPEN: u16 = 8; // open an empty lexical scope (for let*)
     pub const MAKE_CLOSURE: u16 = 9; // pop a closure template; push one capturing the env
     pub const DBG_LINE: u16 = 10; // DAP statement marker (debug only): fire dap::check_line
+    pub const CHECK_ARITY: u16 = 11; // arg=argc; pop sym; signal if it names a subr rejecting argc
 }
 
 pub type SubrFn = fn(&mut ElispHost, &[Value]) -> Result<Value, String>;
@@ -442,6 +443,33 @@ pub enum Resolved {
         /// Dynamic-binding function — see [`Obj::Closure::dynamic`].
         dynamic: bool,
     },
+}
+
+/// What a designator's function cell names *right now*, for the pre-argument
+/// arity guard. Deliberately cheaper than [`ElispHost::resolve_function`]: it
+/// clones no closure body, parameter list or captured environment, because on
+/// the shape it exists to wave through it must cost as little as possible.
+pub enum FnKind {
+    /// A subr, with its `(min, max)` arity (`max: None` is Emacs's `MANY`).
+    Subr(usize, Option<usize>),
+    /// A closure, a macro, or any other callable object.
+    Other,
+    /// Nothing callable: no function cell, or an alias chain that dead-ends.
+    Vacant,
+}
+
+impl FnKind {
+    /// Whether Emacs rejects a call of `argc` arguments *before* evaluating any
+    /// of them. Only a subr's arity is checked that early: `eval_sub` reads
+    /// `XSUBR (fun)->max_args` and signals straight from the argument-count
+    /// switch, while a closure reaches `funcall_lambda` only after its arguments
+    /// have already been evaluated into a vector.
+    pub fn rejects_before_args(&self, argc: usize) -> bool {
+        match self {
+            FnKind::Subr(min, max) => argc < *min || max.is_some_and(|m| argc > m),
+            _ => false,
+        }
+    }
 }
 
 /// print.c `PRINT_CIRCLE`: the max print nesting depth. With `print-circle`
@@ -2174,6 +2202,27 @@ impl ElispHost {
             }
         }
         Ok(p)
+    }
+
+    /// What `f` currently names, following the same alias chain as
+    /// [`Self::resolve_function`] but building none of the callable — see
+    /// [`FnKind`]. Used by the pre-argument arity guard at both compile and run
+    /// time, so the two always agree on what counts as a subr.
+    pub fn fn_kind(&self, f: &Value) -> FnKind {
+        let mut cur = f.clone();
+        for _ in 0..64 {
+            let next = match self.obj(&cur) {
+                Some(Obj::Subr { min, max, .. }) => return FnKind::Subr(*min, *max),
+                Some(Obj::Symbol(s)) => s.function.clone(),
+                Some(_) => return FnKind::Other,
+                None => return FnKind::Vacant,
+            };
+            match next {
+                Some(v) => cur = v,
+                None => return FnKind::Vacant,
+            }
+        }
+        FnKind::Other
     }
 
     /// Resolve a function designator (symbol → function cell, following aliases;
@@ -5033,6 +5082,25 @@ pub fn ext_dispatch(vm: &mut VM, id: u16, arg: u8) {
             match call_function(&symv, &args) {
                 Ok(v) => vm.push(v),
                 Err(e) => abort(vm, e),
+            }
+        }
+        ops::CHECK_ARITY => {
+            // Emacs's `eval_sub` resolves the function cell BEFORE it evaluates
+            // the argument forms, so `(car (setq x 1) (setq y 2))` signals
+            // `(wrong-number-of-arguments car 2)` with x and y still 0. The
+            // verdict is taken here rather than at compile time because
+            // `fset`/`defalias` can retarget the symbol in between, and Emacs
+            // honours the cell that is live at the call.
+            let argc = arg as usize;
+            let symv = vm.pop();
+            let bad = with_host(|h| {
+                // An AOP intercept fronts the callee, so the underlying subr's
+                // arity is not the arity being called — leave those to `CALL`.
+                h.intercepts.is_empty() && h.fn_kind(&symv).rejects_before_args(argc)
+            });
+            if bad {
+                let e = with_host(|h| h.signal_wrong_nargs(&symv, argc));
+                abort(vm, e);
             }
         }
         ops::GETVAR => {

@@ -63,7 +63,12 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// inner decode is attempted. (The AOT heap image is serde_json, which IS
 /// self-describing, so it honours `#[serde(default)]` — but it is embedded in the
 /// object and rebuilt with it, so it is never stale.)
-pub const SHARD_FORMAT_VERSION: u32 = 6;
+/// v7 adds the `CHECK_ARITY` guard op ahead of the argument code of a call. No
+/// serialized *struct* changed shape, so a v6 shard still decodes cleanly — that
+/// is exactly why the bump is needed. A v6 chunk carries no guard, so replaying
+/// it would evaluate a wrong-arity subr's arguments before signalling, silently
+/// serving the pre-fix behaviour to anyone with a warm cache.
+pub const SHARD_FORMAT_VERSION: u32 = 7;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next
