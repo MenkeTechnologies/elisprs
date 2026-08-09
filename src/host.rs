@@ -866,20 +866,20 @@ impl ElispHost {
     /// Reached only from the numeric hook, i.e. only for the operands fusevm
     /// could not compute natively. Integer arithmetic is exact (promoting to a
     /// bignum as needed); any float operand makes the result a float, as in
-    /// Emacs.
+    /// Emacs. Comparison is exact for *every* pair — including an integer
+    /// against a float, which Emacs decides on real values and not on `f64`
+    /// images (see [`num_cmp`]).
     pub fn apply_num_op(&mut self, op: NumOp, a: Num, b: Num) -> Result<Value, String> {
         use NumOp::*;
-        // Comparisons first: they answer a bool for any pair, and comparing two
-        // exact integers must not detour through `f64` (which would call
-        // 2^62 and 2^62+1 equal).
+        // Comparisons first: they answer a bool for any pair, and no comparison
+        // may detour through `f64` — not integer/integer (which would call 2^62
+        // and 2^62+1 equal) and not integer/float either, which is why
+        // [`num_cmp`] compares exact values throughout.
         if matches!(op, Lt | Gt | Le | Ge | Eq | Ne) {
-            let ord = match (&a, &b) {
-                (Num::Int(x), Num::Int(y)) => x.cmp(y),
-                _ => match a.to_f64().partial_cmp(&b.to_f64()) {
-                    Some(o) => o,
-                    // A NaN operand: every comparison is false, `/=` is true.
-                    None => return Ok(Value::Bool(matches!(op, Ne))),
-                },
+            let ord = match num_cmp(&a, &b) {
+                Some(o) => o,
+                // A NaN operand: every comparison is false, `/=` is true.
+                None => return Ok(Value::Bool(matches!(op, Ne))),
             };
             let yes = match op {
                 Lt => ord.is_lt(),
@@ -5436,6 +5436,66 @@ impl Num {
     }
 }
 
+/// Order two elisp numbers the way Emacs's `arithcompare` (data.c) does: on
+/// their *exact* values, never on `f64` images of them.
+///
+/// The mixed integer/float case is the one that matters. An `f64` has 53 bits of
+/// mantissa, so converting a larger integer to compare it rounds — and the
+/// rounded image is a *different number*. Measured against `emacs --batch` (GNU
+/// Emacs 30.2), with `L` = `(expt 3 34)` = 16677181699666569 (a fixnum:
+/// `most-positive-fixnum` is 2^61-1) and `F` = `(float L)` = 16677181699666568.0:
+///
+/// ```text
+/// (= L F) => nil   (< L F) => nil   (> L F) => t
+/// (= F L) => nil   (< F L) => t     (> F L) => nil
+/// ```
+///
+/// Emacs answers on the exact values, so the integer is the larger. This is
+/// Emacs's own rule, not the JVM languages' (Java/Scala/Groovy promote the
+/// integer to `double` and accept the rounded answer) and not Go's (which
+/// rejects the mixed pair outright).
+///
+/// A float is a dyadic rational, so it is exactly comparable to an integer of
+/// any size: truncating it loses nothing, and its fractional part breaks a tie
+/// on equal integer parts.
+///
+/// `None` means "incomparable" — a NaN operand, for which every elisp comparison
+/// is false and `/=` is true.
+pub fn num_cmp(a: &Num, b: &Num) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Num::Int(x), Num::Int(y)) => Some(x.cmp(y)),
+        (Num::Int(x), Num::Float(y)) => cmp_int_f64(x, *y),
+        (Num::Float(x), Num::Int(y)) => cmp_int_f64(y, *x).map(std::cmp::Ordering::reverse),
+        (Num::Float(x), Num::Float(y)) => x.partial_cmp(y),
+    }
+}
+
+/// Exact ordering of the integer `x` against the float `y`, `None` for a NaN.
+/// An infinite `y` is beyond every integer, so it decides on its own.
+fn cmp_int_f64(x: &BigInt, y: f64) -> Option<std::cmp::Ordering> {
+    use num_traits::FromPrimitive;
+    use std::cmp::Ordering;
+    if y.is_nan() {
+        return None;
+    }
+    if y == f64::INFINITY {
+        return Some(Ordering::Less);
+    }
+    if y == f64::NEG_INFINITY {
+        return Some(Ordering::Greater);
+    }
+    // `y` is finite, so `from_f64` — which truncates toward zero — is exact and
+    // cannot fail.
+    let t = y.trunc();
+    let ti = BigInt::from_f64(t)?;
+    Some(match x.cmp(&ti) {
+        // Equal integer parts: the float's fraction decides. `y` above its own
+        // truncation means `y` is the larger, so `x` is the smaller.
+        Ordering::Equal => t.partial_cmp(&y)?,
+        o => o,
+    })
+}
+
 /// `BigInt` → `f64`, the conversion Emacs does when an integer meets a float.
 /// Saturates to ±inf beyond `f64` range, which is what Emacs's `(float (expt 10
 /// 400))` yields.
@@ -5464,9 +5524,19 @@ pub fn bigint_to_f64(i: &BigInt) -> f64 {
 /// - a bignum operand, which rides through the VM as a `Value::Obj` handle;
 /// - an integer result that overflowed `i64` *or* left elisp's fixnum range:
 ///   Emacs's integers are unbounded, so it becomes a bignum.
+/// - a *comparison* of an integer with a float where reading the integer as an
+///   `f64` would round it (`|int| > 2^53`). fusevm answers such a pair natively
+///   up to and including 0.17.0 — on the rounded images, which is the wrong
+///   answer for elisp — and delegates it from the release after 0.17.0, because
+///   only the host knows its language's rule. Emacs's rule is exact comparison
+///   (see [`num_cmp`]), so this hook answers on exact values.
 ///
-/// Everything else — fixnum arithmetic in range, all float arithmetic — never
-/// reaches here and stays on the VM's (and the JIT's) fast path.
+/// Everything else — fixnum arithmetic in range, all float arithmetic, and every
+/// comparison an `f64` can represent without rounding — never reaches here and
+/// stays on the VM's (and the JIT's) fast path. The compiler only ever lowers
+/// `+`/`-`/`*`/`1+`/`1-`/`(- X)` and the six comparisons to VM ops
+/// (`compiler.rs`, `try_native_op`), so `Div`, `Pow` and `Mod` do not arrive
+/// from compiled elisp at all.
 pub(crate) fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, String> {
     with_host(|h| {
         // `(+ 1 (point-marker))` — a marker is a number in arithmetic position.
@@ -5529,5 +5599,176 @@ pub fn run_chunk(chunk: Chunk) -> Result<Value, String> {
         VMResult::Ok(v) => Ok(v),
         VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
         VMResult::Error(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod numeric_hook_tests {
+    use super::*;
+
+    /// `(expt 3 34)`: a fixnum (`most-positive-fixnum` is 2^61-1) far enough past
+    /// 2^53 that its `f64` image is a *different* integer.
+    const L: i64 = 16_677_181_699_666_569;
+    /// `(float (expt 3 34))` — one less than `L`.
+    const F: f64 = 16_677_181_699_666_568.0;
+
+    fn hook(op: NumOp, a: Value, b: Value) -> Value {
+        reset_host();
+        numeric_hook(op, &a, &b).expect("numeric hook")
+    }
+
+    fn truthy(v: &Value) -> bool {
+        matches!(v, Value::Bool(true))
+    }
+
+    /// The rounding the whole fix is about: `L` and `F` are different numbers
+    /// that share an `f64` image, so any comparison routed through `f64` must
+    /// call them equal.
+    #[test]
+    fn the_f64_image_of_l_is_not_l() {
+        assert_eq!(L as f64, F);
+        assert_ne!(L, F as i64);
+        assert_eq!(F as i64, L - 1);
+    }
+
+    /// The hook compares a mixed integer/float pair on exact values, in both
+    /// operand orders. Ground truth (`emacs --batch`, GNU Emacs 30.2), with
+    /// `L` = `(expt 3 34)` and `F` = `(float L)`:
+    ///
+    /// ```text
+    /// (=  L F) => nil   (/= L F) => t     (<  L F) => nil
+    /// (>  L F) => t     (<= L F) => nil   (>= L F) => t
+    /// (=  F L) => nil   (/= F L) => t     (<  F L) => t
+    /// (>  F L) => nil   (<= F L) => t     (>= F L) => nil
+    /// ```
+    ///
+    /// fusevm answers this pair natively through 0.17.0 — on the rounded images,
+    /// so `=` came out `t` — and delegates it here from the next release, which
+    /// is why the hook is exercised directly rather than through `run_chunk`.
+    #[test]
+    fn hook_compares_int_against_float_exactly() {
+        // Integer first: L is the larger.
+        for (op, want) in [
+            (NumOp::Eq, false),
+            (NumOp::Ne, true),
+            (NumOp::Lt, false),
+            (NumOp::Gt, true),
+            (NumOp::Le, false),
+            (NumOp::Ge, true),
+        ] {
+            let got = hook(op, Value::Int(L), Value::Float(F));
+            assert_eq!(truthy(&got), want, "({op:?} L F) => {got:?}");
+        }
+        // Float first: the mirrored answers.
+        for (op, want) in [
+            (NumOp::Eq, false),
+            (NumOp::Ne, true),
+            (NumOp::Lt, true),
+            (NumOp::Gt, false),
+            (NumOp::Le, true),
+            (NumOp::Ge, false),
+        ] {
+            let got = hook(op, Value::Float(F), Value::Int(L));
+            assert_eq!(truthy(&got), want, "({op:?} F L) => {got:?}");
+        }
+    }
+
+    /// Exactness must not cost the ordinary answers: a float that *is* the
+    /// integer still compares equal, and a fractional float still orders.
+    /// Ground truth: `(= 1 1.0)` => t, `(< 1 1.5)` => t, `(> 2 1.5)` => t,
+    /// `(= 0 -0.0)` => t, `(= (expt 2 53) (float (expt 2 53)))` => t,
+    /// `(> (1+ (expt 2 53)) (float (expt 2 53)))` => t.
+    #[test]
+    fn hook_keeps_the_representable_answers() {
+        assert!(truthy(&hook(NumOp::Eq, Value::Int(1), Value::Float(1.0))));
+        assert!(truthy(&hook(NumOp::Lt, Value::Int(1), Value::Float(1.5))));
+        assert!(truthy(&hook(NumOp::Gt, Value::Int(2), Value::Float(1.5))));
+        assert!(truthy(&hook(NumOp::Eq, Value::Int(0), Value::Float(-0.0))));
+        let two53 = 1i64 << 53;
+        let two53f = two53 as f64;
+        assert!(truthy(&hook(
+            NumOp::Eq,
+            Value::Int(two53),
+            Value::Float(two53f)
+        )));
+        assert!(truthy(&hook(
+            NumOp::Gt,
+            Value::Int(two53 + 1),
+            Value::Float(two53f)
+        )));
+    }
+
+    /// An infinity is beyond every integer and a NaN is incomparable, both ways
+    /// round. Ground truth: `(< L 1.0e+INF)` => t, `(> L -1.0e+INF)` => t,
+    /// and against `0.0e+NaN` every comparison is nil while `/=` is t.
+    #[test]
+    fn hook_handles_infinities_and_nan() {
+        assert!(truthy(&hook(
+            NumOp::Lt,
+            Value::Int(L),
+            Value::Float(f64::INFINITY)
+        )));
+        assert!(truthy(&hook(
+            NumOp::Gt,
+            Value::Int(L),
+            Value::Float(f64::NEG_INFINITY)
+        )));
+        for op in [NumOp::Eq, NumOp::Lt, NumOp::Gt, NumOp::Le, NumOp::Ge] {
+            assert!(!truthy(&hook(op, Value::Int(L), Value::Float(f64::NAN))));
+            assert!(!truthy(&hook(op, Value::Float(f64::NAN), Value::Int(L))));
+        }
+        assert!(truthy(&hook(
+            NumOp::Ne,
+            Value::Int(L),
+            Value::Float(f64::NAN)
+        )));
+    }
+
+    /// Arithmetic is *not* exact and must not become so: Emacs is
+    /// float-contagious, so a mixed pair rounds the integer to `f64` first.
+    /// Ground truth: `(+ L 0.0)` => 16677181699666568.0, `(* L 2.0)` =>
+    /// 33354363399333136.0, `(- 0.0 L)` => -16677181699666568.0.
+    #[test]
+    fn hook_arithmetic_stays_float_contagious() {
+        assert_eq!(
+            hook(NumOp::Add, Value::Int(L), Value::Float(0.0)),
+            Value::Float(16_677_181_699_666_568.0)
+        );
+        assert_eq!(
+            hook(NumOp::Mul, Value::Int(L), Value::Float(2.0)),
+            Value::Float(33_354_363_399_333_136.0)
+        );
+        assert_eq!(
+            hook(NumOp::Sub, Value::Float(0.0), Value::Int(L)),
+            Value::Float(-16_677_181_699_666_568.0)
+        );
+    }
+
+    /// A bignum rides through the VM as a heap handle, so the hook sees it as
+    /// `Value::Obj` — and must compare it against a float just as exactly.
+    /// Ground truth, with `B` = `(expt 3 100)`: `(= B (float B))` => nil,
+    /// `(> B (float B))` => t, `(< (float B) B)` => t.
+    #[test]
+    fn hook_compares_bignum_against_float_exactly() {
+        use num_traits::One;
+        reset_host();
+        let (big, bigf) = with_host(|h| {
+            let mut n = BigInt::one();
+            for _ in 0..100 {
+                n *= 3;
+            }
+            let f = bigint_to_f64(&n);
+            (h.make_integer(n), f)
+        });
+        assert!(matches!(big, Value::Obj(_)), "expected a heap bignum");
+        assert!(!truthy(
+            &numeric_hook(NumOp::Eq, &big, &Value::Float(bigf)).unwrap()
+        ));
+        assert!(truthy(
+            &numeric_hook(NumOp::Gt, &big, &Value::Float(bigf)).unwrap()
+        ));
+        assert!(truthy(
+            &numeric_hook(NumOp::Lt, &Value::Float(bigf), &big).unwrap()
+        ));
     }
 }

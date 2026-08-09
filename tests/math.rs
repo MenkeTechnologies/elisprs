@@ -43,3 +43,84 @@ fn arithmetic_shifts() {
     assert_eq!(eval("(ash -8 -1)"), "-4"); // arithmetic (sign-preserving) shift
     assert_eq!(eval("(lsh 1 4)"), "16");
 }
+
+/// Emacs compares an integer against a float on their *exact* values
+/// (`arithcompare` in data.c), never on `f64` images of them. Past 2^53 an
+/// `f64` has no mantissa left, so the two are different numbers that share one
+/// image: `(expt 3 34)` = 16677181699666569 and `(float (expt 3 34))` =
+/// 16677181699666568.0.
+///
+/// Ground truth, `emacs --batch` (GNU Emacs 30.2), with L and F bound to those:
+///
+/// ```text
+/// (=  L F) => nil   (<  L F) => nil   (>  L F) => t
+/// (=  F L) => nil   (<  F L) => t     (>  F L) => nil
+/// ```
+///
+/// A two-argument comparison is lowered to a fusevm op (`compiler.rs`,
+/// `try_native_op`), so these go through `funcall` and the multi-argument forms
+/// to reach the `cmp` subr — the path elisprs owns outright.
+#[test]
+fn integer_and_float_compare_exactly_past_2_pow_53() {
+    let l = "(expt 3 34)";
+    let f = "(float (expt 3 34))";
+    assert_eq!(eval(&format!("(funcall (function =) {l} {f})")), "nil");
+    assert_eq!(eval(&format!("(funcall (function <) {l} {f})")), "nil");
+    assert_eq!(eval(&format!("(funcall (function >) {l} {f})")), "t");
+    assert_eq!(eval(&format!("(funcall (function <=) {l} {f})")), "nil");
+    assert_eq!(eval(&format!("(funcall (function >=) {l} {f})")), "t");
+    // Mirrored, float first.
+    assert_eq!(eval(&format!("(funcall (function =) {f} {l})")), "nil");
+    assert_eq!(eval(&format!("(funcall (function <) {f} {l})")), "t");
+    assert_eq!(eval(&format!("(funcall (function >) {f} {l})")), "nil");
+    assert_eq!(eval(&format!("(funcall (function <=) {f} {l})")), "t");
+    assert_eq!(eval(&format!("(funcall (function >=) {f} {l})")), "nil");
+    // Three arguments never reach the fusevm op either.
+    // Ground truth: (= L F L) => nil, (< F L (1+ L)) => t.
+    assert_eq!(eval(&format!("(= {l} {f} {l})")), "nil");
+    assert_eq!(eval(&format!("(< {f} {l} (1+ {l}))")), "t");
+    // Exactness must not disturb what an f64 represents exactly.
+    // Ground truth: (= (expt 2 53) (float (expt 2 53))) => t,
+    // (> (1+ (expt 2 53)) (float (expt 2 53))) => t, (= 0 -0.0) => t.
+    assert_eq!(
+        eval("(funcall (function =) (expt 2 53) (float (expt 2 53)))"),
+        "t"
+    );
+    assert_eq!(
+        eval("(funcall (function >) (1+ (expt 2 53)) (float (expt 2 53)))"),
+        "t"
+    );
+    assert_eq!(eval("(funcall (function =) 0 -0.0)"), "t");
+    assert_eq!(eval("(funcall (function <) 1 1.5)"), "t");
+}
+
+/// `max`/`min` pick their winner with `arithcompare` too, so a mixed pair is
+/// decided on exact values and the *argument itself* is returned — which makes
+/// the type observable. Ground truth (`emacs --batch`), L and F as above:
+///
+/// ```text
+/// (max L F) => 16677181699666569     (min L F) => 16677181699666568.0
+/// (max F L) => 16677181699666569     (min F L) => 16677181699666568.0
+/// ```
+///
+/// `min` is the telling one: it must answer the *float*, because F is the
+/// smaller number even though L and F round to the same `f64`.
+#[test]
+fn max_and_min_decide_a_mixed_pair_exactly() {
+    let l = "(expt 3 34)";
+    let f = "(float (expt 3 34))";
+    assert_eq!(eval(&format!("(max {l} {f})")), "16677181699666569");
+    assert_eq!(eval(&format!("(min {l} {f})")), "16677181699666568.0");
+    assert_eq!(eval(&format!("(max {f} {l})")), "16677181699666569");
+    assert_eq!(eval(&format!("(min {f} {l})")), "16677181699666568.0");
+    // Ground truth: (max 1 F L) => 16677181699666569,
+    // (min L F (expt 3 35)) => 16677181699666568.0.
+    assert_eq!(eval(&format!("(max 1 {f} {l})")), "16677181699666569");
+    assert_eq!(
+        eval(&format!("(min {l} {f} (expt 3 35))")),
+        "16677181699666568.0"
+    );
+    // A NaN still wins, unchanged. Ground truth: (max 1 0.0e+NaN) => 0.0e+NaN.
+    assert_eq!(eval("(max 1 0.0e+NaN)"), "0.0e+NaN");
+    assert_eq!(eval("(min 1 0.0e+NaN)"), "0.0e+NaN");
+}

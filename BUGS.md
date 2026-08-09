@@ -2509,3 +2509,54 @@ one needs no reference Emacs at all and found the widest class below.
   an empty-name uninterned symbol printing over-escaped, a void function's
   arguments still being evaluated, special forms and macros not checking arity,
   and the silent AOT run whose constants are not reconstructible.
+
+---
+
+## Round 15 — an integer and a float compared through `f64`, so Emacs's exact rule was lost
+
+`(= (expt 3 34) (float (expt 3 34)))` answered `t`; Emacs answers `nil`.
+
+`(expt 3 34)` is 16677181699666569 — a *fixnum*, since `most-positive-fixnum` is
+2^61-1 on a 64-bit build — and it is past 2^53, where an `f64` runs out of
+mantissa. Its float image is 16677181699666568.0, one *less*. So the integer and
+its own float are different numbers, and everything turns on whether the
+comparison rounds the integer or not.
+
+Emacs does not round. `arithcompare` (data.c) decides on exact values, which is
+Emacs's own rule and not the one its neighbours picked: Java, Scala and Groovy
+promote the integer to `double` and accept the rounded answer, while Go rejects
+a mixed pair outright. Measured, `emacs --batch`, GNU Emacs 30.2:
+
+```text
+(=  L F) => nil   (<  L F) => nil   (>  L F) => t
+(=  F L) => nil   (<  F L) => t     (>  F L) => nil
+(max L F) => 16677181699666569      (min L F) => 16677181699666568.0
+```
+
+elisprs rounded, in three places that had to agree and did not:
+
+- `host::apply_num_op` — the numeric hook fusevm calls,
+- `builtins::cmp` — the `=` `<` `>` `<=` `>=` subrs,
+- `builtins::min_max` — `max` / `min`.
+
+Each had an `(Int, Int)` arm comparing exactly (Round 10's fix) and a fallback
+arm that ran both operands through `to_f64`. The mixed pair took the fallback.
+`min` was the visible one: `(min L F)` answered the *integer* where Emacs
+answers the float, because F is the smaller number even though both round to the
+same `f64`.
+
+All three now go through `host::num_cmp`, which compares exact values. A float is
+a dyadic rational, so truncating it loses nothing and its fractional part breaks
+a tie on equal integer parts; a NaN is incomparable and an infinity is beyond
+every integer. Arithmetic is deliberately left alone — Emacs is float-contagious
+there, so `(+ L 0.0)` is 16677181699666568.0 and rounding is the right answer.
+
+One case is not closed by this crate. A **two-argument** comparison is lowered to
+a fusevm op (`compiler.rs`, `try_native_op`), and fusevm 0.17.0 answers a mixed
+`Int`/`Float` pair natively — on the rounded images — without ever consulting the
+hook (`vm.rs`, `cmp_int_fast`: both operands are "native nums"). So `(= L F)`
+still answers `t` here, as does `(/= L F)`, which the prelude defines as
+`(not (= a b))`. The fusevm release after 0.17.0 delegates exactly this pair
+(when reading the integer as `f64` would round it) and the hook fixed here is
+what answers it. Everything that reaches the subrs — `funcall`, `apply`, three or
+more arguments, `sort`, `max`, `min` — is correct now.

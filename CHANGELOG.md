@@ -19,6 +19,22 @@ All notable changes to elisprs are documented here. The format follows
   copies would be two answers.
 
 ### Fixed
+- **An integer and a float compared through `f64`, losing Emacs's exact rule.**
+  `(expt 3 34)` is 16677181699666569 — a fixnum, and past 2^53, where an `f64`
+  runs out of mantissa — so its float image is 16677181699666568.0, a different
+  number. Emacs's `arithcompare` decides on exact values, so `(= L (float L))`
+  is nil and `(> L (float L))` is t; elisprs rounded both operands and answered
+  the opposite. Three sites had to agree and did not: the numeric hook fusevm
+  calls (`host::apply_num_op`), the `=` `<` `>` `<=` `>=` subrs
+  (`builtins::cmp`), and `max`/`min` (`builtins::min_max`) — each compared
+  `(Int, Int)` exactly but fell back to `to_f64` for a mixed pair. `min` showed
+  it plainly: `(min L (float L))` answered the integer where Emacs answers the
+  float. All three now use `host::num_cmp`, which compares exact values and
+  treats a NaN as incomparable. Arithmetic is unchanged and stays
+  float-contagious, as in Emacs. A *two-argument* comparison is lowered to a
+  fusevm op that 0.17.0 still answers natively on rounded images, so that path
+  waits on the fusevm release which delegates the pair; the hook fixed here is
+  what will answer it.
 - **`kill-buffer` could leave a dead buffer current with stale positions, and the
   next `buffer-substring` aborted the process.**
   `(progn (insert "hello") (kill-buffer) (buffer-substring (point-min) (point)))`

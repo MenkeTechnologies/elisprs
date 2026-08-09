@@ -2,7 +2,7 @@
 //! ~irreducible core; the large derived surface (caar.., seq-*, cl-*, alist
 //! helpers) will be defined in an elisp prelude on top of these.
 
-use crate::host::{bigint_to_f64, CharTable, ElispHost, MatchData, Num, Obj, Resolved};
+use crate::host::{bigint_to_f64, num_cmp, CharTable, ElispHost, MatchData, Num, Obj, Resolved};
 use fusevm::Value;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -328,6 +328,11 @@ fn mod_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(max NUM…)` / `(min NUM…)` — Emacs checks each argument in order, so the
 /// error names the FIRST non-number, and both are subrs (which is what their
 /// `wrong-number-of-arguments` and `#<subr min>` printing depend on).
+///
+/// Emacs picks the winner with `arithcompare`, so the comparison is exact
+/// ([`num_cmp`]) and a mixed integer/float pair is decided on real values:
+/// `(min (expt 3 34) (float (expt 3 34)))` is the *float*, because it is the
+/// smaller number even though both round to the same `f64`.
 fn min_max(h: &mut ElispHost, a: &[Value], want_max: bool) -> R {
     let mut best = as_number(h, &a[0])?;
     let mut best_v = a[0].clone();
@@ -335,22 +340,16 @@ fn min_max(h: &mut ElispHost, a: &[Value], want_max: bool) -> R {
         let n = as_number(h, v)?;
         // A NaN operand wins, as in Emacs.
         let nan = matches!(n, Num::Float(f) if f.is_nan());
-        let better = match (&best, &n) {
-            (Num::Int(x), Num::Int(y)) => {
+        // `None` is a NaN pair, which the `nan` flag above already handles.
+        let better = match num_cmp(&n, &best) {
+            Some(o) => {
                 if want_max {
-                    y > x
+                    o.is_gt()
                 } else {
-                    y < x
+                    o.is_lt()
                 }
             }
-            (x, y) => {
-                let (xf, yf) = (x.to_f64(), y.to_f64());
-                if want_max {
-                    yf > xf
-                } else {
-                    yf < xf
-                }
-            }
+            None => false,
         };
         if better || nan {
             best = n;
@@ -383,24 +382,22 @@ fn one_minus(h: &mut ElispHost, a: &[Value]) -> R {
 
 /// Compare adjacent arguments with `pred`.
 ///
-/// Two integers compare *exactly*, never through `f64`: at 2^53 an `f64` runs
-/// out of mantissa, so the old float-only comparison answered `t` to
-/// `(= 2305843009213693950 2305843009213693951)`.
+/// Every pair compares *exactly*, never through `f64` — see [`num_cmp`]. At 2^53
+/// an `f64` runs out of mantissa, so a float-only comparison answered `t` to
+/// `(= 2305843009213693950 2305843009213693951)` and, for a mixed integer/float
+/// pair, `t` to `(= (expt 3 34) (float (expt 3 34)))` where Emacs answers nil.
 fn cmp(h: &ElispHost, a: &[Value], pred: fn(std::cmp::Ordering) -> bool, nan_val: bool) -> R {
     for w in a.windows(2) {
         let (x, y) = (as_number(h, &w[0])?, as_number(h, &w[1])?);
-        let ord = match (&x, &y) {
-            (Num::Int(i), Num::Int(j)) => i.cmp(j),
-            _ => match x.to_f64().partial_cmp(&y.to_f64()) {
-                Some(o) => o,
-                // A NaN operand: `=`/`<`/`>`/`<=`/`>=` are all false.
-                None => {
-                    if nan_val {
-                        continue;
-                    }
-                    return Ok(Value::Undef);
+        let ord = match num_cmp(&x, &y) {
+            Some(o) => o,
+            // A NaN operand: `=`/`<`/`>`/`<=`/`>=` are all false.
+            None => {
+                if nan_val {
+                    continue;
                 }
-            },
+                return Ok(Value::Undef);
+            }
         };
         if !pred(ord) {
             return Ok(Value::Undef);
