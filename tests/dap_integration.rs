@@ -17,6 +17,11 @@ use serde_json::{json, Value};
 /// single statement. Line 3 binds `c`; line 4 prints it.
 const PROGRAM: &str = "(setq a 1)\n(setq b 2)\n(setq c (+ a b))\n(princ (format \"c=%d\\n\" c))\n";
 
+/// A program whose only statement inside a `defun` is on line 2, so a line
+/// breakpoint there can only be reached by entering the function body.
+const FUNCTION_PROGRAM: &str =
+    "(defun add2 (x)\n  (+ x 2))\n(princ (format \"r=%d\\n\" (add2 40)))\n";
+
 struct Session {
     child: Child,
     stdin: ChildStdin,
@@ -25,7 +30,13 @@ struct Session {
 }
 
 impl Session {
+    /// Standard handshake with a single line breakpoint on line 3.
     fn start(program_path: &str) -> Self {
+        Self::start_with_lines(program_path, &[3])
+    }
+
+    /// Same handshake, with the breakpoint lines chosen by the caller.
+    fn start_with_lines(program_path: &str, lines: &[u32]) -> Self {
         let bin = env!("CARGO_BIN_EXE_elisp");
         let mut child = Command::new(bin)
             .arg("--dap")
@@ -51,9 +62,10 @@ impl Session {
         };
         // Standard handshake.
         s.send("initialize", json!({}));
+        let bps: Vec<Value> = lines.iter().map(|l| json!({ "line": l })).collect();
         s.send(
             "setBreakpoints",
-            json!({ "source": { "path": program_path }, "breakpoints": [{ "line": 3 }] }),
+            json!({ "source": { "path": program_path }, "breakpoints": bps }),
         );
         s.send("launch", json!({ "program": program_path }));
         s.send("configurationDone", json!({}));
@@ -120,6 +132,32 @@ impl Session {
         self.send("stackTrace", json!({ "threadId": 1 }));
         let r = self.response("stackTrace");
         r["body"]["stackFrames"][0]["line"].as_u64().unwrap()
+    }
+
+    /// `evaluate` in the paused host — the only view of a *lexical* binding
+    /// (`variables` lists symbol value cells, which a closure parameter is not).
+    fn evaluate(&mut self, expr: &str) -> String {
+        self.send("evaluate", json!({ "expression": expr }));
+        let r = self.response("evaluate");
+        r["body"]["result"].as_str().unwrap_or("").to_string()
+    }
+
+    /// Drive to completion, returning `(concatenated stdout, saw terminated)`.
+    fn run_to_end(&mut self) -> (String, bool) {
+        let mut out = String::new();
+        for _ in 0..50 {
+            match self.read_msg() {
+                Some(m) if m["type"] == "event" && m["event"] == "output" => {
+                    out.push_str(m["body"]["output"].as_str().unwrap_or(""));
+                }
+                Some(m) if m["type"] == "event" && m["event"] == "terminated" => {
+                    return (out, true);
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        (out, false)
     }
 }
 
@@ -194,6 +232,42 @@ fn dap_breakpoint_step_and_terminate() {
         "program stdout (c=3) streamed as an output event"
     );
     assert!(saw_terminated, "session terminated after continue");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Debugging has to reach *inside* a user function, not just the top level.
+///
+/// The whole program compiles to one debug-instrumented chunk, so a `defun`'s
+/// body carries statement markers too — and a compiled call funnels through
+/// `host::call_function` → `run_closure` → `run_chunk`, which keeps those
+/// markers live. This pins that: line 2 exists only inside `add2`'s body, so
+/// the stop proves the function was defined, called, and entered under `--dap`,
+/// and `evaluate` proves the parameter is bound in the paused frame.
+#[test]
+fn dap_line_breakpoint_inside_a_function_body() {
+    let path = std::env::temp_dir().join(format!("elisprs_dap_fn_{}.el", std::process::id()));
+    std::fs::write(&path, FUNCTION_PROGRAM).expect("write program");
+    let path_str = path.to_string_lossy().into_owned();
+
+    let mut s = Session::start_with_lines(&path_str, &[2]);
+
+    let stop = s.stopped();
+    assert_eq!(
+        stop["body"]["reason"], "breakpoint",
+        "stops on the breakpoint inside the function body"
+    );
+    assert_eq!(s.stack_line(), 2, "the stop is on the function's body line");
+    assert_eq!(
+        s.evaluate("x"),
+        "40",
+        "the closure parameter is bound in the paused frame"
+    );
+
+    s.send("continue", json!({ "threadId": 1 }));
+    let (out, terminated) = s.run_to_end();
+    assert!(out.contains("r=42"), "the call returned 42, got {out:?}");
+    assert!(terminated, "session terminated after continue");
 
     let _ = std::fs::remove_file(&path);
 }
