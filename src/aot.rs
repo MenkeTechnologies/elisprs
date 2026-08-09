@@ -67,6 +67,13 @@ pub fn compile_executable(src: &str, out: &Path) -> Result<(), String> {
             "CoreFoundation",
             "-framework",
             "Security",
+            // `sysinfo` (pulled in for `system-name'/load reporting) calls
+            // IOKit — IOServiceMatching, IOIteratorNext, kIOMasterPortDefault.
+            // Without this every `--aot-exe' link died with "symbol(s) not found
+            // for architecture arm64", so the native path could not be run at
+            // all on macOS.
+            "-framework",
+            "IOKit",
             "-liconv",
             "-lc++",
         ]);

@@ -1773,3 +1773,84 @@ confirmed against Emacs 30.2 here rather than taken on trust.
   reader-level backquote preservation, `setf`'s own gv expansion SHAPE,
   `hash-table-size`, `aset` on a string, and the warm-cache `make-symbol`
   re-intern.
+
+---
+
+## Round 10 — exact division with a divisor, argument order, filevercmp, non-finite floats
+
+Every fix in this round was verified by byte-diffing stdout, stderr and exit
+status against `emacs -Q --batch` 30.2 on the interpreter, with the bytecode
+cache disabled, on a warm rkyv cache, and — for everything except the
+non-finite-float items — on an AOT-compiled native executable.
+
+- **`floor`/`ceiling`/`round`/`truncate` with a DIVISOR saturated to `i64`** —
+  ✅ FIXED. `(floor 1.0e30 3)` answered `9223372036854775807`; Emacs says
+  `333333333333333339961541612885`. With a float on either side the quotient
+  went through `apply_rm(x / y) as i64`. Emacs divides *exactly* (every finite
+  float is a dyadic rational), so rounding the `f64` quotient is not enough
+  either — that yields `333333333333333316505293553664`. Both operands now
+  convert to an exact fraction and reuse the bignum rounding division. The
+  one-argument forms were already correct, which is what kept this quiet.
+- **`+`/`-`/`*` with 3+ arguments skipped later arguments' side effects** —
+  ✅ FIXED. They lowered to a chain of binary opcodes that folded as it
+  evaluated, so `(let ((n 0)) (ignore-errors (* 1 t (setq n 9))) n)` left `n` at
+  `0` where Emacs leaves `9`, and `(* 1 t (error "boom"))` reported
+  `(wrong-type-argument number-or-marker-p t)` instead of `(error "boom")`.
+- **A one-argument `+`/`*` skipped its type check** — ✅ FIXED. `(+ t)` answered
+  `t`, `(+ "a")` answered `"a"`. The lone operand was emitted bare. It now goes
+  through the n-ary builtin, which seeds its accumulator from the first argument
+  rather than the identity, so the check happens *and* `(+ -0.0)` stays `-0.0`.
+- **`string-version-lessp` was a byte comparison** — ✅ FIXED. It is gnulib
+  `filevercmp`: `order()` sorts `~` first, then digits, then letters, then every
+  other byte *after* the letters; `.`/`..`/leading-dot names are special-cased
+  and file suffixes are cut before the first pass. `(string-version-lessp "a" " ")`
+  was `nil` (Emacs: `t`), `(string-version-lessp "." "9")` was `nil` (Emacs: `t`).
+  A 4,000-pair differential corpus went from **1,985 divergences to 0**.
+- **`string-to-number` rejected the non-finite float syntax** — ✅ FIXED.
+  `(string-to-number "1.0e+INF")` silently answered the finite `1.0`, so any
+  float round-tripped through `number-to-string` lost its infinity.
+- **NaN payloads were discarded by the reader and the printer** — ✅ FIXED.
+  Emacs stores a token's leading integer in the NaN's significand and prints it
+  back, so `3.7e+NaN` reads and prints as `3.0e+NaN`; everything collapsed to
+  `0.0e+NaN`. The reader also matched only a lowercase `e`, so `1.0E+INF` read
+  back as a *symbol*.
+- **`/` and `mod` flattened the sign of a NaN operand** — ✅ FIXED. Both
+  unconditionally `abs()`ed a NaN result to hide the hardware-dependent sign of a
+  NaN the operation *invents* (`(/ 0.0 0.0)`). That also destroyed the sign of a
+  NaN merely passing through, which IEEE propagates unchanged on every ISA:
+  `(/ -0.0e+NaN -1)` is `-0.0e+NaN` in Emacs. Only invented NaNs are
+  canonicalized now.
+- **Short-circuiting cl-seq searches rejected improper lists** — ✅ FIXED.
+  `cl-position`, `cl-find`, `cl-position-if` and `cl-find-if` normalized through
+  `(append SEQ nil)`, which signals `listp` up front, so `(cl-position 1 (cons 1
+  t))` errored where Emacs answers `0`. They walk the list in place now, which
+  also preserves the signal for a search that really does run off the end
+  (`(cl-find 9 (cons 1 t))`).
+- **`--aot-exe` could not link on macOS** — ✅ FIXED. The link line omitted
+  `-framework IOKit`, which `sysinfo` needs, so every standalone AOT build died
+  with "symbol(s) not found for architecture arm64" and the native path could not
+  be exercised at all.
+
+### Still open after round 10
+
+- **A fixed-arity subr's arity is checked after its arguments are evaluated** —
+  `(let ((n 0)) (ignore-errors (nth 1 t (setq n 9))) n)` is `0` in Emacs and `9`
+  here; same for `car` and `cons` with a surplus argument. The signalled error
+  (`wrong-number-of-arguments`) already matches; only the surplus argument's side
+  effects differ. Closing it means checking subr arity at compile time, before
+  the argument evaluation is emitted.
+- **`\s-` matches a newline here and not in Emacs** — `(string-match "\\s-" "\n")`
+  is `nil` in Emacs and `0` here, because `(char-syntax ?\n)` is `62` (`>`,
+  comment-end) in the standard syntax table and `32` (whitespace) here. The
+  syntax-class table, not the regexp engine.
+- **`(assoc-string nil LIST)`** is `nil` in Emacs and `(wrong-type-argument
+  symbolp nil)` here.
+- **A closure prints the environment it captured** — unchanged from round 9, same
+  substrate reason.
+- **An AOT executable whose constants are not reconstructible exits 0 printing
+  nothing.** `(princ (format "a %s\n" (string-to-number (number-to-string
+  -1.0e+INF))))` builds and links, runs, exits `0`, and produces no output at
+  all; the same file under the interpreter prints correctly. Reproducible on the
+  unmodified tree, so it is not a regression — it is the constant-reification
+  work item recorded in `src/aot_runtime.rs`. The *silence* is the worst part: a
+  failed AOT run is indistinguishable from a program that printed nothing.

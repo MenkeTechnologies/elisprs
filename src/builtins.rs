@@ -182,8 +182,16 @@ fn fold_arith(
     int_op: fn(BigInt, BigInt) -> BigInt,
     float_op: fn(f64, f64) -> f64,
 ) -> R {
-    let mut acc = Num::Int(BigInt::from(init));
-    for v in a {
+    // Seed from the FIRST argument, not from the identity — that is what Emacs's
+    // `arith_driver' does, and it is observable on signed zero: `(+ -0.0)' is
+    // -0.0 because the lone argument is returned (type-checked) rather than
+    // added to 0, while `(+ -0.0 0)' really does add and gives 0.0. Only an
+    // empty argument list falls back to the identity.
+    let mut acc = match a.first() {
+        Some(v) => as_number(h, v)?,
+        None => Num::Int(BigInt::from(init)),
+    };
+    for v in a.iter().skip(1) {
         let n = as_number(h, v)?;
         acc = match (acc, n) {
             (Num::Int(x), Num::Int(y)) => Num::Int(int_op(x, y)),
@@ -237,8 +245,11 @@ fn div(h: &mut ElispHost, a: &[Value]) -> R {
     } else {
         (first, &a[1..])
     };
+    // Whether a NaN was *handed to* the division rather than produced by it.
+    let mut nan_operand = matches!(acc, Num::Float(f) if f.is_nan());
     for v in rest {
         let n = as_number(h, v)?;
+        nan_operand |= matches!(n, Num::Float(f) if f.is_nan());
         acc = match (acc, n) {
             (Num::Int(x), Num::Int(y)) => {
                 if y == BigInt::from(0) {
@@ -252,12 +263,16 @@ fn div(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(match acc {
         Num::Int(i) => h.make_integer(i),
         Num::Float(mut f) => {
-            // A float division that yields NaN (e.g. `(/ 0.0 0.0)`) gets a
-            // hardware-dependent sign bit: x86-64 produces a sign-negative NaN,
-            // ARM a positive one. Emacs prints such a result as "0.0e+NaN"
-            // (positive), so canonicalize the sign to keep output
-            // platform-independent. A later negation still flips it to "-0.0e+NaN".
-            if f.is_nan() {
+            // A NaN the division *invents* (`(/ 0.0 0.0)`) gets a
+            // hardware-dependent sign: x86-64 yields a sign-negative NaN, ARM a
+            // positive one. Emacs inherits that difference from the C division;
+            // canonicalizing to positive keeps elisprs's output the same on both.
+            //
+            // A NaN that merely *passed through* is a different matter: IEEE
+            // propagates an operand NaN unchanged on every ISA, so `(/ -0.0e+NaN
+            // -1)' is -0.0e+NaN in Emacs everywhere. Flattening that one too made
+            // the sign of an existing NaN unobservable through `/'.
+            if f.is_nan() && !nan_operand {
                 f = f.abs();
             }
             Value::Float(f)
@@ -289,9 +304,11 @@ fn mod_fn(h: &mut ElispHost, a: &[Value]) -> R {
         if if yf < 0.0 { r > 0.0 } else { r < 0.0 } {
             r += yf;
         }
-        // Canonicalize the hardware-dependent NaN sign to positive, matching
-        // Emacs's "0.0e+NaN" printer (mirrors the `div` handling above).
-        if r.is_nan() {
+        // Canonicalize only a NaN this computation invented — `(mod 5.0 0)` —
+        // whose sign is hardware-dependent. An operand that was already a NaN
+        // propagates unchanged on every ISA, so `(mod 0 -0.0e+NaN)' keeps its
+        // sign in Emacs and must here too. Mirrors the `div` handling above.
+        if r.is_nan() && !(xf.is_nan() || yf.is_nan()) {
             r = r.abs();
         }
         return Ok(Value::Float(r));
@@ -2999,53 +3016,44 @@ fn quotient(h: &mut ElispHost, a: &[Value], rm: Rm) -> R {
                 let q = big_div(x, y, rm);
                 return Ok(h.make_integer(q));
             }
-        }
-        _ => {
-            return match xn {
-                Num::Int(i) => Ok(h.make_integer(i)),
-                Num::Float(f) => {
-                    if !f.is_finite() {
-                        // (truncate 1.0e+INF), (round (/ 0.0 0.0)) => overflow-error.
-                        return Err("overflow-error".to_string());
-                    }
-                    Ok(float_to_integer(h, apply_rm(f, rm)))
-                }
-            };
-        }
-    }
-    let (xi, xf, xisf) = as_num(h, &a[0])?;
-    match a.get(1) {
-        Some(d) if !is_nil(d) => {
-            let (di, df, disf) = as_num(h, d)?;
-            if !xisf && !disf {
-                if di == 0 {
-                    return Err("arith-error: division by zero".to_string());
-                }
-                return Ok(Value::Int(int_div(xi, di, rm)));
-            }
+            // A float on either side. Emacs does NOT round the `f64` quotient —
+            // it divides *exactly*, because every finite float is an exact
+            // dyadic rational. `(floor 1e30 3)' is 333333333333333339961541612885
+            // (the exact integer 1e30 denotes, divided by 3), not
+            // 333333333333333316505293553664 (`floor' of the `f64' quotient),
+            // and not a saturated `i64::MAX'.
+            let df = dn.to_f64();
             if df == 0.0 {
                 return Err("arith-error: division by zero".to_string());
             }
-            let q = xf / df;
-            if !q.is_finite() {
-                // Emacs signals `overflow-error` when a float rounding op has no
-                // finite integer result (infinite or NaN quotient), rather than
-                // saturating. (truncate 1.0e+INF 2.0) => (overflow-error).
+            if matches!(xn, Num::Float(f) if !f.is_finite()) {
+                // A non-finite NUMERATOR has no integer value at all.
+                // (floor 1.0e+INF 2) and (floor 0.0e+NaN 2) => overflow-error.
                 return Err("overflow-error".to_string());
             }
-            Ok(Value::Int(apply_rm(q, rm) as i64))
+            if df.is_nan() {
+                // (floor 2 0.0e+NaN) => overflow-error, but an *infinite*
+                // divisor is not an error: Emacs rounds the exactly-zero
+                // quotient, so (ceiling 2 1.0e+INF) is 0, not 1.
+                return Err("overflow-error".to_string());
+            }
+            if df.is_infinite() {
+                return Ok(Value::Int(0));
+            }
+            let (xnum, xden) = exact_ratio(&xn);
+            let (dnum, dden) = exact_ratio(&dn);
+            Ok(h.make_integer(big_div(&(xnum * dden), &(xden * dnum), rm)))
         }
-        _ => {
-            if xisf {
-                if !xf.is_finite() {
-                    // (truncate 1.0e+INF), (round (/ 0.0 0.0)) => (overflow-error).
+        _ => match xn {
+            Num::Int(i) => Ok(h.make_integer(i)),
+            Num::Float(f) => {
+                if !f.is_finite() {
+                    // (truncate 1.0e+INF), (round (/ 0.0 0.0)) => overflow-error.
                     return Err("overflow-error".to_string());
                 }
-                Ok(Value::Int(apply_rm(xf, rm) as i64))
-            } else {
-                Ok(Value::Int(xi))
+                Ok(float_to_integer(h, apply_rm(f, rm)))
             }
-        }
+        },
     }
 }
 /// Divide two exact integers with the given rounding mode (Emacs's `floor`,
@@ -3079,6 +3087,39 @@ fn big_div(x: &BigInt, y: &BigInt, rm: Rm) -> BigInt {
     }
 }
 
+/// A finite number as the exact fraction `num / den`, `den` always positive.
+///
+/// Every finite `f64` is a dyadic rational — mantissa times a power of two — so
+/// this loses nothing. It is what lets `floor`/`ceiling`/`round`/`truncate`
+/// divide a float by an integer exactly, the way Emacs does, instead of
+/// rounding an already-lossy `f64` quotient.
+fn exact_ratio(n: &Num) -> (BigInt, BigInt) {
+    let one = BigInt::from(1);
+    let f = match n {
+        Num::Int(i) => return (i.clone(), one),
+        Num::Float(f) => *f,
+    };
+    let bits = f.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & ((1u64 << 52) - 1);
+    // A subnormal has no implicit leading 1 and a fixed exponent; a normal
+    // number carries the hidden bit. 1075 = 1023 bias + 52 mantissa bits.
+    let (mantissa, exp) = if biased == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1u64 << 52), biased - 1075)
+    };
+    let mut num = BigInt::from(mantissa);
+    if bits >> 63 == 1 {
+        num = -num;
+    }
+    if exp >= 0 {
+        (num << exp as usize, one)
+    } else {
+        (num, one << (-exp) as usize)
+    }
+}
+
 /// An already-rounded `f64` as an exact elisp integer. A float beyond `i64` is a
 /// bignum in Emacs: `(truncate 1e30)` is 1000000000000000019884624838656.
 fn float_to_integer(h: &mut ElispHost, f: f64) -> Value {
@@ -3098,17 +3139,6 @@ fn apply_rm(f: f64, rm: Rm) -> f64 {
         Rm::Ceil => f.ceil(),
         Rm::Trunc => f.trunc(),
         Rm::Round => f.round_ties_even(),
-    }
-}
-fn int_div(x: i64, y: i64, rm: Rm) -> i64 {
-    let q = x / y;
-    let r = x % y;
-    match rm {
-        Rm::Trunc => q,
-        Rm::Floor if r != 0 && (r < 0) != (y < 0) => q - 1,
-        Rm::Ceil if r != 0 && (r < 0) == (y < 0) => q + 1,
-        Rm::Round => (x as f64 / y as f64).round_ties_even() as i64,
-        _ => q,
     }
 }
 fn floor_fn(h: &mut ElispHost, a: &[Value]) -> R {
@@ -3551,8 +3581,16 @@ fn string_to_number(h: &mut ElispHost, a: &[Value]) -> R {
             is_float = true;
         }
     }
+    // Non-finite float syntax, straight out of lread.c `string_to_number': after
+    // `e' an explicit `+' may be followed by the literal `INF' or `NaN'. Both are
+    // case-sensitive and both require the `+' — `1.0e-INF', `1.0eINF' and
+    // `1.0e+inf' are not numbers. Without this, `(string-to-number "1.0e+INF")'
+    // silently answered the finite 1.0, so any float round-tripped through
+    // `number-to-string' lost its infinity.
+    let mut nonfinite: Option<f64> = None;
     if has_digit && i < n && (b[i] == 'e' || b[i] == 'E') {
         let mut j = i + 1;
+        let plus = j < n && b[j] == '+';
         if j < n && (b[j] == '+' || b[j] == '-') {
             j += 1;
         }
@@ -3562,12 +3600,30 @@ fn string_to_number(h: &mut ElispHost, a: &[Value]) -> R {
             while i < n && b[i].is_ascii_digit() {
                 i += 1;
             }
+        } else if plus && b[j..].starts_with(&['I', 'N', 'F']) {
+            is_float = true;
+            nonfinite = Some(f64::INFINITY);
+            i = j + 3;
+        } else if plus && b[j..].starts_with(&['N', 'a', 'N']) {
+            is_float = true;
+            // The payload is the token's leading integer, as in the reader.
+            let mant: String = b[start..i].iter().collect();
+            nonfinite = Some(crate::reader::nan_with_payload(
+                crate::reader::leading_integer(&mant),
+                false,
+            ));
+            i = j + 3;
         }
     }
     if !has_digit {
         return Ok(Value::Int(0));
     }
     if is_float {
+        // lread.c negates the value itself so `-0.0e+NaN' and `-1.0e+INF' keep
+        // their sign — the sign is not part of what INF/NaN parsed.
+        if let Some(v) = nonfinite {
+            return Ok(Value::Float(if b[start] == '-' { -v } else { v }));
+        }
         let tok: String = b[start..i].iter().collect();
         Ok(Value::Float(tok.parse().unwrap_or(0.0)))
     } else {

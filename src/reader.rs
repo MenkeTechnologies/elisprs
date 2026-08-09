@@ -819,27 +819,83 @@ fn classify(h: &mut ElispHost, tok: &str) -> Value {
         }
         // Emacs read syntax for the non-finite floats: a float mantissa followed
         // by `e+INF` or `e+NaN` (e.g. `1.0e+INF`, `-0.0e+NaN`).
-        if let Some(mant) = tok.strip_suffix("e+INF") {
-            if mant.parse::<f64>().is_ok() {
-                let inf = if mant.starts_with('-') {
-                    f64::NEG_INFINITY
-                } else {
-                    f64::INFINITY
-                };
-                return Value::Float(inf);
-            }
+        if let Some(mant) = split_nonfinite(tok, "INF") {
+            let inf = if mant.starts_with('-') {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            };
+            return Value::Float(inf);
         }
-        if let Some(mant) = tok.strip_suffix("e+NaN") {
-            if mant.parse::<f64>().is_ok() {
-                return Value::Float(if mant.starts_with('-') {
-                    -f64::NAN
-                } else {
-                    f64::NAN
-                });
-            }
+        if let Some(mant) = split_nonfinite(tok, "NaN") {
+            return Value::Float(nan_with_payload(
+                leading_integer(mant),
+                mant.starts_with('-'),
+            ));
         }
     }
     h.intern(tok)
+}
+
+/// The mantissa of a non-finite float token — `MANTISSA` in `MANTISSA e+WORD`,
+/// where WORD is `INF` or `NaN` — or `None` if TOK is not spelled that way.
+///
+/// lread.c accepts either case of the exponent marker (`*cp == 'e' || *cp ==
+/// 'E'`) but only an explicit `+` and only the exact words `INF` and `NaN`. So
+/// `1.0E+INF` is the same float as `1.0e+INF`, while `1.0e-INF`, `1.0eINF` and
+/// `1.0e+inf` are symbols. Matching only the lowercase `e` read `1.0E+INF` back
+/// as a *symbol*.
+fn split_nonfinite<'a>(tok: &'a str, word: &str) -> Option<&'a str> {
+    let mant = tok
+        .strip_suffix(word)?
+        .strip_suffix('+')?
+        .strip_suffix(['e', 'E'])?;
+    // The mantissa still has to be a number: `e+INF` alone is a symbol.
+    mant.parse::<f64>().ok().map(|_| mant)
+}
+
+/// The 51 significand bits Emacs stores in a NaN written `MANTISSA e+NaN`.
+///
+/// lread.c packs the token's *leading integer* into `ieee754_double.ieee_nan`
+/// (`mantissa0:19` + `mantissa1:32`) and print.c reads it back out as
+/// `(mantissa0 << 32) + mantissa1`, so the payload is observable: `3.7e+NaN`
+/// reads and prints as `3.0e+NaN`, and `2251799813685248.0e+NaN` (2^51, one bit
+/// too wide) comes back as `0.0e+NaN`.
+pub(crate) const NAN_PAYLOAD_MASK: u64 = 0x0007_FFFF_FFFF_FFFF;
+
+/// Build the NaN for a `MANTISSA e+NaN` token: quiet-NaN exponent plus PAYLOAD.
+pub(crate) fn nan_with_payload(payload: u64, negative: bool) -> f64 {
+    let f = f64::from_bits(0x7ff8_0000_0000_0000 | (payload & NAN_PAYLOAD_MASK));
+    if negative {
+        -f
+    } else {
+        f
+    }
+}
+
+/// lread.c's `n` for a float token: the digits *before* the decimal point,
+/// wrapping on overflow the way its `uintmax_t` accumulator does.
+///
+/// With no leading digit, lread.c keeps whatever `digit_to_number' returned and
+/// widens it: `uintmax_t n = leading_digit'. That function answers **-2** for a
+/// non-alphanumeric character (and -1 for an alphanumeric one that is too large
+/// for the base), so `.5e+NaN' carries payload `(-2 as u64) & MASK' —
+/// 2251799813685246, one below the saturated value. Returning -1 here printed
+/// 2251799813685247 and was the last divergence in this surface.
+pub(crate) fn leading_integer(mant: &str) -> u64 {
+    let digits = mant.strip_prefix(['+', '-']).unwrap_or(mant);
+    let mut chars = digits.chars();
+    let Some(first) = chars.next().and_then(|c| c.to_digit(10)) else {
+        return -2i64 as u64;
+    };
+    let mut n = first as u64;
+    for c in chars {
+        match c.to_digit(10) {
+            Some(d) => n = n.wrapping_mul(10).wrapping_add(d as u64),
+            None => break,
+        }
+    }
+    n
 }
 
 /// Does this token read back as an elisp number (integer or float)? Used by the
@@ -860,10 +916,9 @@ pub(crate) fn token_is_number(tok: &str) -> bool {
     if looks_numeric(tok) && tok.parse::<f64>().is_ok() {
         return true;
     }
-    ["e+INF", "e+NaN"].iter().any(|suffix| {
-        tok.strip_suffix(suffix)
-            .is_some_and(|m| m.parse::<f64>().is_ok())
-    })
+    ["INF", "NaN"]
+        .iter()
+        .any(|word| split_nonfinite(tok, word).is_some())
 }
 
 fn looks_numeric(tok: &str) -> bool {

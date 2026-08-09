@@ -16,7 +16,11 @@
 #              reproduces exactly on any machine
 #   -d DEPTH   max form nesting (default 3)
 #   -c FILE    use an existing corpus instead of generating one
-#   -t SECS    per-process timeout (default 20 batch, 5 single-form)
+#   -t SECS    batch timeout (default scales with the corpus: 20 + N/50 seconds;
+#              a single re-run form always gets 5). It has to scale — a fixed 20s
+#              was under what a debug `elisp' needs for a few thousand forms, and
+#              a timeout does not show up as a divergence: both engines print
+#              <HANG>, which compares equal, so the run reports perfect parity.
 #   -q         summary only
 #
 # Artifacts land in target/fuzz/ (gitignored): corpus.el, emacs.out, elisp.out,
@@ -25,7 +29,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-N=500 SEED=1 DEPTH=3 CORPUS= TMO=20 QUIET=0
+N=500 SEED=1 DEPTH=3 CORPUS= TMO= QUIET=0
 EMACS="${EMACS:-emacs}"
 ELISP="${ELISP:-}"
 while [ $# -gt 0 ]; do
@@ -36,7 +40,9 @@ while [ $# -gt 0 ]; do
     -c) CORPUS="$2"; shift 2 ;;
     -t) TMO="$2"; shift 2 ;;
     -q) QUIET=1; shift ;;
-    -h|--help) grep '^#' "$0" | cut -c3- ; exit 0 ;;
+    # Only the header block, not every `#' line in the file: the body's
+    # explanatory comments are not usage text.
+    -h|--help) perl -ne 'next if $. == 1; last unless /^#/; s/^# ?//; print' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -70,6 +76,14 @@ else
 fi
 TOTAL=$(grep -c '' "$OUT/corpus.el")
 [ "$TOTAL" -gt 0 ] || { echo "empty corpus" >&2; exit 2; }
+
+# The batch timeout has to scale with the corpus. A fixed 20s was under the
+# ~30s a debug `elisp' needs for 6000 forms, so the batch was killed and every
+# unprinted form went to one-process-per-form isolation — minutes of wall clock
+# for a run that takes 30 seconds. Worse, a timeout is not visible as a
+# divergence: both engines emit `<HANG>' and `<HANG>' compares equal to
+# `<HANG>', so a run that timed out reports perfect parity. `-t' still wins.
+: "${TMO:=$(( 20 + TOTAL / 50 ))}"
 
 # ── evaluate under both engines ──────────────────────────────────────────────
 # One process for the whole corpus (fast), then any index the batch failed to
@@ -137,20 +151,43 @@ perl -e '
     while (my $l = <$fh>) { chomp $l; $pair->[1]{$1} = $2 if $l =~ /^(\d+)\t(.*)$/s }
   }
   open my $o, ">", $out or die;
-  my $bad = 0;
+  my ($bad, $unresolved) = (0, 0);
   for my $i (0 .. $#forms) {
     my ($a, $b) = ($r{$i} // "<MISSING>", $s{$i} // "<MISSING>");
-    next if $a eq $b;
+    # A form neither engine produced a value for is NOT parity, even though the
+    # two markers are string-equal. Counting it as agreement is how a timed-out
+    # run reports 0 divergences.
+    if ($a eq $b) {
+      $unresolved++ if $a =~ /^<(HANG|CRASH|MISSING)/;
+      next;
+    }
     $bad++;
     print $o "#$i  $forms[$i]\n  emacs: $a\n  elisp: $b\n\n";
   }
-  print "$bad\n";
+  print "$bad $unresolved\n";
 ' "$OUT/corpus.el" "$OUT/emacs.out" "$OUT/elisp.out" "$OUT/diverge.txt" >"$OUT/count"
-BAD=$(cat "$OUT/count")
+read -r BAD UNRESOLVED <"$OUT/count"
+if [ "${UNRESOLVED:-0}" -gt 0 ]; then
+  printf "${R}warning: %d form(s) produced no value under EITHER engine${N_} ${D}(hang/crash — not counted as parity)${N_}\n" \
+    "$UNRESOLVED"
+fi
+
+# How much of the corpus actually MEASURED something. A form the reference could
+# not evaluate — `void-function' because the corpus named something Emacs does
+# not have — makes both engines signal the same error, and two matching failures
+# read as agreement. That is how a mode can score zero divergences while testing
+# nothing, so the numbers are printed rather than left to be assumed.
+VALUED=$(grep -c '	=' "$OUT/emacs.out" || true)
+REFVOID=$(grep -cE '	!\((void-function|void-variable|invalid-function)' "$OUT/emacs.out" || true)
+printf "${D}reference produced a value for %s/%s forms; %s could not be evaluated by Emacs at all${N_}\n" \
+  "$VALUED" "$TOTAL" "$REFVOID"
+if [ "$REFVOID" -gt $((TOTAL / 20)) ]; then
+  printf "${R}warning: >5%% of the corpus is void under Emacs — those forms measure nothing${N_}\n"
+fi
 
 echo
 if [ "$BAD" -eq 0 ]; then
-  printf "${G}PARITY: %d/%d forms agree with Emacs.${N_}\n" "$TOTAL" "$TOTAL"
+  printf "${G}PARITY: %d/%d forms agree with Emacs.${N_}\n" "$((TOTAL - UNRESOLVED))" "$TOTAL"
   exit 0
 fi
 

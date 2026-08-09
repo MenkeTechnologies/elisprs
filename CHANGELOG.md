@@ -53,6 +53,88 @@ All notable changes to elisprs are documented here. The format follows
   whose value — or whose signalled error — differs. Everything below was found
   with it.
 
+### Fixed (Emacs parity — round 8, exact arithmetic, argument order, filevercmp, non-finite floats)
+Found by `scripts/fuzz_parity.sh` plus hand-built probe corpora, and verified by
+byte-diffing stdout, stderr and exit status against `emacs -Q --batch` 30.2 on
+every execution path: interpreter, cache-disabled, warm rkyv bytecode cache, and
+an AOT-compiled native executable. The bignum/rounding/argument-order/filevercmp
+fixes were confirmed on all four. The non-finite-float fixes were confirmed on
+the three interpreted paths only — an AOT executable whose constants are not
+reconstructible still exits 0 printing nothing (the constant-reification work
+item noted in `src/aot_runtime.rs`), which is a pre-existing limitation
+reproducible on the unmodified tree, not a regression.
+
+- **`floor`/`ceiling`/`round`/`truncate` with a DIVISOR saturated to `i64`.**
+  With a float on either side the quotient went through `apply_rm(x/y) as i64`,
+  so `(floor 1e30 3)` answered `9223372036854775807` instead of
+  `333333333333333339961541612885`. Emacs divides *exactly* — every finite float
+  is a dyadic rational — so the two-argument forms now convert both operands to
+  an exact fraction and reuse the bignum rounding division. Rounding the `f64`
+  quotient is not enough either: that gives `333333333333333316505293553664`.
+  The one-argument forms already promoted correctly, which is what made the
+  divisor path's silence so easy to miss.
+- **`+`/`-`/`*` with three or more arguments skipped later arguments' side
+  effects.** They lowered to a chain of binary opcodes that folded as it
+  evaluated, so a type error in argument N aborted before argument N+1 ran:
+  `(let ((n 0)) (ignore-errors (* 1 t (setq n 9))) n)` left `n` at 0 where Emacs
+  leaves 9, and `(* 1 t (error "boom"))` reported the wrong error. Emacs
+  evaluates every argument first and folds afterwards; three-plus operands now
+  go to the n-ary builtin, which the VM calls with all arguments evaluated.
+- **A one-argument `+`/`*` skipped its type check.** `(+ t)` answered `t` and
+  `(+ "a")` answered `"a"` instead of signalling `wrong-type-argument`, because
+  the lone operand was emitted bare. It now routes through the builtin, which
+  seeds its accumulator from the first argument rather than the identity — so
+  the check happens *and* `(+ -0.0)` stays `-0.0`.
+- **`string-version-lessp` was a byte comparison, wrong on ~50% of inputs.**
+  It is gnulib `filevercmp`, whose `order()` sorts `~` first, then digits, then
+  letters, then every other byte *after* the letters, with `.`/`..`/leading-dot
+  names special-cased and file suffixes cut before the first pass. Comparing raw
+  character codes made `(string-version-lessp "a" " ")` `nil` (Emacs: `t`) and
+  `(string-version-lessp "." "9")` `nil` (Emacs: `t`). A 4,000-pair differential
+  corpus went from 1,985 divergences to 0.
+- **`string-to-number` did not accept the non-finite float syntax.**
+  `(string-to-number "1.0e+INF")` silently answered the finite `1.0`, so any
+  float round-tripped through `number-to-string` lost its infinity. Ported
+  lread.c's rule: after `e`/`E` an explicit `+` may be followed by exactly `INF`
+  or `NaN`.
+- **NaN payloads were discarded by the reader and the printer.** Emacs stores a
+  token's leading integer in the NaN's significand and prints it back, so
+  `3.7e+NaN` reads and prints as `3.0e+NaN`; everything used to collapse to
+  `0.0e+NaN`. The reader also only matched a lowercase `e`, so `1.0E+INF` read
+  back as a *symbol*.
+- **`/` and `mod` flattened the sign of a NaN operand.** Both unconditionally
+  `abs()`ed a NaN result to paper over the hardware-dependent sign of a NaN the
+  operation *invents* (`(/ 0.0 0.0)`). That also destroyed the sign of a NaN
+  merely passing through, which IEEE propagates unchanged on every ISA:
+  `(/ -0.0e+NaN -1)` is `-0.0e+NaN` in Emacs. Only invented NaNs are
+  canonicalized now.
+- **Short-circuiting cl-seq searches rejected improper lists.** `cl-position`,
+  `cl-find`, `cl-position-if` and `cl-find-if` normalized through
+  `(append SEQ nil)`, which signals `listp` up front, so `(cl-position 1 (cons 1
+  t))` errored where Emacs answers `0`. They walk the list in place now, which
+  also preserves the signal for a search that really does run off the end.
+- **`--aot-exe` could not link on macOS.** The link line omitted `-framework
+  IOKit`, which `sysinfo` needs, so every standalone AOT build died with
+  "symbol(s) not found for architecture arm64" — the native path could not be
+  exercised at all.
+
+### Changed (fuzz harness)
+- The batch timeout scales with corpus size instead of being a fixed 20s. It was
+  under the ~30s a debug `elisp` needs for 6,000 forms, and a timeout is *not*
+  visible as a divergence: both engines emit `<HANG>`, which compares equal, so a
+  run that timed out reported perfect parity.
+- Forms that produced no value under *either* engine are counted and reported
+  separately rather than silently counting as agreement.
+- Every run now prints how many forms the reference actually evaluated, and warns
+  when more than 5% of the corpus is `void-function` under Emacs — those forms
+  make both engines fail identically and measure nothing. (`float-to-string`,
+  which exists in neither engine, was removed from the call table for this
+  reason.)
+- The generator emits the shapes the bugs above needed: exact-division operands
+  (`1e30`, `2^100`, `9.3e18`), two-argument rounding, one- and four-argument
+  arithmetic, filevercmp-relevant strings (`.`, `..`, `~`, `a.tar.gz`, `foo01`),
+  non-finite float tokens, and improper lists.
+
 ### Fixed (Emacs parity — round 7, semantic areas the fuzz grammar does not generate)
 `scripts/fuzz_parity.sh` reported 1/1500 on its own corpus, so these came from
 hand-built differential probe corpora in the areas `scripts/fuzz/gen.el` never

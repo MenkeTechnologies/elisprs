@@ -1016,3 +1016,185 @@ fn a_radix_literal_may_exceed_the_fixnum_range() {
     assert_eq!(eval("#b1111"), "15");
     assert_eq!(eval("#o777"), "511");
 }
+
+/// `floor`/`ceiling`/`round`/`truncate` with a DIVISOR divide EXACTLY when either
+/// operand is a float, because every finite float is a dyadic rational. The
+/// quotient is therefore an exact integer of any size — `(floor 1e30 3)` is the
+/// bignum 333333333333333339961541612885, not `floor` of the lossy `f64`
+/// quotient (333333333333333316505293553664) and not a saturated `i64::MAX`.
+#[test]
+fn rounding_with_a_divisor_is_exact_and_promotes() {
+    assert_eq!(eval("(floor 1.0e30 3)"), "333333333333333339961541612885");
+    assert_eq!(eval("(truncate 1.0e30 3)"), "333333333333333339961541612885");
+    assert_eq!(eval("(ceiling 1.0e30 3)"), "333333333333333339961541612886");
+    assert_eq!(eval("(round 1.0e30 3)"), "333333333333333339961541612885");
+    assert_eq!(eval("(floor -1.0e30 3)"), "-333333333333333339961541612886");
+    assert_eq!(eval("(floor 1.0e30 -3)"), "-333333333333333339961541612886");
+    assert_eq!(
+        eval("(floor (ash 1 100) 3.0)"),
+        "422550200076076467165567735125"
+    );
+    // Small exact fractions still round half-to-even.
+    assert_eq!(eval("(round 7.5 2)"), "4");
+    assert_eq!(eval("(round 0.5 1)"), "0");
+    assert_eq!(eval("(round 1.5 1)"), "2");
+    assert_eq!(eval("(round 2.5 1)"), "2");
+    assert_eq!(eval("(floor 7.5 2)"), "3");
+    // An infinite divisor rounds an exactly-zero quotient (not an infinitesimal),
+    // an infinite/NaN numerator has no integer value, and zero still signals.
+    assert_eq!(eval("(ceiling 2 1.0e+INF)"), "0");
+    assert_eq!(eval("(floor -2 1.0e+INF)"), "0");
+    assert_eq!(
+        eval("(condition-case e (floor 1.0e+INF 2) (error e))"),
+        "(overflow-error)"
+    );
+    assert_eq!(
+        eval("(condition-case e (floor 2 0.0e+NaN) (error e))"),
+        "(overflow-error)"
+    );
+    assert_eq!(
+        eval("(condition-case e (floor 1.0 0.0) (error e))"),
+        "(arith-error)"
+    );
+}
+
+/// Emacs evaluates EVERY argument of `+`/`-`/`*` before folding, so a type error
+/// in one argument does not cancel a later argument's side effects, and the
+/// error reported is the leftmost bad operand's. A chain of binary opcodes folded
+/// as it evaluated and skipped the rest.
+#[test]
+fn nary_arithmetic_evaluates_all_arguments_first() {
+    assert_eq!(eval("(let ((n 0)) (ignore-errors (* 1 t (setq n 9))) n)"), "9");
+    assert_eq!(eval("(let ((n 0)) (ignore-errors (+ 1 t (setq n 9))) n)"), "9");
+    assert_eq!(eval("(let ((n 0)) (ignore-errors (- 1 t (setq n 9))) n)"), "9");
+    assert_eq!(
+        eval("(condition-case e (* 1 t (error \"boom\")) (error e))"),
+        "(error \"boom\")"
+    );
+    // A lone operand is still type-checked: `(+ t)` signals, it does not answer t.
+    assert_eq!(
+        eval("(condition-case e (+ t) (error e))"),
+        "(wrong-type-argument number-or-marker-p t)"
+    );
+    assert_eq!(
+        eval("(condition-case e (* \"a\") (error e))"),
+        "(wrong-type-argument number-or-marker-p \"a\")"
+    );
+    // ...but it is returned, not folded into the identity, so signed zero and
+    // exactness survive.
+    assert_eq!(eval("(+ -0.0)"), "-0.0");
+    assert_eq!(eval("(* -0.0)"), "-0.0");
+    assert_eq!(eval("(+ -0.0 0)"), "0.0");
+    assert_eq!(eval("(+ 5)"), "5");
+    assert_eq!(eval("(+)"), "0");
+    assert_eq!(eval("(*)"), "1");
+    assert_eq!(eval("(- 10 1 2 3)"), "4");
+    assert_eq!(eval("(+ 1 2 3 4 5 6 7 8)"), "36");
+}
+
+/// `string-version-lessp` is gnulib `filevercmp`, not a byte comparison with
+/// numeric runs: `order()` sorts `~` first, then digits, then letters, then all
+/// other bytes AFTER the letters, and a leading "." is special-cased.
+#[test]
+fn string_version_lessp_is_filevercmp() {
+    // Punctuation and whitespace sort after letters.
+    assert_eq!(eval("(string-version-lessp \"a\" \" \")"), "t");
+    assert_eq!(eval("(string-version-lessp \" \" \"a\")"), "nil");
+    assert_eq!(eval("(string-version-lessp \"!\" \"a\")"), "nil");
+    assert_eq!(eval("(string-version-lessp \"ab\" \"  padded  \")"), "t");
+    // "." sorts before every other name, then "..".
+    assert_eq!(eval("(string-version-lessp \".\" \"9\")"), "t");
+    assert_eq!(eval("(string-version-lessp \"0\" \".\")"), "nil");
+    assert_eq!(eval("(string-version-lessp \".\" \"..\")"), "t");
+    // "~" sorts before everything, including the end of the string.
+    assert_eq!(eval("(string-version-lessp \"a~1\" \"a1\")"), "t");
+    // Digit runs still compare numerically, and file suffixes are cut first.
+    assert_eq!(eval("(string-version-lessp \"foo2\" \"foo10\")"), "t");
+    assert_eq!(eval("(string-version-lessp \"foo10\" \"foo2\")"), "nil");
+    assert_eq!(eval("(string-version-lessp \"foo2.png\" \"foo12.png\")"), "t");
+    assert_eq!(eval("(string-version-lessp \"1.2\" \"1.10\")"), "t");
+    assert_eq!(eval("(string-version-lessp \"\" \"a\")"), "t");
+    assert_eq!(eval("(string-version-lessp \"a\" \"\")"), "nil");
+    assert_eq!(eval("(string-version-lessp \"a1b\" \"a1b\")"), "nil");
+}
+
+/// The non-finite float read syntax. `string-to-number` accepts it (it did not,
+/// so `(string-to-number "1.0e+INF")` silently answered the finite 1.0), either
+/// case of the exponent marker is accepted, and the NaN carries the token's
+/// leading integer in its significand — which Emacs prints back out.
+#[test]
+fn non_finite_float_syntax_round_trips() {
+    assert_eq!(eval("(string-to-number \"1.0e+INF\")"), "1.0e+INF");
+    assert_eq!(eval("(string-to-number \"-1.0e+INF\")"), "-1.0e+INF");
+    assert_eq!(
+        eval("(string-to-number (number-to-string -1.0e+INF))"),
+        "-1.0e+INF"
+    );
+    assert_eq!(eval("(string-to-number \"0.0e+NaN\")"), "0.0e+NaN");
+    assert_eq!(eval("(string-to-number \"-0.0e+NaN\")"), "-0.0e+NaN");
+    // Only an explicit `+' and the exact words INF / NaN; case of `e' is free.
+    assert_eq!(eval("(string-to-number \"1.0E+INF\")"), "1.0e+INF");
+    assert_eq!(eval("(read \"1.0E+INF\")"), "1.0e+INF");
+    assert_eq!(eval("(read \"3.0E+NaN\")"), "3.0e+NaN");
+    assert_eq!(eval("(string-to-number \"1.0e-INF\")"), "1.0");
+    assert_eq!(eval("(string-to-number \"1.0eINF\")"), "1.0");
+    assert_eq!(eval("(string-to-number \"1.0e+inf\")"), "1.0");
+    assert_eq!(eval("(string-to-number \"e+INF\")"), "0");
+    // The NaN payload is the leading integer, masked to 51 bits.
+    assert_eq!(eval("(string-to-number \"3.7e+NaN\")"), "3.0e+NaN");
+    assert_eq!(eval("(string-to-number \"123.0e+NaN\")"), "123.0e+NaN");
+    assert_eq!(eval("(read \"-3.7e+NaN\")"), "-3.0e+NaN");
+    assert_eq!(eval("(read \"9007199254740993.0e+NaN\")"), "1.0e+NaN");
+    assert_eq!(eval("(read \"2251799813685248.0e+NaN\")"), "0.0e+NaN");
+    // No leading digit at all: lread.c keeps digit_to_number's -2.
+    assert_eq!(eval("(read \".5e+NaN\")"), "2251799813685246.0e+NaN");
+}
+
+/// A NaN handed to `/` or `mod` keeps its sign — IEEE propagates an operand NaN
+/// unchanged on every ISA. Only a NaN the operation *invents* has a
+/// hardware-dependent sign, and that one is canonicalized to positive.
+#[test]
+fn nan_operands_keep_their_sign_through_arithmetic() {
+    assert_eq!(eval("(/ -0.0e+NaN -1)"), "-0.0e+NaN");
+    assert_eq!(eval("(mod 0 -0.0e+NaN)"), "-0.0e+NaN");
+    assert_eq!(eval("(/ 0.0 0.0)"), "0.0e+NaN");
+    assert_eq!(eval("(mod 5.0 0)"), "0.0e+NaN");
+    assert_eq!(eval("(mod 5 0.0)"), "0.0e+NaN");
+    assert_eq!(eval("(* -0.0e+NaN 1)"), "-0.0e+NaN");
+    assert_eq!(eval("(min -0.0e+NaN 1)"), "-0.0e+NaN");
+}
+
+/// A short-circuiting cl-seq search walks its list in place, so it may return
+/// before ever reaching an improper tail — `(cl-position 1 (cons 1 t))` is 0 in
+/// Emacs. Normalizing through `append` signalled `listp` up front instead. A
+/// search that DOES run off the end must still signal.
+#[test]
+fn short_circuiting_cl_searches_tolerate_an_improper_tail() {
+    assert_eq!(eval("(cl-position 1 (cons 1 t))"), "0");
+    assert_eq!(eval("(cl-find nil (cons nil t))"), "nil");
+    assert_eq!(eval("(cl-position-if #'numberp (cons 1 t))"), "0");
+    assert_eq!(eval("(cl-find-if #'numberp (cons 1 t))"), "1");
+    assert_eq!(eval("(cl-position 1 '(0 1 . t))"), "1");
+    assert_eq!(
+        eval("(condition-case e (cl-position 2 (cons 1 t)) (error e))"),
+        "(wrong-type-argument listp t)"
+    );
+    assert_eq!(
+        eval("(condition-case e (cl-find 9 (cons 1 t)) (error e))"),
+        "(wrong-type-argument listp t)"
+    );
+    // An exhaustive search has to reach the end, so it always signals.
+    assert_eq!(
+        eval("(condition-case e (cl-count 1 (cons 1 t)) (error e))"),
+        "(wrong-type-argument listp t)"
+    );
+    assert_eq!(
+        eval("(condition-case e (cl-position 1 (cons 1 t) :from-end t) (error e))"),
+        "(wrong-type-argument listp t)"
+    );
+    // Proper lists, vectors and strings are unaffected.
+    assert_eq!(eval("(cl-position 3 '(1 2 3 4 5))"), "2");
+    assert_eq!(eval("(cl-find 2 [1 2 3])"), "2");
+    assert_eq!(eval("(cl-position ?b \"abc\")"), "1");
+    assert_eq!(eval("(cl-find 3 '(1 2 3 4 3) :from-end t)"), "3");
+}

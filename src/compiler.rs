@@ -201,6 +201,31 @@ fn try_native_op(
                 "*" => (1, Op::Mul),
                 _ => (0, Op::Sub),
             };
+            // Which shapes may use the native opcodes:
+            //
+            //   0 args      the identity constant, no operand to check.
+            //   (- X)       `Op::Negate' type-checks X itself.
+            //   2 args      both operands are evaluated before the op runs.
+            //
+            // Everything else goes to the n-ary builtin, which the VM calls with
+            // all arguments already evaluated:
+            //
+            //   (+ X)       a lone operand emitted bare skips the type check
+            //               altogether, so `(+ t)' quietly returned `t' instead
+            //               of signalling `wrong-type-argument'.
+            //   3+ args     a chain of binary ops interleaves evaluation with
+            //               folding, so a type error in argument N aborts before
+            //               argument N+1 is ever evaluated. Emacs evaluates
+            //               *every* argument first and folds afterwards, so
+            //               `(* 1 t (setq n 9))' must still leave `n' at 9.
+            let native = match (name, args.len()) {
+                (_, 0) | (_, 2) => true,
+                ("-", 1) => true,
+                _ => false,
+            };
+            if !native {
+                return Ok(false);
+            }
             if args.is_empty() {
                 b.emit(Op::LoadInt(ident), 0);
             } else if name == "-" && args.len() == 1 {

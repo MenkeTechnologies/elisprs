@@ -433,11 +433,20 @@ pub const PRELUDE: &str = r#"
     (apply 'cl-remove-if nil seq keys)))
 (defun cl-delete-if (pred seq &rest keys) (apply (function cl-remove-if) pred seq keys))
 (defun cl-delete-if-not (pred seq &rest keys) (apply (function cl-remove-if-not) pred seq keys))
+;; The sequence a short-circuiting cl-seq search walks. A list is walked IN
+;; PLACE, never copied through `append': cl--position stops the moment it
+;; matches and so never looks at an improper tail, which is why
+;; `(cl-position 1 (cons 1 t))' is 0 in Emacs while `(append '(1 . t) nil)'
+;; signals `(wrong-type-argument listp t)' up front. Walking in place also keeps
+;; the signal for the searches that DO run off the end — `(cl-find 9 (cons 1 t))'
+;; still signals, because `(car t)' does. Vectors and strings still convert.
+(defun cl--search-seq (seq) (if (listp seq) seq (append seq nil)))
+
 (defun cl-find-if (pred seq &rest keys)
   (let ((key (cl--getkey keys :key 'identity))
         (from-end (cl--getkey keys :from-end nil))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
-        (lst (append seq nil)) (i 0) (r nil) (found nil))
+        (lst (cl--search-seq seq)) (i 0) (r nil) (found nil))
     (while (and lst (or from-end (not found)))
       (when (and (cl--in-bounds i start end) (funcall pred (funcall key (car lst))))
         (setq r (car lst) found t))
@@ -1813,7 +1822,7 @@ TYPE nil maps for side effects only and returns nil."
         (key (cl--getkey keys :key 'identity))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
         (from-end (cl--getkey keys :from-end nil))
-        (lst (append seq nil)) (i 0) (r nil))
+        (lst (cl--search-seq seq)) (i 0) (r nil))
     ;; With :from-end, keep scanning so R ends up the last match.
     (while (and lst (or from-end (not r)))
       (when (and (cl--in-bounds i start end)
@@ -1847,7 +1856,7 @@ TYPE nil maps for side effects only and returns nil."
   (let ((key (cl--getkey keys :key 'identity))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
         (from-end (cl--getkey keys :from-end nil))
-        (lst (append seq nil)) (i 0) (r nil))
+        (lst (cl--search-seq seq)) (i 0) (r nil))
     (while (and lst (or from-end (not r)))
       (when (and (cl--in-bounds i start end) (funcall pred (funcall key (car lst))))
         (setq r i))
@@ -1859,7 +1868,7 @@ TYPE nil maps for side effects only and returns nil."
   (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
         (key (cl--getkey keys :key 'identity)) (from-end (cl--getkey keys :from-end nil))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
-        (lst (append seq nil)) (i 0) (r nil) (found nil))
+        (lst (cl--search-seq seq)) (i 0) (r nil) (found nil))
     (while (and lst (or from-end (not found)))
       (when (and (cl--in-bounds i start end)
                  (cl--seq-match test test-not item (funcall key (car lst))))
@@ -2737,8 +2746,109 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
           (setq i (1+ i)))
         (if (eq res 'eq) (< (length a) (length b)) res)))
      (t (signal (quote type-mismatch) (list a b))))))
+;; ── filevercmp ───────────────────────────────────────────────────────────────
+;; `string-version-lessp' is `filevercmp (S1, S2) < 0' in Emacs, and filevercmp
+;; is gnulib's Debian version-sort, NOT a byte comparison with numeric runs.
+;; Comparing raw character codes got the digit runs right and everything else
+;; wrong: `(string-version-lessp "a" " ")' is t in Emacs (punctuation sorts
+;; AFTER letters) and `(string-version-lessp "." "9")' is t (a lone "." sorts
+;; before every other name). The three helpers below are statement-for-statement
+;; ports of gnulib lib/filevercmp.c so those rules come out of the algorithm
+;; instead of being special-cased.
+(defun filevercmp--alpha-p (c) (or (and (>= c ?A) (<= c ?Z)) (and (>= c ?a) (<= c ?z))))
+(defun filevercmp--alnum-p (c) (or (cl--digitp c) (filevercmp--alpha-p c)))
+
+;; gnulib `order': the sort weight of the byte at POS. Past the end sorts first,
+;; then `~', then any digit (all digits tie — runs are compared numerically
+;; below), then letters by code, then every other byte AFTER the letters.
+(defun filevercmp--order (s pos len)
+  (if (= pos len)
+      -1
+    (let ((c (aref s pos)))
+      (cond ((cl--digitp c) 0)
+            ((filevercmp--alpha-p c) c)
+            ((eq c ?~) -2)
+            ;; c + UCHAR_MAX + 1: pushes punctuation past every letter.
+            (t (+ c 256))))))
+
+;; gnulib `verrevcmp': the Debian version-comparison algorithm. Alternates
+;; between a non-digit stretch compared through `filevercmp--order' and a digit
+;; run compared numerically (leading zeros skipped, longer run wins).
+(defun filevercmp--verrevcmp (s1 n1 s2 n2)
+  (let ((p1 0) (p2 0) (result nil) (first-diff 0))
+    (while (and (null result) (or (< p1 n1) (< p2 n2)))
+      (setq first-diff 0)
+      (while (and (null result)
+                  (or (and (< p1 n1) (not (cl--digitp (aref s1 p1))))
+                      (and (< p2 n2) (not (cl--digitp (aref s2 p2))))))
+        (let ((c1 (filevercmp--order s1 p1 n1))
+              (c2 (filevercmp--order s2 p2 n2)))
+          (if (/= c1 c2)
+              (setq result (- c1 c2))
+            (setq p1 (1+ p1) p2 (1+ p2)))))
+      (unless result
+        (while (and (< p1 n1) (eq (aref s1 p1) ?0)) (setq p1 (1+ p1)))
+        (while (and (< p2 n2) (eq (aref s2 p2) ?0)) (setq p2 (1+ p2)))
+        (while (and (< p1 n1) (< p2 n2)
+                    (cl--digitp (aref s1 p1)) (cl--digitp (aref s2 p2)))
+          (when (= first-diff 0)
+            (setq first-diff (- (aref s1 p1) (aref s2 p2))))
+          (setq p1 (1+ p1) p2 (1+ p2)))
+        ;; A digit left over on one side means that run is longer, so larger.
+        (cond ((and (< p1 n1) (cl--digitp (aref s1 p1))) (setq result 1))
+              ((and (< p2 n2) (cl--digitp (aref s2 p2))) (setq result -1))
+              ((/= first-diff 0) (setq result first-diff)))))
+    (or result 0)))
+
+;; gnulib `file_prefixlen': length of S up to its file suffixes, where a suffix
+;; matches "(\.[A-Za-z~][A-Za-z0-9~]*)*$". Comparing prefixes first is why
+;; "foo2.png" sorts before "foo12.png".
+(defun filevercmp--prefixlen (s n)
+  (let ((i 0) (prefixlen 0) (done nil))
+    (while (not done)
+      (if (= i n)
+          (setq done t)
+        (setq i (1+ i))
+        (setq prefixlen i)
+        (while (and (< (1+ i) n) (eq (aref s i) ?.)
+                    (let ((c (aref s (1+ i))))
+                      (or (filevercmp--alpha-p c) (eq c ?~))))
+          (setq i (+ i 2))
+          (while (and (< i n)
+                      (let ((c (aref s i)))
+                        (or (filevercmp--alnum-p c) (eq c ?~))))
+            (setq i (1+ i))))))
+    prefixlen))
+
+;; gnulib `filenvercmp'.
+(defun filevercmp--cmp (a b)
+  (let ((alen (length a)) (blen (length b)))
+    (cond
+     ;; Empty sorts before everything.
+     ((= alen 0) (if (= blen 0) 0 -1))
+     ((= blen 0) 1)
+     ;; Leading ".": "." sorts first, then "..", then other dotted names, then
+     ;; everything else.
+     ((and (eq (aref a 0) ?.) (not (eq (aref b 0) ?.))) -1)
+     ((and (eq (aref b 0) ?.) (not (eq (aref a 0) ?.))) 1)
+     ((and (eq (aref a 0) ?.) (= alen 1)) (if (= blen 1) 0 -1))
+     ((and (eq (aref b 0) ?.) (= blen 1)) 1)
+     ((and (eq (aref a 0) ?.) (> alen 1) (eq (aref a 1) ?.) (= alen 2))
+      (if (and (> blen 1) (eq (aref b 1) ?.) (= blen 2)) 0 -1))
+     ((and (eq (aref b 0) ?.) (> blen 1) (eq (aref b 1) ?.) (= blen 2)) 1)
+     (t
+      (let* ((ap (filevercmp--prefixlen a alen))
+             (bp (filevercmp--prefixlen b blen))
+             ;; With both suffixes empty the second pass would repeat the first.
+             (one-pass (and (= ap alen) (= bp blen)))
+             (result (filevercmp--verrevcmp a ap b bp)))
+        (if (or (/= result 0) one-pass)
+            result
+          (filevercmp--verrevcmp a alen b blen)))))))
+
 (defun string-version-lessp (s1 s2)
-  ;; Like `string-lessp' but compare embedded decimal runs numerically.
+  ;; `filevercmp (S1, S2) < 0' — see `filevercmp--cmp' above. NOT `string-lessp'
+  ;; with numeric runs: the byte order is `filevercmp--order''s, not ASCII's.
   ;; fns.c `Fstring_version_lessp' takes SYMBOLP first and uses the print name,
   ;; then CHECK_STRINGs both operands -- so `t' and `car' are legal arguments
   ;; ((string-version-lessp "ab" t) => t, comparing "ab" against "t"), while a
@@ -2748,25 +2858,7 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
   (if (symbolp s2) (setq s2 (symbol-name s2)))
   (unless (stringp s1) (signal 'wrong-type-argument (list 'stringp s1)))
   (unless (stringp s2) (signal 'wrong-type-argument (list 'stringp s2)))
-  (let ((i 0) (j 0) (n1 (length s1)) (n2 (length s2)) (res nil) (done nil))
-    (while (not done)
-      (cond
-       ((and (>= i n1) (>= j n2)) (setq done t res nil))
-       ((>= i n1) (setq done t res t))
-       ((>= j n2) (setq done t res nil))
-       (t (let ((c1 (aref s1 i)) (c2 (aref s2 j)))
-            (if (and (cl--digitp c1) (cl--digitp c2))
-                (let ((a i) (b j))
-                  (while (and (< i n1) (cl--digitp (aref s1 i))) (setq i (1+ i)))
-                  (while (and (< j n2) (cl--digitp (aref s2 j))) (setq j (1+ j)))
-                  (let ((v1 (string-to-number (substring s1 a i)))
-                        (v2 (string-to-number (substring s2 b j))))
-                    (cond ((< v1 v2) (setq done t res t))
-                          ((> v1 v2) (setq done t res nil)))))
-              (cond ((< c1 c2) (setq done t res t))
-                    ((> c1 c2) (setq done t res nil))
-                    (t (setq i (1+ i) j (1+ j)))))))))
-    res))
+  (< (filevercmp--cmp s1 s2) 0))
 (defun seq-concatenate (type &rest seqs)
   ;; Concatenate SEQS into one sequence of TYPE (`list', `vector', or `string').
   (let ((all nil))

@@ -2444,12 +2444,12 @@ impl ElispHost {
             Value::Float(f) => {
                 // Emacs's read syntax for the non-finite floats.
                 if f.is_nan() {
-                    if f.is_sign_negative() {
-                        "-0.0e+NaN"
-                    } else {
-                        "0.0e+NaN"
-                    }
-                    .to_string()
+                    // print.c prints the NaN's significand, not a fixed 0:
+                    // `(read "3.7e+NaN")' prints back as `3.0e+NaN'. See
+                    // `reader::NAN_PAYLOAD_MASK'.
+                    let payload = f.to_bits() & crate::reader::NAN_PAYLOAD_MASK;
+                    let sign = if f.is_sign_negative() { "-" } else { "" };
+                    format!("{sign}{payload}.0e+NaN")
                 } else if f.is_infinite() {
                     if *f < 0.0 { "-1.0e+INF" } else { "1.0e+INF" }.to_string()
                 } else {

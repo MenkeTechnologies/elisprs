@@ -52,11 +52,28 @@
   '(0 1 2 3 -1 -2 5 7 8 10 16 42 -7 -42 100 255 256 1000 65535 -65536 123456789
     2305843009213693951 -2305843009213693952 4611686018427387903))
 (defvar fz-small '(0 1 2 3 4 5 6 7))
+;; The large magnitudes matter: a float whose integer part does not fit an i64 is
+;; how `(floor 1e30 3)' told apart an exact bignum quotient from a saturated
+;; `i64::MAX'. The NaNs are spelled with different mantissas on purpose — Emacs
+;; stores a token's leading integer in the NaN's significand and prints it back,
+;; so `3.0e+NaN' and `0.0e+NaN' are distinguishable values.
 (defvar fz-floats
-  '(0.0 -0.0 1.0 -1.0 0.5 -1.5 3.14 2.5 0.1 1.0e+INF -1.0e+INF 0.0e+NaN 1e10 1e-10 1.5e300))
+  '(0.0 -0.0 1.0 -1.0 0.5 -1.5 3.14 2.5 0.1 1.0e+INF -1.0e+INF 0.0e+NaN 3.0e+NaN
+    -0.0e+NaN 1e10 1e-10 1.5e300 1e30 -1e30 1e19 9.3e18 -9.3e18))
 (defvar fz-strings
   '("" "a" "ab" "abc" "Hello, World" "hello world" "  padded  " "a,b,,c" "line\nbreak"
-    "tab\there" "quote\"d" "back\\slash" "123" "-4.5" "ÜñîçøðÉ" "αβγ" "aAbB"))
+    "tab\there" "quote\"d" "back\\slash" "123" "-4.5" "ÜñîçøðÉ" "αβγ" "aAbB"
+    ;; Version-ish and filename-ish spellings: `string-version-lessp' is gnulib
+    ;; filevercmp, where a leading ".", a "~", a file suffix and a digit run each
+    ;; take a different branch. Plain words never reach any of them.
+    "foo2" "foo10" "foo01" "1.2" "1.10" "." ".." ".hidden" "~" "a~1" "x-1"
+    "foo2.png" "foo12.png" "a.tar.gz" "0" "00" "_" "!" "a1b2"))
+;; Non-finite and payload-carrying float *tokens*, as strings, for the
+;; read/print/`string-to-number' round trip.
+(defvar fz-float-tokens
+  '("1.0e+INF" "-1.0e+INF" "0.0e+NaN" "-0.0e+NaN" "3.7e+NaN" "123.0e+NaN" ".5e+NaN"
+    "1e+INF" "1.e+INF" ".5e+INF" "1.0e-INF" "1.0eINF" "1.0E+INF" "1.0e+inf"
+    "1.0e+NAN" "e+INF" "+1.0e+INF" "1.0e+INFx" "0e+NaN" "1." ".5" "1e5"))
 (defvar fz-symbols '(foo bar baz nil t car - + a))
 ;; Emacs regexp syntax, not the `regex`-crate dialect: grouping and alternation
 ;; are backslashed. A few are deliberately malformed — an invalid regexp is a
@@ -95,6 +112,17 @@
    ((eq kind 'bool) (fz-pick '(t nil)))
    ((eq kind 'char) (fz-pick '(?a ?z ?A ?0 ?\s ?\n ?\t ?é)))
    ((eq kind 're) (fz-pick fz-regexps))
+   ((eq kind 'ftok) (fz-pick fz-float-tokens))
+   ;; An improper list. A search that finds its item before the tail must return
+   ;; normally; one that runs off the end must signal `(wrong-type-argument listp
+   ;; TAIL)'. Both halves of that are parity surface, and a proper list tests
+   ;; neither.
+   ((eq kind 'dotted)
+    (let ((head (fz-atom (fz-pick '(int str sym bool))))
+          (tail (fz-pick '(t 'sym 5 "s"))))
+      (if (fz-chance 50)
+          (list 'cons head tail)
+        (list 'cons (fz-atom 'int) (list 'cons head tail)))))
    ((eq kind 'ht)
     ;; A hash table built inline: `(let ((h (make-hash-table …))) (puthash …) h)`.
     (let ((test (fz-pick '(eq eql equal)))
@@ -119,11 +147,20 @@
 (defvar fz-calls
   '(;; arithmetic
     (+ num num) (+ num num num) (- num num) (- num) (* num num) (* num num num)
+    ;; One-argument `+'/`*' still type-check their operand: `(+ t)' signals, it
+    ;; does not answer `t'. Four operands fold left with every argument
+    ;; evaluated first, which a chain of binary opcodes does not do.
+    (+ num) (* num) (- num num num) (+ num num num num) (* num num num num)
     (/ num num) (% int int) (mod num num) (max num num) (min num num) (abs num)
     (1+ num) (1- num) (expt num small) (truncate num) (floor num) (ceiling num)
+    ;; The two-argument rounding forms take a completely different path from the
+    ;; one-argument ones: with a float operand Emacs divides *exactly*, so the
+    ;; quotient can be a bignum no `f64' could hold.
+    (truncate num num) (floor num num) (ceiling num num) (round num num)
+    (cl-truncate num num) (cl-ceiling num num)
     (round num) (float num) (ffloor float) (fceiling float) (ftruncate float)
     (fround float) (sqrt num) (exp num) (log num) (sin num) (cos num) (isnan float)
-    (cl-evenp int) (cl-oddp int) (zerop num) (natnump any) (float-to-string float)
+    (cl-evenp int) (cl-oddp int) (zerop num) (natnump any)
     ;; bits
     (logand int int) (logior int int) (logxor int int) (lognot int) (ash int small)
     (ash int int) (logcount int)
@@ -209,6 +246,15 @@
     (cl-intersection list list) (cl-list* any any list) (cl-ldiff list list)
     (cl-signum num) (cl-gcd int int) (cl-lcm int int) (cl-floor num num)
     (cl-round num num) (cl-mod num num) (cl-rem num num) (cl-adjoin any list)
+    ;; Short-circuiting cl-seq searches: these are the ones that may stop before
+    ;; an improper tail, so they must walk the list in place rather than
+    ;; normalizing it through `append' (which signals `listp' up front).
+    (cl-position any seq) (cl-find any seq) (cl-position-if fn seq) (cl-find-if fn seq)
+    (cl-position any dotted) (cl-find any dotted)
+    (cl-position-if fn dotted) (cl-find-if fn dotted)
+    (cl-count any seq) (cl-some fn dotted) (cl-every fn dotted)
+    ;; Non-finite / payload-carrying float tokens through read and print.
+    (string-to-number ftok) (read ftok) (number-to-string float) (prin1-to-string float)
     ;; string corners
     (compare-strings str any any str any any) (string-version-lessp str str)
     (string-pad str small char) (string-pad str small char bool)
@@ -220,7 +266,11 @@
 
 ;; Slots whose value must stay small for the form to stay bounded, no matter what
 ;; the table says: a chaos int in `make-string' would allocate gigabytes.
-(defvar fz-bounded '(small char re ht))
+;; `dotted' and `ftok' are here for a different reason than the others: not size,
+;; but that chaos-filling or nesting them would destroy the only thing they test.
+;; A `dotted' slot holding a proper list, or an `ftok' slot holding "abc", is a
+;; slot that has stopped covering improper tails and non-finite float syntax.
+(defvar fz-bounded '(small char re ht dotted ftok))
 
 (defvar fz-chaos-rate 12
   "Percent of argument slots filled with a deliberately wrong-typed value.")

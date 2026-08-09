@@ -269,6 +269,11 @@ bash scripts/fuzz_parity.sh -n 5000 -s 42
 
 The seed makes a divergence reproduce exactly on any machine, and a crash or hang in one form is isolated rather than losing the rest of the corpus. It needs a real `emacs` on `PATH`; the parity gaps it has already closed are recorded in [BUGS.md](BUGS.md).
 
+A zero divergence count only means something if the corpus actually exercised the engines, so each run also prints **how many forms the reference evaluated**. Two ways a run can score a false zero are reported rather than hidden:
+
+- **Both engines failed the same way.** A form that hangs or crashes under both produces `<HANG>` on both sides, and `<HANG>` compares equal to `<HANG>`. Those forms are counted separately and never counted as agreement. (The per-batch timeout also scales with corpus size, because a fixed one silently turned a slow run into "perfect parity".)
+- **The form was never valid.** If a corpus form names something Emacs does not have, both engines signal `void-function` and the failures match. The run reports that count and warns above 5%.
+
 ---
 
 ## [0x09] DOCUMENTATION // RENDERED HTML + MARKDOWN
