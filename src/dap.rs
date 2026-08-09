@@ -70,6 +70,10 @@ struct Dap {
     started: bool,
     /// Pause at every statement marker (set by `next` / `stepIn` / stopOnEntry).
     step_mode: bool,
+    /// Step mode was armed by a *function* breakpoint, so the stop it produces
+    /// reports the protocol's `"function breakpoint"` reason instead of
+    /// `"step"`. Consumed by the stop it labels.
+    func_bp_armed: bool,
     /// Client asked to pause asap (honored at the next marker).
     pause_request: bool,
     /// Current statement line while paused (for `stackTrace`).
@@ -106,6 +110,7 @@ pub fn run_stdio() -> i32 {
         config_done: false,
         started: false,
         step_mode: false,
+        func_bp_armed: false,
         pause_request: false,
         cur_line: 0,
         disconnected: false,
@@ -203,6 +208,14 @@ pub fn check_line(line: u32) {
 /// function's first real statement instead of on the call itself. The match rule
 /// lives in the one place, [`Dap::should_stop_at_sub`].
 ///
+/// Deviation from awkrs, stated explicitly: awkrs arms step mode and nothing
+/// else, so the stop it produces is indistinguishable from a `next`. The cause
+/// is carried through here (`func_bp_armed`) so the stop reports the reason the
+/// protocol defines for it, `"function breakpoint"` — one of the StoppedEvent
+/// values listed in the DAP specification (`'step' | 'breakpoint' | 'exception' |
+/// 'pause' | 'entry' | 'goto' | 'function breakpoint' | 'data breakpoint' |
+/// 'instruction breakpoint' | string`).
+///
 /// Off `--dap` this is a `None` check, and inside `--dap` it costs one set
 /// emptiness test until the client sets its first function breakpoint — nothing
 /// is resolved past that point.
@@ -210,6 +223,7 @@ pub fn enter_function(callee: &fusevm::Value) {
     with_dap(|d| {
         if d.should_stop_at_sub(callee) {
             d.set_step_mode(true);
+            d.func_bp_armed = true;
         }
     });
 }
@@ -400,7 +414,12 @@ impl Dap {
         self.cur_line = line;
         let reason = if self.pause_request {
             self.pause_request = false;
+            self.func_bp_armed = false;
             "pause"
+        } else if self.func_bp_armed {
+            // Armed by `enter_function`: this is the function's first statement.
+            self.func_bp_armed = false;
+            "function breakpoint"
         } else if self.step_mode {
             "step"
         } else if self.breakpoint_hit(line) {

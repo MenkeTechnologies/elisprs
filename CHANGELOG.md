@@ -89,7 +89,12 @@ All notable changes to elisprs are documented here. The format follows
   `advice-add`: instrumentation lives on the *function cell*, so `(add2 1)`,
   `(funcall 'add2 1)`, `(apply 'add2 '(1))` and `(funcall (symbol-function 'add2) 1)`
   all break, while a function object captured before a redefinition does not. The
-  set can be replaced or cleared while the executor is paused.
+  set can be replaced or cleared while the executor is paused. One deviation from
+  awkrs, stated rather than hidden: awkrs arms step mode and nothing else, so its
+  stop is indistinguishable from a `next`. The cause is carried through here, so
+  the stop reports the DAP-specified `"function breakpoint"` reason; the
+  attribution is consumed by the stop it labels, and stepping on from there is an
+  ordinary `"step"`.
 - **Real `record` type (`Obj::Record`).** Records (and every `cl-defstruct`
   instance) were `cl-struct-NAME`-tagged vectors, so `(aref (record 'foo 1 2) 0)`
   leaked `cl-struct-foo` instead of `foo`, and `(vectorp REC)` was wrongly `t`.

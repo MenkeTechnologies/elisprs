@@ -160,7 +160,7 @@ Plugin side (`com.menketechnologies.elisprs.dap`):
 
 elisprs side (`src/dap.rs`): DAP requests handled include `initialize`, `launch`, `setBreakpoints`, `setFunctionBreakpoints`, `configurationDone`, `threads`, `stackTrace`, `scopes`, `variables`, `continue`, `next`, `stepIn`, `stepOut`, `pause`, `evaluate`, `disconnect`. Same JSON-RPC framing as the LSP server.
 
-`initialize` advertises `supportsFunctionBreakpoints`, so a client may name functions to break on instead of (or as well as) source lines; entering one arms stepping, so the stop lands on the function's first statement. The match follows the *function cell*, which is what Emacs's own instrumentation does — `(add2 1)`, `(funcall 'add2 1)`, `(apply 'add2 '(1))` and `(funcall (symbol-function 'add2) 1)` all break, a function object captured before a redefinition does not. The plugin does not send this request yet; the adapter answers it for any DAP client that does.
+`initialize` advertises `supportsFunctionBreakpoints`, so a client may name functions to break on instead of (or as well as) source lines; entering one arms stepping, so the stop lands on the function's first statement and reports `reason: "function breakpoint"`. The match follows the *function cell*, which is what Emacs's own instrumentation does — `(add2 1)`, `(funcall 'add2 1)`, `(apply 'add2 '(1))` and `(funcall (symbol-function 'add2) 1)` all break, a function object captured before a redefinition does not. The plugin does not send this request yet; the adapter answers it for any DAP client that does.
 
 ---
 

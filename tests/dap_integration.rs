@@ -341,8 +341,9 @@ fn temp_program(tag: &str, src: &str) -> std::path::PathBuf {
 /// function is the only thing that can produce a stop.
 ///
 /// Entering arms step mode rather than pausing on the call, so the stop lands on
-/// the function's first real statement (line 2) — the reason is therefore
-/// `"step"`, matching awkrs's `should_stop_at_sub` → `set_step_mode(true)`.
+/// the function's first real statement (line 2). The cause is carried through the
+/// arming, so the reason is the protocol's `"function breakpoint"` and not the
+/// `"step"` that awkrs's `set_step_mode(true)` alone would produce.
 #[test]
 fn dap_function_breakpoint_stops_inside_the_named_function() {
     let path = temp_program("fbp", FUNCTION_PROGRAM);
@@ -352,8 +353,8 @@ fn dap_function_breakpoint_stops_inside_the_named_function() {
 
     let stop = s.stopped();
     assert_eq!(
-        stop["body"]["reason"], "step",
-        "entering the function arms stepping, so the stop is on a real line"
+        stop["body"]["reason"], "function breakpoint",
+        "the stop is attributed to the function breakpoint, not to stepping"
     );
     assert_eq!(s.stack_line(), 2, "the stop is the function's body line");
     assert_eq!(s.evaluate("x"), "40", "the argument is bound at the stop");
@@ -365,6 +366,40 @@ fn dap_function_breakpoint_stops_inside_the_named_function() {
         "the call still returned 42, got {out:?}"
     );
     assert!(terminated, "session terminated after continue");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The `"function breakpoint"` attribution belongs to the stop it labels and to
+/// no other. Stepping on from that stop is an ordinary `"step"` — it lands on
+/// line 4, the caller's next statement, because line 3's own marker fired before
+/// the call — and the next call re-arms and is labelled again.
+#[test]
+fn dap_function_breakpoint_reason_does_not_stick_to_later_stops() {
+    let path = temp_program("reason", ROUTES_PROGRAM);
+    let path_str = path.to_string_lossy().into_owned();
+
+    let mut s = Session::start_with_functions(&path_str, &["add2"]);
+
+    assert_eq!(s.stopped()["body"]["reason"], "function breakpoint");
+    assert_eq!(s.stack_line(), 2);
+
+    s.send("next", json!({ "threadId": 1 }));
+    let stepped = s.stopped();
+    assert_eq!(
+        stepped["body"]["reason"], "step",
+        "the attribution was consumed by the stop it labelled"
+    );
+    assert_eq!(
+        s.stack_line(),
+        4,
+        "the step lands on the caller's next line"
+    );
+
+    // Still armed: the `funcall` on line 4 re-enters add2 and is labelled again.
+    s.send("continue", json!({ "threadId": 1 }));
+    assert_eq!(s.stopped()["body"]["reason"], "function breakpoint");
+    assert_eq!(s.stack_line(), 2);
 
     let _ = std::fs::remove_file(&path);
 }
@@ -384,7 +419,7 @@ fn dap_function_breakpoint_fires_on_every_call_route() {
 
     for expected in ["1", "2", "3", "4"] {
         let stop = s.stopped();
-        assert_eq!(stop["body"]["reason"], "step");
+        assert_eq!(stop["body"]["reason"], "function breakpoint");
         assert_eq!(s.stack_line(), 2, "every route stops in the body");
         assert_eq!(
             s.evaluate("x"),
@@ -414,7 +449,7 @@ fn dap_function_breakpoint_ignores_a_stale_function_object() {
     let mut s = Session::start_with_functions(&path_str, &["add2"]);
 
     let stop = s.stopped();
-    assert_eq!(stop["body"]["reason"], "step");
+    assert_eq!(stop["body"]["reason"], "function breakpoint");
     assert_eq!(
         s.stack_line(),
         5,
@@ -471,7 +506,7 @@ fn dap_function_breakpoints_can_be_set_and_cleared_while_paused() {
 
     s.send("continue", json!({ "threadId": 1 }));
     let stop = s.stopped();
-    assert_eq!(stop["body"]["reason"], "step");
+    assert_eq!(stop["body"]["reason"], "function breakpoint");
     assert_eq!(
         s.stack_line(),
         2,
