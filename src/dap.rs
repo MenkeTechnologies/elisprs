@@ -2,8 +2,9 @@
 //! Lisp. Control model ported from zshrs's DAP (`zshrs/src/extensions/dap.rs`):
 //! `DebugAction` / `PauseSnapshot` / `BreakpointState`, breakpoint + step-mode
 //! pause/resume, and the full request set (initialize, launch, setBreakpoints,
-//! configurationDone, threads, stackTrace, scopes, variables, continue, next,
-//! stepIn, stepOut, pause, evaluate, source, disconnect, setExceptionBreakpoints).
+//! setFunctionBreakpoints, configurationDone, threads, stackTrace, scopes,
+//! variables, continue, next, stepIn, stepOut, pause, evaluate, source,
+//! disconnect, setExceptionBreakpoints).
 //!
 //! Granularity is **per statement** (each form in a `progn` / function body /
 //! `let` body / the top level), which is line-level for the usual one-form-per-
@@ -60,6 +61,9 @@ struct Dap {
     seq: i64,
     /// Canonical source path → breakpoint line set (ported: `line_breakpoints`).
     breakpoints: HashMap<String, HashSet<u32>>,
+    /// Function names to break on (ported: awkrs `function_breakpoints` /
+    /// `sub_breakpoints`). Consulted by [`Dap::should_stop_at_sub`].
+    func_breakpoints: HashSet<String>,
     /// Canonical path of the launched program (matches breakpoint keys).
     program: Option<String>,
     config_done: bool,
@@ -97,6 +101,7 @@ pub fn run_stdio() -> i32 {
         out: capture.out.clone(),
         seq: 0,
         breakpoints: HashMap::new(),
+        func_breakpoints: HashSet::new(),
         program: None,
         config_done: false,
         started: false,
@@ -191,6 +196,24 @@ pub fn check_line(line: u32) {
     with_dap(|d| d.on_line(line));
 }
 
+/// Called from the ONE site a user function body is entered
+/// (`host::call_function`'s closure arm, just before `run_closure`). A matching
+/// function breakpoint **arms step mode** rather than pausing here — ported from
+/// awkrs `src/vm.rs:3226`, where the same choice makes the stop land on the
+/// function's first real statement instead of on the call itself. The match rule
+/// lives in the one place, [`Dap::should_stop_at_sub`].
+///
+/// Off `--dap` this is a `None` check, and inside `--dap` it costs one set
+/// emptiness test until the client sets its first function breakpoint — nothing
+/// is resolved past that point.
+pub fn enter_function(callee: &fusevm::Value) {
+    with_dap(|d| {
+        if d.should_stop_at_sub(callee) {
+            d.set_step_mode(true);
+        }
+    });
+}
+
 impl Dap {
     fn next_seq(&mut self) -> i64 {
         self.seq += 1;
@@ -255,6 +278,63 @@ impl Dap {
         self.respond(msg, json!({"breakpoints": verified}));
     }
 
+    /// `setFunctionBreakpoints` — the whole set is replaced on every request, as
+    /// the protocol specifies. Ported from awkrs `src/dap.rs:408` (identical in
+    /// strykelang `dap.rs:414`): take `arguments.breakpoints[].name`, store, and
+    /// answer with one `{"verified": true}` per name. This is the ONE definition;
+    /// both dispatch tables below route here, so a client may add or clear
+    /// function breakpoints while stopped as well as before launch.
+    fn set_function_breakpoints(&mut self, msg: &J) {
+        let names: Vec<String> = msg["arguments"]["breakpoints"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|b| b["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let body: Vec<J> = names.iter().map(|_| json!({"verified": true})).collect();
+        self.func_breakpoints = names.into_iter().collect();
+        self.respond(msg, json!({"breakpoints": body}));
+    }
+
+    /// Whether entering the user function `callee` should stop (ported from awkrs
+    /// `debugger.rs:189`, whose `name` is always a call-site literal).
+    ///
+    /// Which calls count is elisp-specific, because a name is not always what
+    /// reaches the callee: `funcall`/`apply` resolve the designator to the
+    /// function *object* before re-entering, so only the direct `(f 1)` form
+    /// arrives as a symbol. Emacs answers this by instrumenting the *function
+    /// cell*, and that is the rule reproduced here. Measured with `advice-add` on
+    /// GNU Emacs 30.2 — instrumenting `add2` fires for `(add2 40)`,
+    /// `(funcall 'add2 100)`, `(apply 'add2 '(7))` and
+    /// `(funcall (symbol-function 'add2) 5)`, but NOT for a function object
+    /// captured *before* the instrumentation. So an object callee matches only
+    /// what the named symbol's cell holds right now.
+    /// Arm/disarm per-statement pausing (ported from awkrs `set_step_mode`).
+    fn set_step_mode(&mut self, on: bool) {
+        self.step_mode = on;
+    }
+
+    fn should_stop_at_sub(&self, callee: &fusevm::Value) -> bool {
+        if self.func_breakpoints.is_empty() {
+            return false;
+        }
+        with_host(|h| {
+            if let Some(name) = h.sym_name(callee) {
+                return self.func_breakpoints.contains(&name);
+            }
+            let fusevm::Value::Obj(id) = callee else {
+                return false;
+            };
+            self.func_breakpoints.iter().any(|n| {
+                h.find_symbol(n)
+                    .map(|sym| h.function_designator(&sym))
+                    .is_some_and(|f| matches!(f, fusevm::Value::Obj(x) if x == *id))
+            })
+        })
+    }
+
     /// Service a request received while NOT paused. Returns true when the program
     /// should now run (both `launch` and `configurationDone` seen).
     fn handle_toplevel(&mut self, msg: &J) -> bool {
@@ -268,12 +348,14 @@ impl Dap {
                     json!({
                         "supportsConfigurationDoneRequest": true,
                         "supportsEvaluateForHovers": true,
+                        "supportsFunctionBreakpoints": true,
                         "supportsTerminateRequest": true,
                     }),
                 );
                 self.event("initialized", json!({}));
             }
             "setBreakpoints" => self.set_breakpoints(msg),
+            "setFunctionBreakpoints" => self.set_function_breakpoints(msg),
             "setExceptionBreakpoints" => self.respond(msg, json!({})),
             "launch" => {
                 let raw = msg["arguments"]["program"].as_str().unwrap_or("");
@@ -398,6 +480,7 @@ impl Dap {
                     self.respond(&msg, json!({"result": result, "variablesReference": 0}));
                 }
                 "setBreakpoints" => self.set_breakpoints(&msg),
+                "setFunctionBreakpoints" => self.set_function_breakpoints(&msg),
                 "setExceptionBreakpoints" => self.respond(&msg, json!({})),
                 "source" => self.respond(&msg, json!({})),
                 "disconnect" | "terminate" => {

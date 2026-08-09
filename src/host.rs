@@ -4346,6 +4346,10 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             if args.len() < params.required.len() || (params.rest.is_none() && args.len() > max) {
                 return Err(with_host(|h| h.signal_wrong_nargs(&callee, args.len())));
             }
+            // The one place a user function body is entered: every compiled
+            // `CALL`, `funcall` and `apply` funnels through here, so the DAP
+            // function-breakpoint check is hooked once rather than per caller.
+            crate::dap::enter_function(&callee);
             run_closure(&params, &body, env, dynamic, args)
         }
     }

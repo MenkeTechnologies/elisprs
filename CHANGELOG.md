@@ -30,6 +30,21 @@ All notable changes to elisprs are documented here. The format follows
   old behaviour from a warm cache.
 
 ### Added
+- **`setFunctionBreakpoints` in `--dap`.** The adapter answered the request from
+  its catch-all arm — `success: true` with an empty body, no `breakpoints` array —
+  and never advertised `supportsFunctionBreakpoints`, so a conforming client would
+  not have sent it in the first place and naming a function produced no stop at
+  all. The handler is ported from awkrs `src/dap.rs:408` (identical in strykelang
+  `dap.rs:414`) and the firing from awkrs `src/vm.rs:3226`: entering a named
+  function *arms step mode* rather than pausing on the call, so the stop lands on
+  the function's first real statement instead of on the call site. It is hooked at
+  the single place a user function body is entered — `host::call_function`'s
+  closure arm, which every compiled `CALL`, `funcall` and `apply` funnels through.
+  Which calls match is elisp-specific and was measured against GNU Emacs 30.2 with
+  `advice-add`: instrumentation lives on the *function cell*, so `(add2 1)`,
+  `(funcall 'add2 1)`, `(apply 'add2 '(1))` and `(funcall (symbol-function 'add2) 1)`
+  all break, while a function object captured before a redefinition does not. The
+  set can be replaced or cleared while the executor is paused.
 - **Real `record` type (`Obj::Record`).** Records (and every `cl-defstruct`
   instance) were `cl-struct-NAME`-tagged vectors, so `(aref (record 'foo 1 2) 0)`
   leaked `cl-struct-foo` instead of `foo`, and `(vectorp REC)` was wrongly `t`.

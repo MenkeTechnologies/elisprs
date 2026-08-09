@@ -22,11 +22,33 @@ const PROGRAM: &str = "(setq a 1)\n(setq b 2)\n(setq c (+ a b))\n(princ (format 
 const FUNCTION_PROGRAM: &str =
     "(defun add2 (x)\n  (+ x 2))\n(princ (format \"r=%d\\n\" (add2 40)))\n";
 
+/// `add2` reached by every route elisp offers: the direct call, `funcall` and
+/// `apply` on the symbol, and a call of the object read out of the function
+/// cell. GNU Emacs 30.2 (`advice-add` on `add2`, measured) fires on all four.
+const ROUTES_PROGRAM: &str = "(defun add2 (x)\n  (+ x 2))\n\
+    (princ (format \"1=%d\\n\" (add2 1)))\n\
+    (princ (format \"2=%d\\n\" (funcall 'add2 2)))\n\
+    (princ (format \"3=%d\\n\" (apply 'add2 '(3))))\n\
+    (princ (format \"4=%d\\n\" (funcall (symbol-function 'add2) 4)))\n";
+
+/// A function object captured before `add2` is redefined. Emacs 30.2 does NOT
+/// fire on such a stale object — instrumentation lives on the function cell —
+/// so only the second call may stop, and it stops in the *new* body (line 5).
+const STALE_PROGRAM: &str = "(defun add2 (x)\n  (+ x 2))\n\
+    (setq old (symbol-function 'add2))\n\
+    (defun add2 (x)\n  (+ x 3))\n\
+    (princ (format \"old=%d\\n\" (funcall old 10)))\n\
+    (princ (format \"new=%d\\n\" (add2 10)))\n";
+
 struct Session {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     seq: i64,
+    /// Every `output` event's text, accumulated as messages are read. `read_until`
+    /// discards what it skips past, so debuggee output emitted between two stops
+    /// would otherwise be invisible to the assertions.
+    program_output: String,
 }
 
 impl Session {
@@ -37,6 +59,49 @@ impl Session {
 
     /// Same handshake, with the breakpoint lines chosen by the caller.
     fn start_with_lines(program_path: &str, lines: &[u32]) -> Self {
+        let mut s = Self::spawn();
+        s.send("initialize", json!({}));
+        let bps: Vec<Value> = lines.iter().map(|l| json!({ "line": l })).collect();
+        s.send(
+            "setBreakpoints",
+            json!({ "source": { "path": program_path }, "breakpoints": bps }),
+        );
+        s.send("launch", json!({ "program": program_path }));
+        s.send("configurationDone", json!({}));
+        s
+    }
+
+    /// The handshake for a *function* breakpoint session: `initialize` first (so
+    /// the test can read the capabilities back), then the named functions, then
+    /// launch. No line breakpoints at all, so any stop is the function
+    /// breakpoint's doing.
+    fn start_with_functions(program_path: &str, names: &[&str]) -> Self {
+        let mut s = Self::spawn();
+        s.send("initialize", json!({}));
+        let caps = s.response("initialize");
+        assert_eq!(
+            caps["body"]["supportsFunctionBreakpoints"], true,
+            "adapter must advertise supportsFunctionBreakpoints, or a conforming \
+             client never sends setFunctionBreakpoints at all"
+        );
+        let bps: Vec<Value> = names.iter().map(|n| json!({ "name": n })).collect();
+        s.send("setFunctionBreakpoints", json!({ "breakpoints": bps }));
+        let r = s.response("setFunctionBreakpoints");
+        let verified = r["body"]["breakpoints"]
+            .as_array()
+            .expect("breakpoints array");
+        assert_eq!(verified.len(), names.len(), "one entry per requested name");
+        assert!(
+            verified.iter().all(|b| b["verified"] == true),
+            "every function breakpoint is verified"
+        );
+        s.send("launch", json!({ "program": program_path }));
+        s.send("configurationDone", json!({}));
+        s
+    }
+
+    /// Spawn `elisp --dap` with a watchdog; no protocol traffic yet.
+    fn spawn() -> Self {
         let bin = env!("CARGO_BIN_EXE_elisp");
         let mut child = Command::new(bin)
             .arg("--dap")
@@ -54,22 +119,13 @@ impl Session {
         });
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        let mut s = Session {
+        Session {
             child,
             stdin,
             stdout,
             seq: 0,
-        };
-        // Standard handshake.
-        s.send("initialize", json!({}));
-        let bps: Vec<Value> = lines.iter().map(|l| json!({ "line": l })).collect();
-        s.send(
-            "setBreakpoints",
-            json!({ "source": { "path": program_path }, "breakpoints": bps }),
-        );
-        s.send("launch", json!({ "program": program_path }));
-        s.send("configurationDone", json!({}));
-        s
+            program_output: String::new(),
+        }
     }
 
     fn send(&mut self, command: &str, arguments: Value) {
@@ -100,7 +156,12 @@ impl Session {
         }
         let mut buf = vec![0u8; len];
         self.stdout.read_exact(&mut buf).ok()?;
-        serde_json::from_slice(&buf).ok()
+        let msg: Value = serde_json::from_slice(&buf).ok()?;
+        if msg["type"] == "event" && msg["event"] == "output" {
+            self.program_output
+                .push_str(msg["body"]["output"].as_str().unwrap_or(""));
+        }
+        Some(msg)
     }
 
     /// Read messages until one satisfies `pred`, returning it. Panics at EOF so a
@@ -142,22 +203,19 @@ impl Session {
         r["body"]["result"].as_str().unwrap_or("").to_string()
     }
 
-    /// Drive to completion, returning `(concatenated stdout, saw terminated)`.
+    /// Drive to completion. Returns the debuggee's stdout for the WHOLE session
+    /// (see [`Session::program_output`]) and whether `terminated` arrived.
     fn run_to_end(&mut self) -> (String, bool) {
-        let mut out = String::new();
         for _ in 0..50 {
             match self.read_msg() {
-                Some(m) if m["type"] == "event" && m["event"] == "output" => {
-                    out.push_str(m["body"]["output"].as_str().unwrap_or(""));
-                }
                 Some(m) if m["type"] == "event" && m["event"] == "terminated" => {
-                    return (out, true);
+                    return (self.program_output.clone(), true);
                 }
                 Some(_) => continue,
                 None => break,
             }
         }
-        (out, false)
+        (self.program_output.clone(), false)
     }
 }
 
@@ -268,6 +326,169 @@ fn dap_line_breakpoint_inside_a_function_body() {
     let (out, terminated) = s.run_to_end();
     assert!(out.contains("r=42"), "the call returned 42, got {out:?}");
     assert!(terminated, "session terminated after continue");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Write `src` to a uniquely named temp `.el` and hand back its path.
+fn temp_program(tag: &str, src: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("elisprs_dap_{tag}_{}.el", std::process::id()));
+    std::fs::write(&p, src).expect("write program");
+    p
+}
+
+/// `setFunctionBreakpoints` with no line breakpoint at all: entering the named
+/// function is the only thing that can produce a stop.
+///
+/// Entering arms step mode rather than pausing on the call, so the stop lands on
+/// the function's first real statement (line 2) — the reason is therefore
+/// `"step"`, matching awkrs's `should_stop_at_sub` → `set_step_mode(true)`.
+#[test]
+fn dap_function_breakpoint_stops_inside_the_named_function() {
+    let path = temp_program("fbp", FUNCTION_PROGRAM);
+    let path_str = path.to_string_lossy().into_owned();
+
+    let mut s = Session::start_with_functions(&path_str, &["add2"]);
+
+    let stop = s.stopped();
+    assert_eq!(
+        stop["body"]["reason"], "step",
+        "entering the function arms stepping, so the stop is on a real line"
+    );
+    assert_eq!(s.stack_line(), 2, "the stop is the function's body line");
+    assert_eq!(s.evaluate("x"), "40", "the argument is bound at the stop");
+
+    s.send("continue", json!({ "threadId": 1 }));
+    let (out, terminated) = s.run_to_end();
+    assert!(
+        out.contains("r=42"),
+        "the call still returned 42, got {out:?}"
+    );
+    assert!(terminated, "session terminated after continue");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The breakpoint tracks the *function cell*, not the syntax of the call.
+///
+/// `funcall`/`apply` resolve the designator to the function object before the
+/// callee is entered, so a name-only match would silently miss three of these
+/// four routes. Each argument is distinct, so the `evaluate` sequence also pins
+/// which route produced which stop.
+#[test]
+fn dap_function_breakpoint_fires_on_every_call_route() {
+    let path = temp_program("routes", ROUTES_PROGRAM);
+    let path_str = path.to_string_lossy().into_owned();
+
+    let mut s = Session::start_with_functions(&path_str, &["add2"]);
+
+    for expected in ["1", "2", "3", "4"] {
+        let stop = s.stopped();
+        assert_eq!(stop["body"]["reason"], "step");
+        assert_eq!(s.stack_line(), 2, "every route stops in the body");
+        assert_eq!(
+            s.evaluate("x"),
+            expected,
+            "route with argument {expected} must stop"
+        );
+        s.send("continue", json!({ "threadId": 1 }));
+    }
+
+    let (out, terminated) = s.run_to_end();
+    for line in ["1=3", "2=4", "3=5", "4=6"] {
+        assert!(out.contains(line), "output {line} missing from {out:?}");
+    }
+    assert!(terminated, "session terminated after the last continue");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A function object captured before the symbol was redefined is not the cell's
+/// object any more, so it must not stop — the same answer Emacs 30.2 gives.
+/// Only the direct call to the redefined `add2` stops, in the new body.
+#[test]
+fn dap_function_breakpoint_ignores_a_stale_function_object() {
+    let path = temp_program("stale", STALE_PROGRAM);
+    let path_str = path.to_string_lossy().into_owned();
+
+    let mut s = Session::start_with_functions(&path_str, &["add2"]);
+
+    let stop = s.stopped();
+    assert_eq!(stop["body"]["reason"], "step");
+    assert_eq!(
+        s.stack_line(),
+        5,
+        "the only stop is in the redefined body, not the captured one"
+    );
+
+    s.send("continue", json!({ "threadId": 1 }));
+    let (out, terminated) = s.run_to_end();
+    assert!(
+        out.contains("old=12") && out.contains("new=13"),
+        "both calls still ran, got {out:?}"
+    );
+    assert!(terminated, "no second stop: the stale object was ignored");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A breakpoint on a name nothing calls never stops, and the program is
+/// unaffected.
+#[test]
+fn dap_function_breakpoint_on_an_uncalled_name_never_stops() {
+    let path = temp_program("nofn", ROUTES_PROGRAM);
+    let path_str = path.to_string_lossy().into_owned();
+
+    let mut s = Session::start_with_functions(&path_str, &["nosuchfn"]);
+
+    let (out, terminated) = s.run_to_end();
+    assert!(terminated, "the program ran to completion with no stop");
+    for line in ["1=3", "2=4", "3=5", "4=6"] {
+        assert!(out.contains(line), "output {line} missing from {out:?}");
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The set can be replaced while the executor is paused: armed from a line-
+/// breakpoint stop, then cleared with an empty list at the next stop.
+#[test]
+fn dap_function_breakpoints_can_be_set_and_cleared_while_paused() {
+    let path = temp_program("paused", ROUTES_PROGRAM);
+    let path_str = path.to_string_lossy().into_owned();
+
+    // Line 3 is `(princ ... (add2 1))`, so the marker fires before the call.
+    let mut s = Session::start_with_lines(&path_str, &[3]);
+    let stop = s.stopped();
+    assert_eq!(stop["body"]["reason"], "breakpoint");
+
+    s.send(
+        "setFunctionBreakpoints",
+        json!({ "breakpoints": [{ "name": "add2" }] }),
+    );
+    let r = s.response("setFunctionBreakpoints");
+    assert_eq!(r["body"]["breakpoints"].as_array().map(Vec::len), Some(1));
+
+    s.send("continue", json!({ "threadId": 1 }));
+    let stop = s.stopped();
+    assert_eq!(stop["body"]["reason"], "step");
+    assert_eq!(
+        s.stack_line(),
+        2,
+        "the newly armed breakpoint stopped in add2"
+    );
+
+    // Empty list clears the whole set, so the three remaining routes run free.
+    s.send("setFunctionBreakpoints", json!({ "breakpoints": [] }));
+    let r = s.response("setFunctionBreakpoints");
+    assert_eq!(r["body"]["breakpoints"].as_array().map(Vec::len), Some(0));
+
+    s.send("continue", json!({ "threadId": 1 }));
+    let (out, terminated) = s.run_to_end();
+    assert!(terminated, "no further stops after clearing");
+    for line in ["1=3", "2=4", "3=5", "4=6"] {
+        assert!(out.contains(line), "output {line} missing from {out:?}");
+    }
 
     let _ = std::fs::remove_file(&path);
 }
