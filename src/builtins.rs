@@ -1849,13 +1849,77 @@ fn apply_sign(body: String, spec: &FmtSpec) -> String {
     }
 }
 
+/// A character's width in display columns — Emacs's `char-width` (`indent.c`),
+/// which reads `char-width-table` and the `ctl-arrow`/`tab-width` display model.
+///
+/// Measured against `emacs -Q --batch` (GNU Emacs 30.2):
+/// `(list (char-width ?\t) (char-width ?\n) (char-width 7) (char-width 127)
+/// (char-width 200) (char-width ?中))` => `(8 0 2 2 1 2)`. A TAB is a flat
+/// `tab-width` here rather than a distance to the next tab stop, which
+/// `(string-width "a\t")` => `9` confirms.
+pub fn char_display_width(c: u32) -> usize {
+    match c {
+        0x0A => 0,                    // newline occupies no columns
+        0x09 => 8,                    // tab-width
+        0..=0x1F | 0x7F => 2,         // control chars display as `^X`
+        0x0300..=0x036F => 0,         // combining diacriticals
+        0x200B..=0x200F => 0,         // zero-width / directional marks
+        0x1100..=0x115F               // Hangul Jamo
+        | 0x2E80..=0x303E             // CJK radicals … symbols
+        | 0x3041..=0x33FF             // Hiragana … CJK compatibility
+        | 0x3400..=0x4DBF             // CJK ext A
+        | 0x4E00..=0x9FFF             // CJK unified
+        | 0xA000..=0xA4CF             // Yi
+        | 0xAC00..=0xD7A3             // Hangul syllables
+        | 0xF900..=0xFAFF             // CJK compatibility ideographs
+        | 0xFF00..=0xFF60             // fullwidth forms
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F           // misc symbols & pictographs, emoticons
+        | 0x1F900..=0x1F9FF           // supplemental symbols & pictographs
+        | 0x1FA70..=0x1FAFF           // symbols & pictographs ext A
+        | 0x20000..=0x3FFFD => 2,     // CJK ext B+
+        _ => 1,
+    }
+}
+
+/// A string's width in display columns (Emacs's `string-width`).
+pub fn string_display_width(s: &str) -> usize {
+    s.chars().map(|c| char_display_width(c as u32)).sum()
+}
+
+/// The longest prefix of `s` whose display width is at most `cols`.
+///
+/// `format`'s `%.Ns` precision is a column budget, not a character count, and a
+/// character that would overflow the budget is dropped whole:
+/// `(format "%.3s" "\tXY")` is `""` and `(format "%.3s" "中中")` is `"中"` in
+/// Emacs 30.2.
+fn truncate_to_columns(s: &str, cols: usize) -> String {
+    let mut used = 0;
+    let mut out = String::new();
+    for c in s.chars() {
+        let w = char_display_width(c as u32);
+        if used + w > cols {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out
+}
+
 /// Pad `body` to `spec.width` honoring the `-` (left) and `0` (zero-fill) flags.
 /// Zero-fill only applies to right-justified numerics and goes after any sign.
+///
+/// The field width is a count of display *columns*, as every conversion shows:
+/// `(format "%6s|" "中")` is `"    中|"`, `(format "%4c|" ?中)` is `"  中|"` and
+/// `(format "%6S|" "中")` is `"  \"中\"|"` — each padded to six columns, not six
+/// characters.
 fn pad(body: String, spec: &FmtSpec) -> String {
-    if body.chars().count() >= spec.width {
+    let body_cols = string_display_width(&body);
+    if body_cols >= spec.width {
         return body;
     }
-    let fill = spec.width - body.chars().count();
+    let fill = spec.width - body_cols;
     if spec.left {
         format!("{body}{}", " ".repeat(fill))
     } else if spec.zero && matches!(spec.conv, 'd' | 'o' | 'x' | 'X' | 'e' | 'f' | 'g') {
@@ -2029,13 +2093,20 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>
                 let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
                 let s = h.print_checked(arg, false)?;
                 match spec.prec {
-                    Some(p) => s.chars().take(p).collect(),
+                    Some(p) => truncate_to_columns(&s, p),
                     None => s,
                 }
             }
             'S' => {
                 let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
-                h.print_checked(arg, true)?
+                let s = h.print_checked(arg, true)?;
+                // `%S`'s precision truncates the *printed* representation, quote
+                // marks included: `(format "%.3S" "中中中")` is `"\"中"` in
+                // Emacs 30.2 — one column for the opening quote, two for 中.
+                match spec.prec {
+                    Some(p) => truncate_to_columns(&s, p),
+                    None => s,
+                }
             }
             // The `+`/space sign flags apply to the signed conversions (d/e/f/g).
             // `%i` is an accepted alias for `%d` (as in C printf).
@@ -2434,7 +2505,7 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
     };
     let string = as_string(h, &a[0])?;
     let cf = case_fold_search(h);
-    let re = compile_cf(&rexp, cf)?;
+    let re = compile_cf(h, &rexp, cf)?;
     // TRIM is only ever touched inside `push-one`, i.e. after STRING and
     // SEPARATORS have both been accepted.
     let trim = match a.get(3) {
@@ -2443,9 +2514,9 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
     };
     let trim_re = match &trim {
         Some(t) => Some((
-            compile_cf(t, cf)?,
+            compile_cf(h, t, cf)?,
             // `(concat trim "\\'")` — anchored at the end of the SUBSTRING.
-            compile_cf(&format!("{t}\\'"), cf)?,
+            compile_cf(h, &format!("{t}\\'"), cf)?,
         )),
         None => None,
     };
@@ -2728,13 +2799,31 @@ pub(crate) fn char_of_byte(s: &str, byte_idx: usize) -> usize {
     s[..byte_idx].chars().count()
 }
 
+/// `\sC` resolved against the live syntax table.
+///
+/// It borrows the host rather than reaching for the thread-local: every
+/// `compile_cf` caller is already inside a subr holding `&mut ElispHost`, so a
+/// `with_host` here re-enters the same `RefCell` and aborts with
+/// "RefCell already borrowed" on the first `(string-match "\\s_" "-")`.
+struct HostSyntax<'a>(&'a ElispHost);
+impl crate::regexp::SyntaxLookup for HostSyntax<'_> {
+    fn ranges(&self, class: char) -> Vec<(u32, u32)> {
+        self.0.syntax_class_ranges(class)
+    }
+}
+
 /// Compile an elisp regexp to a `fancy_regex::Regex` (optionally case-insensitively,
 /// for `case-fold-search`), surfacing translation and compilation failures as
 /// elisp-style `invalid-regexp` errors.
-pub(crate) fn compile_cf(pat: &str, case_insensitive: bool) -> Result<fancy_regex::Regex, String> {
+pub(crate) fn compile_cf(
+    h: &ElispHost,
+    pat: &str,
+    case_insensitive: bool,
+) -> Result<fancy_regex::Regex, String> {
     // `translate` reports Emacs's own diagnostics ("Unmatched [ or [^", …); they
     // ride under the `invalid-regexp` error symbol, as in Emacs.
-    let translated = crate::regexp::translate(pat).map_err(|e| format!("invalid-regexp: {e}"))?;
+    let translated = crate::regexp::translate_with(pat, &HostSyntax(h))
+        .map_err(|e| format!("invalid-regexp: {e}"))?;
     // Elisp `^`/`$` always match line boundaries, so compile in multiline mode;
     // `\``/`\'` (translated to \A/\z) keep matching the absolute start/end.
     let flags = if case_insensitive { "(?mi)" } else { "(?m)" };
@@ -2796,7 +2885,7 @@ fn string_match(h: &mut ElispHost, a: &[Value]) -> R {
             pos as usize
         }
     };
-    let re = compile_cf(&pat, case_fold_search(h))?;
+    let re = compile_cf(h, &pat, case_fold_search(h))?;
     match run_match(&re, &subject, start) {
         Some(spans) => {
             let begin = spans[0].map(|(b, _)| b as i64).unwrap_or(0);
@@ -3899,6 +3988,14 @@ fn char_or_string_p(_h: &mut ElispHost, a: &[Value]) -> R {
         _ => false,
     };
     Ok(nil_or(ok))
+}
+/// `(char-width CHAR)` — a C primitive in Emacs (`Fchar_width`, `indent.c`), so
+/// it is one here too rather than a prelude `defun`; `format`'s column-measured
+/// width and precision need the same table from Rust, and two copies of it
+/// would be two answers.
+fn char_width_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let c = as_char(h, &a[0])?;
+    Ok(Value::Int(char_display_width(c) as i64))
 }
 fn char_equal(h: &mut ElispHost, a: &[Value]) -> R {
     let (c1, c2) = (as_int(h, &a[0])?, as_int(h, &a[1])?);
@@ -5679,7 +5776,7 @@ fn invocation_file(_h: &mut ElispHost, _a: &[Value]) -> R {
 fn directory_files_raw(h: &mut ElispHost, a: &[Value]) -> R {
     let raw = as_string(h, &a[0])?;
     let match_re = match a.get(1) {
-        Some(v) if !is_nil(v) => Some(compile_cf(&as_string(h, v)?, false)?),
+        Some(v) if !is_nil(v) => Some(compile_cf(h, &as_string(h, v)?, false)?),
         _ => None,
     };
     let nosort = a.get(2).is_some_and(|v| !is_nil(v));
@@ -5709,8 +5806,9 @@ fn set_buffer_fn(h: &mut ElispHost, a: &[Value]) -> R {
     h.set_buffer(&a[0])
 }
 fn get_buffer(h: &mut ElispHost, a: &[Value]) -> R {
-    // A buffer object returns itself if live; a name looks the buffer up.
-    match h.resolve_buffer(&a[0]) {
+    // `Fget_buffer` returns a buffer *object* unchanged — live or killed — and
+    // only the by-name branch can answer nil. See `ElispHost::get_buffer`.
+    match h.get_buffer(&a[0])? {
         Some(idx) => Ok(h.buffers[idx].self_obj.clone()),
         None => Ok(Value::Undef),
     }
@@ -6533,7 +6631,7 @@ fn search_forward(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn re_search_forward(h: &mut ElispHost, a: &[Value]) -> R {
     let pat = as_string(h, &a[0])?;
-    let re = compile_cf(&pat, case_fold_search(h))?;
+    let re = compile_cf(h, &pat, case_fold_search(h))?;
     let bound = match a.get(1) {
         Some(v) if !is_nil(v) => Some(as_int(h, v)?.max(0) as usize),
         _ => None,
@@ -6558,7 +6656,7 @@ fn re_search_forward(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 fn looking_at(h: &mut ElispHost, a: &[Value]) -> R {
-    let re = compile_cf(&as_string(h, &a[0])?, case_fold_search(h))?;
+    let re = compile_cf(h, &as_string(h, &a[0])?, case_fold_search(h))?;
     let text: String = h.cur_buf().text.iter().collect();
     let start_char = h.cur_buf().point - 1;
     match run_match(&re, &text, start_char) {
@@ -6940,7 +7038,7 @@ fn search_backward(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn re_search_backward(h: &mut ElispHost, a: &[Value]) -> R {
     let pat = as_string(h, &a[0])?;
-    let re = compile_cf(&pat, case_fold_search(h))?;
+    let re = compile_cf(h, &pat, case_fold_search(h))?;
     let noerror = a.get(2).is_some_and(|v| !is_nil(v));
     let text: String = h.cur_buf().text.iter().collect();
     let point_char = h.cur_buf().point - 1;
@@ -7489,6 +7587,7 @@ pub fn install(h: &mut ElispHost) {
     s("functionp", 1, Some(1), functionp);
     s("char-or-string-p", 1, Some(1), char_or_string_p);
     s("char-equal", 2, Some(2), char_equal);
+    s("char-width", 1, Some(1), char_width_fn);
     s("vconcat", 0, None, vconcat_fn);
     s("string-to-vector", 1, Some(1), string_to_vector);
     s("abs", 1, Some(1), abs_fn);

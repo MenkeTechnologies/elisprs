@@ -3238,30 +3238,10 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
         (setq n (+ n (cond ((< c 128) 1) ((< c 2048) 2) ((< c 65536) 3) (t 4)))))
       (setq l (cdr l)))
     n))
-(defun char-width (c)
-  ;; 0 for combining marks, 2 for East-Asian wide/fullwidth, else 1.
-  (cond
-   ;; Control chars: newline 0, tab tab-width (8), others display as `^X' (2).
-   ((eq c ?\n) 0)
-   ((eq c ?\t) 8)
-   ((or (< c 32) (eq c 127)) 2)
-   ((or (and (>= c #x0300) (<= c #x036F)) (and (>= c #x200B) (<= c #x200F))) 0)
-   ((or (and (>= c #x1100) (<= c #x115F))   ; Hangul Jamo
-        (and (>= c #x2E80) (<= c #x303E))   ; CJK radicals … symbols
-        (and (>= c #x3041) (<= c #x33FF))   ; Hiragana … CJK compat
-        (and (>= c #x3400) (<= c #x4DBF))   ; CJK ext A
-        (and (>= c #x4E00) (<= c #x9FFF))   ; CJK unified
-        (and (>= c #xA000) (<= c #xA4CF))   ; Yi
-        (and (>= c #xAC00) (<= c #xD7A3))   ; Hangul syllables
-        (and (>= c #xF900) (<= c #xFAFF))   ; CJK compat ideographs
-        (and (>= c #xFF00) (<= c #xFF60))   ; Fullwidth forms
-        (and (>= c #xFFE0) (<= c #xFFE6))
-        (and (>= c #x1F300) (<= c #x1F64F)) ; Misc symbols & pictographs, emoticons
-        (and (>= c #x1F900) (<= c #x1F9FF)) ; Supplemental symbols & pictographs
-        (and (>= c #x1FA70) (<= c #x1FAFF)) ; Symbols & pictographs ext A
-        (and (>= c #x20000) (<= c #x3FFFD))) ; CJK ext B+
-    2)
-   (t 1)))
+;; `char-width' is a subr (`builtins::char_width_fn'), matching Emacs's
+;; `Fchar_width' in indent.c. `format' measures its field width and `%.Ns'
+;; precision in display columns and needs the same table from Rust, so keeping a
+;; second copy here would have been two implementations of one answer.
 (defun string-width (s &optional _from _to)
   ;; `string-to-list' accepts any sequence, so the string check has to be explicit:
   ;; Emacs signals `stringp', not `sequencep'.

@@ -2110,6 +2110,54 @@ The widened corpus is now **1500/1500**.
 
 ---
 
+## Round 14 — a guard against silent identifier collisions, and a `kill-buffer` panic
+
+### The identifier-collision audit — clean, and now enforced
+
+Two sibling fusevm frontends shipped a defect that nothing caught: `scalars` had
+`MAKE_ORDERING` and `MAKE_QUEUE` both assigned 754, and `phplang` had
+`INDEX_ISSET` colliding with `LIST_ELEM_GET` at 105. Both arrived through a
+merge — two branches each appending a registration to a different part of a file
+merge with no conflict marker, and the collision exists only in the result.
+
+elisprs has two such namespaces:
+
+| namespace | where | what a duplicate does |
+| --- | --- | --- |
+| extension-op IDs | `host::ops`, hand-assigned `u16` | the later `ext_dispatch` arm is dead code; `rustc` emits only an `unreachable_patterns` warning |
+| subr names | `builtins::install` + `intercepts`, 340 registrations | `defsubr` ends in `set_function`, so the last registration silently replaces the first |
+
+**Audit result: no collisions.** The 12 `ops::*` constants are `0..=11` with no
+repeats, each dispatched by exactly one `match` arm, and no subr name is
+registered twice.
+
+`tests/registration_ids_unique.rs` now reads both sets out of the source text —
+the only place they exist as a *set*, since `ops::*` are separate constants with
+no registry and `defsubr` keeps no record of what it replaced — and fails on a
+duplicate ID, a duplicate constant name, an op with anything other than one
+dispatch arm, or a repeated subr name.
+
+The guard was verified by reintroducing both collision shapes and reverting
+them. With `CHECK_ARITY` moved from 11 to 9 and a second `s("length", …)`
+appended:
+
+```
+test extension_op_ids_are_unique ... FAILED
+test subr_names_are_registered_once ... FAILED
+
+extension-op IDs collide; the later arm in ext_dispatch is dead code:
+  id 9: ops::MAKE_CLOSURE (host.rs:132), ops::CHECK_ARITY (host.rs:134)
+
+a subr is registered more than once; only the last registration survives:
+  "length": builtins.rs:7100, builtins.rs:7243
+```
+
+Both are real breakage, and both are silent without the guard: `cargo build`
+reported one `unreachable_patterns` warning for the op clash and *nothing* for
+the subr clash, and the built binary failed at startup with
+`prelude form failed: void-function: cadr` — a diagnostic that names neither
+`length` nor the duplicate registration.
+
 ## Round 13 — the propertized-string read syntax, cl-seq's `*-if` contract, and nil's two spellings
 
 Sources this round: `scripts/fuzz_parity.sh` at two fresh seeds (777 × 3,000
@@ -2259,14 +2307,42 @@ one needs no reference Emacs at all and found the widest class below.
   arithmetic to native ops (surrenders the JIT on the hot path) or stop
   representing `t` as `Value::Bool` (a 70-site change that also has to re-wrap
   every comparison result the VM produces).
-- **`kill-buffer` can leave point past the buffer end, and the next
-  `buffer-substring` panics.** After the current buffer is killed, point is not
-  re-clamped to the successor buffer, so `(point)` can be `2` in an empty buffer;
-  `buffer_substring_core` (`src/builtins.rs:5998`) then slices `text[1..1]` of a
-  zero-length vector and the process aborts with a Rust panic instead of
-  signalling. Found by the self-consistency sweep, not by a parity diff — Emacs
-  never lets point leave `[begv, zv]`. The fix belongs in the buffer subsystem
-  (clamp point on every buffer switch), not in the slice.
+- ~~**`kill-buffer` can leave point past the buffer end, and the next
+  `buffer-substring` panics.**~~ — ✅ FIXED (R14-A). The repro was
+  `(progn (insert "hello") (kill-buffer) (buffer-substring (point-min) (point)))`:
+  `kill_buffer` cleared the slot's text but left `point`/`begv`/`zv` at 6, and
+  when the killed buffer was the last live one its `.unwrap_or(0)` left that dead
+  slot *current*, so `buffer_substring_core` sliced `text[..5]` of a zero-length
+  vector and aborted the process. Two ports close it: the killed slot's positions
+  go back to BEG (`reset_buffer`: `b->pt = BEG; b->begv = BEG; b->zv = BEG;`),
+  and the successor follows `Fkill_buffer`'s `Fset_buffer (Fother_buffer (…))`,
+  whose tail is `get-scratch-buffer-create` — "If no other buffer exists, return
+  the buffer `*scratch*' (creating it if necessary)". A dead buffer can no longer
+  be current.
+
+  ```
+  $ emacs -Q --batch --eval '(progn (insert "hello") (kill-buffer) (prin1 (list (point) (point-min) (point-max) (buffer-substring (point-min) (point)))))'
+  (1 1 1 "")
+  $ elisp -e '(progn (insert "hello") (kill-buffer) (prin1 (list (point) (point-min) (point-max) (buffer-substring (point-min) (point)))))'
+  (1 1 1 "")
+  ```
+
+  (`(buffer-name)` is `"*Messages*"` in Emacs and `"*scratch*"` here — elisprs
+  models neither `*Messages*` nor ` *Minibuf-0*`, so its `other-buffer` reaches
+  the `*scratch*` fallback one step earlier. Recorded below.)
+- ~~**`set-buffer` collapsed three distinct Emacs failures into one message.**~~
+  — ✅ FIXED (R14-A), alongside the above, by porting `Fget_buffer` /
+  `Fset_buffer` / `nsberror` (`src/buffer.c`). `Fget_buffer` returns a buffer
+  object unchanged whether or not it is live and `CHECK_STRING`s anything else,
+  so the three cases separate:
+
+  | form | Emacs 30.2 | elisprs before |
+  | --- | --- | --- |
+  | `(get-buffer <killed>)` | `#<killed buffer>` | `nil` |
+  | `(get-buffer 5)` | `(wrong-type-argument stringp 5)` | `nil` |
+  | `(set-buffer 5)` | `(wrong-type-argument stringp 5)` | `(error "No buffer named 5")` |
+  | `(set-buffer "nope")` | `(error "No buffer named nope")` | `(error "No buffer named \"nope\"")` |
+  | `(set-buffer <killed>)` | `(error "Selecting deleted buffer")` | `(error "No buffer named #<killed buffer>")` |
 - **`(seq-elt (cons 1 2) 5)`** is `(wrong-type-argument listp 2)` in Emacs and
   `(wrong-type-argument listp (1 . 2))` here — but *only* because Emacs's seq.el
   is byte-compiled and the `Belt` bytecode has an inline cons walk whose final
@@ -2275,15 +2351,44 @@ one needs no reference Emacs at all and found the widest class below.
   Emacs agrees with elisprs: `(elt (cons 1 2) 5)` is
   `(wrong-type-argument listp (1 . 2))` on both. Same root as the arity item
   above — elisprs has no "this callee was byte-compiled" distinction.
-- **`\s_`, `\s<` and `\s>` do not read the syntax table.** `(string-match "\\s_"
-  "-")` and `(string-match "\\s<" ";")` are `0` in Emacs and `nil` here, and
-  `(string-match "\\s>" "\n")` likewise. `translate_escape` (`src/regexp.rs:208`)
-  maps `\sC` per class with a hardcoded set and falls back to the whitespace set
-  for every class it does not know; it is a pure string translator with no access
-  to the host, so it cannot consult `(syntax-table)`. That also means the classes
-  it *does* know are wrong under `with-syntax-table`. Closing it means resolving
-  `\sC` against the live table where the regexp is compiled, not in the
-  translator.
+- ~~**`\s_`, `\s<` and `\s>` do not read the syntax table.**~~ — ✅ FIXED
+  (R14-C), and `\w`/`\W` with them. `ElispHost::syntax_class_ranges` answers
+  "which characters are in class C" for the *current* table, and
+  `regexp::translate_with` compiles `\sC`/`\SC`/`\w`/`\W` into an explicit
+  character class from it. Answering for the whole character space at compile
+  time is cheap because a `CharTable` stores runs, so the breakpoints of the
+  table and of every table in its parent chain bound each place the answer can
+  change — no 4M-character walk.
+
+  ```
+  $ emacs -Q --batch --eval '(prin1 (list (string-match "\\s_" "-") (string-match "\\s<" ";") (string-match "\\s>" "\n")))'
+  (0 0 0)
+  $ elisp -e '(prin1 (list (string-match "\\s_" "-") (string-match "\\s<" ";") (string-match "\\s>" "\n")))'
+  (0 0 0)
+  ```
+
+  Two things fell out of it. `\w` was the regex crate's `[0-9A-Za-z_]` and is
+  really `SYNTAX (c) == Sword` (`regex-emacs.c`), so `(string-match "\\w" "_")`
+  answered `0` where Emacs answers `nil` — `_` is a symbol constituent under any
+  lisp-mode table. And the emitted class needs `(?-i:…)`: `case-fold-search` is
+  `t` by default, and its `(?i)` made `(progn (modify-syntax-entry ?a "_")
+  (string-match "\\sw" "a"))` answer `0` by folding `a` onto the class's `A-Z`
+  run, where Emacs answers `nil`. Emacs never case-folds a syntax class.
+- **A wrong-arity call to a *closure* named the symbol** — ✅ FIXED (R14-B).
+  `funcall_lambda` signals with `fun`, what indirection landed on; only
+  `eval_sub`'s subr branch signals with `original_fun`. elisprs passed the
+  designator in both branches.
+
+  ```
+  $ emacs -Q --batch --eval '(progn (defun f1 (a) a) (prin1 (condition-case e (f1 1 2) (error e))))'
+  (wrong-number-of-arguments #[(a) (a) (t)] 2)
+  $ elisp -e '(progn (defun f1 (a) a) (prin1 (condition-case e (f1 1 2) (error e))))'
+  (wrong-number-of-arguments #[(a) (a) (t)] 2)
+  ```
+
+  The subr rows are unchanged and pinned: `(car 1 2)` is still
+  `(wrong-number-of-arguments car 2)` and the applied subr is still
+  `#<subr car>`.
 - **A closure still prints the environment it captured** — round 11's
   "Re-verified as already fixed" is wrong, and the fuzzer found it again at seed
   777 (form #1591). The re-verification used `(lambda (x) x)` with nothing in
@@ -2303,23 +2408,101 @@ one needs no reference Emacs at all and found the widest class below.
   cookie — elisprs prints `((q . 5))` either way). Emacs prunes a closure's
   captured environment to the free variables of its BODY; `(lambda (x) (list x
   x))` has none, so it captures nothing. elisprs keeps every binding that was in
-  scope. Unchanged substrate reason from round 9: pruning needs a free-variable
-  analysis in `compiler.rs`.
-- **`format`'s `%Ns` width and `%.Ns` precision count characters, not display
-  columns.** Emacs measures both with the string's display width, so a TAB is 8
-  columns, a control character is 2 (`^G`), a raw byte is 4 (`\200`) and a
-  double-width character is 2:
+  scope.
+
+  Round 13 read the actual pruner and the substrate requirement is larger than
+  "a free-variable analysis in `compiler.rs`". Emacs 30 does this in
+  `cconv-make-interpreted-closure` (`lisp/emacs-lisp/cconv.el`), and the
+  analysis is not run on the source — the function **macroexpands the lambda
+  first** and stores the *expanded* body in the closure:
+
+  ```lisp
+  (let* ((form `#'(lambda ,args ,iform . ,body))
+         (expanded-form (let ((lexical-binding t) …)
+                          (macroexpand-all form macroexpand-all-environment)))
+         (expanded-fun-body (pcase expanded-form
+                              (`#'(lambda ,_args ,_iform . ,newbody) newbody)
+                              (_ body)))
+         (fvs (cconv-fv expanded-form lexvars dynvars))
+         (newenv (nconc (mapcar (lambda (fv) (assq fv env)) (car fvs)) (cdr fvs))))
+    (make-interpreted-closure args expanded-fun-body (or newenv '(t)) …))
+  ```
+
+  That is directly observable, and elisprs diverges on the body as well as on
+  the environment — `macroexp--expand-all` unfolds `(funcall (lambda () X))` to
+  `X` and rewrites a nested `(lambda …)` to `#'(lambda …)`:
+
+  ```
+  $ cat elisprs_closure_body.el     # -*- lexical-binding: t -*-
+  (let ((q 5) (w 7)) (princ (format "f=%S\n" (lambda (x) (funcall (lambda () q)) 99))))
+  (let ((q 5)) (princ (format "h=%S\n" (lambda (x) (mapcar (lambda (y) (+ y q)) x)))))
+  $ emacs -Q --batch -l elisprs_closure_body.el
+  f=#[(x) (q 99) ((q . 5))]
+  h=#[(x) ((mapcar #'(lambda (y) (+ y q)) x)) ((q . 5))]
+  $ elisp elisprs_closure_body.el
+  f=#[(x) ((funcall (lambda nil q)) 99) ((w . 7) (q . 5))]
+  h=#[(x) ((mapcar (lambda (y) (+ y q)) x)) ((q . 5))]
+  ```
+
+  So closing this means (a) macroexpanding the lambda at closure-creation time
+  and storing that as `ClosureSrc::body`, then (b) porting `cconv-fv` —
+  `cconv-analyze-form`'s full special-form dispatch, not a symbol scan, since
+  the analysis has to respect `quote`, `let`/`let*` shadowing, a nested lambda's
+  own parameters, and `setq` as a use. Approximating (b) without (a) is not an
+  option that can be shipped: the pruned environment is the *runtime* one, so an
+  analysis that misses a reference turns a working closure into
+  `void-variable`. Deliberately left unfixed rather than approximated.
+
+  What round 13 *did* fix is the neighbouring half of the same printout: the
+  arity error now names the closure rather than the symbol (see the entry
+  above), so `(f1 1 2)` differs from Emacs only in the environment field.
+- ~~**`format`'s `%Ns` width and `%.Ns` precision count characters, not display
+  columns.**~~ — ✅ FIXED (R14-D).
 
   ```
   $ emacs -Q --batch --eval '(prin1 (list (format "%.3s" "\tXY") (format "%.3s" "中XY") (format "%.3s" "中中") (format "%5s" "a\tb")))'
   ("" "中X" "中" "a\tb")
   $ elisp -e '(prin1 (list (format "%.3s" "\tXY") (format "%.3s" "中XY") (format "%.3s" "中中") (format "%5s" "a\tb")))'
-  ("\tXY" "中XY" "中中" "  a\tb")
+  ("" "中X" "中" "a\tb")
   ```
 
-  Found by the fuzzer at seed 777 (form #1737). Closing it needs Emacs's
-  character-width model (`char-width-table`, tab stops, the `^C`/`\NNN`
-  display forms), which elisprs does not have.
+  The width model was already in the tree — the prelude's `char-width` — just
+  not reachable from `format`, which is Rust. It moved to
+  `builtins::char_display_width` and `char-width` became a subr, which is what
+  Emacs has anyway (`Fchar_width`, `indent.c`; `(subrp (symbol-function
+  'char-width))` is `t` on 30.2). One table, one answer. Measurements the model
+  reproduces: `(list (char-width ?\t) (char-width ?\n) (char-width 7)
+  (char-width 127) (char-width 200) (char-width ?中) (string-width "a\t"))` =>
+  `(8 0 2 2 1 2 9)` — a TAB is a flat `tab-width` rather than a distance to the
+  next tab stop, which the `"a\t"` => 9 row settles.
+
+  Both the field width and the precision are columns, for *every* conversion,
+  not only `%s`: `(format "%4c|" ?中)` is `"  中|"` and `(format "%6S|" "中")` is
+  `"  \"中\"|"`. `%S` also gained the precision it never applied at all —
+  `(format "%.3S" "中中中")` is `"\"中"`, one column for the opening quote plus
+  two for 中.
+
+  Not covered: a raw byte inside a *multibyte* string, the `\200` display form
+  the original report mentioned. `(string-width (unibyte-string 200))` is `1` on
+  30.2 (U+00C8 is one column) and matches; the 4-column form belongs to
+  `print-escape-nonascii`-style rendering, which is a separate model.
+- **`emacs -Q --batch` starts with three buffers, elisprs with one.**
+  `(mapcar #'buffer-name (buffer-list))` is `("*scratch*" " *Minibuf-0*"
+  "*Messages*")` in Emacs and `("*scratch*")` here. It only shows through
+  `other-buffer`: killing `*scratch*` makes `*Messages*` current in Emacs and
+  reaches the `get-scratch-buffer-create` fallback here, so `(buffer-name)`
+  after `(kill-buffer)` is `"*Messages*"` there and `"*scratch*"` here. Point
+  and the buffer contents agree; only the name does not. Found while fixing the
+  `kill-buffer` panic above. Closing it means modelling `*Messages*` (and its
+  `message` side effects) and the minibuffer, which is a larger piece than the
+  panic it turned up next to.
+- **A closure's body is stored unexpanded** — the second half of the closure
+  entry above, recorded separately because it is observable on its own:
+  `(let ((q 5)) (lambda (x) (funcall (lambda () q))))` prints
+  `#[(x) (q) ((q . 5))]` in Emacs and
+  `#[(x) ((funcall (lambda nil q))) ((q . 5))]` here, and a nested lambda prints
+  as `#'(lambda …)` there and `(lambda …)` here. Both follow from
+  `cconv-make-interpreted-closure` storing `macroexpand-all`'s output.
 - Unchanged from rounds 9, 10, 11 and 12, for the reasons already recorded there:
   reader-level backquote preservation, `setf`'s gv expansion shape,
   `hash-table-size`, `aset` on a string, the warm-cache `make-symbol` re-intern,

@@ -5,7 +5,52 @@ All notable changes to elisprs are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **A guard against silent identifier collisions.** Extension-op IDs
+  (`host::ops`) are hand-assigned `u16` constants and subr names go through
+  `defsubr`, which ends in `set_function` — so two registrations sharing a number
+  or a name merge without a conflict marker and the later one silently replaces
+  the earlier. `tests/registration_ids_unique.rs` reads both sets out of the
+  source and fails on a duplicate ID, a duplicate constant name, an op with
+  anything other than one `ext_dispatch` arm, or a repeated subr name. The audit
+  it encodes found no collisions in the current tree.
+- **`char-width` is a subr**, matching Emacs's `Fchar_width` (`indent.c`). It was
+  a prelude `defun`; `format` needs the same width table from Rust, and two
+  copies would be two answers.
+
 ### Fixed
+- **`kill-buffer` could leave a dead buffer current with stale positions, and the
+  next `buffer-substring` aborted the process.**
+  `(progn (insert "hello") (kill-buffer) (buffer-substring (point-min) (point)))`
+  sliced `text[..5]` of a zero-length vector and panicked. The killed slot's
+  `point`/`begv`/`zv` now go back to BEG (Emacs's `reset_buffer`), and the
+  successor follows `Fkill_buffer`'s `Fset_buffer (Fother_buffer (…))`, whose
+  tail creates `*scratch*` when no live buffer remains — so a dead buffer can no
+  longer be current.
+- **`get-buffer` / `set-buffer` collapsed three distinct Emacs failures into
+  one.** Ported `Fget_buffer`, `Fset_buffer` and `nsberror` (`src/buffer.c`): a
+  buffer object comes back from `get-buffer` whether or not it is live
+  (`#<killed buffer>`, was `nil`), a non-buffer non-string is
+  `(wrong-type-argument stringp 5)` before any lookup, an unknown name is
+  `No buffer named nope` unquoted, and a killed buffer object is
+  `Selecting deleted buffer`.
+- **A wrong-arity call to a closure named the symbol, not the closure.**
+  `(progn (defun f1 (a) a) (f1 1 2))` reported `f1` where Emacs reports
+  `#[(a) (a) (t)]`, and a `defalias`ed second name reported that name.
+  `funcall_lambda` signals with the resolved function; only `eval_sub`'s subr
+  branch signals with the designator, and the subr rows are unchanged.
+- **`\sC`, `\SC`, `\w` and `\W` ignored the syntax table.** `translate_escape`
+  mapped a few class letters to fixed sets and fell back to whitespace for the
+  rest, so `(string-match "\\s_" "-")` was `nil` (Emacs: `0`) and no class
+  noticed `with-syntax-table` or `modify-syntax-entry`. They now compile to an
+  explicit character class built from the live table's runs. `\w` is the table's
+  word class too, so `(string-match "\\w" "_")` is `nil` as in Emacs, and the
+  class is emitted `(?-i:…)` because Emacs never case-folds a syntax class.
+- **`format`'s field width and `%.Ns` precision counted characters, not display
+  columns.** `(format "%.3s" "\tXY")` was `"\tXY"` and is now `""`; `(format
+  "%5s" "a\tb")` no longer pads. Columns apply to every conversion — `(format
+  "%4c|" ?中)` is `"  中|"` — and `%S` gained the precision it never applied at
+  all.
 - **A subr's arity is checked before its arguments are evaluated.** `compile_call`
   emitted the argument code ahead of the `CALL` op and arity was enforced in
   `call_function`, so a wrong-arity call to a builtin ran its arguments' side

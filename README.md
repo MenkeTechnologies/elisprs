@@ -143,10 +143,10 @@ elisp --version
 - **Backquote / unquote.** `` ` ``, `,`, and `,@` are read and expanded.
 - **`setcar` / `setcdr`** mutate cons cells in place.
 - **`pcase`.** Structural dispatch over `_`, literals, `'x`, symbol binders, `(pred FN)`, `(guard EXPR)`, `(and …)`, `(or …)`, and **backquote patterns** `` `(,a ,b) `` / `` `(,a . ,rest) `` (incl. nested), recognized from the reader's eager backquote expansion.
-- **Regexps.** `string-match` & friends translate elisp regexp syntax (`\(` `\|` `\{`, `\<`/`\>`, `\w`/`\s-`, backreferences `\1`..`\9`) to a backing engine, honor `case-fold-search`, and record char-indexed match data; `replace-regexp-in-string` is the subr.el Lisp definition (function-valued REP, `\&`/`\N` templates, FIXEDCASE/LITERAL/SUBEXP/START).
+- **Regexps.** `string-match` & friends translate elisp regexp syntax (`\(` `\|` `\{`, `\<`/`\>`, backreferences `\1`..`\9`) to a backing engine, honor `case-fold-search`, and record char-indexed match data; `replace-regexp-in-string` is the subr.el Lisp definition (function-valued REP, `\&`/`\N` templates, FIXEDCASE/LITERAL/SUBEXP/START). The syntax-class escapes `\sC`, `\SC`, `\w` and `\W` are resolved against the syntax table in force where the regexp is compiled, so `with-syntax-table` and `modify-syntax-entry` change what they match.
 - **Vector literals.** `[1 2 3]` reads as a self-evaluating vector (elements unevaluated); `aref` / `elt` / `length` / `append` / `sort` operate on it.
 - **Generalized `setf`** over the common places: `car`, `cdr`, `nth`, `elt`, `aref`, `gethash`, `symbol-value`, plus plain variables and multiple place/value pairs.
-- **`format` field specs.** `%[-][0][width][.prec]` with `s S d o x X c e f g`, e.g. `(format "%05d" 42)` → `00042`.
+- **`format` field specs.** `%[-][0][width][.prec]` with `s S d o x X c e f g`, e.g. `(format "%05d" 42)` → `00042`. Width and precision are measured in *display columns*, as in Emacs: a TAB is 8, a control character 2, a newline 0 and an East-Asian wide character 2, so `(format "%.3s" "\tXY")` is `""` and `(format "%4c|" ?中)` is `"  中|"`.
 
 **Scope.** Both **lexical** (`lexical-binding: t`) and **dynamic** binding are honored — lexical closures capture their defining environment, while `defvar` / special variables bind dynamically.
 

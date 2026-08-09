@@ -25,7 +25,44 @@
 /// rather than failing to compile. Both would otherwise surface as a
 /// `fancy-regex` parse failure whose message names byte offsets in the
 /// *translated* pattern — meaningless to the elisp caller.
+/// Resolves a syntax-class designator (`w`, `_`, `<`, …) to the character
+/// ranges that carry it, so `\sC` can be compiled against the syntax table in
+/// force where the regexp is compiled.
+///
+/// A trait object rather than a direct host call because this module is a pure
+/// translator with no arena access; [`crate::builtins::compile_cf`] supplies the
+/// live table and [`translate`] keeps a no-table path for the unit tests.
+pub trait SyntaxLookup {
+    /// Ascending, non-overlapping `[lo, hi]` character ranges in class `class`.
+    /// An empty result means the class is genuinely empty in this table — `\s!`
+    /// with no generic-comment-fence character, say — and `\sC` then matches
+    /// nothing, which is not the same as having no table at all.
+    fn ranges(&self, class: char) -> Vec<(u32, u32)>;
+    /// Whether a syntax table is reachable. False only for [`NoSyntax`].
+    fn available(&self) -> bool {
+        true
+    }
+}
+
+/// The syntax lookup used when no table is available (the module's own tests).
+/// `translate` then falls back to the hardcoded whitespace/word sets it used
+/// before syntax tables were consulted.
+pub struct NoSyntax;
+impl SyntaxLookup for NoSyntax {
+    fn ranges(&self, _class: char) -> Vec<(u32, u32)> {
+        Vec::new()
+    }
+    fn available(&self) -> bool {
+        false
+    }
+}
+
 pub fn translate(pat: &str) -> Result<String, String> {
+    translate_with(pat, &NoSyntax)
+}
+
+/// [`translate`], resolving `\sC` / `\SC` against `syn`.
+pub fn translate_with(pat: &str, syn: &dyn SyntaxLookup) -> Result<String, String> {
     let mut out = String::with_capacity(pat.len() + 8);
     let mut it = pat.chars().peekable();
     // Depth of open `\(` groups, so a stray `\)` is diagnosed like Emacs's.
@@ -36,7 +73,7 @@ pub fn translate(pat: &str) -> Result<String, String> {
     let mut can_repeat = false;
     while let Some(c) = it.next() {
         match c {
-            '\\' => translate_escape(&mut it, &mut out, &mut depth, &mut can_repeat)?,
+            '\\' => translate_escape(&mut it, &mut out, &mut depth, &mut can_repeat, syn)?,
             // Literal in elisp, special in the crate → escape.
             '(' | ')' | '{' | '}' | '|' => {
                 out.push('\\');
@@ -74,6 +111,50 @@ pub fn translate(pat: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// The largest scalar value a Rust `char` can hold. Emacs's character space runs
+/// to `#x3FFFFF` (raw bytes and unassigned codepoints live above Unicode), but a
+/// `fancy_regex` class can only name real scalar values, so a syntax-class range
+/// is clipped here and the surrogate block is stepped over.
+const MAX_SCALAR: u32 = 0x10FFFF;
+
+/// A `fancy_regex` character class covering `ranges` (or its complement when
+/// `neg`). Empty input yields a class that cannot match — `[^\x{0}-\x{10FFFF}]`
+/// for the positive form, `.`-equivalent for the negated one — because a syntax
+/// class with no characters must match nothing, not everything.
+fn char_class(ranges: &[(u32, u32)], neg: bool) -> String {
+    let mut body = String::new();
+    for &(lo, hi) in ranges {
+        if lo > MAX_SCALAR {
+            continue;
+        }
+        let hi = hi.min(MAX_SCALAR);
+        // Split around the surrogate block: D800–DFFF are not scalar values and
+        // the regex parser rejects them inside a class.
+        for (a, b) in [(lo, hi.min(0xD7FF)), (lo.max(0xE000), hi)] {
+            if a > b || a > MAX_SCALAR {
+                continue;
+            }
+            if a == b {
+                body.push_str(&format!("\\x{{{a:X}}}"));
+            } else {
+                body.push_str(&format!("\\x{{{a:X}}}-\\x{{{b:X}}}"));
+            }
+        }
+    }
+    if body.is_empty() {
+        // No character is in the class.
+        body = "\\x{0}-\\x{10FFFF}".to_string();
+        return format!("(?-i:[{}{body}])", if neg { "" } else { "^" });
+    }
+    // `(?-i:…)` because a syntax class is never case-folded. Emacs's matcher asks
+    // `SYNTAX (c)` of the character as it stands; `case-fold-search` only folds
+    // literal characters. Without the override, `case-fold-search`'s `(?i)`
+    // leaked in and `(progn (modify-syntax-entry ?a "_") (string-match "\\sw"
+    // "a"))` answered 0 — "a" matching the class's `A-Z` run — where Emacs 30.2
+    // answers nil.
+    format!("(?-i:[{}{body}])", if neg { "^" } else { "" })
+}
+
 /// Emacs's own `invalid-regexp` messages (`regex-emacs.c`), reproduced verbatim:
 /// elisp code catches these and prints the string.
 const UNMATCHED_OPEN: &str = "Unmatched ( or \\(";
@@ -88,6 +169,7 @@ fn translate_escape(
     out: &mut String,
     depth: &mut i32,
     can_repeat: &mut bool,
+    syn: &dyn SyntaxLookup,
 ) -> Result<(), String> {
     let Some(e) = it.next() else {
         return Err(TRAILING_BACKSLASH.into());
@@ -198,15 +280,39 @@ fn translate_escape(
             }
         }
         '=' => {} // point — no analogue; matches empty.
-        // Word / boundary escapes shared with the crate.
-        'w' => out.push_str(r"\w"),
-        'W' => out.push_str(r"\W"),
+        // `\w` / `\W` are the word-constituent class of the *syntax table*
+        // (`regex-emacs.c` tests `SYNTAX (c) == Sword`), not the crate's
+        // `[0-9A-Za-z_]`. The two disagree on `_` under any lisp-mode table,
+        // where `_` is a symbol constituent: `(string-match "\\w" "_")` is nil in
+        // Emacs 30.2 and was 0 here.
+        'w' | 'W' => {
+            if syn.available() {
+                out.push_str(&char_class(&syn.ranges('w'), e == 'W'));
+            } else {
+                out.push_str(if e == 'W' { r"\W" } else { r"\w" });
+            }
+        }
         'b' => out.push_str(r"\b"),
         'B' => out.push_str(r"\B"),
-        // Syntax classes `\sC` / `\SC`: map the common whitespace/word codes,
-        // otherwise fall back to "anything" so the pattern still compiles.
+        // Syntax classes `\sC` / `\SC`, resolved against the syntax table in
+        // force where this regexp is compiled.
+        //
+        // Emacs asks `SYNTAX (c) == class` per character while matching; this
+        // translator has to answer for the whole character space up front, which
+        // `SyntaxLookup` does by reading the table's runs. Getting the table
+        // involved is the whole point: `\s_` matched nothing before (the arm
+        // below fell through to the whitespace set), and the classes that *were*
+        // hardcoded ignored `with-syntax-table` entirely.
         's' | 'S' => {
             let neg = e == 'S';
+            let class = it.peek().copied();
+            // `-` is `modify-syntax-entry`'s alias for the whitespace class.
+            let class = class.map(|c| if c == '-' { ' ' } else { c });
+            if let (true, Some(class)) = (syn.available(), class) {
+                it.next();
+                out.push_str(&char_class(&syn.ranges(class), neg));
+                return Ok(());
+            }
             match it.next() {
                 // Whitespace syntax is the SYNTAX TABLE's whitespace class, not
                 // the regex crate's `\s`. They differ on the line terminators:

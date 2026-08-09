@@ -442,6 +442,12 @@ pub enum Resolved {
         env: Lex,
         /// Dynamic-binding function — see [`Obj::Closure::dynamic`].
         dynamic: bool,
+        /// The closure object indirection landed on. `funcall_lambda` signals
+        /// `(wrong-number-of-arguments FUN NARGS)` with `fun`, the *resolved*
+        /// function — never the symbol the caller wrote — so a wrong-arity call
+        /// to a `defun` names `#[(a) (a) (t)]`, not `f1`. (A subr is the other
+        /// way round: `eval_sub` signals with `original_fun`, the symbol.)
+        object: Value,
     },
 }
 
@@ -2288,6 +2294,7 @@ impl ElispHost {
                         is_macro: *is_macro,
                         env: env.clone(),
                         dynamic: *dynamic,
+                        object: cur.clone(),
                     })
                 }
                 Some(Obj::Symbol(s)) => match &s.function {
@@ -2932,6 +2939,56 @@ impl ElispHost {
             },
         }
     }
+    /// The slot a buffer *object* names, live or killed. `resolve_buffer` filters
+    /// killed slots out; the three callers that follow Emacs's `Fget_buffer`
+    /// (`get-buffer`, `set-buffer`, `buffer-name`) must be able to see them,
+    /// because a killed buffer object stays a buffer object in Emacs and only
+    /// `BUFFER_LIVE_P` distinguishes it.
+    fn buffer_slot(&self, v: &Value) -> Option<usize> {
+        match self.obj(v) {
+            Some(Obj::Buffer(idx)) if *idx < self.buffers.len() => Some(*idx),
+            _ => None,
+        }
+    }
+    /// Port of `Fget_buffer` (`src/buffer.c`):
+    ///
+    /// ```c
+    ///   if (BUFFERP (buffer_or_name)) return buffer_or_name;
+    ///   CHECK_STRING (buffer_or_name);
+    ///   return Fcdr (Fassoc (buffer_or_name, Vbuffer_alist, Qnil));
+    /// ```
+    ///
+    /// A buffer object is returned unchanged whether or not it is live — only
+    /// the name lookup can answer nil — and anything that is neither a buffer
+    /// nor a string signals `(wrong-type-argument stringp X)` before any lookup
+    /// happens. `Ok(None)` is Emacs's nil.
+    pub fn get_buffer(&self, v: &Value) -> Result<Option<usize>, String> {
+        if let Some(idx) = self.buffer_slot(v) {
+            return Ok(Some(idx));
+        }
+        match v {
+            Value::Str(s) => Ok(self.find_buffer_by_name(s)),
+            _ => Err(format!(
+                "wrong-type-argument: stringp {}",
+                self.print(v, true)
+            )),
+        }
+    }
+    /// Port of `nsberror` (`src/buffer.c`) — the "no such buffer" signal shared
+    /// by every buffer-taking subr:
+    ///
+    /// ```c
+    ///   if (STRINGP (spec)) error ("No buffer named %s", SDATA (spec));
+    ///   error ("Invalid buffer argument");
+    /// ```
+    ///
+    /// The name goes in unquoted (`SDATA`, not `prin1`).
+    pub fn nsberror(&self, v: &Value) -> String {
+        match v {
+            Value::Str(s) => format!("error: No buffer named {s}"),
+            _ => "error: Invalid buffer argument".to_string(),
+        }
+    }
     /// Index of the live buffer named `name`, if any.
     pub fn find_buffer_by_name(&self, name: &str) -> Option<usize> {
         self.buffers
@@ -2985,11 +3042,24 @@ impl ElispHost {
         }
     }
     /// `(set-buffer BUFFER-OR-NAME)` — make it current, returning its object.
-    /// Signals if the buffer does not exist.
+    /// Port of `Fset_buffer` (`src/buffer.c`):
+    ///
+    /// ```c
+    ///   buffer = Fget_buffer (buffer_or_name);
+    ///   if (NILP (buffer)) nsberror (buffer_or_name);
+    ///   if (!BUFFER_LIVE_P (XBUFFER (buffer))) error ("Selecting deleted buffer");
+    ///   set_buffer_internal (XBUFFER (buffer));
+    /// ```
+    ///
+    /// The three failures are distinct and were one message here before: a
+    /// non-string non-buffer is `(wrong-type-argument stringp X)` from
+    /// `get_buffer`, an unknown *name* is `No buffer named NAME`, and a killed
+    /// buffer *object* is `Selecting deleted buffer`.
     pub fn set_buffer(&mut self, v: &Value) -> Result<Value, String> {
-        let idx = self
-            .resolve_buffer(v)
-            .ok_or_else(|| format!("error: No buffer named {}", self.print(v, true)))?;
+        let idx = self.get_buffer(v)?.ok_or_else(|| self.nsberror(v))?;
+        if self.buffers[idx].name.is_none() {
+            return Err("error: Selecting deleted buffer".to_string());
+        }
         self.current = idx;
         Ok(self.buffers[idx].self_obj.clone())
     }
@@ -3016,6 +3086,21 @@ impl ElispHost {
         b.locals.clear();
         b.se_markers.clear();
         b.restrict_stack.clear();
+        // The text is gone, so every position field has to go back to BEG with
+        // it — `reset_buffer` does exactly this in Emacs:
+        //
+        // ```c
+        //   b->pt = BEG;  b->begv = BEG;  b->zv = BEG;
+        // ```
+        //
+        // Leaving them stale broke `EditBuffer::point`'s documented invariant
+        // ("always kept within `[begv, zv]`"): after `(insert "hello")
+        // (kill-buffer)` point was 6 in a zero-length buffer, and the next
+        // `buffer-substring` sliced `text[..5]` and aborted the process.
+        b.point = 1;
+        b.begv = 1;
+        b.zv = 1;
+        b.mark = None;
         // Detach every marker that pointed into the killed buffer.
         for mk in b.markers.drain(..) {
             let mut md = mk.borrow_mut();
@@ -3023,11 +3108,19 @@ impl ElispHost {
             md.pos = 0;
         }
         if self.current == idx {
-            self.current = self
-                .buffers
-                .iter()
-                .position(|b| b.name.is_some())
-                .unwrap_or(0);
+            // `Fkill_buffer` re-selects with `Fset_buffer (Fother_buffer (…))`,
+            // and `other-buffer` ends in `get-scratch-buffer-create` — "If no
+            // other buffer exists, return the buffer `*scratch*' (creating it if
+            // necessary)". So a killed buffer can never stay current; the old
+            // `.unwrap_or(0)` left slot 0 current even when slot 0 was the
+            // buffer just killed.
+            self.current = match self.buffers.iter().position(|b| b.name.is_some()) {
+                Some(i) => i,
+                None => {
+                    let handle = self.new_buffer("*scratch*".to_string());
+                    self.buffer_slot(&handle).expect("fresh buffer slot")
+                }
+            };
         }
         Value::Bool(true)
     }
@@ -3596,6 +3689,83 @@ impl ElispHost {
                 return Value::Undef;
             }
         }
+    }
+
+    /// The designator characters of the syntax codes, in code order — Emacs's
+    /// `syntax_code_spec` (`src/syntax.c`) and the prelude's
+    /// `--syntax-code-spec--`, which must stay the same string.
+    const SYNTAX_CODE_SPEC: &'static [u8] = b" .w_()'\"$\\/<>@!|";
+
+    /// The syntax table `(syntax-table)` would return: the current buffer's, or
+    /// the standard one when the buffer has none. Read straight out of the two
+    /// prelude variables rather than by calling elisp, because the caller is a
+    /// regexp compile that can happen underneath any evaluation.
+    fn current_syntax_table(&self) -> Value {
+        let local = self
+            .find_symbol("--current-syntax-table--")
+            .and_then(|s| self.get_value(&s).ok());
+        match local {
+            Some(v) if el_truthy(&v) => v,
+            _ => self
+                .find_symbol("--standard-syntax-table--")
+                .and_then(|s| self.get_value(&s).ok())
+                .unwrap_or(Value::Undef),
+        }
+    }
+
+    /// Every character range whose syntax class in the current table is `class`
+    /// (a `modify-syntax-entry` designator: `w`, `_`, `.`, `<`, `>`, …).
+    ///
+    /// This is what `\sC` needs. Emacs's regexp engine asks `SYNTAX (c) ==
+    /// class` per character as it matches; elisprs translates to a `fancy_regex`
+    /// pattern up front, so the same question has to be answered for the whole
+    /// character space at compile time. That is cheap here because a `CharTable`
+    /// stores runs (`ranges: Vec<(u32, Value)>`), not 4M slots: the breakpoints
+    /// of the table and of every table in its parent chain bound every place the
+    /// answer can change.
+    ///
+    /// An entry that is not a `(CODE . MATCH)` cons counts as class 0
+    /// (whitespace), which is what `SYNTAX` yields for an unset slot.
+    pub fn syntax_class_ranges(&self, class: char) -> Vec<(u32, u32)> {
+        let table = self.current_syntax_table();
+        let mut breaks: Vec<u32> = vec![0];
+        let mut cur = table.clone();
+        for _ in 0..64 {
+            let Some(Obj::CharTable(t)) = self.obj(&cur) else {
+                break;
+            };
+            breaks.extend(t.ranges.iter().map(|(s, _)| *s));
+            cur = t.parent.clone();
+        }
+        breaks.sort_unstable();
+        breaks.dedup();
+
+        let class_at = |c: u32| -> char {
+            let v = self.char_table_ref(&table, c);
+            let code = match self.obj(&v) {
+                Some(Obj::Cons(car, _)) => match car {
+                    Value::Int(n) => (*n as u64 & 0xFFFF) as usize,
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            *Self::SYNTAX_CODE_SPEC.get(code).unwrap_or(&b' ') as char
+        };
+
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for (i, &lo) in breaks.iter().enumerate() {
+            let hi = breaks.get(i + 1).map_or(MAX_CHAR, |n| n - 1);
+            if class_at(lo) != class {
+                continue;
+            }
+            // Runs are produced in ascending order, so a run abutting the
+            // previous kept one just extends it.
+            match out.last_mut() {
+                Some(last) if last.1 + 1 == lo => last.1 = hi,
+                _ => out.push((lo, hi)),
+            }
+        }
+        out
     }
 
     /// `eq`-style identity comparison (used for `catch`/`throw` tags).
@@ -4336,15 +4506,20 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             is_macro,
             env,
             dynamic,
+            object,
         } => {
             if is_macro {
                 return Err("macro called as a function (use it in a macro position)".to_string());
             }
-            // Emacs's data is (FUNCTION COUNT) — the closure itself, printed, and
-            // the number of arguments it was handed.
+            // `funcall_lambda`'s signal names the resolved closure, not the
+            // designator: `xsignal2 (Qwrong_number_of_arguments, … fun, …)`.
+            // Passing `callee` here made `(f1 1 2)` report `f1` where Emacs
+            // reports `#[(a) (a) (t)]`, and `defalias`ing a second name onto the
+            // same function reported that second name.
+            let _ = &callee;
             let max = params.required.len() + params.optional.len();
             if args.len() < params.required.len() || (params.rest.is_none() && args.len() > max) {
-                return Err(with_host(|h| h.signal_wrong_nargs(&callee, args.len())));
+                return Err(with_host(|h| h.signal_wrong_nargs(&object, args.len())));
             }
             // The one place a user function body is entered: every compiled
             // `CALL`, `funcall` and `apply` funnels through here, so the DAP
@@ -4534,6 +4709,7 @@ pub fn macroexpand_1(form: &Value) -> Result<Option<Value>, String> {
                 is_macro: true,
                 env,
                 dynamic,
+                ..
             }) => Some((params, body, env, dynamic, elems[1..].to_vec())),
             _ => None,
         }
