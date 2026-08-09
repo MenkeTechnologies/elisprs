@@ -85,6 +85,35 @@ pub enum SerObj {
         /// Dynamic-binding closure — see [`Obj::Closure::dynamic`].
         #[serde(default)]
         dynamic: bool,
+        /// The closure's printable source: its arglist as written and its body
+        /// forms ([`ClosureSrc`]). Both are ordinary heap `Value`s already in
+        /// this image, so they cost handles, not a second encoding.
+        ///
+        /// Omitting them was a silent wrong answer, not a missing feature: the
+        /// closure still *ran*, but printed as `#[nil () (t)]` because the
+        /// importer rebuilt it with `ClosureSrc::default()`. That hit both
+        /// non-interpreted paths — an `--aot-exe` binary, and the ordinary rkyv
+        /// script cache from the second run onward:
+        ///
+        /// ```text
+        /// (princ (prin1-to-string (lambda (x) (* x 2))))   ; lexical-binding: t
+        ///   emacs 30.2   #[(x) ((* x 2)) (t)]
+        ///   cold run     #[(x) ((* x 2)) (t)]
+        ///   cache hit    #[nil () (t)]        <- source gone
+        /// ```
+        ///
+        /// `#[serde(default)]` only helps the AOT image, which is serde_json and
+        /// therefore self-describing. bincode — the script cache's encoding —
+        /// reads fields positionally and ignores the attribute entirely, so a
+        /// heap image written before these fields does NOT load: the decode runs
+        /// off the end of the closure and into the next object. That is why
+        /// `cache::SHARD_FORMAT_VERSION` is bumped to 6 alongside this field;
+        /// the header check rejects a stale shard before any inner decode.
+        #[serde(default)]
+        arglist: Value,
+        /// See `arglist`.
+        #[serde(default)]
+        src_body: Vec<Value>,
     },
     Bignum(BigInt),
 }
@@ -1768,7 +1797,7 @@ impl ElispHost {
                     is_macro,
                     env,
                     dynamic,
-                    ..
+                    src,
                 } => SerObj::Closure {
                     required: params.required.clone(),
                     optional: params.optional.clone(),
@@ -1777,6 +1806,8 @@ impl ElispHost {
                     is_macro: *is_macro,
                     env: self.flatten_lex(env),
                     dynamic: *dynamic,
+                    arglist: src.arglist.clone(),
+                    src_body: src.body.clone(),
                 },
                 // No Subr ever lives in the user range (only `install` makes them).
                 Obj::Subr { .. } => SerObj::Symbol {
@@ -1914,7 +1945,7 @@ impl ElispHost {
                 is_macro,
                 env,
                 dynamic,
-                ..
+                src,
             } => SerObj::Closure {
                 required: params.required.clone(),
                 optional: params.optional.clone(),
@@ -1923,6 +1954,8 @@ impl ElispHost {
                 is_macro: *is_macro,
                 env: self.flatten_lex(env),
                 dynamic: *dynamic,
+                arglist: src.arglist.clone(),
+                src_body: src.body.clone(),
             },
             // Runtime-only objects (and subrs, which `install` recreates): a
             // placeholder keeps the arena indices aligned.
@@ -2066,13 +2099,18 @@ impl ElispHost {
                     is_macro,
                     env,
                     dynamic,
+                    arglist,
+                    src_body,
                 } => Obj::Closure {
                     params: Rc::new(Params {
                         required,
                         optional,
                         rest,
                     }),
-                    src: Rc::new(ClosureSrc::default()),
+                    src: Rc::new(ClosureSrc {
+                        arglist,
+                        body: src_body,
+                    }),
                     body: Rc::new(body),
                     is_macro,
                     env: self.rebuild_lex(env),

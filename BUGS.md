@@ -1831,26 +1831,119 @@ non-finite-float items — on an AOT-compiled native executable.
   with "symbol(s) not found for architecture arm64" and the native path could not
   be exercised at all.
 
-### Still open after round 10
+## Round 11 — the AOT path exited 0 in silence, and the standard syntax table
+
+### R11-A. Every uncaught elisp error vanished on the AOT path — ✅ FIXED
+
+An elisp error never becomes a fusevm `VMResult::Error`. `host::abort`
+(`src/host.rs`) parks the message in the thread-local host error slot and winds
+`vm.ip` past the last op, so the VM terminates exactly the way a program that ran
+off the end does. `host::run_chunk` copes by reading that slot right after
+`vm.run()`; fusevm's AOT driver (`fusevm_aot_run_embedded`) lives in fusevm,
+cannot know about the slot, and mapped the clean termination to **exit 0**.
+
+```text
+$ cat r.el
+(error "boom")
+$ emacs --batch -l r.el ; echo "exit=$?"     # ground truth
+boom
+exit=255
+$ elisp r.el ; echo "exit=$?"                # interpreter
+error: boom
+exit=1
+$ elisp --aot-exe r.el -o r.bin && ./r.bin ; echo "exit=$?"
+exit=0                                       # 0 bytes stdout, 0 bytes stderr
+```
+
+Exit 0 with empty stdout *and* empty stderr is byte-identical to a successful run
+of a program that prints nothing, so no caller could detect the failure. It hit
+every uncaught error — `(error …)`, `void-function`, `arith-error` — not some
+narrow corner.
+
+`elisprs_aot_finish` (`src/aot_runtime.rs`) now reads the slot after the run and
+reports it with the interpreted driver's exact message and status, so both paths
+fail identically (`error: boom`, exit 1). A *handled* error (`condition-case`,
+`ignore-errors`) is consumed by the nested `run_chunk` and correctly leaves the
+slot empty, so it still exits 0.
+
+This is what the round-10 note called "an AOT executable whose constants are not
+reconstructible exits 0 printing nothing". That diagnosis was wrong: the form it
+named — `(princ (format "a %s\n" (string-to-number (number-to-string
+-1.0e+INF))))` — builds, runs and prints `a -1.0e+INF` correctly on the
+*unmodified* pre-round-11 tree. The silence was the error path, not constants.
+
+### R11-B. A closure lost its printed source through the heap image — ✅ FIXED
+
+There *was* a real reification gap, but a different and narrower one, and it was
+not AOT-only. `SerObj::Closure` carried the compiled body chunk, the params and
+the captured environment, but not `ClosureSrc` — the arglist as written and the
+body forms — and `import_heap_image` rebuilt every closure with
+`ClosureSrc::default()`. The closure still *ran*; it just printed empty.
+
+That made it a silent wrong answer on the **default** path: the rkyv script cache
+uses the same image, so every run of a script after the first was affected.
+
+```text
+;;; -*- lexical-binding: t -*-
+(princ (prin1-to-string (lambda (x) (* x 2))))
+
+  emacs --batch    #[(x) ((* x 2)) (t)]
+  elisp, cold      #[(x) ((* x 2)) (t)]
+  elisp, warm      #[nil () (t)]          <- source gone
+  --aot-exe        #[nil () (t)]
+```
+
+`SerObj::Closure` now carries `arglist` + `src_body`, and
+`cache::SHARD_FORMAT_VERSION` goes 5 -> 6 so caches already written to disk are
+rejected by the header check rather than decoded. The bump is required: bincode
+reads fields positionally and ignores `#[serde(default)]`, so a v5 closure decoded
+with the v6 struct runs off the end of the object (measured: `io error: unexpected
+end of file`), and one in the middle of an image can over-read a following object
+and still produce a plausible, wrong heap. All four paths now print what Emacs
+prints, byte for byte.
+
+### R11-C. The standard syntax table classed the control characters wrong — ✅ FIXED
+
+`--init-standard-syntax-table--` made C0 controls and DEL *punctuation* and made
+`?\n` and `?\r` *whitespace*. Emacs 30.2 makes controls and DEL symbol
+constituents, newline comment-end, and leaves CR a symbol constituent:
+
+| char | Emacs 30.2 | was |
+|---|---|---|
+| 0–8, 11, 14–31, 127 | `95` (`_`) | `46` (`.`) |
+| `?\n` (10) | `62` (`>`) | `32` (whitespace) |
+| `?\r` (13) | `95` (`_`) | `32` (whitespace) |
+
+`(char-syntax C)` now agrees with Emacs across 0–32, 127 and 160.
+
+### R11-D. `\s-` matched a newline — ✅ FIXED
+
+Downstream of R11-C, and independently wrong: `src/regexp.rs` translated `\s-` to
+the `regex` crate's `\s`, which matches `\n`, `\r` and `\v`. Emacs reads the
+syntax table, where none of those three are whitespace, so `\s-` silently matched
+across line boundaries. It now translates to the standard table's whitespace set
+`[\t\x0C\x{A0} ]` (and `\S-` to its complement). Verified against Emacs 30.2 for
+`\n \r \v \t \f` space, U+00A0 and a letter, in both polarities.
+
+### Re-verified as already fixed
+
+- **`(assoc-string nil LIST)`** — both `nil` now.
+- **A closure prints the environment it captured** — `(lambda (x) x)` is
+  `#[(x) (x) (t)]` and `(let ((n 5)) (lambda () n))` is `#[nil (n) ((n . 5))]`
+  under both. The round-10 report compared a file *without* a
+  `lexical-binding` cookie, where Emacs 30 uses dynamic binding.
+
+### Still open after round 11
 
 - **A fixed-arity subr's arity is checked after its arguments are evaluated** —
   `(let ((n 0)) (ignore-errors (nth 1 t (setq n 9))) n)` is `0` in Emacs and `9`
-  here; same for `car` and `cons` with a surplus argument. The signalled error
+  here; same for `car` with a surplus argument. The signalled error
   (`wrong-number-of-arguments`) already matches; only the surplus argument's side
-  effects differ. Closing it means checking subr arity at compile time, before
-  the argument evaluation is emitted.
-- **`\s-` matches a newline here and not in Emacs** — `(string-match "\\s-" "\n")`
-  is `nil` in Emacs and `0` here, because `(char-syntax ?\n)` is `62` (`>`,
-  comment-end) in the standard syntax table and `32` (whitespace) here. The
-  syntax-class table, not the regexp engine.
-- **`(assoc-string nil LIST)`** is `nil` in Emacs and `(wrong-type-argument
-  symbolp nil)` here.
-- **A closure prints the environment it captured** — unchanged from round 9, same
-  substrate reason.
-- **An AOT executable whose constants are not reconstructible exits 0 printing
-  nothing.** `(princ (format "a %s\n" (string-to-number (number-to-string
-  -1.0e+INF))))` builds and links, runs, exits `0`, and produces no output at
-  all; the same file under the interpreter prints correctly. Reproducible on the
-  unmodified tree, so it is not a regression — it is the constant-reification
-  work item recorded in `src/aot_runtime.rs`. The *silence* is the worst part: a
-  failed AOT run is indistinguishable from a program that printed nothing.
+  effects differ. `compile_call` emits the argument expressions before the `CALL`
+  extension op, and arity is enforced in `call_function` once the arguments are
+  already on the stack. Closing it needs an arity check emitted *before* the
+  argument code — cheaply, only for the calls a static read can already see are
+  wrong, since the function cell can be redefined between compile and call.
+- **An empty-name uninterned symbol prints over-escaped** — `(make-symbol "")` is
+  `##` in Emacs and `\#\#` here. Found by the fuzzer (seed 7, form #1633); present
+  identically on the pre-round-11 tree, so it is not a regression.

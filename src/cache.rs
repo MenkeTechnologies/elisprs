@@ -51,7 +51,19 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// symbol in the heap image and an uninterned prelude local could shadow a builtin.
 /// v5 adds `SerObj::Record`/`SerObj::BoolVector` — mid-enum variants that shift the
 /// bincode discriminants of every later `SerObj`, so a v4 heap image misdeserializes.
-pub const SHARD_FORMAT_VERSION: u32 = 5;
+/// v6 adds `arglist`/`src_body` to `SerObj::Closure` (the closure's printed source).
+/// bincode is NOT self-describing and reads fields positionally, so `#[serde(default)]`
+/// does nothing for it: decoding a v5 closure with the v6 struct runs off the end of
+/// that object and into the next one. Measured — serializing the v5 `Closure` layout
+/// and deserializing it as the v6 `SerObj` gives
+/// `io error: unexpected end of file`. `get` would turn that into a cache miss, but
+/// only when the over-read happens to fail; a closure in the middle of an image can
+/// consume a following object's bytes and still produce a plausible, wrong image.
+/// The version bump makes `header_ok` reject a stale shard outright, before any
+/// inner decode is attempted. (The AOT heap image is serde_json, which IS
+/// self-describing, so it honours `#[serde(default)]` — but it is embedded in the
+/// object and rebuilt with it, so it is never stale.)
+pub const SHARD_FORMAT_VERSION: u32 = 6;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next

@@ -134,3 +134,45 @@ fn warm_cache_restores_oclosures_and_captured_environments() {
         "warm cache lost the OClosure metadata or its captures"
     );
 }
+
+/// A closure's *printable source* — its arglist as written and its body forms —
+/// has to survive the image too. `SerObj::Closure` carried the compiled body
+/// chunk, the params and the captured env, but not `ClosureSrc`, and the
+/// importer rebuilt every closure with `ClosureSrc::default()`. The closure
+/// still ran, so nothing errored; it just printed as `#[nil () ...]`:
+///
+/// ```text
+/// $ emacs --batch -l script.el     # ground truth (GNU Emacs 30.2)
+/// #[(x) ((* x 2)) (t)]
+/// $ elisp script.el                # cold
+/// #[(x) ((* x 2)) (t)]
+/// $ elisp script.el                # warm — source gone
+/// #[nil () (t)]
+/// ```
+///
+/// A silent wrong answer on the *default* path from the second run onward, and
+/// identically on `--aot-exe` (same importer). Emacs prints the arglist and body
+/// for an interpreted closure, so the cold run is the correct answer and the warm
+/// run must equal it.
+#[test]
+fn warm_cache_preserves_closure_printed_source() {
+    let script = r#";;; -*- lexical-binding: t -*-
+(princ (prin1-to-string (lambda (x) (* x 2))))
+(terpri)
+(let ((n 5)) (princ (prin1-to-string (lambda () n))))
+(terpri)
+(defun keeps-src (a &optional b) (list a b))
+(princ (prin1-to-string (symbol-function 'keeps-src)))
+(terpri)
+"#;
+    let (cold, warm) = run_cold_then_warm("closure-src", script);
+    // Byte-for-byte what `emacs --batch -l` prints for this script.
+    assert_eq!(
+        cold, "#[(x) ((* x 2)) (t)]\n#[nil (n) ((n . 5))]\n#[(a &optional b) ((list a b)) (t)]\n",
+        "cold run must match Emacs"
+    );
+    assert_eq!(
+        warm, cold,
+        "warm cache lost the closures' printed source (arglist/body)"
+    );
+}

@@ -52,8 +52,13 @@ pub fn compile_executable(src: &str, out: &Path) -> Result<(), String> {
     let main_c = tmp.join("elisprs_aot_main.c");
     std::fs::write(
         &main_c,
+        // `elisprs_aot_finish` (aot_runtime.rs) reports an uncaught elisp error
+        // and maps it to a non-zero status. Without it the process exits 0 in
+        // silence, because an elisp error halts the VM cleanly instead of
+        // surfacing as a fusevm `VMResult::Error`.
         "extern long fusevm_aot_run_embedded(void);\n\
-         int main(void) { return (int)fusevm_aot_run_embedded(); }\n",
+         extern long elisprs_aot_finish(long code);\n\
+         int main(void) { return (int)elisprs_aot_finish(fusevm_aot_run_embedded()); }\n",
     )
     .map_err(|e| e.to_string())?;
 

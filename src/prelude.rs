@@ -7264,12 +7264,21 @@ Return nil if SYNTAX is nil."
         (symbol (string-to-syntax "_")))
     ;; Word everywhere by default (letters, digits, most non-ASCII).
     (set-char-table-range tbl t word)
-    ;; Control chars 0..31 are punctuation ...
-    (set-char-table-range tbl '(0 . 31) punct)
-    ;; ... except the whitespace ones, plus space and U+00A0.
-    (dolist (c '(?\t ?\n ?\f ?\r ?\s 160)) (aset tbl c space))
+    ;; Control chars 0..31 and DEL are SYMBOL constituents, not punctuation:
+    ;; `(char-syntax 1)' is 95 (`_') in Emacs 30.2, and so is `(char-syntax 127)'.
+    (set-char-table-range tbl '(0 . 31) symbol)
+    (aset tbl 127 symbol)
+    ;; ... except tab, formfeed, space and U+00A0, which are whitespace. `?\r' is
+    ;; deliberately NOT in this list -- Emacs leaves carriage return a symbol
+    ;; constituent (`(char-syntax ?\r)' => 95), unlike the other C0 whitespace.
+    (dolist (c '(?\t ?\f ?\s 160)) (aset tbl c space))
+    ;; Newline is COMMENT-END (`>', class 12 => `(char-syntax ?\n)' = 62), not
+    ;; whitespace. This is what makes `\s-' -- whitespace syntax -- fail to match
+    ;; a newline: `(string-match "\\s-" "\n")' is nil in Emacs. Classing it as
+    ;; whitespace made every `\s-' silently match across line boundaries.
+    (aset tbl ?\n (string-to-syntax ">"))
     ;; ASCII punctuation.
-    (dolist (c '(?! ?# ?' ?, ?. ?: ?\; ?? ?@ ?^ ?` ?~ 127)) (aset tbl c punct))
+    (dolist (c '(?! ?# ?' ?, ?. ?: ?\; ?? ?@ ?^ ?` ?~)) (aset tbl c punct))
     ;; ASCII symbol constituents.
     (dolist (c '(?& ?* ?+ ?- ?/ ?< ?= ?> ?_ ?|)) (aset tbl c symbol))
     ;; String quote and escape.

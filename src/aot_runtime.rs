@@ -8,16 +8,56 @@
 //! (this hook) + a `main` that calls `fusevm::aot::fusevm_aot_run_embedded()`.
 //!
 //! NOTE (the elisp-specific catch): elisp chunk constants are `Value::Obj`
-//! handles into the ElispHost heap. The prelude is reloaded here so prelude
-//! symbols re-intern to the same deterministic handles, but a *user* program's
-//! interned symbols / quoted data / closure templates are not yet reconstructed
-//! at load — that requires constant reification (compiling symbols/quotes/
-//! closures as runtime construction instead of baked heap handles). Until then,
-//! AOT objects run correctly only for programs whose constants are all
-//! reconstructed by the prelude/builtins. See compiler.rs for the reification
-//! work item.
+//! handles into the ElispHost heap, so they only mean anything if the heap they
+//! index is rebuilt first. `elisp --aot` therefore exports the whole arena as a
+//! `SerObj` image and parks it in `chunk.names` behind [`crate::host::HEAP_IMAGE_TAG`];
+//! the hook below re-imports it before the chunk runs, in arena order, so every
+//! handle lands on the object it had at compile time. A user program's interned
+//! symbols, quoted data, vectors, records, hash tables, char-tables, bignums and
+//! closures all come back this way — they are *not* limited to what the prelude
+//! happens to rebuild.
+//!
+//! The image is the whole contract, so anything it drops is a silent wrong
+//! answer rather than an error. Two things it still drops, both deliberate:
+//! `Obj::Buffer` / `Obj::Marker` / `Obj::Obarray` become placeholder symbols
+//! (they are live runtime state, and the slot exists only to keep arena indices
+//! aligned), and a subr is re-created by `install` rather than carried. Closure
+//! *source* used to be dropped too — see `SerObj::Closure::arglist`.
 
 use fusevm::VM;
+
+/// Turn the AOT run's raw exit code into the process exit code, reporting any
+/// uncaught elisp error first. `main` (emitted by [`crate::aot`]) pipes
+/// `fusevm_aot_run_embedded()`'s return value through here.
+///
+/// This exists because an elisp error never reaches fusevm's `VMResult`.
+/// `host::abort` parks the message in the thread-local host error slot and winds
+/// `vm.ip` past the last op, so the VM terminates *normally* and fusevm's AOT
+/// driver sees `VMResult::Halted` and returns 0. The interpreted driver reads
+/// that slot right after `vm.run()` (`host::run_chunk`); the AOT driver lives in
+/// fusevm and cannot. The result, before this hook: EVERY uncaught elisp error
+/// in a standalone AOT binary exited 0 with nothing on stdout or stderr —
+/// byte-identical to a successful run of a program that prints nothing. A
+/// `(error "boom")` binary and a `(princ "")` binary were indistinguishable.
+///
+/// The message and exit status match the interpreted driver's (`main.rs`:
+/// `eprintln!("error: {}", format_error(&e))` + `ExitCode::FAILURE`) so the two
+/// execution paths report an identical failure.
+///
+/// Kept separate from `main` (rather than wrapping `fusevm_aot_run_embedded`
+/// in Rust) so this function references no AOT-object-only symbols: it is
+/// compiled into the plain `elisprs` rlib too, and pulling in
+/// `fusevm_aot_chunk_blob` would leave the ordinary `elisp` binary with
+/// undefined symbols at link time.
+#[no_mangle]
+pub extern "C" fn elisprs_aot_finish(code: i64) -> i64 {
+    // Take the error BEFORE formatting: `format_error` calls back into elisp
+    // (`error-message-string`), and that call's `run_chunk` clears the slot.
+    let err = crate::host::with_host(|h| h.take_error());
+    let Some(e) = err else { return code };
+    eprintln!("error: {}", crate::format_error(&e));
+    1
+}
 
 /// Register the elisp subrs + extension handlers on the AOT VM. Required link
 /// symbol for a standalone elisp AOT binary.

@@ -190,6 +190,7 @@ elisp cells (cons / symbol / vector / closure / macro / subr) live in the `Elisp
 | `src/intercepts.rs` | AOP pattern-intercept layer (glob advice across many function names) — an elisprs extension ported from `zshrs`, fired on the `call_function` join point |
 | `src/prelude.rs` | The `[DERIVED]` elisp prelude — breadth written in elisp on top of the primitives |
 | `src/aot.rs` | `--aot` / `--aot-exe` driver: lowers a `.el` file to a `fusevm::Chunk`, emits a native object via `fusevm::aot::compile_object`, and links a standalone executable |
+| `src/aot_runtime.rs` | The AOT binary's runtime hook: rebuilds the elisp heap from the image embedded in the object, installs the subrs, extension handlers and numeric contract on the fresh VM, and reports an uncaught elisp error as the interpreter does (an error halts the VM cleanly, so without this the process exited 0 in silence) |
 | `src/lsp.rs` / `src/dap.rs` | `--lsp` (completion/hover/diagnostics/signature help) and `--dap` (breakpoints/stepping/variables) servers |
 | `src/main.rs` | The `elisp` CLI + REPL |
 

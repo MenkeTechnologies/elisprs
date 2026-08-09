@@ -53,6 +53,50 @@ All notable changes to elisprs are documented here. The format follows
   whose value — or whose signalled error — differs. Everything below was found
   with it.
 
+### Fixed (round 11 — the AOT path failed in total silence)
+- **An uncaught elisp error on the AOT path exited 0 printing nothing.** An elisp
+  error never becomes a fusevm `VMResult::Error`: `host::abort` parks the message
+  in the thread-local host error slot and winds `vm.ip` past the last op, so the VM
+  terminates the way a program that ran off the end does. `host::run_chunk` reads
+  that slot; fusevm's AOT driver lives in fusevm and cannot, so it mapped the clean
+  termination to exit 0. A standalone `--aot-exe` binary for `(error "boom")`
+  produced **0 bytes of stdout, 0 bytes of stderr, exit 0** — byte-identical to a
+  successful run of a program that prints nothing, so no caller could tell it had
+  failed. It applied to every uncaught error, not a corner case.
+  `elisprs_aot_finish` (`src/aot_runtime.rs`) now reads the slot after the run and
+  reports it with the interpreted driver's exact message and exit status
+  (`error: boom`, exit 1), so both paths fail identically. A handled error
+  (`condition-case` / `ignore-errors`) is consumed by the nested `run_chunk` and
+  still exits 0.
+- **A closure lost its printed source through the heap image.** `SerObj::Closure`
+  carried the compiled body, params and captured environment but not `ClosureSrc`
+  (the arglist as written and the body forms), and the importer rebuilt every
+  closure with `ClosureSrc::default()`. The closure still ran, so nothing errored —
+  it just printed as `#[nil () …]`. Because the rkyv script cache uses the same
+  image, this was a silent wrong answer on the *default* path from the second run
+  of any script onward, and identically under `--aot-exe`:
+  `(prin1-to-string (lambda (x) (* x 2)))` was `#[(x) ((* x 2)) (t)]` cold and
+  `#[nil () (t)]` warm, where Emacs 30.2 says the former. The image now carries
+  `arglist` + `src_body`, and `cache::SHARD_FORMAT_VERSION` is bumped 5 -> 6 so
+  already-written caches on disk are rejected by the header check. That bump is
+  required, not hygiene: bincode reads fields positionally and ignores
+  `#[serde(default)]`, so decoding a v5 closure with the v6 struct runs off the end
+  of the object (measured: `io error: unexpected end of file`). Without the bump a
+  closure in the middle of an image could over-read a following object and still
+  yield a plausible, wrong heap. The AOT image is serde_json, which is
+  self-describing, and is rebuilt with the object anyway.
+- **The standard syntax table classed the control characters wrong.** C0 controls
+  and DEL were punctuation (`46`) where Emacs 30.2 makes them symbol constituents
+  (`95`); `?\n` was whitespace where Emacs makes it comment-end (`62`); and `?\r`
+  was whitespace where Emacs leaves it a symbol constituent. `(char-syntax C)` now
+  agrees with Emacs across 0–32, 127 and 160.
+- **`\s-` matched a newline.** `src/regexp.rs` translated it to the `regex` crate's
+  `\s`, which matches `\n`, `\r` and `\v`; Emacs reads the syntax table, where
+  none of the three are whitespace, so `(string-match "\\s-" "\n")` is `nil` there
+  and was `0` here — every `\s-` silently matched across line boundaries. It now
+  translates to the standard table's whitespace set `[\t\x0C\x{A0} ]`, and `\S-`
+  to its complement.
+
 ### Fixed (Emacs parity — round 8, exact arithmetic, argument order, filevercmp, non-finite floats)
 Found by `scripts/fuzz_parity.sh` plus hand-built probe corpora, and verified by
 byte-diffing stdout, stderr and exit status against `emacs -Q --batch` 30.2 on

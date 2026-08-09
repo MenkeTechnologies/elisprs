@@ -208,9 +208,22 @@ fn translate_escape(
         's' | 'S' => {
             let neg = e == 'S';
             match it.next() {
-                Some('-') | Some(' ') => out.push_str(if neg { r"\S" } else { r"\s" }),
+                // Whitespace syntax is the SYNTAX TABLE's whitespace class, not
+                // the regex crate's `\s`. They differ on the line terminators:
+                // `\s` matches `\n`, `\r` and `\v`, but the standard syntax table
+                // classes newline as comment-end (`>`) and CR as a symbol
+                // constituent, so Emacs does not. Verified against GNU Emacs 30.2:
+                //
+                //   (string-match "\\s-" "\n") => nil    "\r" => nil   "\v" => nil
+                //   (string-match "\\s-" "\t") => 0      "\f" => 0     " "  => 0
+                //   (string-match "\\s-" " ") => 0
+                //
+                // which is exactly `?\t ?\f ?\s 160` — the set the standard table
+                // marks whitespace. Emitting `\s` made every `\s-` silently match
+                // across a line boundary.
+                Some('-') | Some(' ') => out.push_str(if neg { WS_SYNTAX_NEG } else { WS_SYNTAX }),
                 Some('w') => out.push_str(if neg { r"\W" } else { r"\w" }),
-                Some(_) | None => out.push_str(if neg { r"\S" } else { r"\s" }),
+                Some(_) | None => out.push_str(if neg { WS_SYNTAX_NEG } else { WS_SYNTAX }),
             }
         }
         // Backreferences `\1`..`\9` — fancy-regex's backtracking engine handles
@@ -247,6 +260,15 @@ fn valid_brace_body(body: &str) -> bool {
     }
 }
 
+/// The standard syntax table's whitespace class, as a `regex` character class:
+/// tab, formfeed, space, U+00A0. This is what `\s-` means in Emacs — see the
+/// `'s' | 'S'` arm of [`translate_escape`] for the ground-truth transcript.
+/// Newline, CR and vertical tab are deliberately absent; the regex crate's `\s`
+/// includes them.
+const WS_SYNTAX: &str = "[\\t\\x0C\\x{A0} ]";
+/// Complement of [`WS_SYNTAX`] — the translation of `\S-`.
+const WS_SYNTAX_NEG: &str = "[^\\t\\x0C\\x{A0} ]";
+
 /// Emacs's `[:class:]` names, as class BODY text for the `regex` crate.
 ///
 /// The `regex` crate's own POSIX classes are ASCII-only, so copying `[:alpha:]`
@@ -271,7 +293,9 @@ fn valid_brace_body(body: &str) -> bool {
 /// `space`/`punct`/`word` are improved but still approximations: in Emacs those
 /// three read the SYNTAX TABLE, not a Unicode property, so their answer depends
 /// on the major mode — `(string-match "[[:space:]]" "\n")` is nil in
-/// fundamental-mode and 0 in text-mode. elisprs has no syntax table to consult.
+/// fundamental-mode and 0 in text-mode. `translate` is a pure string→string
+/// function with no host access, so it cannot read the live table here; the
+/// `\s-` escape is handled separately via [`WS_SYNTAX`].
 fn posix_class(name: &str) -> Option<&'static str> {
     Some(match name {
         "alpha" => r"\p{Alphabetic}\p{M}",
@@ -425,9 +449,35 @@ mod tests {
         assert_eq!(t(r"\\[{[]"), r"\\[{\[]");
     }
 
+    /// `\s-` is the syntax table's whitespace class, NOT the regex crate's `\s`.
+    /// This expectation was `\w+\s\w` — that spelling is what made `\s-` match a
+    /// newline, because the crate's `\s` includes `\n`, `\r` and `\v` while the
+    /// standard syntax table classes newline as comment-end and CR as a symbol
+    /// constituent. Ground truth (GNU Emacs 30.2):
+    ///
+    /// ```text
+    /// (string-match "\\s-" "\n") => nil    (string-match "\\s-" "\t") => 0
+    /// (string-match "\\s-" "\r") => nil    (string-match "\\s-" "\f") => 0
+    /// (string-match "\\s-" "\v") => nil    (string-match "\\s-" " ")  => 0
+    ///                                      (string-match "\\s-" " ") => 0
+    /// ```
     #[test]
     fn syntax_and_word_escapes() {
-        assert_eq!(t(r"\w+\s-\sw"), r"\w+\s\w");
+        assert_eq!(t(r"\w+\s-\sw"), "\\w+[\\t\\x0C\\x{A0} ]\\w");
+    }
+
+    /// The set `\s-` translates to must be exactly the standard syntax table's
+    /// whitespace characters — pinned by matching, not by string equality, so a
+    /// re-spelling of the class body that keeps the same meaning still passes.
+    #[test]
+    fn whitespace_syntax_class_excludes_line_terminators() {
+        let re = fancy_regex::Regex::new(&t(r"\s-")).expect("compiles");
+        for yes in ["\t", "\u{0C}", " ", "\u{A0}"] {
+            assert!(re.is_match(yes).unwrap(), "\\s- must match {yes:?}");
+        }
+        for no in ["\n", "\r", "\u{0B}", "a"] {
+            assert!(!re.is_match(no).unwrap(), "\\s- must not match {no:?}");
+        }
     }
 
     #[test]
