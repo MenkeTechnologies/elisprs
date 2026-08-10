@@ -30,9 +30,19 @@
 diff nobody fixes, and the first 400 characters always contain the divergence
 for the shapes this corpus generates.")
 
+;; The clip marker carries the full length and the last 40 characters, because
+;; the comparison is string equality on the clipped line: two results that agree
+;; for 400 characters and then diverge would otherwise print the same text under
+;; both engines and be reported as parity. Length and tail are computed from the
+;; string itself, so they are directly comparable between the two engines and
+;; introduce no oracle of their own. This narrows the blind spot rather than
+;; removing it — a divergence that is confined to the middle of a >400-character
+;; result, with the same total length and the same last 40 characters, is still
+;; invisible. `fz-max-print' can be raised when that matters.
 (defun fz-clip (s)
   (if (> (length s) fz-max-print)
-      (concat (substring s 0 fz-max-print) "...<clipped>")
+      (format "%s...<clipped, %d chars, tail %S>"
+              (substring s 0 fz-max-print) (length s) (substring s -40))
     s))
 
 (defun fz-lines (path)
