@@ -51,6 +51,40 @@ if [ -t 1 ]; then C='\033[36m'; G='\033[32m'; R='\033[31m'; D='\033[2m'; N_='\03
 say() { printf "${C}==>${N_} %s\n" "$1"; }
 
 command -v "$EMACS" >/dev/null 2>&1 || { echo "no \`$EMACS' on PATH — the fuzzer needs real Emacs as ground truth" >&2; exit 2; }
+
+# ---- oracle gate -----------------------------------------------------------
+# The ground truth is whatever `$EMACS' resolves to, and `$EMACS' is read from
+# the environment — so an ambient setting silently redirects the oracle. Every
+# expectation in BUGS.md, the tests and the examples was measured against one
+# specific Emacs, and a different one does not fail loudly: it reports a
+# different set of diverging forms, which reads exactly like a regression (or,
+# worse, blesses output that the pinned version would have rejected).
+#
+# So: resolve the oracle, print what actually answered, and refuse to run at all
+# if it is not the pinned version. The expected version is single-sourced from
+# BUGS.md's header rather than typed here, so it cannot drift from the document
+# the numbers live in; `EMACS_VERSION_EXPECT' overrides it for a deliberate
+# cross-version run.
+ORACLE_PATH=$(command -v "$EMACS")
+ORACLE_VERSION=$("$EMACS" --version 2>/dev/null | head -1 | perl -ne 'print $1 if /GNU Emacs ([0-9]+(?:\.[0-9]+)*)/')
+EXPECT="${EMACS_VERSION_EXPECT:-$(perl -ne 'print $1 and last if /checked against \*\*GNU Emacs ([0-9]+(?:\.[0-9]+)*)\*\*/' BUGS.md)}"
+if [ -z "$EXPECT" ]; then
+  echo "cannot determine the pinned oracle version: no \"checked against **GNU Emacs X.Y**\" line in BUGS.md." >&2
+  echo "Restore it, or set EMACS_VERSION_EXPECT explicitly." >&2
+  exit 2
+fi
+if [ -z "$ORACLE_VERSION" ]; then
+  echo "\`$ORACLE_PATH --version' did not report a GNU Emacs version — refusing to trust it as ground truth." >&2
+  exit 2
+fi
+if [ "$ORACLE_VERSION" != "$EXPECT" ]; then
+  echo "oracle is GNU Emacs $ORACLE_VERSION, but every expectation in this tree was measured against $EXPECT." >&2
+  echo "  resolved: $ORACLE_PATH   (from EMACS=${EMACS})" >&2
+  echo "  A mismatched oracle reports a different divergence set, not an error." >&2
+  echo "  Install $EXPECT, or set EMACS_VERSION_EXPECT=$ORACLE_VERSION to accept this deliberately." >&2
+  exit 2
+fi
+[ "$QUIET" = 1 ] || printf "oracle: GNU Emacs %s at %s\n" "$ORACLE_VERSION" "$ORACLE_PATH"
 if [ -z "$ELISP" ]; then
   if   [ -x target/debug/elisp ];   then ELISP=target/debug/elisp
   elif [ -x target/release/elisp ]; then ELISP=target/release/elisp
