@@ -751,7 +751,9 @@ pub const PRELUDE: &str = r#"
   (let ((n gensym-counter))
     (setq gensym-counter (1+ gensym-counter))
     (make-symbol (concat (or prefix "g") (number-to-string n)))))
-(defun keywordp (x) (and (symbolp x) (let ((n (symbol-name x))) (and (> (length n) 0) (eq (aref n 0) 58)))))
+;; `keywordp' is a subr (see `builtins::install'): the test is not the spelling
+;; but whether the symbol is the one the standard obarray holds, which only the
+;; host can answer.
 
 ;;; ---- control macros ----
 (defmacro prog2 (a b &rest body) (list (quote progn) a (cons (quote prog1) (cons b body))))

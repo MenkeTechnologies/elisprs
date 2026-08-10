@@ -2486,16 +2486,8 @@ one needs no reference Emacs at all and found the widest class below.
   the original report mentioned. `(string-width (unibyte-string 200))` is `1` on
   30.2 (U+00C8 is one column) and matches; the 4-column form belongs to
   `print-escape-nonascii`-style rendering, which is a separate model.
-- **`emacs -Q --batch` starts with three buffers, elisprs with one.**
-  `(mapcar #'buffer-name (buffer-list))` is `("*scratch*" " *Minibuf-0*"
-  "*Messages*")` in Emacs and `("*scratch*")` here. It only shows through
-  `other-buffer`: killing `*scratch*` makes `*Messages*` current in Emacs and
-  reaches the `get-scratch-buffer-create` fallback here, so `(buffer-name)`
-  after `(kill-buffer)` is `"*Messages*"` there and `"*scratch*"` here. Point
-  and the buffer contents agree; only the name does not. Found while fixing the
-  `kill-buffer` panic above. Closing it means modelling `*Messages*` (and its
-  `message` side effects) and the minibuffer, which is a larger piece than the
-  panic it turned up next to.
+- **`emacs -Q --batch` starts with three buffers, elisprs with one** — ✅ FIXED
+  in round 16 (R16-D).
 - **A closure's body is stored unexpanded** — the second half of the closure
   entry above, recorded separately because it is observable on its own:
   `(let ((q 5)) (lambda (x) (funcall (lambda () q))))` prints
@@ -2560,3 +2552,249 @@ still answers `t` here, as does `(/= L F)`, which the prelude defines as
 (when reading the integer as `f64` would round it) and the hook fixed here is
 what answers it. Everything that reaches the subrs — `funcall`, `apply`, three or
 more arguments, `sort`, `max`, `min` — is correct now.
+
+---
+
+## Round 16 — constant symbols, `defvar` vs `defconst`, and the startup buffers
+
+The self-consistency sweep (call every bound *function* with a literal and with
+an expression of the same value; anything that differs is a bug provable without
+a reference implementation) reported `set-default` as the only real divergence
+once macros and special forms were excluded — macros do not evaluate their
+arguments, so the sweep only means anything for `functionp` symbols. Pulling on
+`set-default` turned up a whole model that was missing rather than a single
+builtin: elisprs had no notion of a constant symbol.
+
+### R16-A. `nil`, `t`, and keywords were not constants — ✅ FIXED
+
+Emacs marks exactly three kinds of symbol constant (`make_symbol_constant`), and
+every writer funnels through `set_internal`, which signals `setting-constant`
+with the rejected symbol as the error data. elisprs did neither. It failed in
+two different directions at once:
+
+| form | Emacs 30.2 | elisprs (before) |
+| --- | --- | --- |
+| `(set nil 1)` | `(setting-constant nil)` | `(set "not a symbol")` |
+| `(set t 1)` | `(setting-constant t)` | `(set "not a symbol")` |
+| `(set :kw 1)` | `(setting-constant :kw)` | `1` |
+| `(setq :a 1)` | `(setting-constant :a)` | `1` |
+| `(set-default :kw 1)` | `(setting-constant :kw)` | `1` |
+| `(setq-default nil 5)` | `(setting-constant nil)` | `(set-default "not a symbol")` |
+| `(makunbound t)` | `(setting-constant t)` | `(makunbound "not a symbol")` |
+| `(make-local-variable nil)` | `(setting-constant nil)` | `(make-local-variable "not a symbol")` |
+| `(let ((nil 1)) nil)` | `(setting-constant nil)` | `(let "binding name must be a symbol")` |
+| `(let (:kw) 1)` | `(setting-constant :kw)` | `1` |
+| `(defconst :dc 1)` | `(setting-constant :dc)` | `:dc` |
+| `(set (intern "t") 1)` | `(setting-constant t)` | `1` |
+
+For `nil` and `t` the condition was invented and named the *builtin* rather than
+the symbol; for keywords there was no error at all and the write went through.
+The `ops::SETVAR` and `ops::FSET` dispatch arms compounded it by discarding the
+host's result with `let _ =`, so even a failing write let the form answer its own
+value; both now `abort` on `Err` the way `GETVAR` already did.
+
+`setting-constant` was added to the conditions whose message is re-read as error
+*data* (`make_error_object`), which is what turns `"setting-constant: nil"` into
+`(setting-constant nil)` rather than a message string.
+
+The prelude was already relying on this: `macroexp--const-symbol-p` with
+`any-value` detects a constant by doing `(set symbol (symbol-value symbol))`
+inside a `condition-case` for `setting-constant`. That branch could never fire
+before, so the predicate silently answered nil for every constant.
+
+### R16-B. A keyword was not its own value — ✅ FIXED
+
+The other half of the same model, and a `intern_driver` (lread.c) port. Interning
+a `:`-prefixed name in the standard obarray seeds the symbol's value cell with
+the symbol itself, declares it special, and makes it constant. `intern`
+(`src/host.rs`) set `value: None` unconditionally, so:
+
+```elisp
+(boundp :fresh)          ; Emacs t   — elisprs nil
+(default-boundp :fresh)  ; Emacs t   — elisprs nil
+(default-value :fresh)   ; Emacs :fresh — elisprs (void-variable :fresh)
+(special-variable-p :kw) ; Emacs t   — elisprs nil
+```
+
+`(symbol-value :a)` did answer `:a`, but only because the builtin special-cased
+the name; the docstring next to it claimed `intern` seeded the cell and made it
+constant, which was not true of either half. The cell is really seeded now and
+the docstring describes what the code does.
+
+**The obarray is part of the keyword test, not just the spelling.** Emacs applies
+the treatment only for `initial_obarray`, so a `:`-spelled symbol created any
+other way is an ordinary, writable, unbound symbol:
+
+```elisp
+(let ((s (make-symbol ":u")))
+  (list (keywordp s) (boundp s) (progn (set s 1) (symbol-value s))))
+;; Emacs 30.2 => (nil nil 1);  elisprs => (t nil :u)
+
+(let* ((ob (obarray-make)) (s (intern ":ob" ob)))
+  (list (keywordp s) (boundp s) (progn (set s 7) (symbol-value s))))
+;; Emacs 30.2 => (nil nil 7);  elisprs => (t nil :ob)
+```
+
+`keywordp` was a name-prefix check in the prelude and answered `t` for both. It
+is a subr now — only the host can tell which object the obarray holds — and the
+prelude definition is gone rather than duplicated, so the
+`subr_names_are_registered_once` guard still sees one registration.
+
+`:` itself is a keyword and is constant; there is no exception for the
+one-character name.
+
+### R16-B2. The rejection happens at bind time, not at compile time
+
+Worth recording separately because the first fix put it in the wrong place.
+Emacs evaluates every initializer before it attempts the first write:
+
+```elisp
+(let ((x 0)) (list (condition-case e (let ((a (setq x 1)) (nil 2)) nil) (error e)) x))
+;; Emacs 30.2 => ((setting-constant nil) 1)   — x is 1, so the init ran
+```
+
+Rejecting in `parse_binding` at compile time produced the right error object but
+skipped the initializer, and — the part that actually broke — put the failure
+outside the enclosing `condition-case`, because nothing ever started running. The
+check lives in the `SPECBIND` / `LETBIND` dispatch arms instead. `LETBIND` opens
+no scope on the failing path, so nothing needs unwinding.
+
+### R16-C. `defvar` overwrote an existing value — ✅ FIXED
+
+Independent of the above, found while checking that `(defvar :dv 1)` stayed
+legal. `defvar` and `defconst` differ in exactly one way, and it is not the
+declaration: both mark the variable special, but `defvar`'s initializer runs
+*only when the variable is still void*, while `defconst` always assigns.
+elisprs compiled both to an unconditional `SETVAR`.
+
+```elisp
+(progn (setq zz 5) (defvar zz 9) zz)      ; Emacs 5  — elisprs 9
+(progn (defvar yy 1) (defvar yy 2) yy)    ; Emacs 1  — elisprs 2
+(progn (setq zz 5) (defconst zz 9) zz)    ; Emacs 9  — elisprs 9 (control)
+```
+
+This is the rule that makes it safe to `setq` a library's variable before loading
+the library, so the old behaviour silently discarded user configuration. A new
+`ops::DEFVAR_INIT` writes only a void cell; `defconst` keeps `SETVAR`. It also
+makes `(defvar :dv 1)` a no-op returning `:dv` — matching Emacs — because a
+keyword is never void, rather than a `setting-constant` error.
+
+### R16-D. The startup buffer list — ✅ FIXED
+
+Carried over from round 14. `emacs -Q --batch` starts with three buffers and
+elisprs started with one:
+
+```elisp
+(mapcar #'buffer-name (buffer-list))
+;; Emacs 30.2 => ("*scratch*" " *Minibuf-0*" "*Messages*")
+;; elisprs     => ("*scratch*")
+```
+
+`(get-buffer "*Messages*")` answered nil, so nothing could address it. Both
+buffers are created in the bootstrap next to `*scratch*`, inside the built-in
+arena prefix so they are never serialized as user heap. The leading space on
+` *Minibuf-0*` is what marks a buffer hidden.
+
+### R16-E. An empty closure body printed as `()` rather than `(nil)` — ✅ FIXED
+
+Fell out of the `fset` comparisons. Emacs normalizes an absent body to the single
+form `nil`, uniformly across `lambda`, `defun`, and `defmacro`:
+
+```elisp
+(prin1-to-string (lambda ()))                     ; Emacs "#[nil (nil) (t)]"  — elisprs "#[nil () (t)]"
+(prin1-to-string (lambda (x)))                    ; Emacs "#[(x) (nil) (t)]"  — elisprs "#[(x) () (t)]"
+(progn (defmacro m7 ()) (prin1-to-string (symbol-function 'm7)))
+                                                  ; Emacs "(macro . #[nil (nil) (t)])"
+```
+
+Only the printed source is affected — an empty compiled body already evaluated
+to nil in both.
+
+### Declined this round, with the evidence
+
+- **Closure environment pruning, and the unexpanded closure body.** Unchanged
+  from round 14, and still the right refusal. Closing it needs
+  macroexpand-at-closure-creation *and* a port of `cconv-fv`'s special-form
+  dispatch, together: `cconv-make-interpreted-closure` macroexpands the lambda
+  first and stores the expanded body, and the pruned environment *is* the runtime
+  environment, so a reference the free-variable walk misses turns a working
+  closure into `void-variable`. Half of it is worse than none of it.
+- **`other-buffer`.** Suggested as the observable for R15-D, but it is not
+  implemented at all here — `src/host.rs` only mentions it in a comment — and its
+  result is not a function of `buffer-list`. Measured on 30.2, with
+  `(buffer-list)` = `("*scratch*" " *Minibuf-0*" "*Messages*" " *load*" "aaa")`
+  and `(frame-parameter nil 'buffer-list)` = `("*scratch*")`:
+
+  | BUFFER arg | current | `other-buffer` |
+  | --- | --- | --- |
+  | nil | `*scratch*` | `*Messages*` |
+  | nil | `aaa` | `*Messages*` |
+  | `*scratch*` | `aaa` | `*Messages*` |
+  | `*Messages*` | `*scratch*` | `*scratch*` |
+  | nil (after killing `*Messages*`) | `aaa` | `aaa` |
+
+  No first-match or last-match rule over `buffer-list` reproduces all five rows.
+  What does: buffers in the frame's own buffer list are demoted to the fallback
+  (`notsogood`) and only used when nothing else qualifies, which is why
+  `*scratch*` — the sole entry of `(frame-parameter nil 'buffer-list)` — is never
+  returned unless it is the only candidate left. That is the `record_buffer` MRU
+  model, and elisprs has no frame representation at all (zero references to
+  `selected-frame` or `frame-parameter`). A version that returns a plausible but
+  wrong successor is worse than the current `void-function`.
+- **`(fset t …)` and `defvaralias` onto `nil`/`t`.** One shared root cause:
+  `nil` and `t` are `Value::Undef` / `Value::Bool(true)` here, not arena symbols,
+  and `alias_of` is an `Option<u32>` into the arena. Emacs allows both —
+  `(progn (fset t (lambda () 42)) (funcall t))` is `42`, and
+  `(progn (defvaralias 'xa nil) (setq xa 5))` signals `(setting-constant xa)`,
+  naming the *alias*. Supporting the write without the read-back would be a
+  silent wrong value, so both are left alone. The alias side that does not need
+  arena identity — a constant as the *alias* — is fixed:
+  `(defvaralias nil 'x)` now signals
+  `(error "Cannot make a constant an alias: nil")`, which is a plain `error` in
+  Emacs, not `setting-constant`.
+
+### Not a bug — sweep artifacts
+
+Recorded so the next round does not re-investigate them. The sweep flags any pair
+that differs, and these differ for reasons that are not divergences:
+`time-convert` / `time-to-seconds` (clock), `make-temp-name` / `sxhash-eq` /
+`sxhash-eql` (identity or randomness), `unintern` / `kill-buffer` /
+`re-search-forward` / `search-backward` / `skip-chars-forward` (stateful — the
+first call of the pair changes what the second sees), and the
+`Error setting nil: …` line on stderr, which is `custom-theme-set-variables`'
+own `condition-case` handler reporting a call the sweep made with nil.
+
+### Found this round, not fixed — two failures that predate it
+
+Both reproduce byte-identically at the round's start commit
+(`2156c2e1cab92914078932e17965d3dd82b7b5cf`), so neither is a regression from the
+work above. Neither the tests nor the examples were touched to hide them.
+
+- **`ert` runs a test body in `*scratch*`; Emacs runs it in a temp buffer.**
+  This is what fails `examples/char-syntax-tables.el` (`st-standard-table`) under
+  `cargo test --test examples`, and the example passes under
+  `emacs -Q --batch -l` — so the expectation is right and elisprs is wrong. The
+  whole difference is which buffer is current inside the body:
+
+  ```elisp
+  (require 'ert)
+  (ert-deftest where-am-i ()
+    (message "buffer=%S mode=%S char-syntax(.)=%S"
+             (buffer-name) major-mode (char-syntax ?.))
+    (should t))
+  (ert-run-tests-batch-and-exit)
+  ;; Emacs 30.2 => buffer=" *temp*"   mode=fundamental-mode        char-syntax(.)=46
+  ;; elisprs     => buffer="*scratch*" mode=fundamental-mode        char-syntax(.)=95
+  ```
+
+  `*scratch*` carries the lisp syntax table, where `.` is a symbol constituent
+  (`_`, 95); a temp buffer carries the standard table, where it is punctuation
+  (`.`, 46). Everything else agrees — `(aref (standard-syntax-table) ?.)` is
+  `(1)` in both, and `(with-temp-buffer (char-syntax ?.))` is 46 in both. The fix
+  is to run each `ert` body inside a temp buffer, but that changes the current
+  buffer for every existing example self-test at once, so it wants its own round
+  with a full `--test examples` re-run rather than a drive-by.
+- **`regexp::tests::classes_pass_through`** (a `--lib` unit test) fails at the
+  start commit: `[[:alpha:]]` is expected to pass through unchanged and is
+  rewritten to `[\p{Alphabetic}\p{M}]`. Untouched here; it is the unit-test
+  counterpart of the R9-H `[:class:]` work already recorded above.

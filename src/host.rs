@@ -132,6 +132,7 @@ pub mod ops {
     pub const MAKE_CLOSURE: u16 = 9; // pop a closure template; push one capturing the env
     pub const DBG_LINE: u16 = 10; // DAP statement marker (debug only): fire dap::check_line
     pub const CHECK_ARITY: u16 = 11; // arg=argc; pop sym; signal if it names a subr rejecting argc
+    pub const DEFVAR_INIT: u16 = 12; // pop val, pop sym; set value cell only if void; push val
 }
 
 pub type SubrFn = fn(&mut ElispHost, &[Value]) -> Result<Value, String>;
@@ -795,6 +796,15 @@ impl ElispHost {
         // built-in prefix and is never serialized as user heap).
         let scratch = h.alloc(Obj::Buffer(0));
         h.buffers[0].self_obj = scratch;
+        // The other two buffers a bare `emacs -Q --batch` starts with, in the
+        // order `buffer-list` reports them: `("*scratch*" " *Minibuf-0*"
+        // "*Messages*")`. They are not decoration — `(get-buffer "*Messages*")`
+        // answers a live buffer, `message` has somewhere to append, and the
+        // leading space on ` *Minibuf-0*` is what marks it hidden. Created here
+        // so they land in the built-in prefix alongside `*scratch*` and are
+        // never serialized as user heap.
+        h.new_buffer(" *Minibuf-0*".to_string());
+        h.new_buffer("*Messages*".to_string());
         // The global obarray object — the value of the `obarray` variable. Its
         // symbol set lives in `self.obarray` (the HashMap), so its own `symbols`
         // map stays empty and `global` routes every lookup there. Allocated in
@@ -933,11 +943,20 @@ impl ElispHost {
             return Value::Obj(id);
         }
         let id = self.arena.len() as u32;
+        // `intern_driver` (lread.c) gives a `:`-prefixed name interned in the
+        // standard obarray the keyword treatment: the symbol becomes its own
+        // value, is declared special, and its value cell is made constant. That
+        // is why `(symbol-value :a)` is `:a` and `(boundp :a)` is `t` for a
+        // keyword nothing has ever mentioned before. The treatment is keyed on
+        // the obarray, so `make_symbol` and the private-obarray `intern` below
+        // deliberately do not apply it — a `:`-spelled symbol outside the
+        // standard obarray is an ordinary, writable, unbound symbol.
+        let keyword = name.starts_with(':');
         self.arena.push(Obj::Symbol(SymbolData {
             name: name.to_string(),
-            value: None,
+            value: keyword.then_some(Value::Obj(id)),
             function: None,
-            special: false,
+            special: keyword,
             buffer_local_auto: false,
             alias_of: None,
         }));
@@ -1041,6 +1060,62 @@ impl ElispHost {
             },
         }
     }
+    /// True if the symbol object at `id` is the one the standard obarray holds
+    /// under its own name — i.e. it was produced by `intern`, not `make-symbol`
+    /// and not `(intern NAME PRIVATE-OBARRAY)`.
+    fn interned_in_standard_obarray(&self, id: u32) -> bool {
+        match &self.arena[id as usize] {
+            Obj::Symbol(s) => self.obarray.get(&s.name) == Some(&id),
+            _ => false,
+        }
+    }
+    /// `(keywordp V)` — V is a symbol interned in the *standard* obarray whose
+    /// name begins with `:`.
+    ///
+    /// The obarray is part of the test, not just the spelling: Emacs applies the
+    /// keyword treatment in `intern_driver` only for `initial_obarray`, so
+    /// `(keywordp (make-symbol ":u"))` and `(keywordp (intern ":u" (obarray-make)))`
+    /// are both nil even though the names start with a colon. `:` itself is a
+    /// keyword — there is no exception for the one-character name.
+    pub fn is_keyword(&self, v: &Value) -> bool {
+        match self.sym_handle(v) {
+            Some(id) => match &self.arena[id as usize] {
+                Obj::Symbol(s) => s.name.starts_with(':') && self.interned_in_standard_obarray(id),
+                _ => false,
+            },
+            None => false,
+        }
+    }
+    /// The name of the constant symbol `v` denotes, if writing its value cell is
+    /// forbidden; None for every ordinary symbol.
+    ///
+    /// Emacs marks `nil`, `t`, and every standard-obarray keyword constant
+    /// (`make_symbol_constant`), and `set_internal` — the single funnel under
+    /// `set`, `setq`, `set-default`, `makunbound`, `let`, and
+    /// `make-local-variable` — signals `setting-constant` for them. An
+    /// uninterned symbol merely *named* "t" is not constant, so the check is on
+    /// obarray identity rather than on the name alone.
+    pub fn constant_symbol_name(&self, v: &Value) -> Option<String> {
+        if matches!(v, Value::Bool(true)) {
+            return Some("t".to_string());
+        }
+        if el_nil(v) {
+            return Some("nil".to_string());
+        }
+        let id = self.sym_handle(v)?;
+        let Obj::Symbol(s) = &self.arena[id as usize] else {
+            return None;
+        };
+        let constant_name = s.name == "nil" || s.name == "t" || s.name.starts_with(':');
+        (constant_name && self.interned_in_standard_obarray(id)).then(|| s.name.clone())
+    }
+    /// `Err("setting-constant: NAME")` if `v` names a constant symbol.
+    pub fn check_settable(&self, v: &Value) -> Result<(), String> {
+        match self.constant_symbol_name(v) {
+            Some(name) => Err(format!("setting-constant: {name}")),
+            None => Ok(()),
+        }
+    }
 
     // ── cons ──
     pub fn cons(&mut self, a: Value, b: Value) -> Value {
@@ -1114,6 +1189,13 @@ impl ElispHost {
     /// BASE inherits it; BASE (and thus ALIAS) becomes special. Returns BASE.
     /// Signals `cyclic-variable-indirection` if the alias chain would loop.
     pub fn defvaralias(&mut self, alias: &Value, base: &Value) -> Result<Value, String> {
+        // A constant cannot be given a forwarding cell. `Fdefvaralias` reports
+        // this as a plain `error`, not as `setting-constant`, and names the
+        // alias. (The `error: ` prefix is stripped by `make_error_object`, which
+        // splits on the first colon only, so the message keeps its own colon.)
+        if let Some(name) = self.constant_symbol_name(alias) {
+            return Err(format!("error: Cannot make a constant an alias: {name}"));
+        }
         let aid = self.sym_handle(alias).ok_or("defvaralias: not a symbol")?;
         let bid = self.sym_handle(base).ok_or("defvaralias: not a symbol")?;
         // Reject a chain that would make BASE indirect back to ALIAS.
@@ -1159,6 +1241,7 @@ impl ElispHost {
         Ok(base.clone())
     }
     pub fn set_value(&mut self, v: &Value, val: Value) -> Result<(), String> {
+        self.check_settable(v)?;
         let id0 = self.sym_handle(v).ok_or("set: not a symbol")?;
         let id = self.indirect_var(id0);
         // A lexical binding shadows both the buffer-local and global cells.
@@ -1187,6 +1270,7 @@ impl ElispHost {
     /// default), snapshotting it; a void default yields a void local. No-op if a
     /// local already exists. Returns SYM.
     pub fn make_local_variable(&mut self, v: &Value) -> Result<Value, String> {
+        self.check_settable(v)?;
         let id0 = self
             .sym_handle(v)
             .ok_or("make-local-variable: not a symbol")?;
@@ -1204,6 +1288,7 @@ impl ElispHost {
     /// `(make-variable-buffer-local SYM)` — mark SYM automatically buffer-local
     /// (and special, like Emacs). Returns SYM.
     pub fn make_variable_buffer_local(&mut self, v: &Value) -> Result<Value, String> {
+        self.check_settable(v)?;
         let id0 = self
             .sym_handle(v)
             .ok_or("make-variable-buffer-local: not a symbol")?;
@@ -1283,6 +1368,7 @@ impl ElispHost {
     /// Clear a symbol's global value cell (`makunbound`). Lexical bindings are
     /// left untouched — they shadow the cell and unwind on their own.
     pub fn unset_value(&mut self, v: &Value) -> Result<(), String> {
+        self.check_settable(v)?;
         let id0 = self.sym_handle(v).ok_or("makunbound: not a symbol")?;
         let id = self.indirect_var(id0);
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
@@ -1348,6 +1434,12 @@ impl ElispHost {
     }
     /// True if the global (default) value cell is bound (`default-boundp`).
     pub fn default_boundp_raw(&self, v: &Value) -> bool {
+        // `nil`, `t`, and keywords are their own value and can never be void.
+        // `nil` and `t` are not arena symbols here, so the handle lookup below
+        // would otherwise call them unbound and let `(defvar nil 1)` try a write.
+        if self.constant_symbol_name(v).is_some() {
+            return true;
+        }
         match self.sym_handle(v) {
             Some(id0) => {
                 let id = self.indirect_var(id0);
@@ -1359,6 +1451,7 @@ impl ElispHost {
     /// Write the global (default) value cell directly (`set-default`), bypassing
     /// lexical and buffer-local bindings.
     pub fn set_raw_global(&mut self, v: &Value, val: Value) -> Result<(), String> {
+        self.check_settable(v)?;
         let id0 = self.sym_handle(v).ok_or("set-default: not a symbol")?;
         let id = self.indirect_var(id0);
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
@@ -1379,11 +1472,23 @@ impl ElispHost {
     }
     /// True if V is a symbol marked special (defvar/defconst), for `special-variable-p`.
     pub fn symbol_special(&self, v: &Value) -> bool {
+        // `nil`, `t`, and keywords are permanently declared special, so
+        // `special-variable-p` answers t for them even though no `defvar` ever
+        // mentioned them.
+        if self.constant_symbol_name(v).is_some() {
+            return true;
+        }
         self.sym_handle(v)
             .map(|id| self.is_special(self.indirect_var(id)))
             .unwrap_or(false)
     }
     pub fn set_function_value(&mut self, sym: &Value, def: Value) -> Result<(), String> {
+        // `Ffset` guards only `nil` (and `unbound`), not the whole constant set:
+        // `t` and keywords have constant *value* cells but writable *function*
+        // cells, so `(fset t (lambda ()))` is legal and returns the definition.
+        if matches!(self.constant_symbol_name(sym).as_deref(), Some("nil")) {
+            return Err("setting-constant: nil".to_string());
+        }
         let id = self.sym_handle(sym).ok_or("fset: not a symbol")?;
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.function = Some(def);
@@ -3937,6 +4042,8 @@ impl ElispHost {
                 | "invalid-function"
                 // `(excessive-lisp-nesting DEPTH)` — DEPTH is the integer, not "1601".
                 | "excessive-lisp-nesting"
+                // `(setting-constant SYM)` — the rejected symbol itself.
+                | "setting-constant"
         ) {
             if let Some(data) = self.read_all_forms(&msg) {
                 let s = self.intern(&sym);
@@ -5341,20 +5448,50 @@ pub fn ext_dispatch(vm: &mut VM, id: u16, arg: u8) {
         ops::SETVAR => {
             let val = vm.pop();
             let symv = vm.pop();
-            let _ = with_host(|h| h.set_value(&symv, val.clone()));
-            vm.push(val);
+            // The write can fail — `(setq nil 1)` is `setting-constant` — and a
+            // discarded error would let the form quietly answer its own value.
+            match with_host(|h| h.set_value(&symv, val.clone())) {
+                Ok(()) => vm.push(val),
+                Err(e) => abort(vm, e),
+            }
+        }
+        ops::DEFVAR_INIT => {
+            // `defvar`'s initializer runs only when the variable is void: after
+            // `(setq zz 5)`, a later `(defvar zz 9)` leaves zz at 5. `defconst`
+            // is the unconditional one and compiles to SETVAR instead. Keywords
+            // are self-bound, which is why `(defvar :dv 1)` is a silent no-op
+            // rather than `setting-constant`.
+            let val = vm.pop();
+            let symv = vm.pop();
+            let bound = with_host(|h| h.default_boundp_raw(&symv));
+            if bound {
+                vm.push(val);
+            } else {
+                match with_host(|h| h.set_value(&symv, val.clone())) {
+                    Ok(()) => vm.push(val),
+                    Err(e) => abort(vm, e),
+                }
+            }
         }
         ops::FSET => {
             let def = vm.pop();
             let symv = vm.pop();
-            let _ = with_host(|h| h.set_function_value(&symv, def));
-            vm.push(symv);
+            match with_host(|h| h.set_function_value(&symv, def)) {
+                Ok(()) => vm.push(symv),
+                Err(e) => abort(vm, e),
+            }
         }
         ops::SPECBIND => {
             // BIND1: bind into the current (already-open) scope; used by let*.
             let symv = vm.pop();
             let val = vm.pop();
-            with_host(|h| h.bind_value(&symv, val));
+            // `let*` binds each variable as it reaches it, so a constant in the
+            // second binding still lets the first init run — which is Emacs's
+            // order too.
+            match with_host(|h| h.check_settable(&symv)) {
+                Ok(()) => with_host(|h| h.bind_value(&symv, val)),
+                Err(e) => abort(vm, e),
+            }
         }
         ops::SCOPE_OPEN => {
             with_host(|h| h.open_scope());
@@ -5389,12 +5526,25 @@ pub fn ext_dispatch_wide(vm: &mut VM, id: u16, n: usize) {
                 let val = vm.pop();
                 pairs.push((sym, val));
             }
-            with_host(|h| {
-                h.open_scope();
-                for (sym, val) in pairs.into_iter().rev() {
-                    h.bind_value(&sym, val);
-                }
+            pairs.reverse();
+            // A constant in binding position is rejected here rather than at
+            // compile time: the inits have already run, which is Emacs's order,
+            // and the signal stays inside any enclosing `condition-case`. No
+            // scope is opened on the failing path, so nothing needs unwinding.
+            let rejected = with_host(|h| {
+                pairs
+                    .iter()
+                    .find_map(|(sym, _)| h.check_settable(sym).err())
             });
+            match rejected {
+                Some(e) => abort(vm, e),
+                None => with_host(|h| {
+                    h.open_scope();
+                    for (sym, val) in pairs {
+                        h.bind_value(&sym, val);
+                    }
+                }),
+            }
         }
         ops::UNBIND => {
             let _ = n;

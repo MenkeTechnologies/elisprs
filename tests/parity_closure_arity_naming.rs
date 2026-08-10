@@ -68,3 +68,36 @@ fn a_subr_still_reports_the_designator() {
         "(wrong-number-of-arguments #<subr car> 2)"
     );
 }
+
+/// An absent body prints as `(nil)`, not `()`.
+///
+/// Emacs normalizes an empty closure body to the single form `nil`, uniformly
+/// across `lambda`, `defun`, and `defmacro`. elisprs stored the empty slice and
+/// printed `#[nil () (t)]`. Only the printed source is affected — an empty
+/// compiled body already evaluated to nil, which the last row pins so the fix
+/// cannot be mistaken for one that inserts a real `nil` form.
+#[test]
+fn an_empty_closure_body_prints_as_nil() {
+    assert_eq!(
+        eval("(prin1-to-string (lambda ()))"),
+        "\"#[nil (nil) (t)]\""
+    );
+    assert_eq!(
+        eval("(prin1-to-string (lambda (x)))"),
+        "\"#[(x) (nil) (t)]\""
+    );
+    assert_eq!(
+        eval("(progn (defun f7 ()) (prin1-to-string (symbol-function 'f7)))"),
+        "\"#[nil (nil) (t)]\""
+    );
+    assert_eq!(
+        eval("(progn (defmacro m7 ()) (prin1-to-string (symbol-function 'm7)))"),
+        "\"(macro . #[nil (nil) (t)])\""
+    );
+    // A non-empty body is untouched, and an empty one still evaluates to nil.
+    assert_eq!(
+        eval("(prin1-to-string (lambda (x) x))"),
+        "\"#[(x) (x) (t)]\""
+    );
+    assert_eq!(eval("(funcall (lambda ()))"), "nil");
+}

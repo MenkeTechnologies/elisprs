@@ -129,7 +129,8 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
         Some("setq") => compile_setq(h, b, &elems[1..])?,
         Some("defun") => compile_defun(h, b, &elems, false)?,
         Some("defmacro") => compile_defun(h, b, &elems, true)?,
-        Some("defvar") | Some("defconst") => compile_defvar(h, b, &elems)?,
+        Some("defvar") => compile_defvar(h, b, &elems, false)?,
+        Some("defconst") => compile_defvar(h, b, &elems, true)?,
         Some("catch") => compile_catch(h, b, &elems)?,
         Some("unwind-protect") => compile_unwind(h, b, &elems)?,
         Some("condition-case") => compile_condition_case(h, b, &elems)?,
@@ -367,6 +368,18 @@ fn compile_body_chunk(h: &mut ElispHost, forms: &[Value]) -> Result<Chunk, Strin
     Ok(bb.build())
 }
 
+/// The body forms a closure *prints*, with Emacs's normalization of the empty
+/// body: `(lambda ())` prints as `#[nil (nil) (t)]`, never `#[nil () (t)]`, and
+/// the same holds for `defun` and `defmacro`. Only the printed source is
+/// affected — an empty compiled body already evaluates to nil.
+fn printable_body(forms: &[Value]) -> Vec<Value> {
+    if forms.is_empty() {
+        vec![Value::Undef]
+    } else {
+        forms.to_vec()
+    }
+}
+
 fn compile_lambda(
     h: &mut ElispHost,
     b: &mut ChunkBuilder,
@@ -380,7 +393,7 @@ fn compile_lambda(
     // and the compiled `Chunk` cannot be turned back into forms.
     let src = Rc::new(crate::host::ClosureSrc {
         arglist: arglist.clone(),
-        body: elems.get(2..).unwrap_or(&[]).to_vec(),
+        body: printable_body(elems.get(2..).unwrap_or(&[])),
     });
     let template = h.alloc(Obj::Closure {
         params: Rc::new(params),
@@ -413,7 +426,7 @@ fn compile_defun(
     let body = compile_body_chunk(h, elems.get(3..).unwrap_or(&[]))?;
     let src = Rc::new(crate::host::ClosureSrc {
         arglist: arglist.clone(),
-        body: elems.get(3..).unwrap_or(&[]).to_vec(),
+        body: printable_body(elems.get(3..).unwrap_or(&[])),
     });
     let template = h.alloc(Obj::Closure {
         params: Rc::new(params),
@@ -435,14 +448,30 @@ fn compile_defun(
     Ok(())
 }
 
-fn compile_defvar(h: &mut ElispHost, b: &mut ChunkBuilder, elems: &[Value]) -> Result<(), String> {
+/// `defvar` and `defconst` differ in exactly one way, and it is not the
+/// declaration: both mark the variable special, but `defvar`'s initializer runs
+/// only when the variable is still void, while `defconst` always assigns. A
+/// user's `(setq foo 5)` therefore survives a later `(defvar foo 9)` — which is
+/// what makes it safe to `setq` a library's variable before loading it — and
+/// does not survive `(defconst foo 9)`.
+fn compile_defvar(
+    h: &mut ElispHost,
+    b: &mut ChunkBuilder,
+    elems: &[Value],
+    constant: bool,
+) -> Result<(), String> {
     let name = elems.get(1).cloned().ok_or("defvar: missing name")?;
     // defvar/defconst declare a dynamically-scoped (special) variable.
     h.set_special(&name);
     if let Some(init) = elems.get(2) {
         load_const(b, name.clone());
         compile_form(h, b, init)?;
-        b.emit(Op::Extended(ops::SETVAR, 0), 0);
+        let op = if constant {
+            ops::SETVAR
+        } else {
+            ops::DEFVAR_INIT
+        };
+        b.emit(Op::Extended(op, 0), 0);
         b.emit(Op::Pop, 0);
     }
     load_const(b, name);
@@ -450,12 +479,20 @@ fn compile_defvar(h: &mut ElispHost, b: &mut ChunkBuilder, elems: &[Value]) -> R
 }
 
 fn parse_binding(h: &ElispHost, bd: &Value) -> Result<(Value, Value), String> {
+    // A constant in binding position is accepted here and rejected by the
+    // runtime binder. Emacs evaluates every init before it attempts the first
+    // write — `(let ((a (setq x 1)) (nil 2)) …)` sets x and *then* signals
+    // `setting-constant` — and rejecting at compile time would additionally put
+    // the error outside any enclosing `condition-case`, which catches it.
+    if h.constant_symbol_name(bd).is_some() {
+        return Ok((bd.clone(), Value::Undef));
+    }
     if matches!(h.obj(bd), Some(Obj::Symbol(_))) {
         return Ok((bd.clone(), Value::Undef));
     }
     let parts = h.list_vec(bd).ok_or("let: malformed binding")?;
     let sym = parts.first().cloned().ok_or("let: empty binding")?;
-    if !matches!(h.obj(&sym), Some(Obj::Symbol(_))) {
+    if !matches!(h.obj(&sym), Some(Obj::Symbol(_))) && h.constant_symbol_name(&sym).is_none() {
         return Err("let: binding name must be a symbol".to_string());
     }
     Ok((sym, parts.get(1).cloned().unwrap_or(Value::Undef)))

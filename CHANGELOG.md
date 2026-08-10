@@ -17,6 +17,17 @@ All notable changes to elisprs are documented here. The format follows
 - **`char-width` is a subr**, matching Emacs's `Fchar_width` (`indent.c`). It was
   a prelude `defun`; `format` needs the same width table from Rust, and two
   copies would be two answers.
+- **Constant symbols.** `nil`, `t`, and keywords interned in the standard obarray
+  are constant, as in Emacs's `make_symbol_constant`. `set`, `setq`,
+  `set-default`, `setq-default`, `makunbound`, `let`, `let*`, `setq-local`,
+  `make-local-variable`, `make-variable-buffer-local`, and `defconst` all signal
+  `(setting-constant SYM)` for them.
+- **The two other buffers `emacs -Q --batch` starts with.** `buffer-list` is
+  `("*scratch*" " *Minibuf-0*" "*Messages*")`, so `(get-buffer "*Messages*")`
+  answers a live buffer instead of nil.
+- **`keywordp` is a subr.** The test is obarray identity, not the leading colon:
+  `(make-symbol ":u")` and `(intern ":u" (obarray-make))` are not keywords, which
+  a prelude name-prefix check could not express.
 
 ### Fixed
 - **An integer and a float compared through `f64`, losing Emacs's exact rule.**
@@ -35,6 +46,26 @@ All notable changes to elisprs are documented here. The format follows
   fusevm op that 0.17.0 still answers natively on rounded images, so that path
   waits on the fusevm release which delegates the pair; the hook fixed here is
   what will answer it.
+- **`nil`, `t`, and keywords were writable.** `(set :kw 1)` and `(setq :a 1)`
+  performed the write and returned the value; `(set nil 1)` signalled
+  `(set "not a symbol")` — a made-up condition naming the builtin rather than
+  Emacs's `(setting-constant nil)`. The `SETVAR` and `FSET` dispatch arms also
+  discarded the host's `Err` with `let _ =`, so a failed write still let the form
+  answer its own value.
+- **A keyword was not its own value.** `intern` never seeded the value cell that
+  `intern_driver` (lread.c) seeds, so `(boundp :a)` was nil, `(default-value :a)`
+  signalled `void-variable`, and `(special-variable-p :a)` was nil — `t`, `:a`,
+  and `t` in Emacs.
+- **`defvar` overwrote an existing value.** `defvar` initializes only a void
+  variable; only `defconst` always assigns. `(progn (setq zz 5) (defvar zz 9) zz)`
+  answered 9 and is now 5, which is what makes it safe to `setq` a library's
+  variable before loading the library.
+- **An empty closure body printed as `()`.** Emacs normalizes an absent body to
+  the single form `nil`, so `(lambda ())` prints `#[nil (nil) (t)]`, uniformly
+  across `lambda`, `defun`, and `defmacro`.
+- **`defvaralias` onto a constant** signals
+  `(error "Cannot make a constant an alias: nil")` rather than a
+  `"not a symbol"` message.
 - **`kill-buffer` could leave a dead buffer current with stale positions, and the
   next `buffer-substring` aborted the process.**
   `(progn (insert "hello") (kill-buffer) (buffer-substring (point-min) (point)))`

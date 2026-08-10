@@ -1442,17 +1442,25 @@ fn set_fn(h: &mut ElispHost, a: &[Value]) -> R {
     h.set_value(&a[0], a[1].clone())?;
     Ok(a[1].clone())
 }
+/// `(keywordp OBJECT)` — OBJECT is a symbol interned in the standard obarray
+/// under a `:`-prefixed name.
+///
+/// Spelling alone is not the test: `(make-symbol ":u")` and
+/// `(intern ":u" (obarray-make))` both read back as `:u` and are both non-keywords,
+/// because `intern_driver` applies the keyword treatment only for the standard
+/// obarray. Only the host knows which object the obarray holds, so this cannot
+/// live in the prelude.
+fn keywordp(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Bool(h.is_keyword(&a[0])))
+}
 /// `(symbol-value SYMBOL)` — SYMBOL's dynamic value.
 ///
-/// A keyword is its own value: `intern` seeds `:foo`'s value cell with `:foo` and
-/// makes it constant, so `(symbol-value :a)` is `:a`, never `void-variable`. The
-/// compiler already loads a keyword as a self-evaluating constant, so this is the
-/// only path that could reach the (empty) value cell.
+/// A keyword is its own value, seeded into its value cell by `intern`. The
+/// compiler already loads a keyword as a self-evaluating constant, so the only
+/// way to reach this path with one is an indirect `(symbol-value SYM)`.
 fn symbol_value(h: &mut ElispHost, a: &[Value]) -> R {
-    if let Some(name) = h.sym_name(&a[0]) {
-        if name.starts_with(':') {
-            return Ok(a[0].clone());
-        }
+    if h.is_keyword(&a[0]) {
+        return Ok(a[0].clone());
     }
     h.get_value(&a[0])
 }
@@ -7247,6 +7255,7 @@ pub fn install(h: &mut ElispHost) {
     s("make-symbol", 1, Some(1), make_symbol_fn);
     s("set", 2, Some(2), set_fn);
     s("symbol-value", 1, Some(1), symbol_value);
+    s("keywordp", 1, Some(1), keywordp);
     s("boundp", 1, Some(1), boundp);
     s("default-boundp", 1, Some(1), default_boundp);
     s("default-toplevel-value", 1, Some(1), default_toplevel_value);
