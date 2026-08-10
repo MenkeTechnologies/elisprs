@@ -49,6 +49,13 @@ struct Session {
     /// discards what it skips past, so debuggee output emitted between two stops
     /// would otherwise be invisible to the assertions.
     program_output: String,
+    /// How many `stopped` events arrived over the whole session.
+    ///
+    /// Three tests here assert an *absence* of a stop, which `terminated` plus
+    /// stdout cannot express: `run_to_end` and `read_until` discard every message
+    /// they skip, so an adapter that announced a bogus stop without actually
+    /// pausing produced exactly the same observations as one that stayed silent.
+    stops_seen: usize,
 }
 
 impl Session {
@@ -125,6 +132,7 @@ impl Session {
             stdout,
             seq: 0,
             program_output: String::new(),
+            stops_seen: 0,
         }
     }
 
@@ -160,6 +168,9 @@ impl Session {
         if msg["type"] == "event" && msg["event"] == "output" {
             self.program_output
                 .push_str(msg["body"]["output"].as_str().unwrap_or(""));
+        }
+        if msg["type"] == "event" && msg["event"] == "stopped" {
+            self.stops_seen += 1;
         }
         Some(msg)
     }
@@ -463,6 +474,10 @@ fn dap_function_breakpoint_ignores_a_stale_function_object() {
         "both calls still ran, got {out:?}"
     );
     assert!(terminated, "no second stop: the stale object was ignored");
+    assert_eq!(
+        s.stops_seen, 1,
+        "only the redefined body stops; the stale function object must not"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -478,6 +493,10 @@ fn dap_function_breakpoint_on_an_uncalled_name_never_stops() {
 
     let (out, terminated) = s.run_to_end();
     assert!(terminated, "the program ran to completion with no stop");
+    assert_eq!(
+        s.stops_seen, 0,
+        "a breakpoint on an uncalled name must produce no stopped event at all"
+    );
     for line in ["1=3", "2=4", "3=5", "4=6"] {
         assert!(out.contains(line), "output {line} missing from {out:?}");
     }
@@ -521,6 +540,10 @@ fn dap_function_breakpoints_can_be_set_and_cleared_while_paused() {
     s.send("continue", json!({ "threadId": 1 }));
     let (out, terminated) = s.run_to_end();
     assert!(terminated, "no further stops after clearing");
+    assert_eq!(
+        s.stops_seen, 2,
+        "the line breakpoint and the one function breakpoint, nothing after the clear"
+    );
     for line in ["1=3", "2=4", "3=5", "4=6"] {
         assert!(out.contains(line), "output {line} missing from {out:?}");
     }

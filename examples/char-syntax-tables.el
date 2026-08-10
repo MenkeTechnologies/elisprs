@@ -115,17 +115,27 @@
                        (aref (standard-syntax-table) ?\()
                        (aref (standard-syntax-table) ?0))
                  '((2) (4 . 41) (2))))
-  ;; `char-syntax' reads the CURRENT BUFFER's table, which is not the standard
-  ;; one: `emacs -Q --batch -l FILE' -- the invocation this script models -- runs
-  ;; in *scratch* under `lisp-interaction-mode', whose table makes `?.' a symbol
-  ;; constituent.  Ground truth, GNU Emacs 30.2:
-  ;;   emacs -Q --batch -l probe.el
-  ;;     buffer table   => (119 119 32 95 40 95)   i.e. (?w ?w ?\s ?_ ?\( ?_)
-  ;;     standard table => (119 119 32 46 40 95)   i.e. (?w ?w ?\s ?. ?\( ?_)
-  ;; Both are pinned so the two tables cannot silently collapse back into one.
+  ;; `char-syntax' reads the CURRENT BUFFER's table, and inside an `ert-deftest'
+  ;; body that buffer is ` *temp*', not *scratch*: `ert--run-test-internal'
+  ;; (ert.el:796) wraps every body in `with-temp-buffer'.  ` *temp*' is in
+  ;; fundamental-mode, so its table IS the standard one and `?.' is punctuation.
+  ;;
+  ;; The previous pin here said `?_' -- the value *scratch* gives at top level
+  ;; under `lisp-interaction-mode'.  It never described an ERT body in any
+  ;; Emacs: GNU Emacs 30.2 fails this very assertion,
+  ;;   :form (equal (119 119 32 46 40 95) (119 119 32 95 40 95))
+  ;;   (list-elt 3 (different-atoms (46 "#x2e" "?.") (95 "#x5f" "?_")))
+  ;; and it only passed here because elisprs did not wrap bodies in a temp
+  ;; buffer.  Measured under both engines, byte-identical:
+  ;;   body-buf=" *temp*" body-dot=46 scratch-dot=95 std-dot=46
+  ;; All three are pinned below, so the two tables still cannot collapse.
   (should (equal (list (char-syntax ?a) (char-syntax ?0) (char-syntax ?\s)
                        (char-syntax ?.) (char-syntax ?\() (char-syntax ?-))
-                 '(?w ?w ?\s ?_ ?\( ?_)))
+                 '(?w ?w ?\s ?. ?\( ?_)))
+  (should (equal (buffer-name) " *temp*"))
+  ;; *scratch* keeps `lisp-interaction-mode's table, where `?.' is a symbol
+  ;; constituent -- the distinction the old pin was reaching for.
+  (should (eq (with-current-buffer "*scratch*" (char-syntax ?.)) ?_))
   (should (equal (with-syntax-table (standard-syntax-table)
                    (list (char-syntax ?a) (char-syntax ?0) (char-syntax ?\s)
                          (char-syntax ?.) (char-syntax ?\() (char-syntax ?-)))

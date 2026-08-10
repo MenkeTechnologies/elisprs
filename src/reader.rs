@@ -122,16 +122,16 @@ impl Reader {
 
     fn read_form_inner(&mut self, h: &mut ElispHost) -> Result<Value, String> {
         self.skip_ws();
-        let c = self.peek().ok_or("unexpected end of input")?;
+        let c = self.peek().ok_or("end-of-file")?;
         match c {
             '(' => self.read_list(h),
-            ')' => Err("unexpected )".to_string()),
+            ')' => Err("invalid-read-syntax: )".to_string()),
             // A separator `.` reaching `read_form` is misplaced: the valid dotted
             // position is handled inside `read_list`. Top-level `(read ".")`, a
             // vector element `[a . b]`, or a quoted `'.` all signal invalid syntax.
             '.' if self.dot_is_separator() => Err("invalid-read-syntax: .".to_string()),
             '[' => self.read_vector(h),
-            ']' => Err("unexpected ]".to_string()),
+            ']' => Err("invalid-read-syntax: ]".to_string()),
             '`' => {
                 self.pos += 1;
                 let f = self.read_form(h)?;
@@ -179,6 +179,35 @@ impl Reader {
             {
                 self.read_radix(h)
             }
+            // `##` is the interned symbol whose name is empty:
+            // `(eq (read "##") (intern ""))` is t. It reached `read_atom` and
+            // came back as a two-character symbol named "##".
+            '#' if self.peek_at(1) == Some('#') => {
+                self.pos += 2;
+                Ok(h.intern(""))
+            }
+            // `#:NAME` is an *uninterned* symbol named NAME — `read_atom` used to
+            // produce an interned one whose name still carried the `#:`.
+            '#' if self.peek_at(1) == Some(':') => {
+                self.pos += 2;
+                let mut name = String::new();
+                while let Some(c) = self.peek() {
+                    if is_delim(c) {
+                        break;
+                    }
+                    name.push(c);
+                    self.pos += 1;
+                }
+                Ok(h.make_symbol(&name))
+            }
+            // Every other `#` dispatch is invalid syntax, and the datum is the
+            // `#` together with the character that followed it (just `"#"` at end
+            // of input). Falling through to `read_atom` silently produced a
+            // symbol named `#z` / `#` instead of signalling.
+            '#' => Err(match self.peek_at(1) {
+                Some(c2) => format!("invalid-read-syntax: #{c2}"),
+                None => "invalid-read-syntax: #".to_string(),
+            }),
             _ => self.read_atom(h),
         }
     }
@@ -192,7 +221,7 @@ impl Reader {
         loop {
             self.skip_ws();
             match self.peek() {
-                None => return Err("unclosed list".to_string()),
+                None => return Err("end-of-file".to_string()),
                 Some(')') => {
                     self.pos += 1;
                     break;
@@ -236,7 +265,7 @@ impl Reader {
         loop {
             self.skip_ws();
             match self.peek() {
-                None => return Err("unclosed vector".to_string()),
+                None => return Err("end-of-file".to_string()),
                 Some(']') => {
                     self.pos += 1;
                     break;
@@ -254,14 +283,14 @@ impl Reader {
         let mut s = String::new();
         loop {
             match self.peek() {
-                None => return Err("unterminated string".to_string()),
+                None => return Err("end-of-file".to_string()),
                 Some('"') => {
                     self.pos += 1;
                     break;
                 }
                 Some('\\') => {
                     self.pos += 1;
-                    let e = self.peek().ok_or("unterminated string")?;
+                    let e = self.peek().ok_or("end-of-file")?;
                     let dash = self.peek_at(1) == Some('-');
                     let scalar = match e {
                         // Control: `\^X` and `\C-X` fold like char literals. The
@@ -311,12 +340,12 @@ impl Reader {
     /// prefixes `\C-` / `\^` (control), `\M-` (meta), `\S-` (shift), `\H-`,
     /// `\s-`, `\A-`, which may nest: `?\C-\M-a` => control+meta a.
     fn read_char_spec(&mut self) -> Result<i64, String> {
-        let c = self.peek().ok_or("unterminated char literal")?;
+        let c = self.peek().ok_or("end-of-file")?;
         self.pos += 1;
         if c != '\\' {
             return Ok(c as i64);
         }
-        let e = self.peek().ok_or("unterminated char literal")?;
+        let e = self.peek().ok_or("end-of-file")?;
         let dash = self.peek_at(1) == Some('-');
         match e {
             'C' if dash => {
@@ -616,9 +645,9 @@ impl Reader {
         }
         let len: usize = num
             .parse()
-            .map_err(|_| "malformed #& bool-vector length".to_string())?;
+            .map_err(|_| "invalid-read-syntax: #&".to_string())?;
         if self.peek() != Some('"') {
-            return Err("expected packed string in #& bool-vector".to_string());
+            return Err("invalid-read-syntax: #&".to_string());
         }
         // The packed byte string reads with normal string-escape rules (`\OOO`
         // octal for bytes >= 128); each resulting code point is one packed byte.
@@ -1137,7 +1166,7 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
                 let mut s = String::new();
                 loop {
                     match chars.get(pos) {
-                        None => return Err("unterminated string".to_string()),
+                        None => return Err("end-of-file".to_string()),
                         Some('"') => {
                             pos += 1;
                             break;
@@ -1150,7 +1179,7 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
                                     s.push(e);
                                     pos += 1;
                                 }
-                                None => return Err("unterminated string".to_string()),
+                                None => return Err("end-of-file".to_string()),
                             }
                         }
                         Some(&ch) => {
@@ -1165,7 +1194,7 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
                 pos += 1;
                 let mut s = String::new();
                 match chars.get(pos) {
-                    None => return Err("unterminated char literal".to_string()),
+                    None => return Err("end-of-file".to_string()),
                     // `?\…` escape (incl. modifier prefixes `\C-`, `\M-`, `\x41`):
                     // consume the escape body up to the next delimiter.
                     Some('\\') => {

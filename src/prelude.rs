@@ -858,7 +858,7 @@ pub const PRELUDE: &str = r#"
                     ((eq head 'gethash) `(puthash ,(car args) ,val ,(cadr args)))
                     ((eq head 'symbol-value) `(set ,(car args) ,val))
                     ((eq head 'alist-get) `(setcdr (assq ,(car args) ,(cadr args)) ,val))
-                    (t (error "setf: unsupported place: %S" place))))
+                    (t (signal 'gv-invalid-place (list place)))))
                `(setq ,place ,val))))
         (if rest `(progn ,exp (setf ,@rest)) exp)))))
 ;; subr.el: `(car-safe (prog1 PLACE (setq PLACE (cdr PLACE))))'. The `car-safe'
@@ -3173,7 +3173,7 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (define-error 'invalid-function "Invalid function")
 (define-error 'wrong-length-argument "Wrong length argument")
 (define-error 'invalid-regexp "Invalid regexp")
-(define-error 'cyclic-variable-indirection "Cyclic variable indirection")
+(define-error 'cyclic-variable-indirection "Symbol's chain of variable indirections contains a loop")
 (define-error 'cl-assertion-failed "Assertion failed")
 (define-error 'end-of-file "End of file during parsing")
 ;; The rest of the data.c/fileio.c seed table, verbatim (messages and parents as
@@ -5099,6 +5099,9 @@ If all LST elements are zeros or LST is nil, return zero."
 (defun setf--expand (place val)
   (if (symbolp place)
       (list 'setq place val)
+    ;; gv.el:80 rejects a place that is neither a symbol nor a cons with its own
+    ;; condition; falling through to `(car place)' reported `listp' instead.
+    (unless (consp place) (signal 'gv-invalid-place (list place)))
     (let ((head (car place)) (args (cdr place)))
       (cond
        ((eq head 'car) (list 'setcar (car args) val))
@@ -5255,7 +5258,7 @@ If all LST elements are zeros or LST is nil, return zero."
                     (let ((setter (intern (format "(setf %s)" head))))
                       (if (fboundp setter)
                           (cons 'funcall (cons (list 'function setter) (cons val args)))
-                        (error "setf: unsupported place %S" place)))
+                        (signal 'gv-invalid-place (list place))))
                   (setf--expand me val))))))))))
 (defmacro setf (&rest pairs)
   (let ((forms nil))
@@ -5393,7 +5396,7 @@ HOOK should be a symbol; its value is a function or a list of functions."
    ;; anychar/anything match ANY char incl. newline (empty negated class).
    ((memq s '(anychar anything)) "[^z-a]")
    ((eq s 'unmatchable) "\\`a\\`")
-   (t (error "rx: unknown symbol %S" s))))
+   (t (error "Unknown rx symbol `%s'" s))))
 (defun rx--atom-p (s)
   ;; A regexp that a quantifier can suffix without a shy group.
   (let ((n (length s)))
@@ -5419,19 +5422,22 @@ HOOK should be a symbol; its value is a function or a list of functions."
    ((and (consp arg) (memq (car arg) '(any in char)))
     (concat "[^" (rx--charset (cdr arg)) "]"))
    ((eq arg 'word-boundary) "\\B")
+   ;; `(not CHAR)' is the complement of a single character: (rx-to-string
+   ;; '(not ?a)) => "[^a]". It is not an error.
+   ((integerp arg) (concat "[^" (char-to-string arg) "]"))
    ((symbolp arg)
     (let ((s (rx--symbol arg)))
       (if (and (> (length s) 1) (eq (aref s 0) ?\[))
           (concat "[^" (substring s 1 (1- (length s))) "]")
         (concat "[^" s "]"))))
-   (t (error "rx: bad (not ...) %S" arg))))
+   (t (error "Illegal argument to rx `not': %S" arg))))
 (defun rx--form (form)
   (cond
    ((stringp form) (regexp-quote form))
    ((integerp form) (regexp-quote (char-to-string form)))
    ((symbolp form) (rx--symbol form))
    ((consp form) (rx--list form))
-   (t (error "rx: bad form %S" form))))
+   (t (error "Bad rx expression: %S" form))))
 (defun rx--seq (forms) (mapconcat 'rx--form forms ""))
 (defun rx--1char (a) (cond ((integerp a) (char-to-string a)) ((stringp a) a) (t "")))
 (defun rx--all-1char-p (args)
@@ -5453,7 +5459,7 @@ HOOK should be a symbol; its value is a function or a list of functions."
         ((eq sym 'comment-start) "<")
         ((eq sym 'comment-end) ">")
         ((eq sym 'escape) "\\\\")
-        (t (error "rx: unknown syntax class %S" sym))))
+        (t (error "Unknown rx syntax name `%s'" sym))))
 (defun rx--list (form)
   (let ((head (car form)) (args (cdr form)))
     (cond
@@ -5491,7 +5497,7 @@ HOOK should be a symbol; its value is a function or a list of functions."
      ;; minimal-match/maximal-match: render the inner form (greediness control
      ;; isn't modeled separately here).
      ((memq head '(minimal-match maximal-match)) (rx--form (car args)))
-     (t (error "rx: unknown form %S" head)))))
+     (t (if (symbolp head) (error "Unknown rx form `%s'" head) (error "Bad rx operator `%S'" head))))))
 (defmacro rx (&rest forms) (rx--seq forms))
 (defun rx-to-string (form &optional no-group)
   "Translate the rx FORM to a regexp string; wrap in a shy group unless NO-GROUP
@@ -5596,7 +5602,7 @@ or the result is already atomic/grouped."
   ;; Like pcase, but error if no clause matches.
   `(let ((--pcase-v-- ,expr))
      (cond ,@(mapcar (function pcase--clause) clauses)
-           (t (error "No clause matching %S" --pcase-v--)))))
+           (t (error "No clause matching `%S'" --pcase-v--)))))
 (defmacro pcase-let (bindings &rest body)
   ;; Each binding is (PATTERN VALUE); destructure VALUE against PATTERN (reusing
   ;; `pcase--compile'), binding the pattern variables for BODY.
@@ -6088,6 +6094,8 @@ This is like the `&' operator of the C language."
          (if (map--plist-p map) (cons key (cons value map)) (cons (cons key value) map)))
         ((hash-table-p map) (let ((h (copy-hash-table map))) (puthash key value h) h))
         (t (error "map-insert: unsupported map type"))))
+;; map.el's own condition -- an alist that has to grow is not a plain `error'.
+(define-error 'map-not-inplace "Cannot modify map in-place")
 (defun map-put! (map key value &optional testfn)
   "Set KEY to VALUE in MAP in place; error if an alist must grow."
   (cond
@@ -6097,7 +6105,7 @@ This is like the `&' operator of the C language."
         (progn (plist-put map key value) value)
       (let ((entry (assoc key map (or testfn #'equal))))
         (if entry (progn (setcdr entry value) map)
-          (error "Cannot modify map in-place: %S" map)))))
+          (signal 'map-not-inplace (list map))))))
    ((arrayp map) (aset map key value) map)
    (t (error "map-put!: unsupported map type"))))
 (defun map-values-apply (function map) (map-apply (lambda (_k v) (funcall function v)) map))
@@ -7306,9 +7314,11 @@ The property `char-table-extra-slots' of SUBTYPE controls the number of
 extra slots to reserve in this char-table.  This slot number is an
 integer between 0 and 10, or nil, meaning 0."
   (let ((n (get subtype 'char-table-extra-slots)))
+    ;; chartab.c rejects an out-of-range slot count with `args_out_of_range',
+    ;; naming the property value and INIT -- not with an `error' of its own.
     (setq n (cond ((null n) 0)
                   ((and (integerp n) (>= n 0) (<= n 10)) n)
-                  (t (error "Invalid number of extra slots"))))
+                  (t (signal 'args-out-of-range (list n init)))))
     (make-char-table--new subtype init n)))
 
 ;;; ---- syntax tables (syntax.c documented behavior, over char-tables) ----
@@ -10357,12 +10367,28 @@ No problems result if this variable is not bound.
        ',name)))
 
 (defun ert-run-tests-batch ()
-  (let ((tests (reverse ert--tests)) (total 0) (unexpected 0) (skipped 0))
+  ;; Test ORDER is by name, not by definition order.  `ert-select-tests' walks
+  ;; `ert--test-obarray' and `ert-run-tests-batch' takes them as they come out,
+  ;; which for an obarray is alphabetical -- measured on 30.2 with ten
+  ;; deliberately unsorted names (defined q7 b2 z9 a1 m5 c3 y8 d4 x6 e0, run
+  ;; a1 b2 c3 d4 e0 m5 q7 x6 y8 z9).  Running in definition order let a test
+  ;; depend on an earlier one's side effects and pass here while failing under
+  ;; `emacs -Q --batch -l'.
+  (let ((tests (sort (reverse ert--tests)
+                     (lambda (a b) (string-lessp (symbol-name (car a))
+                                                 (symbol-name (car b))))))
+        (total 0) (unexpected 0) (skipped 0))
     (while tests
       (let* ((entry (car tests)) (name (car entry)) (expected (cdr entry)))
         (setq total (1+ total))
         (condition-case --ert-err--
-            (progn
+            ;; `ert--run-test-internal' (ert.el:796) runs the body inside
+            ;; `(with-temp-buffer (save-window-excursion …))', so a test body
+            ;; starts in ` *temp*' with the standard syntax table -- not in
+            ;; `*scratch*' under `emacs-lisp-mode-syntax-table'.  Measured:
+            ;;   emacs:   TOP buf="*scratch*" cs.=95  BODY buf=" *temp*"  cs.=46
+            ;; and elisprs used to answer 95 in the body too.
+            (with-temp-buffer
               (funcall name)
               (if (eq expected :failed)
                   (progn (setq unexpected (1+ unexpected))

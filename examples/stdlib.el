@@ -29,7 +29,14 @@
 
 (ert-deftest std-strings ()
   (should (string= "ab" "ab"))
+  ;; Without the negatives, a `string=' that ignored its arguments and always
+  ;; answered t passed this test.
+  (should-not (string= "ab" "ac"))
+  (should-not (string= "ab" "abc"))
+  ;; `string=' compares a symbol by its name, where `equal' would say nil.
+  (should (string= "ab" 'ab))
   (should (string< "abc" "abd"))
+  (should-not (string< "abd" "abc"))
   (should (equal (upcase "hello") "HELLO"))
   (should (equal (downcase "HELLO") "hello"))
   (should (equal (capitalize "hello") "Hello"))

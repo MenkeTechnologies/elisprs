@@ -45,10 +45,20 @@ Real Emacs: (version-to-list \"22.3a\") => (22 3 1)."
 (ert-deftest vc-to-list-invalid ()
   "Invalid syntax signals an `error'; the two failure classes differ in message.
 Real Emacs: non-number start => `(must start with a number)'; bad tail => plain."
-  (should-error (version-to-list "1.0prepre2"))
-  (should-error (version-to-list "22.8X3"))
-  (should-error (version-to-list "alpha3.2"))
-  (should-error (version-to-list 42)))
+  ;; A bare `should-error' cannot see the distinction the docstring names -- it
+  ;; accepts the plain message where the "(must start with a number)" one is due,
+  ;; and accepts a `wrong-type-argument' leaking out of an internal
+  ;; `string-match' where the deliberate "Version must be a string" is due. The
+  ;; four condition objects below are `emacs -Q --batch' 30.2's, verbatim (the
+  ;; quotes are U+2018/U+2019, from `format-message').
+  (should (equal (should-error (version-to-list "1.0prepre2"))
+                 '(error "Invalid version syntax: ‘1.0prepre2’")))
+  (should (equal (should-error (version-to-list "22.8X3"))
+                 '(error "Invalid version syntax: ‘22.8X3’")))
+  (should (equal (should-error (version-to-list "alpha3.2"))
+                 '(error "Invalid version syntax: ‘alpha3.2’ (must start with a number)")))
+  (should (equal (should-error (version-to-list 42))
+                 '(error "Version must be a string"))))
 
 (ert-deftest vc-list-not-zero ()
   "version-list-not-zero returns the first non-zero, else 0.

@@ -16,9 +16,117 @@
 //! Not yet lowered (next milestone): macro expansion, backquote, and the
 //! nonlocal-exit forms (catch/throw/condition-case/unwind-protect).
 
+use crate::host;
 use crate::host::{ops, ElispHost, FnKind, Obj};
 use fusevm::{Chunk, ChunkBuilder, Op, Value};
 use std::rc::Rc;
+
+/// The primitives GNU Emacs 30.2's byte compiler turns into a bytecode op, which
+/// calls the C function directly and never consults the symbol's function cell.
+/// A call to one of these from *byte-compiled* Lisp therefore ignores any advice
+/// on the symbol, while a call to anything else honours it — and Emacs ships its
+/// preloaded Lisp byte-compiled, so this is the behaviour the prelude must have.
+///
+/// Not derived from bytecode.c (its opcode table is not in the installed tree)
+/// but measured, one name at a time, on the 30.2 in `emacs-version`: byte-compile
+/// `(lambda (a…) (NAME a…))`, `advice-add` NAME with an `:around` that records a
+/// flag, call it, and read the flag. The 30 names it answered "advice fires" for
+/// — `assoc` `eql` `safe-length` `symbol-function` `set` `append` `vectorp`
+/// `natnump` `sequencep` `bufferp` `arrayp` `markerp` `functionp` `fboundp`
+/// `boundp` `put` `buffer-string` `format` `message` `intern` `vector` `throw`
+/// `signal` `error` `mapcar` `add-to-list` `assoc-default` `byte-code-function-p`
+/// `called-interactively-p` `beginning-of-line` — are deliberately absent below.
+///
+/// Sorted; `is_open_coded` binary-searches it.
+const OPEN_CODED: &[&str] = &[
+    "%",
+    "*",
+    "+",
+    "-",
+    "/",
+    "/=",
+    "1+",
+    "1-",
+    "<",
+    "<=",
+    "=",
+    ">",
+    ">=",
+    "aref",
+    "aset",
+    "assq",
+    "bobp",
+    "bolp",
+    "buffer-substring",
+    "car",
+    "car-safe",
+    "cdr",
+    "cdr-safe",
+    "char-after",
+    "concat",
+    "cons",
+    "consp",
+    "current-buffer",
+    "current-column",
+    "delete-region",
+    "downcase",
+    "elt",
+    "end-of-line",
+    "eobp",
+    "eolp",
+    "eq",
+    "equal",
+    "following-char",
+    "forward-char",
+    "forward-line",
+    "fset",
+    "funcall",
+    "get",
+    "goto-char",
+    "indent-to",
+    "insert",
+    "integerp",
+    "length",
+    "list",
+    "listp",
+    "match-beginning",
+    "match-end",
+    "max",
+    "member",
+    "memq",
+    "min",
+    "narrow-to-region",
+    "nconc",
+    "not",
+    "nreverse",
+    "nth",
+    "nthcdr",
+    "null",
+    "numberp",
+    "point",
+    "point-max",
+    "point-min",
+    "preceding-char",
+    "set-buffer",
+    "setcar",
+    "setcdr",
+    "skip-chars-forward",
+    "string-equal",
+    "string-lessp",
+    "string<",
+    "string=",
+    "stringp",
+    "substring",
+    "symbol-value",
+    "symbolp",
+    "upcase",
+    "widen",
+];
+
+/// Whether `name` is in [`OPEN_CODED`].
+fn is_open_coded(name: &str) -> bool {
+    OPEN_CODED.binary_search(&name).is_ok()
+}
 
 pub fn compile_top(h: &mut ElispHost, form: &Value) -> Result<Chunk, String> {
     let mut b = ChunkBuilder::new();
@@ -173,7 +281,14 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
             if head_is_lambda {
                 compile_lambda(h, b, &head_elems.unwrap(), false)?;
             } else {
-                load_const(b, head);
+                // Inside the prelude, a call to one of the primitives Emacs's
+                // byte compiler open-codes loads the subr itself, not the
+                // symbol — see `OPEN_CODED`.
+                let direct = name
+                    .as_deref()
+                    .filter(|n| host::prelude_compiling() && is_open_coded(n))
+                    .and_then(|n| h.primitive_fn_value(n));
+                load_const(b, direct.unwrap_or(head));
             }
             for arg in &elems[1..] {
                 compile_form(h, b, arg)?;

@@ -3,6 +3,22 @@
 //! bareword. Requires `rustc` on PATH (always present in Rust CI); skips cleanly
 //! otherwise so a toolchain-less environment never reports a false failure.
 
+/// True when this test may quietly do nothing. Two of the three FFI tests used
+/// to `return` with no output at all, so a green run was indistinguishable from
+/// a suite that never executed. Setting `ELISPRS_REQUIRE_RUSTC=1` (CI) turns the
+/// skip into a failure; otherwise it at least says so on stderr.
+fn skip_without_rustc(test: &str) -> bool {
+    if rustc_available() {
+        return false;
+    }
+    assert!(
+        std::env::var_os("ELISPRS_REQUIRE_RUSTC").is_none(),
+        "{test}: rustc is not on PATH but ELISPRS_REQUIRE_RUSTC is set"
+    );
+    eprintln!("skipping FFI test {test}: rustc not on PATH");
+    true
+}
+
 fn rustc_available() -> bool {
     std::process::Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
         .arg("--version")
@@ -13,8 +29,7 @@ fn rustc_available() -> bool {
 
 #[test]
 fn rust_block_exports_are_callable_by_bareword() {
-    if !rustc_available() {
-        eprintln!("skipping FFI test: rustc not on PATH");
+    if skip_without_rustc("rust_block_exports_are_callable_by_bareword") {
         return;
     }
     elisprs::reset_host();
@@ -33,7 +48,7 @@ fn rust_block_exports_are_callable_by_bareword() {
 
 #[test]
 fn user_defun_shadows_ffi_export() {
-    if !rustc_available() {
+    if skip_without_rustc("user_defun_shadows_ffi_export") {
         return;
     }
     elisprs::reset_host();
@@ -49,7 +64,7 @@ fn user_defun_shadows_ffi_export() {
 
 #[test]
 fn rust_block_with_no_exports_errors() {
-    if !rustc_available() {
+    if skip_without_rustc("rust_block_with_no_exports_errors") {
         return;
     }
     elisprs::reset_host();

@@ -176,15 +176,30 @@
 
 ;; ---- change-eol-conversion: structural round-trip over the registry ----
 (ert-deftest cs-change-eol-registry ()
-  ;; For every undecided base system, change-eol to dos must equal the second
-  ;; slot of its eol-type vector; changing back to nil returns the base.
-  (dolist (cs (coding-system-list t))
-    (let ((eol (coding-system-eol-type cs)))
-      (when (vectorp eol)
-        (should (eq (coding-system-change-eol-conversion cs 'unix) (aref eol 0)))
-        (should (eq (coding-system-change-eol-conversion cs 'dos) (aref eol 1)))
-        (should (eq (coding-system-change-eol-conversion cs 'mac) (aref eol 2)))
-        (should (eq (coding-system-change-eol-conversion cs nil)
-                    (coding-system-base cs)))))))
+  ;; For every undecided base system, change-eol must name the BASE-unix /
+  ;; BASE-dos / BASE-mac subsidiary, and changing back to nil returns the system.
+  ;;
+  ;; The expected names are spelled out from the symbol rather than read back out
+  ;; of `coding-system-eol-type' -- that is the very function
+  ;; `coding-system-change-eol-conversion' consults internally, so `(aref eol 1)'
+  ;; compared the implementation to itself: dropping the `coding-system-base'
+  ;; call from the implementation moved both sides together and all 369
+  ;; assertions still passed.
+  (let ((checked 0))
+    (dolist (cs (coding-system-list t))
+      (let ((eol (coding-system-eol-type cs)))
+        (when (vectorp eol)
+          (setq checked (1+ checked))
+          (let ((n (symbol-name (coding-system-base cs))))
+            (should (eq (coding-system-change-eol-conversion cs 'unix)
+                        (intern (concat n "-unix"))))
+            (should (eq (coding-system-change-eol-conversion cs 'dos)
+                        (intern (concat n "-dos"))))
+            (should (eq (coding-system-change-eol-conversion cs 'mac)
+                        (intern (concat n "-mac"))))
+            (should (eq (coding-system-change-eol-conversion cs nil) cs))))))
+    ;; The `when' must not be able to become a never-taken branch: under
+    ;; emacs -Q --batch 30.2, 123 of the 125 base systems have a vector EOL type.
+    (should (= checked 123))))
 
 (ert-run-tests-batch-and-exit)

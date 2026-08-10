@@ -16,7 +16,10 @@
 
 (ert-deftest number-sequence-zero-increment ()
   "A zero increment signals rather than looping forever; FROM=TO short-circuits."
-  (should-error (number-sequence 1 10 0))
+  ;; The message is subr.el's own, not a generic args-out-of-range from an
+  ;; internal guard -- an untyped `should-error' could not tell them apart.
+  (should (equal (should-error (number-sequence 1 10 0))
+                 '(error "The increment can not be zero")))
   (should (equal (number-sequence 5 5 0) '(5)))
   (should (equal (number-sequence 1 7 3) '(1 4 7)))
   (should (equal (number-sequence 5 1 -1) '(5 4 3 2 1))))

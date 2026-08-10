@@ -57,10 +57,19 @@
   (should (equal (process-lines "printf" "x\ny\n") '("x" "y"))))
 
 (ert-deftest script-demo-cleanup ()
-  "Tidy the scratch files."
-  (dolist (f '("people.txt" "people.json"))
-    (let ((p (file-name-concat script-demo--dir f)))
-      (when (file-exists-p p) (delete-file p))))
-  (should t))
+  "Tidy the scratch files -- and prove the tidying happened.
+
+The trailing assertion used to be `(should t)', which passed just as well when
+`file-name-concat' built the wrong path and nothing was deleted at all; the next
+run would then read a stale people.json."
+  (let ((paths (mapcar (lambda (f) (file-name-concat script-demo--dir f))
+                       '("people.txt" "people.json"))))
+    ;; Create both outright rather than relying on an earlier test having run:
+    ;; ERT orders tests by name, so this one runs FIRST.
+    (script-demo--setup)
+    (write-region "{}" nil (nth 1 paths))
+    (should (equal (mapcar #'file-exists-p paths) '(t t)))
+    (dolist (p paths) (delete-file p))
+    (should (equal (mapcar #'file-exists-p paths) '(nil nil)))))
 
 (ert-run-tests-batch-and-exit)

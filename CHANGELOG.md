@@ -114,6 +114,57 @@ All notable changes to elisprs are documented here. The format follows
   a prelude name-prefix check could not express.
 
 ### Fixed
+- **`advice-add` on a Rust subr corrupted it for the rest of the process.**
+  `(advice-add 'car :filter-return #'1+)` did not just fail — every later `car`,
+  including `(symbol-function 'car)`, raised
+  `(wrong-type-argument number-or-marker-p #[nil ((get v 'defalias-fset-function)) …])`.
+  `advice-add` advises the function cell before calling
+  `(add-function :around (get symbol 'defalias-fset-function) …)`, and `gv-deref`
+  is `(funcall (car ref))`, so the getter closure went to the advice it had just
+  installed. Emacs is immune because its preloaded Lisp is **byte-compiled**, and
+  the byte compiler turns ~80 primitives into opcodes that never consult the
+  function cell. That set is now measured (not guessed: byte-compile a wrapper,
+  advise the name, see whether the advice fires — 82 names it does not fire for,
+  30 it does) and lowered the same way inside the prelude only, since an
+  interpreted user `defun` in Emacs *does* honour advice on `car`. See BUGS.md
+  R19-A, with a cold/warm cache regression.
+- **A hardcoded-reference-string audit of `src/`** — 776 literals extracted, 751
+  checked against Emacs 30.2's Lisp sources, binary string table and `etc/DOC`,
+  131 executed side by side; **40 sites / 30 texts were wrong and are fixed.**
+  The reader now signals `(end-of-file)` and `(invalid-read-syntax …)` instead of
+  nine kinds of lowercase prose, and reads `##` and `#:foo`; the four
+  `Wrong type argument: closurep` OClosure sites signal
+  `(cl-assertion-failed (closurep oclosure))`; `setf` on a bad place signals
+  `gv-invalid-place` from all three paths (two of which disagreed with each other
+  over a colon); `cyclic-variable-indirection`, `map-not-inplace`,
+  `pcase-exhaustive`, `char-table-range`'s curly quotes, and five `rx`
+  diagnostics now read as Emacs writes them; `setcar`/`setcdr`/`unintern`/the
+  hash-table accessors/`buffer-local-value` name the offending value;
+  `goto-char`/`forward-char`/`char-equal` use `integer-or-marker-p`/`fixnump`/
+  `characterp` instead of one shared `integerp`; `fset`, `get-buffer-create ""`,
+  `(format "%")` and `buffer-substring` out of range all signal what Emacs
+  signals. Full table in BUGS.md R19-B.
+- **`replace-match` panicked the interpreter thread.** Match data is global and
+  outlives the buffer or string it was set from, and the span was indexed with no
+  bounds check: `(with-temp-buffer (insert "abc") (replace-match "x"))` aborted
+  with `range start index 8 out of range for slice of length 3`. `Freplace_match`
+  bounds-checks against BEGV/ZV (and against `SCHARS` in string mode) and signals
+  `args-out-of-range`; a missing subexpression is
+  `(error "replace-match subexpression does not exist" SUBEXP)`.
+- **`string-to-number` skipped the wrong whitespace and mis-typed BASE.** Emacs
+  skips exactly SPC and TAB, so `(string-to-number "\n12")` is 0 — `\r`, `\f`,
+  `\v`, U+00A0 and U+3000 likewise; `trim_start` skipped all of them. BASE is
+  `CHECK_FIXNUM`: `(string-to-number "1" 2.0)` truncated the float to base 2 and
+  answered 1 where Emacs signals `(wrong-type-argument fixnump 2.0)`, and a
+  symbol, bignum or marker said `integerp` instead of `fixnump`.
+- **ERT ran tests in definition order.** Emacs runs them by name (measured over
+  ten deliberately unsorted names). Definition order let a test depend on an
+  earlier test's side effects and pass here while failing under
+  `emacs -Q --batch -l`.
+- **Error DATA dropped any value with no read syntax.** The data list is rebuilt
+  by re-reading the rendered message, so a marker, buffer or closure — printed as
+  `#<…>` / `#[…]` — vanished, leaving `(wrong-type-argument fixnump)` with no
+  offender. `ElispHost::signal_wrong_type` now carries the object.
 - **`string-to-syntax` dropped the `c` flag, mis-handled `@`, and consed.**
   `Fstring_to_syntax` accepts eight flag characters; `c` (bit 23, the third
   comment style) was the one missing, so `(string-to-syntax ". c")` answered

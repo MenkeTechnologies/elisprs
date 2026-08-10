@@ -52,12 +52,19 @@
 
 (ert-deftest secure-hash-start-end-region ()
   "START/END select a char sub-range before hashing, like the oracle."
-  ;; (secure-hash 'sha256 \"aabcd\" 1 4) hashes \"abc\".
+  ;; (secure-hash 'sha256 \"aabcd\" 1 4) hashes \"abc\" -- pinned to the FIPS-180
+  ;; sha256(\"abc\") digest rather than to another call of the function under
+  ;; test, which a `secure-hash' that ignored its STRING entirely would satisfy.
+  ;; sha256 is the one algorithm this file otherwise never pins to a literal.
+  (should (equal (secure-hash 'sha256 "abc")
+                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"))
   (should (equal (secure-hash 'sha256 "aabcd" 1 4)
-                 (secure-hash 'sha256 "abc")))
+                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"))
   ;; sha512 honors the same START/END path.
   (should (equal (secure-hash 'sha512 "zzabc" 2)
-                 (secure-hash 'sha512 "abc"))))
+                 (concat "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea2"
+                         "0a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd"
+                         "454d4423643ce80e2a9ac94fa54ca49f"))))
 
 (ert-deftest secure-hash-binary-form ()
   "Non-nil BINARY returns raw digest bytes, whose length is the byte count."

@@ -138,6 +138,9 @@ fn load_prelude() {
         return;
     }
     host::set_prelude_loaded(true);
+    // The prelude models Emacs's *preloaded* Lisp, which a real Emacs ships
+    // byte-compiled. See `compiler::OPEN_CODED`.
+    host::set_prelude_compiling(true);
     // The nadvice segment is loaded after the core PRELUDE because it depends on
     // oclosure/gv/cl-lib defined there (and is kept separate — see prelude::NADVICE).
     for src in [prelude::PRELUDE, prelude::NADVICE] {
@@ -156,6 +159,7 @@ fn load_prelude() {
             }
         }
     }
+    host::set_prelude_compiling(false);
 }
 
 /// Render a value (prin1 style when `readable`).

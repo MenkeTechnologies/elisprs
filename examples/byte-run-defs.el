@@ -39,7 +39,8 @@
   ;; emacs -Q: (get 'brd-oldv 'byte-obsolete-variable) => (brd-newv set "30.1")
   (should (equal '(brd-newv set "30.1") (get 'brd-oldv 'byte-obsolete-variable)))
   ;; A quote-mark slip (nil/t as name) is an error, not a silent no-op.
-  (should-error (make-obsolete nil 'x "30.1")))
+  (should (equal (should-error (make-obsolete nil 'x "30.1"))
+                 '(error "Can’t make ‘nil’ obsolete; did you forget a quote mark?"))))
 
 ;; ---- define-obsolete-function-alias (byte-run.el): defalias + make-obsolete ----
 (ert-deftest byte-run-define-obsolete-function-alias ()
@@ -121,8 +122,15 @@
   (def-edebug-elem-spec 'brd-spec '(sexp form))
   (should (equal '(sexp form) (get 'brd-spec 'edebug-elem-spec)))
   ;; A `&'/`:'-prefixed name is rejected; a non-list spec is rejected.
-  (should-error (def-edebug-elem-spec '&bad '(x)))
-  (should-error (def-edebug-elem-spec 'brd-notalist 'x)))
+  ;; Two distinct rejections. An untyped `should-error' accepted them collapsing
+  ;; into one diagnostic, and accepted a `wrong-type-argument' leaking out of an
+  ;; internal `car'. Both strings are Emacs 30.2's; the quotes around & and :
+  ;; really are U+2019 on BOTH sides, because `format-message' maps each source
+  ;; apostrophe to a right quote.
+  (should (equal (should-error (def-edebug-elem-spec '&bad '(x)))
+                 '(error "Edebug spec name cannot start with ’&’ or ’:’")))
+  (should (equal (should-error (def-edebug-elem-spec 'brd-notalist 'x))
+                 '(error "Edebug spec has to be a list: x"))))
 
 ;; ---- setf: macro-defined places expand and retry (gv.el:103) ----
 ;; (cl--generic name) style: a macro place expanding to (get name 'slot).

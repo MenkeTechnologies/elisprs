@@ -118,8 +118,11 @@ fn catch_all_pattern_fires_for_any_call() {
              (itwo)
              iall)"#,
     );
-    // Both user calls matched "all". (Advice-body calls are guarded off.)
-    assert!(out.parse::<i64>().unwrap() >= 2, "got {out}");
+    // Both user calls matched "all" and *only* those two: the advice body's own
+    // `setq`/`1+` calls are guarded off. `>= 2` asserted only half of that — an
+    // `intercept_active` guard that regressed and let the body's calls match too
+    // would push the counter to 4 or 8 and still pass.
+    assert_eq!(out, "2", "catch-all must fire once per user call, no more");
 }
 
 #[test]

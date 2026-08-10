@@ -116,13 +116,32 @@ fn check_array_len(n: i64) -> Result<usize, String> {
 /// Character-code accessor: a valid character is an integer in [0, #x3FFFFF];
 /// anything else signals `wrong-type-argument characterp VALUE` (a negative code
 /// or one past the upper bound, as `char-to-string`/`make-string` do).
-fn as_char(h: &ElispHost, v: &Value) -> Result<u32, String> {
+/// `CHECK_FIXNUM` under a caller-chosen predicate name: a float, a bignum, a
+/// marker and a string are all rejected. `forward-char`/`backward-char` name
+/// `fixnump`, where the shared `as_int` accessor would have said `integerp`.
+fn as_fixnum_named(h: &mut ElispHost, v: &Value, pred: &str) -> Result<i64, String> {
+    match v {
+        Value::Int(n) => Ok(*n),
+        _ => Err(h.signal_wrong_type(pred, v)),
+    }
+}
+
+/// `CHECK_FIXNUM_COERCE_MARKER` under a caller-chosen predicate name: a fixnum
+/// or a marker (which contributes its position), never a float or a bignum.
+fn as_int_or_marker(h: &mut ElispHost, v: &Value, pred: &str) -> Result<i64, String> {
+    match v {
+        Value::Int(n) => Ok(*n),
+        _ => match h.marker_position(v) {
+            Some(p) => Ok(p as i64),
+            None => Err(h.signal_wrong_type(pred, v)),
+        },
+    }
+}
+
+fn as_char(h: &mut ElispHost, v: &Value) -> Result<u32, String> {
     match v {
         Value::Int(n) if (0..=0x3F_FFFF).contains(n) => Ok(*n as u32),
-        _ => Err(format!(
-            "wrong-type-argument: characterp {}",
-            h.print(v, true)
-        )),
+        _ => Err(h.signal_wrong_type("characterp", v)),
     }
 }
 
@@ -518,7 +537,10 @@ fn setcar(h: &mut ElispHost, a: &[Value]) -> R {
             return Ok(a[1].clone());
         }
     }
-    Err("wrong-type-argument: consp".to_string())
+    Err(format!(
+        "wrong-type-argument: consp {}",
+        h.print(&a[0], true)
+    ))
 }
 fn setcdr(h: &mut ElispHost, a: &[Value]) -> R {
     if let Value::Obj(id) = &a[0] {
@@ -527,7 +549,10 @@ fn setcdr(h: &mut ElispHost, a: &[Value]) -> R {
             return Ok(a[1].clone());
         }
     }
-    Err("wrong-type-argument: consp".to_string())
+    Err(format!(
+        "wrong-type-argument: consp {}",
+        h.print(&a[0], true)
+    ))
 }
 fn list_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.list_from(a.to_vec()))
@@ -1394,7 +1419,9 @@ fn char_table_range(h: &mut ElispHost, a: &[Value]) -> R {
             Some(Obj::CharTable(t)) => Ok(t.default.clone()),
             _ => unreachable!(),
         },
-        Value::Bool(true) => Err("Invalid RANGE argument to 'char-table-range'".to_string()),
+        Value::Bool(true) => {
+            Err("Invalid RANGE argument to \u{2018}char-table-range\u{2019}".to_string())
+        }
         Value::Int(_) => {
             let c = as_char(h, &a[1])?;
             Ok(h.char_table_ref(&a[0], c))
@@ -1406,7 +1433,7 @@ fn char_table_range(h: &mut ElispHost, a: &[Value]) -> R {
                 let c = as_char(h, &from)?;
                 Ok(h.char_table_ref(&a[0], c))
             } else {
-                Err("Invalid RANGE argument to 'char-table-range'".to_string())
+                Err("Invalid RANGE argument to \u{2018}char-table-range\u{2019}".to_string())
             }
         }
     }
@@ -1439,7 +1466,12 @@ fn set_char_table_range(h: &mut ElispHost, a: &[Value]) -> R {
         _ => {
             let (from, to) = match h.obj(&a[1]) {
                 Some(Obj::Cons(f, t)) => (f.clone(), t.clone()),
-                _ => return Err("Invalid RANGE argument to 'set-char-table-range'".to_string()),
+                _ => {
+                    return Err(
+                        "Invalid RANGE argument to \u{2018}set-char-table-range\u{2019}"
+                            .to_string(),
+                    )
+                }
             };
             let from = as_char(h, &from)?;
             let to = as_char(h, &to)?;
@@ -1527,7 +1559,9 @@ fn obarrayp_fn(h: &mut ElispHost, a: &[Value]) -> R {
 fn unintern_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let name = match &a[0] {
         Value::Str(s) => s.to_string(),
-        _ => h.sym_name(&a[0]).ok_or("wrong-type-argument: stringp")?,
+        _ => h
+            .sym_name(&a[0])
+            .ok_or_else(|| format!("wrong-type-argument: stringp {}", h.print(&a[0], true)))?,
     };
     let removed = match obarray_arg(h, a.get(1))? {
         None => h.obarray_unintern_global(&name),
@@ -2185,9 +2219,10 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>
             }
             prec = Some(p);
         }
+        // A `%` with no conversion character after it is an error, not a literal
+        // `%`: `(format "abc%")` signals in Emacs and answered "abc%" here.
         let Some(conv) = chars.next() else {
-            out.push('%');
-            break;
+            return Err("Format string ends in middle of format specifier".to_string());
         };
         let mut spec = FmtSpec {
             left,
@@ -2486,7 +2521,10 @@ fn make_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
 fn ht_view(h: &ElispHost, v: &Value) -> Result<(u8, Vec<(Value, Value)>), String> {
     match h.obj(v) {
         Some(Obj::HashTable { test, entries }) => Ok((*test, entries.clone())),
-        _ => Err("wrong-type-argument: hash-table-p".to_string()),
+        _ => Err(format!(
+            "wrong-type-argument: hash-table-p {}",
+            h.print(v, true)
+        )),
     }
 }
 fn gethash(h: &mut ElispHost, a: &[Value]) -> R {
@@ -3797,12 +3835,22 @@ fn ftruncate_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// float when a `.` or exponent is present. Non-numeric input yields 0.
 fn string_to_number(h: &mut ElispHost, a: &[Value]) -> R {
     let raw = as_string(h, &a[0])?;
-    let s = raw.trim_start();
+    // Emacs skips exactly SPC and TAB, never the rest of the ASCII whitespace
+    // set and never Unicode spaces: `(string-to-number "\n12")` is 0, as are the
+    // `\r` `\f` `\v` U+00A0 and U+3000 forms. `trim_start` skipped all of them.
+    let s = raw.trim_start_matches([' ', '\t']);
     if let Some(bv) = a.get(1) {
         // Base 10 (and nil) use the float-capable default parser below; only a
         // non-decimal base forces integer-only parsing.
         if !is_nil(bv) {
-            let base_i = as_int(h, bv)?;
+            // BASE is CHECK_FIXNUM: a float, a bignum, a marker and `t` are all
+            // `fixnump`, and that check precedes the 2..=16 range check.
+            let base_i = match bv {
+                Value::Int(n) => *n,
+                v => {
+                    return Err(format!("wrong-type-argument: fixnump {}", h.print(v, true)));
+                }
+            };
             // Emacs restricts BASE to 2..16 and signals args-out-of-range
             // otherwise (checked before the base==10 fast path).
             if !(2..=16).contains(&base_i) {
@@ -4093,7 +4141,7 @@ fn closurep_fn(h: &mut ElispHost, a: &[Value]) -> R {
 fn oclosure_fix_type(h: &mut ElispHost, a: &[Value]) -> R {
     let closure = a[3].clone();
     if !h.is_closure(&closure) {
-        return Err("Wrong type argument: closurep".to_string());
+        return Err("cl-assertion-failed: (closurep oclosure)".to_string());
     }
     let ty = h
         .as_sym_handle(&a[0])
@@ -4125,7 +4173,7 @@ fn oclosure_type_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// mutable env cell; mutability is enforced by the class in `oclosure--set-slot-value`).
 fn oclosure_get_fn(h: &mut ElispHost, a: &[Value]) -> R {
     if !h.is_closure(&a[0]) {
-        return Err("Wrong type argument: closurep".to_string());
+        return Err("cl-assertion-failed: (closurep oclosure)".to_string());
     }
     let idx = as_int(h, &a[1])? as usize;
     h.oclosure_get(&a[0], idx)
@@ -4135,7 +4183,7 @@ fn oclosure_get_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(oclosure--set V OCLOSURE INDEX)` — set slot INDEX to V; returns V.
 fn oclosure_set_fn(h: &mut ElispHost, a: &[Value]) -> R {
     if !h.is_closure(&a[1]) {
-        return Err("Wrong type argument: closurep".to_string());
+        return Err("cl-assertion-failed: (closurep oclosure)".to_string());
     }
     let idx = as_int(h, &a[2])? as usize;
     if h.oclosure_set(&a[1], idx, &a[0]) {
@@ -4150,7 +4198,7 @@ fn oclosure_set_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// wrapping) is irrelevant to elisprs's env-cell slots and ignored.
 fn oclosure_copy_fn(h: &mut ElispHost, a: &[Value]) -> R {
     if !h.is_closure(&a[0]) {
-        return Err("Wrong type argument: closurep".to_string());
+        return Err("cl-assertion-failed: (closurep oclosure)".to_string());
     }
     let args: Vec<Value> = a[2..].to_vec();
     h.oclosure_copy(&a[0], &args)
@@ -4185,7 +4233,9 @@ fn char_width_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Int(char_display_width(c) as i64))
 }
 fn char_equal(h: &mut ElispHost, a: &[Value]) -> R {
-    let (c1, c2) = (as_int(h, &a[0])?, as_int(h, &a[1])?);
+    // `CHECK_CHARACTER`, not `CHECK_FIXNUM`: a float, a negative code, a code
+    // past MAX_CHAR and a marker are all `(wrong-type-argument characterp X)`.
+    let (c1, c2) = (as_char(h, &a[0])? as i64, as_char(h, &a[1])? as i64);
     if c1 == c2 {
         return Ok(Value::Bool(true));
     }
@@ -6014,10 +6064,20 @@ fn get_buffer(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn get_buffer_create(h: &mut ElispHost, a: &[Value]) -> R {
     let name = as_string(h, &a[0])?;
+    check_buffer_name(&name)?;
     Ok(h.get_buffer_create(&name))
+}
+/// buffer.c refuses the empty name outright rather than making an unnameable
+/// buffer, in `get-buffer-create` and in `generate-new-buffer-name` alike.
+fn check_buffer_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("error: Empty string for buffer name is not allowed".to_string());
+    }
+    Ok(())
 }
 fn generate_new_buffer(h: &mut ElispHost, a: &[Value]) -> R {
     let base = as_string(h, &a[0])?;
+    check_buffer_name(&base)?;
     let name = h.generate_new_buffer_name(&base, None);
     // generate-new-buffer always makes a fresh buffer (the unique name is free).
     Ok(h.get_buffer_create(&name))
@@ -6165,7 +6225,7 @@ fn buffer_local_value_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let idx = match a.get(1) {
         Some(v) if !is_nil(v) => h
             .resolve_buffer(v)
-            .ok_or("error: Wrong type argument: bufferp")?,
+            .ok_or_else(|| format!("wrong-type-argument: bufferp {}", h.print(v, true)))?,
         _ => h.current,
     };
     h.buffer_local_or_default(&a[0], idx)
@@ -6264,12 +6324,13 @@ fn point_max(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(Value::Int(h.cur_buf().zv as i64))
 }
 fn goto_char(h: &mut ElispHost, a: &[Value]) -> R {
-    let arg = as_int(h, &a[0])?;
+    let arg = as_int_or_marker(h, &a[0], "integer-or-marker-p")?;
     let buf = h.cur_buf();
     // Point is clamped to the accessible region, but `goto-char` returns its
-    // POSITION argument unchanged (verified against the binary).
+    // POSITION argument unchanged — the marker object itself when it was given
+    // one, not the position that marker held.
     buf.point = arg.clamp(buf.begv as i64, buf.zv as i64) as usize;
-    Ok(Value::Int(arg))
+    Ok(a[0].clone())
 }
 fn erase_buffer(h: &mut ElispHost, _a: &[Value]) -> R {
     // Delete the whole buffer (ignoring narrowing) and remove the restriction.
@@ -6297,14 +6358,31 @@ fn char_after(h: &mut ElispHost, a: &[Value]) -> R {
 /// the accessible-region-clamped `[lo, hi)` character range as a fresh string;
 /// when `with_props`, the source characters' text properties are copied onto the
 /// returned string (registered in the string-property side table).
+/// `args_out_of_range_3 (Fcurrent_buffer (), START, END)` — the buffer *object*
+/// leads the DATA, so the object is attached rather than rendered and re-read
+/// (`#<buffer zb>` has no read syntax).
+fn args_out_of_range_in_buffer(h: &mut ElispHost, start: i64, end: i64) -> String {
+    let buf = h.current_buffer();
+    let sym = h.intern("args-out-of-range");
+    let data = h.list_from(vec![buf.clone(), Value::Int(start), Value::Int(end)]);
+    let obj = h.cons(sym, data);
+    let msg = format!("args-out-of-range: {} {start} {end}", h.print(&buf, true));
+    h.set_pending_error(&msg, obj);
+    msg
+}
+
 fn buffer_substring_core(h: &mut ElispHost, a: &[Value], with_props: bool) -> R {
-    let s0 = as_int(h, &a[0])?;
-    let e0 = as_int(h, &a[1])?;
+    let s0 = as_int_or_marker(h, &a[0], "integer-or-marker-p")?;
+    let e0 = as_int_or_marker(h, &a[1], "integer-or-marker-p")?;
     let buf = h.cur_buf_ref();
     let (lo0, hi0) = (buf.begv as i64, buf.zv as i64);
-    let s = s0.clamp(lo0, hi0);
-    let e = e0.clamp(lo0, hi0);
-    let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+    // `validate_region`: swap first, then reject anything outside the accessible
+    // portion. Clamping instead silently answered the whole buffer for
+    // `(buffer-substring 1 999)`, where Emacs signals.
+    let (lo, hi) = if s0 <= e0 { (s0, e0) } else { (e0, s0) };
+    if lo < lo0 || hi > hi0 {
+        return Err(args_out_of_range_in_buffer(h, s0, e0));
+    }
     let text: String = buf.text[(lo - 1) as usize..(hi - 1) as usize]
         .iter()
         .collect();
@@ -6646,14 +6724,14 @@ fn move_point_by(h: &mut ElispHost, delta: i64) -> R {
 }
 fn forward_char(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(h, v)?,
+        Some(v) if !is_nil(v) => as_fixnum_named(h, v, "fixnump")?,
         _ => 1,
     };
     move_point_by(h, n)
 }
 fn backward_char(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(h, v)?,
+        Some(v) if !is_nil(v) => as_fixnum_named(h, v, "fixnump")?,
         _ => 1,
     };
     move_point_by(h, -n)
@@ -6920,6 +6998,19 @@ fn expand_repl(newtext: &str, gt: &dyn Fn(usize) -> String) -> Result<String, St
 /// replaced; otherwise edits the current buffer and leaves point after the
 /// replacement. Expands `\&`/`\N`/`\\` unless LITERAL, adapts case unless
 /// FIXEDCASE.
+/// search.c's `(error "replace-match subexpression does not exist" SUBEXP)`.
+/// Two DATA elements, so the render-and-re-read path every other error helper
+/// uses cannot express it — the object is attached directly.
+fn no_such_subexp(h: &mut ElispHost, subexp: usize) -> String {
+    let sym = h.intern("error");
+    let text = Value::str("replace-match subexpression does not exist");
+    let data = h.list_from(vec![text, Value::Int(subexp as i64)]);
+    let obj = h.cons(sym, data);
+    let msg = format!("error: replace-match subexpression does not exist: {subexp}");
+    h.set_pending_error(&msg, obj);
+    msg
+}
+
 fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
     let newtext = as_string(h, &a[0])?;
     let fixedcase = !matches!(
@@ -6944,16 +7035,22 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
     // STRING mode: spans are 0-based char indices into STRING; return a new string.
     if let Some(Value::Str(s)) = a.get(3) {
         let subject: Vec<char> = s.chars().collect();
-        let (b, e) = spans
-            .get(subexp)
-            .copied()
-            .flatten()
-            .ok_or("args-out-of-range: no such subexpression".to_string())?;
+        let Some((b, e)) = spans.get(subexp).copied().flatten() else {
+            return Err(no_such_subexp(h, subexp));
+        };
+        // `Freplace_match` bounds-checks the span against STRING before touching
+        // it: match data is global and outlives the string it was set from, so
+        // the span routinely points past a *different* string. Indexing without
+        // this check panicked the interpreter thread.
+        if e > subject.len() || b > e {
+            return Err(format!("args-out-of-range: {b} {e}"));
+        }
         let gt = |n: usize| -> String {
             spans
                 .get(n)
                 .copied()
                 .flatten()
+                .filter(|(gb, ge)| *ge <= subject.len() && gb <= ge)
                 .map(|(gb, ge)| subject[gb..ge].iter().collect::<String>())
                 .unwrap_or_default()
         };
@@ -6974,16 +7071,22 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
         return Ok(Value::str(out));
     }
     let text: Vec<char> = h.cur_buf().text.clone();
-    let (b, e) = spans
-        .get(subexp)
-        .copied()
-        .flatten()
-        .ok_or("args-out-of-range: no such subexpression".to_string())?;
+    let (begv, zv) = (h.cur_buf().begv, h.cur_buf().zv);
+    let Some((b, e)) = spans.get(subexp).copied().flatten() else {
+        return Err(no_such_subexp(h, subexp));
+    };
+    // `! (BEGV <= sub_start && sub_end <= ZV)` => args_out_of_range, exactly as
+    // search.c does. The global match data survives the buffer it was set in, so
+    // without the check a stale span indexed past the buffer text and panicked.
+    if b < begv || e > zv || b > e {
+        return Err(format!("args-out-of-range: {b} {e}"));
+    }
     let gt = |n: usize| -> String {
         spans
             .get(n)
             .copied()
             .flatten()
+            .filter(|(gb, ge)| *gb >= begv && *ge <= zv && gb <= ge)
             .map(|(gb, ge)| text[(gb - 1)..(ge - 1)].iter().collect::<String>())
             .unwrap_or_default()
     };

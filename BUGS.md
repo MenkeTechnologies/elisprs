@@ -3423,6 +3423,239 @@ registers but this tree does not takes the unknown-charset path, so
 nil. The adjacent phrase "exactly as Emacs does for an unknown charset" is true
 only for genuinely unknown names.
 
+## Round 19 — what the frontend hardcodes about Emacs
+
+Reference: **GNU Emacs 30.2** (`/opt/homebrew/bin/emacs`, `emacs --version` →
+`GNU Emacs 30.2`). Entry points measured: `emacs -Q --batch --eval '(prin1 FORM)'`
+against `elisp -e 'FORM'`, and `emacs -Q --batch -l FILE` against `elisp FILE`
+for the ERT examples. Emacs's own Lisp sources are on disk at
+`/opt/homebrew/Cellar/emacs/30.2_2/share/emacs/30.2/lisp/` (1,622 `*.el.gz`); the
+C sources are not, so C-level literals were checked against
+`strings -a -n 6 /opt/homebrew/Cellar/emacs/30.2_2/bin/emacs-30.2` (4,856
+strings) and `etc/DOC`.
+
+### R19-A. Advising a Rust subr corrupted it process-wide — ✅ FIXED
+
+Round 18's worst open item, and the root cause is not in `nadvice.el` at all.
+`(advice-add 'car :filter-return #'1+)` did not merely fail; it left `car`
+broken for the rest of the process, and `(symbol-function 'car)` raised the same
+error:
+
+```text
+error: wrong-type-argument: number-or-marker-p #[nil ((get v 'defalias-fset-function))
+       ((v . car) (nf . #<subr car>) (f . #<subr car>) … (function . 1+))]
+```
+
+That closure is the `gv-ref` *getter* for the `(get symbol 'defalias-fset-function)`
+place. `advice-add` advises the symbol's function cell first and only then calls
+`(add-function :around (get symbol 'defalias-fset-function) …)`; `gv-deref` is
+`(funcall (car ref))`, so by that point `car` was the advised `car` and the
+getter closure went to `1+`.
+
+**Emacs does not have this problem because its preloaded Lisp is byte-compiled**,
+and the byte compiler turns a call to one of ~80 primitives into an opcode that
+calls the C function directly and never consults the function cell. elisprs's
+prelude is the same layer of Lisp and had been lowered as ordinary symbol calls.
+
+The open-code set was measured rather than guessed — `bytecode.c`'s opcode table
+is not in the installed tree, and disassembling is ambiguous (the compiler also
+*source*-inlines `error`, `add-to-list`, `eql`, …). The probe asks the question
+that actually matters: byte-compile `(lambda (a…) (NAME a…))`, `advice-add` NAME
+with an `:around` that sets a flag, call it, read the flag.
+
+| verdict | count | examples |
+| --- | --- | --- |
+| advice does NOT fire from byte-compiled code | 82 | `car` `cdr` `nth` `memq` `aref` `length` `+` `=` `list` `concat` `substring` `funcall` `insert` `goto-char` `point` `upcase` `string=` … |
+| advice DOES fire | 30 | `assoc` `eql` `safe-length` `symbol-function` `set` `append` `vectorp` `functionp` `boundp` `put` `format` `message` `intern` `vector` `signal` `error` `mapcar` `beginning-of-line` … |
+
+`compiler::OPEN_CODED` is exactly the first list. It applies **only while the
+prelude is being lowered** (`host::prelude_compiling`), because a user's
+*interpreted* `defun` in Emacs does honour advice on `car` — measured:
+`(progn (defun my-g (x) (car x)) (advice-add 'car :filter-return #'1+) (my-g '(1 2)))`
+is `2` in both engines now. Where the name is open-coded the compiler loads the
+subr *value* as the call's operator instead of the symbol, which is what the
+opcode does.
+
+```text
+(advice-add 'car :filter-return #'1+) then (car '(1 2))        emacs 2        elisp 2
+… (list (car '(1 2)) (cdr '(1 2)) (nth 0 '(5 6)) (assq 'a …))  emacs (2 (2) 5 (a . 1))  elisp same
+(advice-add 'length :filter-return #'1+) (length "abc")        emacs 4        elisp 4
+(advice-remove 'car #'1+) (car '(1 2))                         emacs 1        elisp 1
+(advice-add 'message :filter-return #'upcase) (message "hi")   emacs "HI"     elisp "HI"
+```
+
+Cold/warm regression (`~/.elisprs/scripts.rkyv` removed, then two more runs):
+identical on all three, and `char-syntax`/`buffer-name` still answer 95 and
+`*scratch*` on both paths.
+
+### R19-B. Hardcoded-reference-string audit
+
+776 candidate literals extracted from `src/` (373 Rust message literals, 111
+`prelude.rs` `error`/`user-error` strings, 42 `define-error` messages, 250
+prelude docstring first lines); **751 checked** against the Lisp corpus, the
+binary's string table or `etc/DOC`, of which **131 were additionally executed
+side by side**. **40 sites / 30 distinct texts were wrong.** Every one was
+re-measured independently before being touched; **35 of 35 re-measurements
+reproduced**. Fixed this round:
+
+| what | was | Emacs 30.2 |
+| --- | --- | --- |
+| `oclosure--get`/`--set`/`--copy`/`--fix-type` (4 sites) | `(Wrong\ type\ argument "closurep")` | `(cl-assertion-failed (closurep oclosure))` |
+| `read "("` / `"[1"` / `"\"ab"` / `"?"` (11 sites) | `(error "unclosed list")` … | `(end-of-file)` |
+| `read ")"` / `"]"` | `(error "unexpected )")` | `(invalid-read-syntax ")")` |
+| `read "#z"` / `"#"` / `"(#)"` | the *symbol* `\#z` | `(invalid-read-syntax "#z")` |
+| `read "#&3"` | `(error "expected packed string …")` | `(invalid-read-syntax "#&")` |
+| `read "##"` | symbol named `##` | the interned empty-name symbol |
+| `read "#:foo"` | symbol named `#:foo` | an *uninterned* symbol named `foo` |
+| `setf 5` / `cl-incf 5` (3 sites, two disagreeing texts) | `(error "setf: unsupported place: %S")` / `(error "setf: unsupported place %S")` | `(gv-invalid-place 5)` |
+| `define-error 'cyclic-variable-indirection` | `"Cyclic variable indirection"` | `"Symbol's chain of variable indirections contains a loop"` |
+| `(defvaralias 'q1 'q1)` data | `(cyclic-variable-indirection "q1")` | `(cyclic-variable-indirection q1)` |
+| `char-table-range` / `set-char-table-range` (3 sites) | `'char-table-range'` | `‘char-table-range’` |
+| `setcar` `setcdr` `unintern` `gethash`/`puthash`/`remhash` `buffer-local-value` | `(wrong-type-argument consp)` — no offender | `(wrong-type-argument consp 5)` |
+| `goto-char` | `integerp` | `integer-or-marker-p`, and it returns POSITION *as given* (a marker stays the marker) |
+| `forward-char` / `backward-char` | `integerp`, and a float/marker was silently accepted | `fixnump` |
+| `char-equal` | `integerp`, and `1.5`/`-1`/`#x400000`/a marker were accepted | `characterp` |
+| `make-char-table` with a bad `char-table-extra-slots` | `(error "Invalid number of extra slots")` — absent from every Emacs corpus | `(args-out-of-range 99 nil)` |
+| `pcase-exhaustive` | `No clause matching 5` | `No clause matching ‘5’` |
+| `map-put!` on a growing alist | `(error "Cannot modify map in-place: …")` | `(map-not-inplace ((1 . 2)))` |
+| `rx` (5 texts) | `rx: unknown form %S` … | `Unknown rx form ‘zzz’`, `Unknown rx symbol ‘zzz’`, `Unknown rx syntax name ‘zzz’`, `Bad rx expression: %S`, `Bad rx operator ‘97’`, `Illegal argument to rx ‘not’: %S` |
+| `(rx-to-string '(not 5))` | signalled | `"[^\5]"` — `(not CHAR)` is legal |
+| `fset` on a non-symbol | `(fset "not a symbol")` | `(wrong-type-argument symbolp 5)` |
+| `(get-buffer-create "")` / `(generate-new-buffer "")` | made a buffer named `""` | `(error "Empty string for buffer name is not allowed")` |
+| `(format "%")` / `(format "abc%")` | returned `"%"` / `"abc%"` | `(error "Format string ends in middle of format specifier")` |
+| `(buffer-substring 1 999)` | clamped, answered the whole buffer | `(args-out-of-range #<buffer zb> 1 999)` |
+| `(replace-match "x")` with stale match data | **panicked the interpreter thread** (`range start index 8 out of range for slice of length 3`) | `(args-out-of-range …)` |
+| `(replace-match "X" nil nil "abc" 5)` | `(args-out-of-range no such subexpression)` | `(error "replace-match subexpression does not exist" 5)` |
+
+Two structural repairs came out of it. `make_error_object` now re-reads DATA as
+values for `cl-assertion-failed` and `cyclic-variable-indirection` as well; and
+`ElispHost::signal_wrong_type` carries the offending value as an **object**
+rather than rendering it into the message — a marker, buffer or closure prints
+as `#<…>` / `#[…]`, which the reader rejects, so the datum used to be dropped
+entirely and the condition came back as `(wrong-type-argument fixnump)` with no
+offender.
+
+The round's named defect shape — an older wording frozen in source while a
+sibling path emits the current one — appears three times: the four
+`Wrong type argument: closurep` sites next to ~40 correct
+`wrong-type-argument: PRED VALUE` sentinels; `reader.rs:210`/`:215` emitting
+`invalid-read-syntax:` while nine sibling branches emitted lowercase prose; and
+the two `setf` paths that disagreed *with each other* over a colon while
+`gv-get` three thousand lines away already signalled `gv-invalid-place`.
+
+**Verified correct, against expectation:** 41 of 42 `define-error` messages; 83
+of 111 prelude `error` strings appear verbatim in Emacs 30.2's own sources; every
+printed form (`#<subr car>`, `#[(x) (x) (t)]`, `#s(hash-table)`, `##`,
+`#<marker in no buffer>`, `#&3""`); and
+`"Memory exhausted--use C-x s then exit and restart Emacs"`, which *looks* like
+frozen pre-substitution text (the binary only contains the `M-x
+save-some-buffers` template) but is what `substitute-command-keys` produces at
+run time.
+
+### R19-C. Name-lookalike mapping sweep
+
+| family | probes | disagreed | note |
+| --- | --- | --- | --- |
+| `/` `%` `mod` on negatives, floats, zero divisors, bignums, `most-negative-fixnum` | 50 | 0 | `%` truncates, `mod` floors — both confirmed, including `(mod -7 2)`=1 / `(% -7 2)`=-1 and the bignum and infinity cases |
+| `round`/`truncate`/`floor`/`ceiling`, with and without a divisor, plus `fround`&co | 58 | 0 | half-to-even confirmed at `.5` for both signs and through a divisor |
+| `abs` at `most-negative-fixnum`, `-0.0`, NaN, bignum; `max`/`min` on NaN and mixed int/float | 39 | 0 | `(abs most-negative-fixnum)` promotes to a bignum in both |
+| `string-lessp` / `string>` / `compare-strings` / `string-distance` / sorting, incl. non-ASCII and embedded NUL | 40 | 0 | |
+| `string-to-number` prefix parsing and BASE | 74 | 3 → 0 | see below |
+| float printing shortest-round-trip (hand-picked corners) | 30 | 0 | |
+| float printing, 4,000 random literals through `number-to-string` | 4,000 | 0 | seeded `srand(6)`, mantissa 1–17 digits, exponent −20…+20 |
+| `upcase`/`downcase` as **strings** over the BMP (1–0xD7FF) | 55,295 | 19 | |
+| `upcase`/`downcase` as **strings** over the SMP (0x10000–0x1FFFF) | 65,536 | 94 | |
+
+The `string-to-number` failures were real and are fixed:
+
+- **Leading whitespace.** Emacs skips exactly SPC and TAB. `trim_start` skipped
+  the whole Unicode set, so `(string-to-number "\n12")` answered 12 where Emacs
+  answers 0 — likewise `\r`, `\f`, `\v`, U+00A0 and U+3000.
+- **BASE is `CHECK_FIXNUM`.** `(string-to-number "1" 'a)` said `integerp`, not
+  `fixnump`; `(string-to-number "1" 2.0)` *truncated the float to base 2* and
+  answered 1; a bignum and a marker were likewise mis-typed.
+
+The case sweep confirms the string forms behave exactly like the character forms
+already recorded in R18-G: the diverging code points are **the same 19**, set
+for set (`comm -3` over the two sorted lists is empty), and they are the
+Unicode-table-lag set, not a lookalike. Notably absent from the diff are the
+full-case-mapping traps — `(upcase "ß")` is `(83 83)`, `(downcase "İ")` is
+`(105 775)`, `(upcase "ΐ")` is `(921 776 769)` — identical in both engines, so
+elisprs is not falling through to Rust's simple per-`char` mapping.
+
+### R19-D. ERT ran tests in definition order; Emacs runs them by name — ✅ FIXED
+
+Ten deliberately unsorted names:
+
+```text
+defined: q7 b2 z9 a1 m5 c3 y8 d4 x6 e0
+emacs:   a1 b2 c3 d4 e0 m5 q7 x6 y8 z9
+elisprs: q7 b2 z9 a1 m5 c3 y8 d4 x6 e0   (before)
+```
+
+This is not cosmetic: it let an example test depend on an earlier test's side
+effects and pass here while failing under `emacs -Q --batch -l`.
+`examples/script-demo.el`'s cleanup test was exactly that, and it is now
+self-sufficient.
+
+### R19-E. Assertions that could not fail
+
+Swept 45 `tests/*.rs` files (672 `#[test]` fns, 3,633 assertion macros, all 42
+bare `assert!`s read individually) and 71 `examples/*.el` (400 `ert-deftest`,
+1,470 `should` forms). Zero hits for `assert!(true)`, `is_ok() || is_err()`,
+`len() >= 0`, `assert_eq!(x, x)`, or a helper that swallows a failure — every
+shared helper panics. Nine assertions were strengthened; none deleted:
+
+| site | why it could not fail | now |
+| --- | --- | --- |
+| `examples/temporary-file-directory.el` | the whole body sat inside `(when tmp …)`; with `TMPDIR` unset — every container CI image — it ran **zero** `should` forms and reported PASS, so a hardcoded `"/tmp/"` was invisible | `skip-unless`, so the harness counts a skip, plus a `file-directory-p` assertion that runs on both branches |
+| `examples/script-demo.el:64` | `(should t)` after deleting two files: a `delete-file` that no-opped, or a wrong path so nothing was ever deleted, passed identically | asserts both files exist, deletes, asserts both are gone |
+| `examples/coding-systems.el` | expected value was `(aref (coding-system-eol-type cs) N)` — the very expression the implementation evaluates, so 369 assertions compared the code to itself | expectation spelled from `(coding-system-base cs)`, plus `(should (= checked 123))` so the `when` cannot become a never-taken branch |
+| `examples/secure-hash-algorithms.el` | `(secure-hash 'sha256 "aabcd" 1 4)` compared against `(secure-hash 'sha256 "abc")` — a `secure-hash` ignoring its STRING passed; sha256 was the one algorithm never pinned to a literal | both pinned to the FIPS-180 digest |
+| `examples/version-compare.el` | four untyped `should-error`s under a docstring naming a distinction they cannot observe | pinned to the four exact condition objects |
+| `examples/byte-run-defs.el` (2) | two *different* rejections both checked as "some error" | pinned to Emacs's exact strings |
+| `examples/prelude-audit.el` | untyped `should-error` on `(number-sequence 1 10 0)` | pinned to `"The increment can not be zero"` |
+| `examples/stdlib.el` | `(should (string= "ab" "ab"))` with no negative case: a `string=` returning t unconditionally passed | negatives added, plus the symbol-name case |
+| `tests/intercepts.rs:122` | `>= 2` on a counter whose whole point is that the guard stops over-firing; 4, 8, 40 all passed | `assert_eq!(out, "2")` |
+| `tests/dap_integration.rs` (3) | three "never stops" tests asserted only `terminated` + stdout; `run_to_end` *discards* a `stopped` event, so an adapter announcing a bogus stop was indistinguishable | a `stops_seen` counter on the session, asserted `== 0`, `== 1`, `== 2` |
+| `tests/ffi.rs` (2) | two of three FFI tests returned silently with no output, so a green run could not be told from a suite that never ran | a named skip that prints, and fails outright under `ELISPRS_REQUIRE_RUSTC=1` |
+
+### Still open after round 19, with the evidence
+
+- **`(match-data)` at startup differs.** Emacs answers `(0 3)`, elisprs `(9 10)`
+  — each an artifact of its own startup. It is observable through
+  `replace-match` with no intervening search: `(replace-match "x" nil nil "ab")`
+  is `(args-out-of-range 0 3)` there and `(args-out-of-range 9 10)` here (both
+  signal now; before this round elisprs panicked). Pinning Emacs's pair would be
+  freezing an artifact, so it is recorded instead.
+- **`(read "#[1 2]")`** is `(invalid-read-syntax "#[")` here and
+  `(invalid-read-syntax "Invalid byte-code object")` in Emacs: elisprs has no
+  reader for `#[…]` at all, even though it *prints* closures in that syntax.
+- **`(read "# ")`** loses the trailing space from the datum (`"#"` vs `"# "`) —
+  `make_error_object` trims the rendered message.
+- **`(car-safe)`** reports the prelude closure where Emacs reports
+  `#<subr car-safe>`; `car-safe` is Lisp here and C there.
+- **`(kbd "C-")`** is `[C-]` here, `"C-"` in Emacs.
+- **A macroexpansion-time signal escapes an enclosing `condition-case`.**
+  `(condition-case e (cl-incf 5) (error e))` catches `(gv-invalid-place 5)` in
+  Emacs; here the expansion runs before the handler is established and the error
+  reaches top level. The *condition* is right now; the timing is not.
+- **`ert` runs a test body in the current buffer; Emacs runs it in ` *temp*`.**
+  See the round-18 entry; still open, and see the verdict below.
+- **`condition-case` matches a handler symbol that carries no
+  `error-conditions`.** `(condition-case nil (signal 'my-err '(1 2)) (my-err
+  'caught) (t 'top))` is `top` in Emacs and `caught` here.
+- **`(pcase nil (nil 'n))`** answers `n` here; Emacs signals
+  `Unknown pattern ‘nil’`.
+- **`(regexp-opt '("a" "b"))`** is `"[ab]"` in Emacs and `"\\(?:a\\|b\\)"` here.
+- **`unibyte-string` is void.**
+- **`%x` / `%X` / `%Ec` / `%EX` / `%Ex` / `%Om` / `%Od`** in
+  `format-time-string`, and `locale-info`, `system-time-locale`,
+  `system-messages-locale`, `locale-coding-system` — see R18-E.
+- **61 prelude docstring first lines do not match Emacs's**, but nothing can
+  print them: `documentation`, `describe-function` and `documentation-property`
+  are all void here. Latent, not observable.
+
 ### Still open after round 18, with the evidence
 
 - **`ert` runs a test body in the current buffer; Emacs runs it in ` *temp*`.**
@@ -3441,14 +3674,9 @@ only for genuinely unknown names.
   for a before and an after. Landing it blind could break the example gate.
   `examples/char-syntax-tables.el` is the one example known to depend on it, and
   its pinned `95` is wrong in the same place: Emacs fails that test.
-- **Advising a Rust subr corrupts it.** `advice-add` on a prelude-defined
-  function works (all 18 pins in `tests/parity_nadvice.rs` advise a `defun` and
-  all 18 match Emacs). On a subr it does not:
-  `(progn (advice-add 'car :filter-return #'1+) (car '(1 2)))` is 2 in Emacs and
-  `(wrong-type-argument number-or-marker-p …)` here, and `car` stays broken for
-  the rest of the process. `README.md`, `CHANGELOG.md` and BUGS.md R5-U all say
-  the combinators are verified against 30.2; that is true only of the `defun`
-  case, which is the one every test exercises.
+- **Advising a Rust subr corrupts it.** Closed in round 19 — see R19-A. The
+  claim in `README.md`, `CHANGELOG.md` and R5-U that the combinators are
+  verified against 30.2 was true only of the `defun` case until then.
 - **`condition-case` matches a handler symbol that carries no
   `error-conditions`.** `(condition-case nil (signal 'my-err '(1 2)) (my-err
   'caught) (t 'top))` is `top` in Emacs — `my-err` has no condition list, so the
@@ -3462,7 +3690,6 @@ only for genuinely unknown names.
 - **`%x` / `%X` / `%Ec` / `%EX` / `%Ex` / `%Om` / `%Od`** in
   `format-time-string`, and `locale-info`, `system-time-locale`,
   `system-messages-locale`, `locale-coding-system` — see R18-E.
-- **README's subr count** is given as "~90" in one place and "~80" in another;
-  `grep -c 's("' src/builtins.rs` reports 351. All three are inconsistent, and
-  a count that has to be maintained by hand will go stale again — it should be
-  generated, not typed.
+- **README's subr count** was given as "~90" in one place and "~80" in another,
+  both stale. Round 19 removed both rather than typing a third: a hand-kept
+  count goes stale again, so README names the one-liner that computes it.

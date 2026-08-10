@@ -1512,7 +1512,16 @@ impl ElispHost {
         if matches!(self.constant_symbol_name(sym).as_deref(), Some("nil")) {
             return Err("setting-constant: nil".to_string());
         }
-        let id = self.sym_handle(sym).ok_or("fset: not a symbol")?;
+        let id = match self.sym_handle(sym) {
+            Some(id) => id,
+            // `CHECK_SYMBOL`, which names the offender.
+            None => {
+                return Err(format!(
+                    "wrong-type-argument: symbolp {}",
+                    self.print(sym, true)
+                ))
+            }
+        };
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.function = Some(def);
         }
@@ -2054,6 +2063,22 @@ impl ElispHost {
     /// True if `name`'s function cell still holds its original primitive subr
     /// (not redefined by the user). The compiler only lowers `+`/`<`/… to native
     /// fusevm ops when this holds, so a user `(defun + …)` keeps host semantics.
+    /// The subr in `name`'s function cell, or None when the cell holds anything
+    /// else (a closure, an advice oclosure, nothing). The compiler loads this
+    /// *value* — rather than the symbol — for the primitives Emacs's byte
+    /// compiler open-codes, so a call from the prelude reaches the primitive
+    /// even after `advice-add` has replaced the symbol's cell.
+    pub fn primitive_fn_value(&self, name: &str) -> Option<Value> {
+        let f = self
+            .obarray
+            .get(name)
+            .and_then(|&id| self.arena.get(id as usize))
+            .and_then(|o| match o {
+                Obj::Symbol(s) => s.function.clone(),
+                _ => None,
+            })?;
+        matches!(self.obj(&f), Some(Obj::Subr { .. })).then_some(f)
+    }
     pub fn is_primitive_fn(&self, name: &str) -> bool {
         self.obarray
             .get(name)
@@ -4142,6 +4167,23 @@ impl ElispHost {
         msg
     }
 
+    /// `(wrong-type-argument PRED VALUE)` with VALUE carried as the *object*.
+    ///
+    /// The usual path renders the value into the message and re-reads it, which
+    /// only works for values that have read syntax. A marker, a buffer or a
+    /// closure prints as `#<…>` / `#[…]`, which the reader rejects — so the datum
+    /// was silently dropped and the condition came back as `(wrong-type-argument
+    /// PRED)` with no offender at all.
+    pub fn signal_wrong_type(&mut self, pred: &str, value: &Value) -> String {
+        let msg = format!("wrong-type-argument: {pred} {}", self.print(value, true));
+        let sym = self.intern("wrong-type-argument");
+        let p = self.intern(pred);
+        let data = self.list_from(vec![p, value.clone()]);
+        let obj = self.cons(sym, data);
+        self.set_pending_error(&msg, obj);
+        msg
+    }
+
     /// Record the error object that belongs to `msg` (the string the failing call
     /// returns as its `Err`). See [`Self::take_pending_error`].
     pub fn set_pending_error(&mut self, msg: &str, obj: Value) {
@@ -4199,6 +4241,11 @@ impl ElispHost {
                 | "excessive-lisp-nesting"
                 // `(setting-constant SYM)` — the rejected symbol itself.
                 | "setting-constant"
+                // `(cl-assertion-failed (FORM ARGS…))` — the failed form, as a
+                // form, never its printed text.
+                | "cl-assertion-failed"
+                // `(cyclic-variable-indirection SYM)` — the symbol, not its name.
+                | "cyclic-variable-indirection"
         ) {
             if let Some(data) = self.read_all_forms(&msg) {
                 let s = self.intern(&sym);
@@ -4344,6 +4391,11 @@ fn print_symbol_readable(name: &str) -> String {
 thread_local! {
     static HOST: RefCell<ElispHost> = RefCell::new(ElispHost::new());
     static PRELUDE_LOADED: Cell<bool> = const { Cell::new(false) };
+    /// On only while the prelude source is being lowered. Emacs's preloaded Lisp
+    /// is byte-compiled, and the byte compiler turns a call to one of ~80
+    /// primitives into an opcode that never consults the symbol's function cell;
+    /// this flag is what tells the compiler it is lowering that same layer.
+    static PRELUDE_COMPILING: Cell<bool> = const { Cell::new(false) };
     /// DAP debug execution: when on, the compiler emits `DBG_LINE` statement
     /// markers and `run_chunk` skips the tracing JIT so every marker fires
     /// through the interpreter. Off = zero overhead (no markers emitted at all).
@@ -4368,12 +4420,19 @@ pub fn with_host<R>(f: impl FnOnce(&mut ElispHost) -> R) -> R {
 pub fn reset_host() {
     HOST.with(|h| *h.borrow_mut() = ElispHost::new());
     PRELUDE_LOADED.with(|c| c.set(false));
+    PRELUDE_COMPILING.with(|c| c.set(false));
 }
 pub fn prelude_loaded() -> bool {
     PRELUDE_LOADED.with(|c| c.get())
 }
 pub fn set_prelude_loaded(b: bool) {
     PRELUDE_LOADED.with(|c| c.set(b));
+}
+pub fn prelude_compiling() -> bool {
+    PRELUDE_COMPILING.with(|c| c.get())
+}
+pub fn set_prelude_compiling(b: bool) {
+    PRELUDE_COMPILING.with(|c| c.set(b));
 }
 
 /// Call a function designator with already-evaluated args. The single

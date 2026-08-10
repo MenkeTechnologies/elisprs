@@ -18,16 +18,24 @@
   (should (stringp temporary-file-directory))
   (should (> (length temporary-file-directory) 0))
   (should (string-suffix-p "/" temporary-file-directory))
-  (should (directory-name-p temporary-file-directory)))
+  (should (directory-name-p temporary-file-directory))
+  ;; Whichever branch of the C resolution order produced it, the result names a
+  ;; directory that exists. This is the only assertion here that still has teeth
+  ;; when TMPDIR is unset, which is the state of every container CI image.
+  (should (file-directory-p temporary-file-directory)))
 
 (ert-deftest temporary-file-directory-tracks-tmpdir ()
   ;; When TMPDIR is set (as it is under a normal login/test environment), the
   ;; value is exactly `file-name-as-directory' of TMPDIR -- the first branch of
-  ;; the C resolution order. Skipped only if the harness runs with TMPDIR unset.
-  (let ((tmp (getenv "TMPDIR")))
-    (when tmp
-      (should (string= temporary-file-directory
-                       (file-name-as-directory tmp))))))
+  ;; the C resolution order.
+  ;;
+  ;; `skip-unless', not `when': with the body wrapped in a `when' this test ran
+  ;; zero `should' forms under a TMPDIR-less environment and still reported PASS,
+  ;; so a `temporary-file-directory' hardcoded to "/tmp/" was indistinguishable
+  ;; from a correct one. A skip is at least counted as a skip.
+  (skip-unless (getenv "TMPDIR"))
+  (should (string= temporary-file-directory
+                   (file-name-as-directory (getenv "TMPDIR")))))
 
 (ert-deftest temporary-file-directory-is-absolute-or-dot ()
   ;; Either an absolute path, or "./" for the empty-TMPDIR edge case -- matching

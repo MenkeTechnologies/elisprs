@@ -99,7 +99,7 @@ elisp --version
 
 **Special forms (21).** `quote` `function` `lambda` `progn` `prog1` `if` `when` `unless` `cond` `and` `or` `while` `setq` `let` `let*` `defun` `defmacro` `defvar` `defconst` `condition-case` `unwind-protect`.
 
-**Subrs (~90).**
+**Subrs.** (The live count is whatever `elisp -e "(let ((n 0)) (mapatoms (lambda (s) (when (and (fboundp s) (subrp (symbol-function s))) (setq n (1+ n))))) n)"` reports; it moves every round, so it is not written down here.)
 
 | Group | Functions |
 |---|---|
@@ -212,7 +212,7 @@ The grid reflects the current state of the tree.
 | Lisp-2 obarray (value + function cells) | Working |
 | Dynamic binding (`let`/`let*`, special vars) | Working |
 | Special forms (21) + macros (`defmacro`) | Working |
-| Subr standard library (~80) | Working |
+| Subr standard library | Working |
 | Hash tables (`make-hash-table`/`gethash`/`puthash`/`maphash`) | Working |
 | Dotted pairs, backquote/unquote, `setcar`/`setcdr` | Working |
 | `elisp` CLI — file / `-e` / REPL | Working |
