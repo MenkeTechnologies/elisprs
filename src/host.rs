@@ -4382,7 +4382,18 @@ pub fn set_prelude_loaded(b: bool) {
 pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
     // Higher-order primitives are intercepted here so they don't run inside a
     // host borrow (which would deadlock the nested call).
-    if let Some(name) = with_host(|h| h.sym_name(f)) {
+    //
+    // The designator may be the *subr object* rather than the symbol — that is
+    // what `(funcall (symbol-function 'mapcar) …)` passes, and what any code
+    // that went through `indirect-function` first passes — so the name is read
+    // from either. A subr that is not in the match below falls through to the
+    // ordinary path exactly as before.
+    if let Some(name) = with_host(|h| {
+        h.sym_name(f).or_else(|| match h.obj(f) {
+            Some(Obj::Subr { name, .. }) => Some(name.clone()),
+            _ => None,
+        })
+    }) {
         match name.as_str() {
             "funcall" => {
                 // `(funcall)` with no function designator: Emacs signals

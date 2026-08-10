@@ -659,6 +659,109 @@ fn case_fold(h: &mut ElispHost, a: &[Value], upper: bool) -> R {
         )),
     }
 }
+/// `(--char-titlecase-- CHAR)` — the Unicode *title-case* mapping of CHAR, as a
+/// string, because it is one-to-many for some characters (ß → "Ss", ﬁ → "Fi")
+/// and differs from upper case for the digraphs (ǳ → ǲ, not Ǳ).
+///
+/// This is what `casefiddle.c` reaches for at a word start: `case_character_impl`
+/// consults `special-titlecase` first, then the `titlecase` char-table, and only
+/// then falls back to `upcase`. Not an Emacs function — `capitalize` and
+/// `upcase-initials` in the prelude are its only callers.
+fn char_titlecase(h: &mut ElispHost, a: &[Value]) -> R {
+    match &a[0] {
+        Value::Int(c) if (0..=0x3F_FFFF).contains(c) => match char::from_u32(*c as u32) {
+            Some(ch) => Ok(Value::str(titlecase_str(ch))),
+            // A code point with no scalar value (a surrogate) has no case.
+            None => Ok(Value::str(String::new())),
+        },
+        v => Err(format!(
+            "wrong-type-argument: characterp {}",
+            h.print(v, true)
+        )),
+    }
+}
+
+/// The Unicode title-case mapping of `ch`, as a string.
+///
+/// `char::to_titlecase` is unstable, so this derives the same answer from the
+/// stable uppercase mapping plus the two closed sets where title case is not
+/// "upper-case the first, lower-case the rest":
+///
+/// * the four Latin digraph triples, whose title form is the *middle* code
+///   point of the triple (ǳ/Ǳ title to ǲ, not to Ǳ);
+/// * Greek letters with ypogegrammeni, whose full uppercase is two characters
+///   (ᾀ → "ἈΙ") but whose title case is the single precomposed capital
+///   (ᾀ → ᾈ), laid out one block of eight below its lowercase run.
+///
+/// Everywhere else the rule holds exactly: ß → "SS" → "Ss", ﬁ → "FI" → "Fi",
+/// ﬃ → "FFI" → "Ffi". `titlecase_char_only` is the same mapping restricted to
+/// the one-to-one cases, which is what a *character* argument gets.
+fn titlecase_str(ch: char) -> String {
+    if let Some(t) = titlecase_char_only(ch) {
+        return t.to_string();
+    }
+    // Everything up to and including the first *cased* character of the
+    // uppercase expansion stays as it is; the rest is lower-cased. Taking
+    // "index 0" instead is wrong for ŉ (U+0149), whose uppercase is "ʼN": the
+    // apostrophe carries no case, so the N is the letter that must stay
+    // capital, and Emacs answers "ʼN" where "lower-case everything after the
+    // first character" answers "ʼn".
+    let mut out = String::new();
+    let mut seen_cased = false;
+    for u in ch.to_uppercase() {
+        if seen_cased {
+            // A non-initial capital iota in an uppercase expansion can only
+            // have come from a ypogegrammeni, and its title form is the
+            // COMBINING GREEK YPOGEGRAMMENI, not a lowercase iota: ᾲ title-cases
+            // to "Ὰ" + U+0345, which is what Emacs answers.
+            if u == '\u{0399}' {
+                out.push('\u{0345}');
+            } else {
+                out.extend(u.to_lowercase());
+            }
+        } else {
+            out.push(u);
+            if u.to_lowercase().next() != Some(u) {
+                seen_cased = true;
+            }
+        }
+    }
+    out
+}
+
+/// The one-to-one title-case mapping, when it differs from `to_uppercase` or
+/// when `to_uppercase` is one-to-many but a single title character exists.
+/// `None` means "no special case — derive it from the uppercase mapping".
+fn titlecase_char_only(ch: char) -> Option<char> {
+    let c = ch as u32;
+    let t = match c {
+        // Latin digraphs: DŽ/Dž/dž, LJ/Lj/lj, NJ/Nj/nj, DZ/Dz/dz.
+        0x01C4..=0x01C6 => 0x01C5,
+        0x01C7..=0x01C9 => 0x01C8,
+        0x01CA..=0x01CC => 0x01CB,
+        0x01F1..=0x01F3 => 0x01F2,
+        // Greek with ypogegrammeni: three runs of sixteen, each a lowercase
+        // eight followed by the capital eight that is also the title form.
+        0x1F80..=0x1F87 => c + 8,
+        0x1F90..=0x1F97 => c + 8,
+        0x1FA0..=0x1FA7 => c + 8,
+        0x1FB3 => 0x1FBC,
+        0x1FC3 => 0x1FCC,
+        0x1FF3 => 0x1FFC,
+        // The capital halves of those runs are already the title forms, and
+        // must stay put: their full *uppercase* is two characters (ᾈ → "ἈΙ"),
+        // so deriving from it would decompose a character Emacs leaves alone.
+        0x1F88..=0x1F8F | 0x1F98..=0x1F9F | 0x1FA8..=0x1FAF => c,
+        0x1FBC | 0x1FCC | 0x1FFC => c,
+        // Georgian Mkhedruli: Unicode gives these an uppercase (the Mtavruli
+        // block) but no title case, so a word-initial ა stays ა even though
+        // `(upcase ?ა)` is Ა. Deriving the title form from the uppercase one
+        // would capitalize Georgian text that Emacs leaves alone.
+        0x10D0..=0x10FA | 0x10FD..=0x10FF => c,
+        _ => return None,
+    };
+    char::from_u32(t)
+}
 fn downcase_fn(h: &mut ElispHost, a: &[Value]) -> R {
     case_fold(h, a, false)
 }
@@ -4099,6 +4202,18 @@ fn char_equal(h: &mut ElispHost, a: &[Value]) -> R {
 fn symbol_function(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.introspect_function_cell(&a[0]).unwrap_or(Value::Undef))
 }
+/// The body of a subr whose calls `host::call_function` intercepts by name. It
+/// exists so the function cell — and therefore `fboundp`, `functionp`,
+/// `func-arity`, `subrp`, `indirect-function` and `symbol-function` — reports
+/// what Emacs reports. Reaching it means a call site bypassed the intercept,
+/// which is a routing bug, not a user error.
+fn intercepted_subr(_h: &mut ElispHost, _a: &[Value]) -> R {
+    Err(
+        "internal: an intercepted higher-order primitive was called through its \
+         subr body; host::call_function should have matched it by name"
+            .to_string(),
+    )
+}
 /// `(--set-intrinsic-macro-cell SYM CELL)` — record the `(macro . FUNCTION)` an
 /// intrinsically-lowered macro reports through `symbol-function` / `fboundp` /
 /// `indirect-function`. Called once from the prelude; not an Emacs function.
@@ -7375,7 +7490,35 @@ pub fn install(h: &mut ElispHost) {
     s("fset", 2, Some(2), fset);
     s("fboundp", 1, Some(1), fboundp);
     s("indirect-function", 1, Some(2), indirect_function);
-    // functional (funcall/apply/mapcar/mapc are handled in host::call_function)
+    // The higher-order primitives run in `host::call_function`, which intercepts
+    // them by name *before* any function-cell lookup so they never execute
+    // inside a host borrow. That left them with no function cell at all, so
+    // `(fboundp 'mapcar)`, `(functionp 'eval)`, `(func-arity 'funcall)`,
+    // `(indirect-function 'apply)` and `(symbol-function 'load)` all answered as
+    // though the name were undefined, where Emacs reports `#<subr NAME>`.
+    // Registering the cell here restores every one of those answers; the bodies
+    // below are unreachable, because `call_function` matches the name first —
+    // for a bare symbol and, since this change, for the subr object too, so
+    // `(funcall (symbol-function 'mapcar) …)` routes to the intercept as well.
+    // `intercepted_subr` is what runs if that ever stops being true, and it says
+    // so rather than answering wrongly.
+    //
+    // NAMED boundary: `macroexpand-1` and `macroexpand-all` are byte-compiled
+    // Lisp in Emacs (macroexp.el), not subrs, so `(subrp (symbol-function
+    // 'macroexpand-1))` is nil there and t here. The other four observables
+    // agree; they are native here, and there is no Lisp definition to point at.
+    s("funcall", 1, None, intercepted_subr);
+    s("apply", 1, None, intercepted_subr);
+    s("mapcar", 2, Some(2), intercepted_subr);
+    s("mapc", 2, Some(2), intercepted_subr);
+    s("maphash", 2, Some(2), intercepted_subr);
+    s("mapatoms", 1, Some(2), intercepted_subr);
+    s("load", 1, Some(5), intercepted_subr);
+    s("eval", 1, Some(2), intercepted_subr);
+    s("macroexpand", 1, Some(2), intercepted_subr);
+    s("macroexpand-1", 1, Some(2), intercepted_subr);
+    s("macroexpand-all", 1, Some(2), intercepted_subr);
+    s("sort", 1, None, intercepted_subr);
     s("identity", 1, Some(1), identity);
     s("terpri", 0, Some(1), terpri);
     s("print", 1, Some(2), print_fn);
@@ -7666,6 +7809,7 @@ pub fn install(h: &mut ElispHost) {
     s("string-to-number", 1, Some(2), string_to_number);
     s("downcase", 1, Some(1), downcase_fn);
     s("upcase", 1, Some(1), upcase_fn);
+    s("--char-titlecase--", 1, Some(1), char_titlecase);
     s("type-of", 1, Some(1), type_of);
     s("recordp", 1, Some(1), recordp);
     s("closurep", 1, Some(1), closurep_fn);

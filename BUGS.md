@@ -3097,3 +3097,192 @@ consecutive runs of the same cached script with different arguments.
 - **`buffer-modified-p` and `buffer-file-name`** are void, so two rows of the
   ` *load*` probe cannot be compared at all. Not attempted here; they are buffer
   bookkeeping rather than entry-point state.
+
+---
+
+## Round 18 — the scanner, and what the harnesses structurally cannot see
+
+Round 17 closed the entry-point boundary and left three rows of its table void:
+`forward-sexp`, `scan-sexps` and `parse-partial-sexp`/`syntax-ppss`. Those are
+this round's opening. The rest of the round audits the two things that sit above
+the oracle: what each harness is *incapable* of reporting, and which recorded
+claims were never true.
+
+Oracle: **GNU Emacs 30.2** at `/opt/homebrew/bin/emacs` (`emacs --version` =>
+`GNU Emacs 30.2`). Entry points measured: `emacs -Q --batch --eval` (modelled by
+`elisp -e`), `emacs -Q --batch -l FILE` (modelled by `elisp FILE`), and
+`emacs --script FILE` (modelled by `elisp --script FILE`).
+
+### R18-A. Harness blind-spot census
+
+What each harness is *structurally* unable to report — not "has not caught yet",
+but "cannot, by construction".
+
+| harness | cannot see | why |
+| --- | --- | --- |
+| `tests/examples.rs` | a script that ran **no tests** | `ert-run-tests-batch-and-exit` exits 0 after `Ran 0 tests`. A renamed `ert-deftest`, or one moved inside a false `when`, drops coverage to zero and still passes. **CLOSED** (R18-B) |
+| `tests/examples.rs` | a script whose tests were all **skipped** | same: `Ran 5 tests: 0 unexpected, 5 skipped.` exits 0. **CLOSED** (R18-B) |
+| `tests/examples.rs` | wrong *output* | only the exit status is checked. The examples are self-checking, so a wrong value fails from the inside — but a wrong value its own `should` agrees with is invisible. Not closed: the only honest fix is an Emacs-side oracle, and the examples depend on the preloaded prelude, so Emacs cannot run them |
+| `tests/examples.rs` | entry-point and cache-path divergence | every example runs as `elisp FILE`, never `--script`, never twice. A `--script`-only or warm-cache-only regression cannot appear |
+| `scripts/fuzz/gen.el` | anything with **buffer or text state** | every generated form must be pure and bounded, so `insert`/`point`/`goto-char`/narrowing/markers/buffer text properties are never emitted. The entire text-editing subsystem — including this round's scanner — is unreachable |
+| `scripts/fuzz/gen.el` | anything with **syntax tables** | no `modify-syntax-entry`, `with-syntax-table`, `char-syntax` in the call table |
+| `scripts/fuzz/gen.el` | **multi-form** behavior | one form per line, evaluated independently: `setq` across forms, `defvar` semantics, dynamic binding, `defun`/`defmacro` definition order, and load-order effects are all out of reach |
+| `scripts/fuzz/gen.el` | **non-local exit** shapes | no `catch`/`throw`/`unwind-protect`/`condition-case` in the call table |
+| `scripts/fuzz/gen.el` | astral-plane and raw-byte characters | the char pool is `?a ?z ?A ?0 ?\s ?\n ?\t ?é` |
+| `scripts/fuzz/drive.el` | **stdout, stderr, exit code, the message buffer, point** | the comparison is `prin1` of the value, or of the error object. A form that prints the wrong thing and returns the right thing is parity |
+| `scripts/fuzz/drive.el` | a divergence past character **400** | results are clipped. Two results agreeing for 400 characters compared *equal*. **NARROWED** (R18-C) |
+| `scripts/fuzz/drive.el` | dynamic-binding paths | `(eval FORM t)` — lexical only |
+| `scripts/fuzz/drive.el` | a library Emacs does not preload but elisprs does | it `require`s `cl-lib`/`seq`/`subr-x` on the Emacs side to compare like with like, which also hides any case where elisprs providing something early is itself the divergence |
+| `scripts/fuzz_parity.sh` | a **corpus generator** mismatch | the generator runs under `$EMACS`, the same binary the version gate pins. Verified separately that it does not matter: generating 400 forms at seed 1 under `emacs` and under `elisp` gives byte-identical corpora (`diff` empty), so `gen.el`'s claim to be engine-independent is TRUE |
+| the in-process `eval_str` suites | anything about the **cache** | they call `reset_host()` + `eval_str`; `~/.elisprs/scripts.rkyv` is never consulted |
+| the in-process `eval_str` suites | **entry-point** variation | always the `--eval` model (`*scratch*`, `lisp-interaction-mode`), so a syntax-table-derived expectation captured under `-l`/`--script` cannot be checked here |
+| the in-process `eval_str` suites | a **fabricated** expectation | every expectation is a frozen string literal with no live oracle. Nothing in the harness can tell "Emacs said this once" from "someone typed this" |
+| all of the above | a **stack-depth** regression | the shipped binary runs the interpreter on a 512 MiB thread (`INTERP_STACK_BYTES`); a test thread gets 2 MiB. This round hit it: `cl-flet` around the scanner's largest form pushed prelude loading past 2 MiB and aborted seven suites with `stack overflow` while `./target/debug/elisp` ran the same code fine. The closure was rewritten as a plain lexical `lambda`; the asymmetry itself remains |
+
+### R18-B. `tests/examples.rs` accepted a script that tested nothing — ✅ CLOSED
+
+The harness now parses ERT's summary line and requires the count to equal the
+number of top-level `(ert-deftest ` forms in the file, with zero unexpected
+results and not every test skipped. Measured over all 71 examples before the
+change: 71/71 already satisfy it (`Ran N` equals the `ert-deftest` count in every
+file; one file, `examples/ert.el`, skips exactly one of five on purpose, which is
+why the rule is "not *all* skipped" rather than "none skipped"). It costs no
+extra runtime — the output was already captured for the failure message.
+
+### R18-C. `scripts/fuzz/drive.el` clipped away divergences — ✅ NARROWED
+
+`fz-clip` truncated a result at 400 characters and appended a constant marker, so
+two results that agree for 400 characters and then differ printed the same line
+under both engines and were counted as parity. The marker now carries the full
+length and the last 40 characters, both computed from the string itself, so they
+introduce no oracle of their own. Still not a proof: a divergence confined to the
+middle of a >400-character result with the same total length and the same tail is
+still invisible.
+
+### R18-D. The `syntax.c` scanner family — ✅ ADDED
+
+Ported as one machine, from `syntax.c` (Emacs 30.2): `scan_lists`,
+`scan_sexps_forward`, `forw_comment`, `back_comment`, `char_quoted`,
+`prev_char_comend_first`, `find_defun_start`, `in_2char_comment_start`,
+`internalize_parse_state`, plus `Fscan_lists`, `Fscan_sexps`,
+`Fparse_partial_sexp`, `Fforward_comment`, `Fbackward_prefix_chars`,
+`Fmatching_paren`, and `lisp.el`'s motion commands and `syntax.el`'s
+`syntax-ppss`. Round 17 declined a subset on the grounds that
+"`forward-sexp` over balanced parens with no comment handling would answer
+plausibly on the common case and wrongly inside a string or comment"; that still
+holds, which is why the comment/string state machine is in.
+
+`scan_sexps_forward` is one C function with eleven labels and a fallthrough
+switch. It is transcribed as an explicit label machine — a `label` variable
+holding the C's program counter — rather than re-derived as structured elisp,
+because re-deriving the control flow is the step that turns a port into a
+rewrite.
+
+Verification: 236 differential probes under `emacs -Q --batch -l` and under
+`elisp`, covering balanced text, strings, escapes, C-style `/* */` and `//`
+comments in both `parse-sexp-ignore-comments` settings, nested `#| |#`, generic
+string and comment fences, the `$` math class, resumption from a partial state
+(including one stopped between the two halves of a two-character delimiter),
+`targetdepth`, `stopbefore`, `commentstop`, the `syntax-table` text property,
+every motion command, and the error shapes. **236/236 agree**, on the cold and
+the warm cache path alike.
+
+The three ❌ rows of round 17's entry-point table are now:
+
+| observable | `--eval` / `-l` | `--script` | `elisp FILE` | `elisp --script FILE` |
+| --- | --- | --- | --- | --- |
+| `(forward-sexp 1)` | `8` | `4` | `8` ✅ | `4` ✅ |
+| `(scan-sexps 1 1)` | `8` | `4` | `8` ✅ | `4` ✅ |
+| `(nth 4 (parse-partial-sexp …))` / `(nth 4 (syntax-ppss …))` | `t` / `t` | `nil` / `nil` | `t` / `t` ✅ | `nil` / `nil` ✅ |
+
+(The `parse-partial-sexp` row is re-measured here with a probe of its own —
+`"foo.bar ;c"` inserted into the entry point's buffer, asking whether position
+`point-max` is inside a comment — so its `--eval`/`-l` cell is `t`, not the
+`t` / `nil` pair round 17 recorded for its differently-shaped probe.)
+
+**Named boundary:** `syntax-ppss` parses from `point-min` on every call instead
+of memoizing in `syntax-ppss-cache` / `syntax-ppss-last`. That is exactly what
+Emacs does on a cold cache, which is the only state a batch process is ever in;
+the difference is speed, plus elements 2 and 6, which Emacs's own docstring
+already says "cannot be relied upon".
+
+**Named boundary:** `syntax-propertize` runs `syntax-propertize-function` (nil by
+default, so a no-op) but does not implement `syntax-propertize-rules` or the
+`syntax-multiline` machinery.
+
+### R18-E. Locale
+
+`grep -rn 'setlocale' src/` finds nothing: elisprs never calls `setlocale(3)`, so
+its libc stays in the C locale and **no elisprs answer probed here changes with
+`LC_ALL`**. All 43 frozen case/time expressions in the tests produce byte-identical
+output under `LC_ALL=en_US.UTF-8`, `LC_ALL=C` and `LC_ALL=de_DE.UTF-8`, and the
+case tests pass under all three. The exposure is on the *oracle* side.
+
+Three frozen records encode an Emacs answer that only holds under an English
+`LC_TIME`, so re-deriving them on a German or French machine would produce a
+different string:
+
+| record | frozen | `LC_ALL=de_DE.UTF-8` Emacs | `LC_ALL=fr_FR.UTF-8` Emacs |
+| --- | --- | --- | --- |
+| `tests/eval.rs:1833` `(format-time-string "%A %B %e, %Y" 0 t)` | `"Thursday January  1, 1970"` | `"Donnerstag Januar  1, 1970"` | `"jeudi janvier  1, 1970"` |
+| `tests/eval.rs:1841` `(format-time-string "%I:%M %p" 0 t)` | `"12:00 AM"` | `"12:00 "` | `"12:00 "` |
+| `tests/eval.rs:1845` `(format-time-string "%j (%a)" 0 t)` | `"001 (Thu)"` | `"001 (Do.)"` | `"001 (jeu.)"` |
+
+`LC_ALL=C` is safe for all three — C and `en_US.UTF-8` give byte-identical Emacs
+output for `%A %B %a %b %p %c`. Left as they are, and named here rather than
+"fixed", because the frozen values are what elisprs structurally produces: it
+hardcodes the English tables and has no `system-time-locale`.
+
+Still open from the sweep, each verified against 30.2 and none of them
+locale-*dependent* in elisprs:
+
+- `%x` and `%X` are unimplemented — `(format-time-string "%x" 0 t)` answers
+  `"%x"` where Emacs answers `"01/01/1970"` (and `"01/01/70"` under `LC_ALL=C`,
+  the only C-vs-en_US drift found anywhere). `%Ec %EX %Ex` and `%Om %Od`
+  likewise.
+- `system-time-locale`, `system-messages-locale` and `locale-coding-system` are
+  void; Emacs binds all three (the first two nil, the third `utf-8-unix` — and
+  `nil` under `LC_ALL=C`).
+- `locale-info` is void.
+- `(current-time-zone 0)` answers `(-18000 nil)` where Emacs names the zone,
+  `(-18000 "EST")`. `(current-time-zone 0 t)` agrees: `(0 "UTC")`.
+- `(string-collate-equalp "a" "A" nil t)` is t here, nil on this Emacs — but this
+  macOS build has no working collation at all (its own docstring says so, and it
+  ignores an explicit LOCALE argument), so that row is darwin-scoped. On a glibc
+  box the divergence would invert and `string-collate-lessp` on non-ASCII would
+  become locale-sensitive in Emacs while staying `string-lessp` here. **Not
+  verified from this machine.**
+
+### R18-F. `capitalize` / `upcase-initials` — ✅ FIXED
+
+See the CHANGELOG entry. Measured character by character over the whole BMP
+(55,295 code points, `(capitalize (string C))` and `(upcase-initials (string C))`
+under both engines): **0 remaining behavioral differences.**
+
+### R18-G. Emacs 30.2's case tables lag Unicode — NOT FIXED, measured
+
+Sweeping `(upcase C)` and `(downcase C)` over every code point:
+
+| range | code points | where elisprs maps a character Emacs 30.2 leaves alone |
+| --- | --- | --- |
+| BMP (1–0xD7FF) | 55,295 | 19 |
+| SMP (0x10000–0x1FFFF) | 65,536 | 94 |
+
+and the same sweep for `capitalize`/`upcase-initials` leaves 8 in the BMP, all a
+subset of the 19. Examples: U+0131 ı, U+017F ſ, U+019B ƛ, U+0264 ɤ, U+212A KELVIN
+SIGN, the U+A7Bx Latin Extended-D additions, and in the SMP the Vithkuqi, Garay
+and Old Hungarian blocks. There is no logic to fix: Rust's Unicode tables are
+newer than the `uni-*.el` tables this Emacs was built with, and some entries
+(ı → I) Emacs deliberately omits because its case table is a *pairing* and i → I
+already owns the target. Freezing an exclusion list would pin this tree to one
+Emacs build's Unicode version, so it is recorded rather than encoded.
+
+Reproduce:
+
+```sh
+emacs -Q --batch --eval '(dotimes (c 55296) (princ (format "%d %d %d\n" c (upcase c) (downcase c))))' > /tmp/a
+# `elisp -e' prints the expression's own value too, so drop the trailing `nil'.
+elisp -e '(dotimes (c 55296) (princ (format "%d %d %d\n" c (upcase c) (downcase c))))' \
+  | grep -v '^nil$' > /tmp/b
+diff /tmp/a /tmp/b | grep -c '^<'
+```

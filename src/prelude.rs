@@ -1477,22 +1477,14 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
     (signal 'wrong-type-argument (list 'char-or-string-p s)))
   s)
 (defun capitalize (s)
+  "Convert argument to capitalized form and return that.
+This means that each word's first character is converted to either
+title case or upper case, and the rest to lower case.
+The argument may be a character or string.  The result has the same type."
   (char-or-string--check s)
-  ;; Upcase the first letter of every word (run of alphanumerics), downcase the
-  ;; rest: (capitalize "hello world") => "Hello World". A character argument
-  ;; capitalizes to its uppercase form (like `upcase').
-  (if (integerp s) (upcase s)
-  (let ((out nil) (in-word nil))
-    (dolist (c (string-to-list s))
-      ;; Word constituent: a digit, or a cased letter (upcase ≠ downcase) —
-      ;; the latter covers non-ASCII letters like é/ÿ too.
-      (let ((wordc (or (and (>= c ?0) (<= c ?9)) (/= (downcase c) (upcase c)))))
-        (cond
-         ((not wordc) (setq out (cons c out)))
-         (in-word (setq out (cons (downcase c) out)))
-         (t (setq out (cons (upcase c) out))))
-        (setq in-word wordc)))
-    (elisprs--carry-text-properties s (apply (function string) (reverse out))))))
+  ;; A character argument cannot grow, so it takes the one-to-one path:
+  ;; `(capitalize ?ß)' is ẞ, while `(capitalize "ß")' is "Ss".
+  (if (integerp s) (--char-titlecase-1-- s) (--casify-capitalize-- s nil)))
 (defun string-trim-left (s &optional regexp)
   ;; Strip a leading match of REGEXP (default whitespace).
   (let ((re (concat "\\`\\(?:" (or regexp "[ \t\n\r]+") "\\)")))
@@ -1697,7 +1689,15 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
     (if (arrayp seq) (reverse seq)
       (signal 'wrong-type-argument (list 'arrayp seq)))))
 
-;;; ---- sort (stable merge sort, lists) ----
+;;; ---- sort ----
+;; `sort' itself is native: `host::call_function' intercepts it so PRED and :key
+;; can re-enter elisp, and it handles the Emacs-30 keyword form and vectors,
+;; neither of which the two-argument merge sort below ever did. Defining a Lisp
+;; `sort' here only overwrote the subr's function cell, so `(func-arity 'sort)'
+;; answered `(2 . 2)' where Emacs says `(1 . many)' and `(subrp (symbol-function
+;; 'sort))' answered nil — while every actual call still went to the intercept.
+;; The merge-sort helpers stay: `std--merge' is the stable merge other list code
+;; uses directly.
 (defun std--merge (a b pred)
   (cond ((null a) b)
         ((null b) a)
@@ -1708,10 +1708,6 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
     (while (and fast (cdr fast))
       (setq front (cons (car slow) front)) (setq slow (cdr slow)) (setq fast (cdr (cdr fast))))
     (cons (reverse front) slow)))
-(defun sort (lst pred)
-  (if (or (null lst) (null (cdr lst))) lst
-    (let ((h (std--halves lst)))
-      (std--merge (sort (car h) pred) (sort (cdr h) pred) pred))))
 
 ;;; ---- seq.el (list-oriented) ----
 ;; seq-generic: coerce to a list, then restore SEQ's own type (vector/string).
@@ -2114,6 +2110,9 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 ;; (walked at runtime so a subtype satisfies a parent's predicate).
 (defvar cl-struct--slots nil)
 (defvar cl-struct--parent nil)
+;; NAME -> index of its first slot: 1 for a named struct (a record, or a
+;; `:type'd one with `:named'), 0 for an unnamed `:type list'/`:type vector'.
+(defvar cl-struct--base nil)
 (defun cl-struct--is-a (tag target)
   (let ((res nil))
     (while (and tag (not res))
@@ -2178,6 +2177,22 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
                        (when (and (consp opt) (eq (car opt) :include))
                          (setq p (car (cdr opt))))))
                    p))
+         ;; (:type list)/(:type vector) select an untagged list or vector
+         ;; representation instead of a record; a bare `:named' in the options
+         ;; puts the type symbol back in slot 0.  A record is always named, so
+         ;; without `:type' both of these are fixed.  cl-macs.el only generates
+         ;; a predicate for a named struct, and only a named struct's slots are
+         ;; offset by the tag -- BASE is that offset, and it is what makes an
+         ;; unnamed `(:type list)' accessor `(nth 0 x)' rather than `(nth 1 x)'.
+         (stype (let ((ty nil))
+                  (when (consp name-spec)
+                    (dolist (opt (cdr name-spec))
+                      (when (and (consp opt) (eq (car opt) :type))
+                        (setq ty (car (cdr opt))))))
+                  ty))
+         (named (or (null stype)
+                    (and (consp name-spec) (memq :named (cdr name-spec)) t)))
+         (base (if named 1 0))
          (parent-slots (and parent (boundp 'cl-struct--slots)
                             (cdr (assq parent cl-struct--slots))))
          (all-slots (append parent-slots slots))
@@ -2190,23 +2205,29 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
          (readonly (mapcar (lambda (s) (and (consp s) (plist-get (cdr (cdr s)) :read-only)))
                            all-slots))
          (forms nil)
-         ;; constructor: vector of defaults, then apply :keyword overrides.
-         (kw-clauses (let ((j 1) (cs nil))
+         ;; How an instance is built and how slot J is read and written.
+         (build (cond ((eq stype 'list) 'list) ((eq stype 'vector) 'vector) (t 'record)))
+         (tag-args (if named (list (list 'quote tag)) nil))
+         ;; constructor: the fresh instance, then apply :keyword overrides.
+         (kw-clauses (let ((j base) (cs nil))
                        (dolist (sn snames)
                          (setq cs (cons (list (list 'eq '--k-- (intern (concat ":" (symbol-name sn))))
-                                              (list 'aset '--v-- j '--val--))
+                                              (if (eq stype 'list)
+                                                  (list 'setcar (list 'nthcdr j '--v--) '--val--)
+                                                (list 'aset '--v-- j '--val--)))
                                         cs))
                          (setq j (1+ j)))
                        (reverse cs))))
     ;; Record this struct's full (inherited + own) slot specs at macroexpansion
     ;; time so a later (:include this) can read them.
     (setq cl-struct--slots (cons (cons name all-slots) cl-struct--slots))
+    (setq cl-struct--base (cons (cons name base) cl-struct--base))
     (dolist (cspec constructors)
       (let ((cname (car cspec)) (ckind (cdr cspec)))
         (if (eq ckind 'kw)
             (setq forms
                   (cons `(defun ,cname (&rest --args--)
-                           (let ((--v-- (record ',tag ,@defaults)) (--a-- --args--))
+                           (let ((--v-- (,build ,@tag-args ,@defaults)) (--a-- --args--))
                              (while --a--
                                (let ((--k-- (car --a--)) (--val-- (car (cdr --a--))))
                                  (cond ,@kw-clauses))
@@ -2230,11 +2251,25 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
                            (setq vs (cons (if (memq (car sn) avars) (car sn) (car df)) vs))
                            (setq sn (cdr sn) df (cdr df)))
                          (reverse vs))))
-            (setq forms (cons `(defun ,cname ,defargs (record ',tag ,@vals)) forms))))))
-    (setq forms (cons `(defun ,(intern pred) (--o--)
-                         (and (recordp --o--) (> (length --o--) 0)
-                              (cl-struct--is-a (aref --o-- 0) ',tag)))
-                      forms))
+            (setq forms (cons `(defun ,cname ,defargs (,build ,@tag-args ,@vals)) forms))))))
+    ;; cl-macs.el generates a predicate only for a NAMED struct: an unnamed
+    ;; `(:type list)' instance carries nothing to recognize it by, so
+    ;; `(fboundp 'NAME-p)' is nil in Emacs and must be here too.
+    (when named
+      (setq forms
+            (cons (cond
+                   ((eq stype 'list)
+                    `(defun ,(intern pred) (--o--)
+                       (and (consp --o--) (cl-struct--is-a (car --o--) ',tag))))
+                   ((eq stype 'vector)
+                    `(defun ,(intern pred) (--o--)
+                       (and (vectorp --o--) (> (length --o--) 0)
+                            (cl-struct--is-a (aref --o-- 0) ',tag))))
+                   (t
+                    `(defun ,(intern pred) (--o--)
+                       (and (recordp --o--) (> (length --o--) 0)
+                            (cl-struct--is-a (aref --o-- 0) ',tag)))))
+                  forms)))
     ;; Record the tag's parent so the predicate accepts subtypes.  With an
     ;; explicit `:include' the parent is that struct; otherwise every "normal"
     ;; struct implicitly roots at `cl-structure-object' (cl-macs.el defaults
@@ -2262,12 +2297,20 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
                                    (cl--find-class 'cl-structure-object)))
                          nil nil nil nil nil nil nil)))
                 forms))
-    (let ((j 1) (ros readonly))
+    (let ((j base) (ros readonly))
       (dolist (sn snames)
         (let ((acc (intern (concat conc (symbol-name sn)))))
-          (setq forms (cons `(defun ,acc (--s--) (aref --s-- ,j)) forms))
-          (setq forms (cons `(setq cl-struct--slot-index
-                                   (cons (cons ',acc ,j) cl-struct--slot-index))
+          (setq forms (cons (if (eq stype 'list)
+                                `(defun ,acc (--s--) (nth ,j --s--))
+                              `(defun ,acc (--s--) (aref --s-- ,j)))
+                            forms))
+          ;; A list-typed slot's setter is `(setcar (nthcdr J S) V)', not `aset',
+          ;; so the two representations need separate registries for `setf'.
+          (setq forms (cons (if (eq stype 'list)
+                                `(setq cl-struct--slot-list-index
+                                       (cons (cons ',acc ,j) cl-struct--slot-list-index))
+                              `(setq cl-struct--slot-index
+                                     (cons (cons ',acc ,j) cl-struct--slot-index)))
                             forms))
           (when (car ros)
             (setq forms (cons `(setq cl-struct--slot-readonly
@@ -2279,7 +2322,9 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 ;; Generic struct-slot introspection. Slots are stored as bare symbols (no
 ;; default) or `(NAME DEFAULT)' pairs; slot 0 of the vector is the type tag.
 (defun cl-struct-slot-offset (struct-type slot-name)
-  (let ((slots (cdr (assq struct-type cl-struct--slots))) (i 1) (idx nil))
+  (let ((slots (cdr (assq struct-type cl-struct--slots)))
+        (i (or (cdr (assq struct-type cl-struct--base)) 1))
+        (idx nil))
     (dolist (s slots)
       (when (eq (if (consp s) (car s) s) slot-name) (setq idx i))
       (setq i (1+ i)))
@@ -3380,22 +3425,12 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
   (unless (stringp b) (signal 'wrong-type-argument (list 'stringp b)))
   (string= (downcase a) (downcase b)))
 (defun upcase-initials (s)
-  ;; Upcase the first letter of every word, leaving the rest unchanged.
-  ;; A character argument upcases to its uppercase form, like `upcase'.
+  "Convert the initial of each word in the argument to upper case.
+This means that each word's first character is converted to either
+title case or upper case, and the rest are left unchanged.
+The argument may be a character or string.  The result has the same type."
   (char-or-string--check s)
-  (if (integerp s)
-      (upcase s)
-    (let ((out nil) (in-word nil))
-      (dolist (c (string-to-list s))
-        ;; Word constituent: a digit, or a cased letter (upcase ≠ downcase) —
-        ;; the same test `capitalize' uses, so Greek/Cyrillic/accented letters
-        ;; both start words and get upcased: (upcase-initials "αβγ") => "Αβγ".
-        (let ((wordc (or (and (>= c ?0) (<= c ?9)) (/= (downcase c) (upcase c)))))
-          (cond ((not wordc) (setq out (cons c out)))
-                (in-word (setq out (cons c out)))
-                (t (setq out (cons (upcase c) out))))
-          (setq in-word wordc)))
-      (apply (function string) (reverse out)))))
+  (if (integerp s) (--char-titlecase-1-- s) (--casify-capitalize-- s t)))
 (defun string-replace (from to s)
   ;; Emacs signals on an empty FROMSTRING rather than looping forever.
   (if (string-empty-p from) (signal 'wrong-length-argument (list 0))
@@ -5055,6 +5090,9 @@ If all LST elements are zeros or LST is nil, return zero."
 ;; `cl-defstruct' when it runs, consulted by `setf--expand' when expanding later
 ;; top-level forms — which works because forms are processed in order).
 (defvar cl-struct--slot-index nil)
+;; The same, for the accessors of a `(:type list)' struct, whose setter is
+;; `(setcar (nthcdr INDEX S) V)' because there is nothing to `aset'.
+(defvar cl-struct--slot-list-index nil)
 ;; Accessors of `:read-only' cl-defstruct slots. `setf--expand' signals the same
 ;; "ACCESSOR is a read-only slot" error cl-macs.el:3260 raises via gv-define-expander.
 (defvar cl-struct--slot-readonly nil)
@@ -5165,6 +5203,11 @@ If all LST elements are zeros or LST is nil, return zero."
        ;; A cl-defstruct accessor: (setf (NAME-SLOT s) v) -> (aset s INDEX v).
        ((assq head cl-struct--slot-index)
         (list 'aset (car args) (cdr (assq head cl-struct--slot-index)) val))
+       ;; The `(:type list)' form of the same: the slot is a list position.
+       ((assq head cl-struct--slot-list-index)
+        (list 'setcar
+              (list 'nthcdr (cdr (assq head cl-struct--slot-list-index)) (car args))
+              val))
        ;; (setf (map-elt MAP KEY) V): rebind MAP to a copy with KEY updated/added
        ;; (hash-tables/arrays mutate in place; alists may grow at the head).
        ((eq head 'map-elt)
@@ -7283,34 +7326,59 @@ integer between 0 and 10, or nil, meaning 0."
   (aref --syntax-code-spec-- syntax-class))
 
 ;; The flag descriptor characters and the bit each sets in the syntax code.
+;; `c' (bit 23) is the third comment style, added for modes that need a third
+;; two-character comment delimiter; it is in `Fstring_to_syntax' alongside the
+;; other seven and was the only one missing here.
 (defconst --syntax-flag-alist--
-  '((?1 . 16) (?2 . 17) (?3 . 18) (?4 . 19) (?p . 20) (?b . 21) (?n . 22))
+  '((?1 . 16) (?2 . 17) (?3 . 18) (?4 . 19) (?p . 20) (?b . 21) (?n . 22)
+    (?c . 23))
   "Maps a `modify-syntax-entry' flag char to the bit it sets in the syntax code.")
+
+;; syntax.c `Vsyntax_code_object': one shared `(CODE)' cons per bare class, so
+;; that two descriptors naming the same class with no match char and no flags
+;; are `eq'.  `init_syntax_once' builds it and `Fstring_to_syntax' returns from
+;; it whenever `val < Smax' and MATCH is nil; freshly consing instead makes
+;; `(eq (string-to-syntax "w") (string-to-syntax "w"))' nil where Emacs says t.
+(defconst --syntax-code-object--
+  (let ((v (make-vector 16 nil)) (i 0))
+    (while (< i 16) (aset v i (list i)) (setq i (1+ i)))
+    v)
+  "Vector of the shared (CODE) conses, indexed by syntax class.")
 
 (defun string-to-syntax (descriptor)
   "Convert syntax DESCRIPTOR string into the internal (CODE . MATCH) form.
 DESCRIPTOR's first char names the class, the second the matching char
 \(a space or missing means none), and any remaining chars are flags."
-  (when (or (null descriptor) (= (length descriptor) 0))
-    (error "Invalid syntax description string: %S" descriptor))
-  (let* ((c (aref descriptor 0))
+  (unless (stringp descriptor)
+    (signal 'wrong-type-argument (list 'stringp descriptor)))
+  ;; `Fstring_to_syntax' indexes `syntax_spec_code' with the first BYTE, and the
+  ;; empty string's is the terminating NUL -- which is why Emacs reports the
+  ;; letter as an unprintable character rather than rejecting the string.
+  (let* ((c (if (= (length descriptor) 0) 0 (aref descriptor 0)))
          ;; `-' is an alias for whitespace; otherwise look C up in the spec.
          (class (if (eq c ?-) 0
                   (let ((i 0) (found nil) (len (length --syntax-code-spec--)))
                     (while (and (not found) (< i len))
                       (when (eq (aref --syntax-code-spec-- i) c) (setq found i))
                       (setq i (1+ i)))
-                    (or found (error "Invalid syntax description string: %S" descriptor)))))
-         (match (and (> (length descriptor) 1)
-                     (let ((m (aref descriptor 1)))
-                       (unless (eq m ?\s) m))))
-         (code class)
-         (i 2) (len (length descriptor)))
-    (while (< i len)
-      (let ((bit (cdr (assq (aref descriptor i) --syntax-flag-alist--))))
-        (when bit (setq code (logior code (ash 1 bit)))))
-      (setq i (1+ i)))
-    (cons code match)))
+                    (or found
+                        (error "Invalid syntax description letter: %c" c))))))
+    ;; Sinherit ("@") means "use the standard table here", which is spelled as a
+    ;; nil descriptor -- not as class 13.
+    (if (= class 13)
+        nil
+      (let ((match (and (> (length descriptor) 1)
+                        (let ((m (aref descriptor 1)))
+                          (unless (eq m ?\s) m))))
+            (code class)
+            (i 2) (len (length descriptor)))
+        (while (< i len)
+          (let ((bit (cdr (assq (aref descriptor i) --syntax-flag-alist--))))
+            (when bit (setq code (logior code (ash 1 bit)))))
+          (setq i (1+ i)))
+        (if (and (< code 16) (null match))
+            (aref --syntax-code-object-- code)
+          (cons code match))))))
 
 (defun syntax-class (syntax)
   "Return the syntax class part of the syntax code SYNTAX (a (CODE . MATCH) cons).
@@ -7441,6 +7509,64 @@ returned.  The characters that correspond to various syntax codes are
 listed in the documentation of `modify-syntax-entry'."
   (syntax-class-to-char (syntax-class (aref (syntax-table) character))))
 
+;; ---- capitalize / upcase-initials (casefiddle.c) ----
+;; These live here, after `char-syntax', because the word test is the SYNTAX
+;; TABLE's -- `case_ch_is_word (SYNTAX (ch))' -- not "is this a cased letter or
+;; a digit", which is what elisprs used to ask. The difference is observable:
+;; `ﬁ' has no one-to-one upper case, so the old test called it a non-word
+;; character, which made the *next* character a word start:
+;; `(capitalize "ﬁnd")' answered "ﬁNd" where Emacs answers "Find".
+;;
+;; The other half is that a word's first character is TITLE-cased, not
+;; upper-cased. `case_character_impl' consults `special-titlecase' (one-to-many)
+;; before the `titlecase' char-table and only then `upcase', which is why
+;; `(capitalize "ßäöü")' is "Ssäöü" (not "ẞäöü") and `(capitalize "ǳa")' is
+;; "ǲa" (not "Ǳa"): ǲ is the title-case digraph, distinct from Ǳ.
+(defvar case-symbols-as-words nil
+  "Non-nil means the case functions treat symbol constituents as word ones.")
+
+(defun --char-titlecase-1-- (c)
+  "The one-to-one title case of character C.
+`case_character_impl' with a NULL buffer skips the one-to-many
+`special-titlecase' table and consults the `titlecase' char-table, falling
+back to `upcase' -- so `(capitalize ?\u01f3)' is the title digraph
+\u01f2, while `(capitalize ?\u00df)', whose title case is two characters,
+is the upper-case \u1e9e."
+  (let ((tc (--char-titlecase-- c)))
+    (if (= (length tc) 1) (aref tc 0) (upcase c))))
+
+(defun --case-ch-is-word-- (c)
+  "casefiddle.c `case_ch_is_word': is C a word constituent for casing?"
+  (let ((sy (--syntax-code-at-- nil c)))
+    (or (= sy 2) (and case-symbols-as-words (= sy 3)))))
+
+(defun --casify-capitalize-- (s up-only)
+  "casefiddle.c `do_casify_multibyte_string' for the two capitalizing flags.
+UP-ONLY non-nil is CASE_CAPITALIZE_UP (`upcase-initials'), which leaves the
+rest of each word alone; nil is CASE_CAPITALIZE (`capitalize'), which
+down-cases it."
+  (let ((chars (string-to-list s)) (out nil) (was nil) (in-word nil) c rest)
+    (while chars
+      (setq c (car chars))
+      (setq rest (cdr chars))
+      (setq was in-word)
+      (setq in-word (--case-ch-is-word-- c))
+      (cond
+       ((not was) (push (--char-titlecase-- c) out))
+       (up-only (push (string c) out))
+       ;; CASE_DOWN, plus `case_character''s Greek rule: a capital sigma that
+       ;; ends a word down-cases to the FINAL sigma ς, not to σ.
+       ((and (eq c 931) (or (null rest) (not (--case-ch-is-word-- (car rest)))))
+        (push (string 962) out))
+       (t (push (downcase (string c)) out)))
+      (setq chars rest))
+    (let ((res (apply (function concat) (reverse out))))
+      ;; Text properties can only be carried straight across when no character
+      ;; expanded, which the one-to-many title/lower mappings can break.
+      (if (= (length res) (length s))
+          (elisprs--carry-text-properties s res)
+        res))))
+
 ;; ---- skip-syntax-forward / skip-syntax-backward (syntax.c `skip_syntaxes') ----
 ;; The C builds a 256-entry fastmap over syntax CLASS CODES:
 ;;
@@ -7531,6 +7657,1262 @@ over the one current buffer's syntax-table slot.)"
              (set-syntax-table ,table)
              ,@body)
          (set-syntax-table ,old-table)))))
+
+;;; ---- syntax.c's sexp/comment scanner ----
+;; `scan-lists', `parse-partial-sexp' and everything built on them are one
+;; port, not seven: `Fforward_sexp' is `scan_lists', and `scan_lists' and
+;; `Fparse_partial_sexp' share the comment/string state machine
+;; (`scan_sexps_forward', `forw_comment', `back_comment', `char_quoted'),
+;; including two-character comment delimiters, nested comments, the
+;; `syntax-table' text property and `parse-sexp-ignore-comments'.  A
+;; parens-only subset would answer plausibly on the common case and wrongly
+;; inside a string or a comment, so the whole machine is ported.
+
+(defun buffer-end (arg)
+  "Return the \"far end\" position of the buffer, in direction ARG."
+  (if (> arg 0) (point-max) (point-min)))
+
+;; ---- variables the scanner consults (syntax.c DEFVARs) ----
+(defvar parse-sexp-ignore-comments nil
+  "Non-nil means `forward-sexp', etc., should treat comments as whitespace.")
+(defvar parse-sexp-lookup-properties nil
+  "Non-nil means `forward-sexp', etc., obey the `syntax-table' text property.")
+(defvar-local comment-end-can-be-escaped nil
+  "Non-nil means an escaped ender doesn't end the comment.")
+(defvar multibyte-syntax-as-symbol nil
+  "Non-nil means `scan-sexps' treats all multibyte characters as symbol.")
+(defvar open-paren-in-column-0-is-defun-start t
+  "Non-nil means an open paren in column 0 denotes the start of a defun.")
+(defvar words-include-escapes nil
+  "Non-nil means `forward-word', etc., should treat escape chars part of words.")
+(defvar comment-use-syntax-ppss t
+  "Non-nil means `forward-comment' can use `syntax-ppss' internally.")
+
+;; ST_COMMENT_STYLE / ST_STRING_STYLE (syntax.c): sentinels for the styles that
+;; the comment-fence and string-fence classes start, which no `b'/`c' flag
+;; combination can name.
+(defconst --st-comment-style-- 257)
+(defconst --st-string-style-- 258)
+;; enum syntaxcode.  Smax doubles as "this position's syntax is used up".
+(defconst --syn-smax-- 16)
+
+;; ---- syntax lookup (syntax.h SYNTAX_ENTRY / SYNTAX_WITH_FLAGS / SYNTAX) ----
+;; The C reads the entry through gl_state, which UPDATE_SYNTAX_TABLE_* keeps in
+;; step with the `syntax-table' text property when `parse-sexp-lookup-properties'
+;; is on.  Here the position travels with the character instead, so the property
+;; is consulted at the point of use and there is no cache to keep valid.  A
+;; property whose value is a syntax table selects that table for the character;
+;; a cons is the raw descriptor itself, exactly as update_syntax_table does.
+(defun --syntax-raw-at-- (pos c)
+  "The raw syntax descriptor (CODE . MATCH) for character C at POS."
+  (let ((prop (and parse-sexp-lookup-properties pos
+                   (get-char-property pos 'syntax-table))))
+    (cond ((consp prop) prop)
+          ((syntax-table-p prop) (aref prop c))
+          (t (aref (syntax-table) c)))))
+
+(defun --syntax-flags-at-- (pos c)
+  "SYNTAX_WITH_FLAGS: the code+flags integer for C at POS.
+A non-cons entry reads as whitespace, as in `syntax_property_with_flags'."
+  (let ((e (--syntax-raw-at-- pos c)))
+    (if (consp e) (car e) 0)))
+
+(defun --syntax-code-at-- (pos c)
+  "SYNTAX: the syntax class of C at POS."
+  (logand (--syntax-flags-at-- pos c) 255))
+
+(defun --syntax-match-at-- (pos c)
+  "SYNTAX_MATCH: the matching character of C at POS, or nil."
+  (let ((e (--syntax-raw-at-- pos c)))
+    (and (consp e) (cdr e))))
+
+;; syntax_multibyte: with `multibyte-syntax-as-symbol', every non-ASCII
+;; character reads as a symbol constituent regardless of its table entry.
+(defun --syntax-code-mb-- (pos c mbsym)
+  (if (or (< c 128) (not mbsym)) (--syntax-code-at-- pos c) 3))
+
+;; ---- SYNTAX_FLAGS_* (syntax.c) ----
+(defun --syn-comstart-first-- (f) (/= 0 (logand f 65536)))      ; 1 << 16
+(defun --syn-comstart-second-- (f) (/= 0 (logand f 131072)))    ; 1 << 17
+(defun --syn-comend-first-- (f) (/= 0 (logand f 262144)))       ; 1 << 18
+(defun --syn-comend-second-- (f) (/= 0 (logand f 524288)))      ; 1 << 19
+(defun --syn-comstartend-first-- (f) (/= 0 (logand f 327680)))  ; 0x50000
+(defun --syn-prefix-- (f) (/= 0 (logand f 1048576)))            ; 1 << 20
+(defun --syn-styleb-- (f) (if (/= 0 (logand f 2097152)) 1 0))   ; 1 << 21
+(defun --syn-nested-- (f) (/= 0 (logand f 4194304)))            ; 1 << 22
+(defun --syn-stylec2-- (f) (logand (ash f -22) 2))              ; 1 << 23 -> 2
+;; FLAGS is the flags of the main char of the marker: the second for a comment
+;; start, the first for a comment end.
+(defun --syn-comment-style-- (f other)
+  (logior (--syn-styleb-- f) (--syn-stylec2-- f) (--syn-stylec2-- other)))
+
+;; ---- char_quoted / prev_char_comend_first ----
+(defun --char-quoted-- (charpos)
+  "Port of syntax.c `char_quoted': is CHARPOS preceded by an odd escape run?"
+  (let ((beg (point-min)) (pos charpos) (quoted nil) (stop nil) c code)
+    (while (and (not stop) (> pos beg))
+      (setq pos (1- pos))
+      (setq c (char-after pos))
+      (setq code (--syntax-code-at-- pos c))
+      (if (or (= code 9) (= code 10))   ; Sescape, Scharquote
+          (setq quoted (not quoted))
+        (setq stop t)))
+    quoted))
+
+(defun --prev-char-comend-first-- (pos)
+  "Port of syntax.c `prev_char_comend_first'."
+  (let ((c (char-after (1- pos))))
+    (--syn-comend-first-- (--syntax-flags-at-- (1- pos) c))))
+
+;; ---- find_defun_start (syntax.c), without the one-entry memo ----
+;; The memo is pure speed; it caches the answer for a repeated query and is
+;; invalidated on every buffer modification, so dropping it cannot change a
+;; result.  `open-paren-in-column-0-is-defun-start' nil means only BEGV counts.
+(defun --find-defun-start-- (pos)
+  (let ((beg (point-min)) (found nil))
+    (if (not open-paren-in-column-0-is-defun-start)
+        beg
+      (save-excursion
+        (goto-char pos)
+        (while (and (not found) (> (point) beg))
+          (goto-char (line-beginning-position))
+          (if (and (< (point) (point-max))
+                   (eq (--syntax-code-at-- (point) (char-after (point))) 4))
+              (setq found (point))
+            (if (<= (point) beg) (setq found beg) (goto-char (1- (point))))))
+        (or found beg)))))
+
+;; ---- forw_comment (syntax.c) ----
+;; Returns (FOUND POSITION INCOMMENT LAST-SYNTAX).  INCOMMENT and LAST-SYNTAX
+;; are only meaningful when FOUND is nil, exactly as the C's out-parameters are
+;; only written on the not-found path.
+(defun --forw-comment-- (from stop nesting style prev-syntax)
+  (let ((syntax prev-syntax) code c c1 other-syntax
+        (skip-head nil) (broke nil) (out nil))
+    (when (<= nesting 0) (setq nesting -1))
+    (setq code (logand syntax 255))
+    ;; "Enter the loop in the middle so that we find a 2-char comment ender if
+    ;; we start in the middle of it."
+    (when (and (/= syntax 0) (< from stop)) (setq skip-head t))
+    (while (and (not out) (not broke))
+      (if skip-head
+          (setq skip-head nil)
+        (if (= from stop)
+            (setq out (list nil from nesting
+                            (if (or (= code 9) (= code 10)
+                                    (--syn-comend-first-- syntax)
+                                    (and (> nesting 0)
+                                         (--syn-comstart-first-- syntax)))
+                                syntax --syn-smax--)))
+          (setq c (char-after from))
+          (setq prev-syntax syntax)
+          (setq syntax (--syntax-flags-at-- from c))
+          (setq code (logand syntax 255))
+          (cond
+           ;; A comment ender of the style this comment section began with.
+           ((and (= code 12)
+                 (= (--syn-comment-style-- syntax 0) style)
+                 (if (--syn-nested-- syntax)
+                     (and (> nesting 0) (= (setq nesting (1- nesting)) 0))
+                   (< nesting 0))
+                 (not (and comment-end-can-be-escaped
+                           (memq (logand prev-syntax 255) '(9 10)))))
+            (setq broke t))
+           ;; A comment fence ends a fence-style comment.
+           ((and (= code 14) (= style --st-comment-style--))
+            (setq broke t))
+           (t
+            (when (and (> nesting 0) (= code 11) (--syn-nested-- syntax)
+                       (= (--syn-comment-style-- syntax 0) style))
+              (setq nesting (1+ nesting)))
+            (when (and comment-end-can-be-escaped (memq code '(9 10)))
+              (setq from (1+ from))
+              (if (= from stop)
+                  (setq skip-head 'continue)
+                (setq c (char-after from))
+                (setq prev-syntax syntax)
+                (setq syntax --syn-smax--)
+                (setq code syntax)))
+            (unless (eq skip-head 'continue)
+              (setq from (1+ from)))))))
+      (when (and (not out) (not broke))
+        (if (eq skip-head 'continue)
+            (setq skip-head nil)
+          ;; forw_incomment:
+          (when (and (< from stop) (--syn-comend-first-- syntax)
+                     (progn (setq c1 (char-after from))
+                            (setq other-syntax (--syntax-flags-at-- from c1))
+                            (--syn-comend-second-- other-syntax))
+                     (= (--syn-comment-style-- syntax other-syntax) style)
+                     (if (or (--syn-nested-- syntax) (--syn-nested-- other-syntax))
+                         (> nesting 0)
+                       (< nesting 0)))
+            ;; So that a two-char |# ender cannot report its # as LAST-SYNTAX.
+            (setq syntax --syn-smax--)
+            (setq nesting (1- nesting))
+            (if (<= nesting 0)
+                (setq broke t)
+              (setq from (1+ from))))
+          (when (and (not broke)
+                     (> nesting 0) (< from stop)
+                     (--syn-comstart-first-- syntax)
+                     (progn (setq c1 (char-after from))
+                            (setq other-syntax (--syntax-flags-at-- from c1))
+                            (and (= (--syn-comment-style-- other-syntax syntax) style)
+                                 (--syn-comstart-second-- other-syntax)))
+                     (or (--syn-nested-- syntax) (--syn-nested-- other-syntax)))
+            ;; So that a #|# run is not also a comment ender.
+            (setq syntax --syn-smax--)
+            (setq from (1+ from))
+            (setq nesting (1+ nesting))))))
+    (or out (list t from nesting --syn-smax--))))
+
+;; ---- back_comment (syntax.c) ----
+;; Returns (FOUND POSITION).  FOUND is `from != comment_end'.
+(defun --back-comment-- (from stop comnested comstyle)
+  (let ((string-style -1) (string-lossage nil) (comment-lossage nil)
+        (comment-end from) (comstart-pos 0) (defun-start 0)
+        (nesting 1) (syntax 0) (lossage nil) (done nil) (loop t)
+        code c prev-syntax com2start com2end comstart)
+    (while (and loop (/= from stop))
+      (setq from (1- from))
+      (setq prev-syntax syntax)
+      (setq c (char-after from))
+      (setq syntax (--syntax-flags-at-- from c))
+      (setq code (logand syntax 255))
+      (setq com2start (and (--syn-comstart-first-- syntax)
+                           (--syn-comstart-second-- prev-syntax)
+                           (= comstyle (--syn-comment-style-- prev-syntax syntax))
+                           (eq (and (or (--syn-nested-- prev-syntax)
+                                        (--syn-nested-- syntax))
+                                    t)
+                               (and comnested t))))
+      (setq com2end (and (--syn-comend-first-- syntax)
+                         (--syn-comend-second-- prev-syntax)))
+      (setq comstart (or com2start (= code 11)))
+      ;; Overlapping 2-char markers: don't try to be clever.
+      (when (and (> from stop) (or com2end comstart))
+        (let* ((next-c (char-after (1- from)))
+               (next-syntax (--syntax-flags-at-- (1- from) next-c)))
+          (when (or (and (or comstart comnested)
+                         (--syn-comend-second-- syntax)
+                         (--syn-comend-first-- next-syntax))
+                    (and (or com2end comnested)
+                         (--syn-comstart-second-- syntax)
+                         (= comstyle (--syn-comment-style-- syntax prev-syntax))
+                         (--syn-comstart-first-- next-syntax)))
+            (setq lossage t loop nil))))
+      (when loop
+        ;; The first 2-char marker seen counts as a starter, later ones as enders.
+        (when (and com2start (= comstart-pos 0)) (setq com2end nil))
+        (cond (com2end (setq code 12))
+              (com2start (setq code 11)))
+        (cond
+         ;; Comment starters of a different style are not ours.
+         ((and (not com2end) (not com2start) (= code 11)
+               (or (/= comstyle (--syn-comment-style-- syntax 0))
+                   (not (eq (and (--syn-nested-- syntax) t) (and comnested t)))))
+          nil)
+         ;; Escaped characters, except comment-enders, which cannot be escaped.
+         ((and (or comment-end-can-be-escaped (/= code 12))
+               (--char-quoted-- from))
+          nil)
+         (t
+          (cond
+           ((memq code '(15 14 7))      ; Sstring_fence, Scomment_fence, Sstring
+            (when (memq code '(15 14))
+              (setq c (if (= code 15) --st-string-style-- --st-comment-style--)))
+            (cond ((= string-style -1) (setq string-style c))
+                  ((= string-style c) (setq string-style -1))
+                  (t (setq string-lossage t))))
+           ((= code 11)                 ; Scomment
+            (if (or (/= string-style -1) comment-lossage string-lossage)
+                (setq lossage t loop nil)
+              (if (not comnested)
+                  (setq comstart-pos from)
+                (setq nesting (1- nesting))
+                (when (<= nesting 0) (setq done t loop nil)))))
+           ((= code 12)                 ; Sendcomment
+            (if (and (= (--syn-comment-style-- syntax 0) comstyle)
+                     (eq (and (or (and com2end (--syn-nested-- prev-syntax))
+                                  (--syn-nested-- syntax))
+                              t)
+                         (and comnested t)))
+                (if comnested
+                    (setq nesting (1+ nesting))
+                  ;; Anything before this would match this ender, not ours.
+                  (setq from stop))
+              (when (or (/= comstart-pos 0) (not (eq c ?\n)))
+                (setq comment-lossage t))))
+           ((= code 4)                  ; Sopen
+            (when (and open-paren-in-column-0-is-defun-start
+                       (null comment-use-syntax-ppss)
+                       (or (= from stop) (eq (char-after (1- from)) ?\n)))
+              (setq defun-start from)
+              (setq from stop)))
+           (t nil))))))
+    (cond
+     (done nil)
+     (lossage
+      ;; Two kinds of string delimiter mixed together: decode going forwards
+      ;; from a known safe place, recording where we last passed a starter.
+      (when (= defun-start 0)
+        (setq defun-start (--find-defun-start-- comment-end)))
+      (let ((go t) state)
+        (while go
+          (setq state (--scan-sexps-forward-- (--pps-internalize-- nil)
+                                              defun-start comment-end
+                                              --pps-no-target-- nil 0))
+          (setq defun-start comment-end)
+          (if (and (= (--pps-incomment-- state) (if comnested 1 -1))
+                   (= (--pps-comstyle-- state) comstyle))
+              (setq from (--pps-comstr-start-- state))
+            (setq from comment-end)
+            (when (/= (--pps-incomment-- state) 0)
+              (setq defun-start (+ (--pps-comstr-start-- state) 2))))
+          (setq go (< defun-start comment-end)))))
+     ((= comstart-pos 0) (setq from comment-end))
+     (t (setq from comstart-pos)))
+    (list (/= from comment-end) from)))
+
+;; ---- the parse state of scan_sexps_forward ----
+;; A 12-slot vector standing in for `struct lisp_parse_state'.
+(defconst --pps-no-target-- -2305843009213693952
+  "Stand-in for TYPE_MINIMUM (EMACS_INT): a depth the scan cannot reach.")
+
+(defun --pps-depth-- (s) (aref s 0))
+(defun --pps-instring-- (s) (aref s 1))
+(defun --pps-incomment-- (s) (aref s 2))
+(defun --pps-comstyle-- (s) (aref s 3))
+(defun --pps-quoted-- (s) (aref s 4))
+(defun --pps-mindepth-- (s) (aref s 5))
+(defun --pps-thislevelstart-- (s) (aref s 6))
+(defun --pps-prevlevelstart-- (s) (aref s 7))
+(defun --pps-location-- (s) (aref s 8))
+(defun --pps-comstr-start-- (s) (aref s 9))
+(defun --pps-levelstarts-- (s) (aref s 10))
+(defun --pps-prev-syntax-- (s) (aref s 11))
+
+(defun --pps-internalize-- (external)
+  "Port of syntax.c `internalize_parse_state'."
+  (if (null external)
+      (vector 0 -1 0 0 nil 0 -1 -1 0 -1 nil --syn-smax--)
+    (let* ((depth (let ((tem (nth 0 external))) (if (integerp tem) tem 0)))
+           (tem3 (nth 3 external))
+           (instring (if tem3 (if (characterp tem3) tem3 --st-string-style--) -1))
+           (tem4 (nth 4 external))
+           (incomment (if tem4 (if (integerp tem4) tem4 -1) 0))
+           (quoted (and (nth 5 external) t))
+           (tem7 (nth 7 external))
+           (comstyle (cond ((null tem7) 0)
+                           ((and (integerp tem7) (>= tem7 0)
+                                 (<= tem7 --st-comment-style--))
+                            tem7)
+                           (t --st-comment-style--)))
+           (tem8 (nth 8 external))
+           (comstr-start (if (integerp tem8) tem8 -1))
+           (levelstarts (nth 9 external))
+           (tem10 (nth 10 external))
+           (prev-syntax (if (null tem10) --syn-smax-- tem10)))
+      (vector depth instring incomment comstyle quoted 0 -1 -1 0
+              comstr-start levelstarts prev-syntax))))
+
+;; in_2char_comment_start (syntax.c): is the char at FROM the second half of a
+;; 2-character comment opener begun by PREV-FROM-SYNTAX?  Updates STATE.
+(defun --pps-in-2char-comment-start-- (state prev-from-syntax prev-from from)
+  (let (c1 syntax)
+    (when (and (--syn-comstart-first-- prev-from-syntax)
+               (progn (setq c1 (char-after from))
+                      (setq syntax (--syntax-flags-at-- from c1))
+                      (--syn-comstart-second-- syntax)))
+      (aset state 3 (--syn-comment-style-- syntax prev-from-syntax))
+      (aset state 2 (if (or (--syn-nested-- prev-from-syntax)
+                            (--syn-nested-- syntax))
+                        1 -1))
+      (aset state 9 prev-from)
+      t)))
+
+;; ---- scan_sexps_forward (syntax.c) ----
+;; The C is one function with eleven labels and a fallthrough switch.  It is
+;; transcribed here as an explicit label machine: LABEL holds the C's program
+;; counter, each branch returns the next label, and nil ends the scan.  Writing
+;; it as structured elisp would need the control flow to be re-derived, which is
+;; exactly the step that turns a port into a rewrite.
+;;
+;; `struct level levelstart[100]' becomes OUTER (a list of (LAST . PREV) conses,
+;; innermost first) plus CUR-LAST/CUR-PREV for `curlevel'.  The C silently
+;; clamps at 100 levels rather than signalling, so NLEV does too.
+(defun --scan-sexps-forward-- (state from end targetdepth stopbefore commentstop)
+  (let* ((depth (--pps-depth-- state))
+         (start-quoted (--pps-quoted-- state))
+         (mindepth depth)
+         (prev-from from)
+         (prev-from-syntax (--pps-prev-syntax-- state))
+         (prev-prev-from-syntax --syn-smax--)
+         (boundary-stop (eq commentstop -1))
+         (begv (point-min))
+         (cur-last -1) (cur-prev -1) (outer nil) (nlev 0)
+         (label 'entry)
+         nofence res code c c-code symchar tem)
+    (when (/= from begv) (setq prev-from (1- from)))
+    ;; INC_FROM, as a closure so every call site reads like the C's macro.  A
+    ;; plain lexical closure rather than `cl-flet': `cl-flet' walks the whole
+    ;; body to rewrite the call sites, and this body is the largest form in the
+    ;; prelude, which pushed prelude loading past the 2 MiB stack a test thread
+    ;; gets (the shipped binary runs on a 512 MiB interpreter stack and never
+    ;; saw it).
+    (let ((inc-from (lambda ()
+                      (setq prev-from from)
+                      (setq tem (char-after prev-from))
+                      (setq prev-prev-from-syntax prev-from-syntax)
+                      (setq prev-from-syntax (--syntax-flags-at-- prev-from tem))
+                      (setq from (1+ from)))))
+      (while label
+        (setq label
+              (cond
+               ;; ---- entry dispatch ----
+               ((eq label 'entry)
+                (dolist (temhd (--pps-levelstarts-- state))
+                  (when (integerp temhd) (setq cur-last temhd))
+                  (if (= nlev 99)
+                      nil
+                    (push (cons cur-last cur-prev) outer)
+                    (setq nlev (1+ nlev)))
+                  (setq cur-prev -1 cur-last -1))
+                (setq cur-prev -1 cur-last -1)
+                (aset state 4 nil)
+                (cond
+                 ((/= (--pps-incomment-- state) 0) 'startincomment)
+                 ((>= (--pps-instring-- state) 0)
+                  (setq nofence (/= (--pps-instring-- state) --st-string-style--))
+                  (if start-quoted 'startquotedinstring 'startinstring))
+                 (start-quoted 'startquoted)
+                 ((and (< from end)
+                       (--pps-in-2char-comment-start-- state prev-from-syntax
+                                                        prev-from from))
+                  (funcall inc-from)
+                  (setq prev-from-syntax --syn-smax--)
+                  'atcomment)
+                 (t 'main)))
+
+               ;; ---- while (from < end) ----
+               ((eq label 'main)
+                (if (>= from end)
+                    'done
+                  (funcall inc-from)
+                  (cond
+                   ((and (< from end)
+                         (--pps-in-2char-comment-start-- state prev-from-syntax
+                                                          prev-from from))
+                    (funcall inc-from)
+                    (setq prev-from-syntax --syn-smax--)
+                    'atcomment)
+                   ((--syn-prefix-- prev-from-syntax) 'main)
+                   (t
+                    (setq code (logand prev-from-syntax 255))
+                    (cond
+                     ((memq code '(9 10))            ; Sescape, Scharquote
+                      (if stopbefore 'stop
+                        (setq cur-last prev-from)
+                        'startquoted))
+                     ((memq code '(2 3))             ; Sword, Ssymbol
+                      (if stopbefore 'stop
+                        (setq cur-last prev-from)
+                        'symstarted))
+                     ((= code 14)                    ; Scomment_fence
+                      (aset state 3 --st-comment-style--)
+                      (aset state 2 -1)
+                      (aset state 9 prev-from)
+                      'atcomment)
+                     ((= code 11)                    ; Scomment
+                      (aset state 3 (--syn-comment-style-- prev-from-syntax 0))
+                      (aset state 2 (if (--syn-nested-- prev-from-syntax) 1 -1))
+                      (aset state 9 prev-from)
+                      'atcomment)
+                     ((= code 4)                     ; Sopen
+                      (if stopbefore 'stop
+                        (setq depth (1+ depth))
+                        (setq cur-last prev-from)
+                        (if (= nlev 99)
+                            nil
+                          (push (cons cur-last cur-prev) outer)
+                          (setq nlev (1+ nlev)))
+                        (setq cur-prev -1 cur-last -1)
+                        (if (= targetdepth depth) 'done 'main)))
+                     ((= code 5)                     ; Sclose
+                      (setq depth (1- depth))
+                      (when (< depth mindepth) (setq mindepth depth))
+                      (when (> nlev 0)
+                        (setq cur-last (car (car outer)))
+                        (setq cur-prev (cdr (car outer)))
+                        (setq outer (cdr outer))
+                        (setq nlev (1- nlev)))
+                      (setq cur-prev cur-last)
+                      (if (= targetdepth depth) 'done 'main))
+                     ((memq code '(7 15))            ; Sstring, Sstring_fence
+                      (aset state 9 (1- from))
+                      (if stopbefore 'stop
+                        (setq cur-last prev-from)
+                        (aset state 1 (if (= code 7)
+                                          (char-after prev-from)
+                                        --st-string-style--))
+                        (if boundary-stop 'done 'startinstring)))
+                     (t 'main))))))            ; Smath, whitespace, punct, ...
+
+               ;; ---- startquoted ----
+               ((eq label 'startquoted)
+                (if (= from end) 'endquoted (funcall inc-from) 'symstarted))
+
+               ;; ---- symstarted / symdone ----
+               ((eq label 'symstarted)
+                (cond
+                 ((>= from end) (setq cur-prev cur-last) 'main)
+                 ((--pps-in-2char-comment-start-- state prev-from-syntax
+                                                   prev-from from)
+                  (funcall inc-from)
+                  (setq prev-from-syntax --syn-smax--)
+                  'atcomment)
+                 (t
+                  (setq symchar (char-after from))
+                  (setq code (--syntax-code-at-- from symchar))
+                  (cond
+                   ((memq code '(9 10))              ; Scharquote, Sescape
+                    (funcall inc-from)
+                    (if (= from end) 'endquoted (funcall inc-from) 'symstarted))
+                   ((memq code '(2 3 6))             ; Sword, Ssymbol, Squote
+                    (funcall inc-from)
+                    'symstarted)
+                   (t (setq cur-prev cur-last) 'main)))))
+
+               ;; ---- atcomment / startincomment ----
+               ((eq label 'atcomment)
+                (if (or (/= commentstop 0) boundary-stop)
+                    'done
+                  'startincomment))
+
+               ((eq label 'startincomment)
+                ;; The (from == BEGV) test enters forw_comment in the middle so
+                ;; that a 2-char ender is found even when the scan starts inside
+                ;; it -- but not when we are only just at the comment's start
+                ;; (think of "(*) ... (*)").
+                (setq res (--forw-comment-- from end
+                                            (--pps-incomment-- state)
+                                            (--pps-comstyle-- state)
+                                            (if (= from begv) 0 prev-from-syntax)))
+                (setq from (nth 1 res))
+                (setq prev-from-syntax (nth 3 res))
+                (if (not (nth 0 res))
+                    (progn
+                      (aset state 2 (nth 2 res))
+                      (if (memq (logand prev-from-syntax 255) '(9 10))
+                          'endquoted
+                        'done))
+                  (funcall inc-from)
+                  (aset state 2 0)
+                  (aset state 3 0)
+                  (setq prev-from-syntax --syn-smax--)
+                  (if boundary-stop 'done 'main)))
+
+               ;; ---- startinstring / startquotedinstring / string_end ----
+               ((eq label 'startinstring)
+                (setq nofence (/= (--pps-instring-- state) --st-string-style--))
+                'instring-loop)
+
+               ((eq label 'startquotedinstring)
+                (if (>= from end) 'endquoted (funcall inc-from) 'instring-loop))
+
+               ((eq label 'instring-loop)
+                (if (>= from end)
+                    'done
+                  (setq c (char-after from))
+                  (setq c-code (--syntax-code-at-- from c))
+                  (if (and nofence (eq c (--pps-instring-- state)) (= c-code 7))
+                      'string-end
+                    (cond
+                     ((= c-code 15)                  ; Sstring_fence
+                      (if (not nofence) 'string-end (funcall inc-from) 'instring-loop))
+                     ((memq c-code '(9 10))          ; Scharquote, Sescape
+                      (funcall inc-from)
+                      (if (>= from end) 'endquoted (funcall inc-from) 'instring-loop))
+                     (t (funcall inc-from) 'instring-loop)))))
+
+               ((eq label 'string-end)
+                (aset state 1 -1)
+                (setq cur-prev cur-last)
+                (funcall inc-from)
+                (if boundary-stop 'done 'main))
+
+               ;; ---- stop / endquoted / done ----
+               ((eq label 'stop)
+                (setq from prev-from)
+                (setq prev-from-syntax prev-prev-from-syntax)
+                'done)
+
+               ((eq label 'endquoted)
+                (aset state 4 t)
+                'done)
+
+               ((eq label 'done)
+                (aset state 0 depth)
+                (aset state 5 mindepth)
+                (aset state 6 cur-prev)
+                (aset state 7 (if (= nlev 0) -1 (car (car outer))))
+                (aset state 8 from)
+                (aset state 10 (reverse (mapcar #'car outer)))
+                (aset state 11 (if (or (--syn-comstartend-first-- prev-from-syntax)
+                                       (--pps-quoted-- state))
+                                   prev-from-syntax
+                                 --syn-smax--))
+                nil)))))
+    state))
+
+;; ---- scan_lists (syntax.c) ----
+;; The C's `goto lose' is a signal, so it stays a signal here.  `done'/`done2'
+;; end one iteration of the count loop and `return Qnil' leaves the whole scan,
+;; so those two are catch tags.
+(defun --scan-lists-- (from0 count depth sexpflag)
+  (let* ((stop (if (> count 0) (point-max) (point-min)))
+         (min-depth (if (> depth 0) 0 depth))
+         (from (max (point-min) (min (point-max) from0)))
+         (last-good from0)
+         (comstyle 0) (comnested nil) (mathexit nil)
+         (mbsym (and sexpflag multibyte-syntax-as-symbol t))
+         c c1 code syntax other-syntax comstart-first prefix
+         stringterm c-code quoted temp-pos res act inner)
+    (catch '--sl-return--
+      (while (> count 0)
+        (catch '--sl-done--
+          (while (< from stop)
+            (setq c (char-after from))
+            (setq syntax (--syntax-flags-at-- from c))
+            (setq code (--syntax-code-mb-- from c mbsym))
+            (setq comstart-first (--syn-comstart-first-- syntax))
+            (setq comnested (--syn-nested-- syntax))
+            (setq comstyle (--syn-comment-style-- syntax 0))
+            (setq prefix (--syn-prefix-- syntax))
+            (when (= depth min-depth) (setq last-good from))
+            (setq from (1+ from))
+            ;; The C reassigns C inside the && chain, so it is clobbered
+            ;; whenever the first two conjuncts hold -- even if
+            ;; `parse-sexp-ignore-comments' is nil and the branch is not taken.
+            (when (and (< from stop) comstart-first)
+              (setq c (char-after from))
+              (setq other-syntax (--syntax-flags-at-- from c))
+              (when (and (--syn-comstart-second-- other-syntax)
+                         parse-sexp-ignore-comments)
+                (setq code 11)
+                (setq comstyle (--syn-comment-style-- other-syntax syntax))
+                (setq comnested (or comnested (--syn-nested-- other-syntax)))
+                (setq from (1+ from))))
+            (unless prefix
+              (setq act nil)
+              (when (memq code '(9 10))            ; Sescape, Scharquote
+                (when (= from stop) (--sl-lose-- last-good from))
+                (setq from (1+ from))
+                (setq code 2))                     ; fall through to Sword
+              (cond
+               ((memq code '(2 3))                 ; Sword, Ssymbol
+                (unless (or (/= depth 0) (not sexpflag))
+                  (setq inner t)
+                  (while (and inner (< from stop))
+                    (setq c (char-after from))
+                    (setq c-code (--syntax-code-mb-- from c mbsym))
+                    (cond
+                     ((memq c-code '(9 10))
+                      (setq from (1+ from))
+                      (when (= from stop) (--sl-lose-- last-good from)))
+                     ((memq c-code '(2 3 6)) nil)  ; Sword, Ssymbol, Squote
+                     (t (setq inner nil)))
+                    (when inner (setq from (1+ from))))
+                  (throw '--sl-done-- nil)))
+               ((memq code '(11 14))               ; Scomment, Scomment_fence
+                (when (= code 14) (setq comstyle --st-comment-style--))
+                (when parse-sexp-ignore-comments
+                  (setq res (--forw-comment-- from stop
+                                              (if comnested 1 0) comstyle 0))
+                  (setq from (nth 1 res))
+                  (unless (nth 0 res)
+                    (if (= depth 0)
+                        (throw '--sl-done-- nil)
+                      (--sl-lose-- last-good from)))
+                  (setq from (1+ from))))
+               ((= code 8)                         ; Smath
+                (when sexpflag
+                  (when (and (/= from stop) (eq c (char-after from)))
+                    (setq from (1+ from)))
+                  (if mathexit
+                      (progn (setq mathexit nil) (setq act 'close))
+                    (setq mathexit t)
+                    (setq act 'open))))
+               ((= code 4) (setq act 'open))       ; Sopen
+               ((= code 5) (setq act 'close))      ; Sclose
+               ((memq code '(7 15))                ; Sstring, Sstring_fence
+                (setq stringterm (char-after (1- from)))
+                (setq inner t)
+                (while inner
+                  (when (>= from stop) (--sl-lose-- last-good from))
+                  (setq c (char-after from))
+                  (setq c-code (--syntax-code-mb-- from c mbsym))
+                  (if (if (= code 7)
+                          (and (eq c stringterm) (= c-code 7))
+                        (= c-code 15))
+                      (setq inner nil)
+                    (when (memq c-code '(9 10)) (setq from (1+ from)))
+                    (setq from (1+ from))))
+                (setq from (1+ from))
+                (when (and (= depth 0) sexpflag) (throw '--sl-done-- nil)))
+               (t nil))                            ; whitespace, punct, quote...
+              (cond
+               ((eq act 'open)
+                (setq depth (1+ depth))
+                (when (= depth 0) (throw '--sl-done-- nil)))
+               ((eq act 'close)
+                (setq depth (1- depth))
+                (when (= depth 0) (throw '--sl-done-- nil))
+                (when (< depth min-depth)
+                  (signal 'scan-error
+                          (list "Containing expression ends prematurely"
+                                last-good from)))))))
+          ;; Reached end of buffer: error if within an object, nil if between.
+          (when (/= depth 0) (--sl-lose-- last-good from))
+          (throw '--sl-return-- nil))
+        (setq count (1- count)))
+
+      (while (< count 0)
+        (catch '--sl-done--
+          (while (> from stop)
+            (setq from (1- from))
+            (setq c (char-after from))
+            (setq syntax (--syntax-flags-at-- from c))
+            (setq code (--syntax-code-mb-- from c mbsym))
+            (when (= depth min-depth) (setq last-good from))
+            (setq comstyle 0)
+            (setq comnested (--syn-nested-- syntax))
+            (when (= code 12) (setq comstyle (--syn-comment-style-- syntax 0)))
+            (setq prefix nil)
+            (when (and (> from stop) (--syn-comend-second-- syntax)
+                       (--prev-char-comend-first-- from)
+                       parse-sexp-ignore-comments)
+              (setq from (1- from))
+              (setq code 12)
+              (setq c1 (char-after from))
+              (setq other-syntax (--syntax-flags-at-- from c1))
+              (setq comstyle (--syn-comment-style-- other-syntax syntax))
+              (setq comnested (or comnested (--syn-nested-- other-syntax))))
+            ;; Quoting turns anything but a comment-ender into a word char.
+            (if (and (/= code 12) (--char-quoted-- from))
+                (progn (setq from (1- from)) (setq code 2))
+              (when (--syn-prefix-- syntax) (setq prefix t)))
+            (unless prefix
+              (setq act nil)
+              (cond
+               ((memq code '(2 3 9 10))            ; Sword, Ssymbol, Sescape, ...
+                (unless (or (/= depth 0) (not sexpflag))
+                  (setq inner t)
+                  (while (and inner (> from stop))
+                    (setq temp-pos (1- from))
+                    (setq c1 (char-after temp-pos))
+                    ;; Don't allow comment-end to be quoted.
+                    (if (= (--syntax-code-mb-- temp-pos c1 mbsym) 12)
+                        (setq inner nil)
+                      (setq quoted (--char-quoted-- (1- from)))
+                      (when quoted
+                        (setq from (1- from))
+                        (setq temp-pos (1- temp-pos)))
+                      (setq c1 (char-after temp-pos))
+                      (if (and (not quoted)
+                               (not (memq (--syntax-code-mb-- temp-pos c1 mbsym)
+                                          '(2 3 6))))
+                          (setq inner nil)
+                        (setq from (1- from)))))
+                  (throw '--sl-done-- nil)))
+               ((= code 8)                         ; Smath
+                (when sexpflag
+                  (when (> from (point-min))
+                    (setq temp-pos (1- from))
+                    (when (and (/= from stop) (eq c (char-after temp-pos)))
+                      (setq from (1- from))))
+                  (if mathexit
+                      (progn (setq mathexit nil) (setq act 'open))
+                    (setq mathexit t)
+                    (setq act 'close))))
+               ((= code 5) (setq act 'close))      ; Sclose
+               ((= code 4) (setq act 'open))       ; Sopen
+               ((= code 12)                        ; Sendcomment
+                (when parse-sexp-ignore-comments
+                  (setq res (--back-comment-- from stop comnested comstyle))
+                  (when (nth 0 res) (setq from (nth 1 res)))))
+               ((memq code '(14 15))               ; Scomment_fence, Sstring_fence
+                (setq inner t)
+                (while inner
+                  (when (= from stop) (--sl-lose-- last-good from))
+                  (setq from (1- from))
+                  (unless (--char-quoted-- from)
+                    (setq c (char-after from))
+                    (when (= (--syntax-code-mb-- from c mbsym) code)
+                      (setq inner nil))))
+                (when (and (= code 15) (= depth 0) sexpflag)
+                  (throw '--sl-done-- nil)))
+               ((= code 7)                         ; Sstring
+                (setq stringterm (char-after from))
+                (setq inner t)
+                (while inner
+                  (when (= from stop) (--sl-lose-- last-good from))
+                  (setq from (1- from))
+                  (unless (--char-quoted-- from)
+                    (setq c (char-after from))
+                    (when (and (eq c stringterm)
+                               (= (--syntax-code-mb-- from c mbsym) 7))
+                      (setq inner nil))))
+                (when (and (= depth 0) sexpflag) (throw '--sl-done-- nil)))
+               (t nil))
+              (cond
+               ((eq act 'close)
+                (setq depth (1+ depth))
+                (when (= depth 0) (throw '--sl-done-- nil)))
+               ((eq act 'open)
+                (setq depth (1- depth))
+                (when (= depth 0) (throw '--sl-done-- nil))
+                (when (< depth min-depth)
+                  (signal 'scan-error
+                          (list "Containing expression ends prematurely"
+                                last-good from)))))))
+          (when (/= depth 0) (--sl-lose-- last-good from))
+          (throw '--sl-return-- nil))
+        (setq count (1+ count)))
+      from)))
+
+(defun --sl-lose-- (last-good from)
+  (signal 'scan-error (list "Unbalanced parentheses" last-good from)))
+
+;; ---- the scanner's Lisp entry points ----
+(defun scan-lists (from count depth)
+  "Scan from character number FROM by COUNT lists.
+Scan forward if COUNT is positive, backward if COUNT is negative.
+Return the character number of the position thus found.
+
+A \"list\", in this context, refers to a balanced parenthetical
+grouping, as determined by the syntax table.
+
+If DEPTH is nonzero, treat that as the nesting depth of the starting
+point (i.e. the starting point is DEPTH parentheses deep).  This
+function scans over parentheses until the depth goes to zero COUNT
+times.  Hence, positive DEPTH moves out that number of levels of
+parentheses, while negative DEPTH moves to a deeper level.
+
+Comments are ignored if `parse-sexp-ignore-comments' is non-nil.
+
+If we reach the beginning or end of the accessible part of the buffer
+before we have scanned over COUNT lists, return nil if the depth at
+that point is zero, and signal an error if the depth is nonzero."
+  (unless (integerp from) (signal 'wrong-type-argument (list 'fixnump from)))
+  (unless (integerp count) (signal 'wrong-type-argument (list 'fixnump count)))
+  (unless (integerp depth) (signal 'wrong-type-argument (list 'fixnump depth)))
+  (--scan-lists-- from count depth nil))
+
+(defun scan-sexps (from count)
+  "Scan from character number FROM by COUNT balanced expressions.
+If COUNT is negative, scan backwards.
+Returns the character number of the position thus found.
+
+Comments are ignored if `parse-sexp-ignore-comments' is non-nil.
+
+If the beginning or end of (the accessible part of) the buffer is reached
+in the middle of a parenthetical grouping, an error is signaled.
+If the beginning or end is reached between groupings
+but before count is used up, nil is returned."
+  (unless (integerp from) (signal 'wrong-type-argument (list 'fixnump from)))
+  (unless (integerp count) (signal 'wrong-type-argument (list 'fixnump count)))
+  (--scan-lists-- from count 0 t))
+
+(defun matching-paren (character)
+  "Return the matching parenthesis of CHARACTER, or nil if none."
+  (unless (characterp character)
+    (signal 'wrong-type-argument (list 'characterp character)))
+  (let ((code (--syntax-code-at-- nil character)))
+    (and (memq code '(4 5)) (--syntax-match-at-- nil character))))
+
+(defun syntax-after (pos)
+  "Return the raw syntax descriptor for the char after POS.
+If POS is outside the buffer's accessible portion, return nil."
+  (unless (or (< pos (point-min)) (>= pos (point-max)))
+    (let ((st (and parse-sexp-lookup-properties
+                   (get-char-property pos 'syntax-table))))
+      (if (consp st) st (aref (syntax-table) (char-after pos))))))
+
+(defun syntax-prefix-flag-p (c)
+  "Whether the syntax of character C has the prefix flag set."
+  (--syn-prefix-- (--syntax-flags-at-- nil c)))
+
+(defun backward-prefix-chars ()
+  "Move point backward over any number of chars with prefix syntax.
+This includes chars with expression prefix syntax class (') and those with
+the prefix syntax flag (p)."
+  (let* ((beg (point-min)) (opoint (point)) (pos (point)) (go t) c)
+    (if (<= pos beg)
+        (progn (goto-char opoint) nil)
+      (setq pos (1- pos))
+      (while (and go
+                  (not (--char-quoted-- pos))
+                  (progn (setq c (char-after pos))
+                         (or (= (--syntax-code-at-- pos c) 6)
+                             (syntax-prefix-flag-p c))))
+        (setq opoint pos)
+        (if (<= pos beg)
+            (setq go nil)
+          (setq pos (1- pos))))
+      (goto-char opoint)
+      nil)))
+
+(defun forward-comment (count)
+  "Move forward across up to COUNT comments.  If COUNT is negative, move backward.
+Stop scanning if we find something other than a comment or whitespace.
+Set point to where scanning stops.
+If COUNT comments are found as expected, with nothing except whitespace
+between them, return t; otherwise return nil."
+  (unless (integerp count) (signal 'wrong-type-argument (list 'fixnump count)))
+  (let* ((stop (if (> count 0) (point-max) (point-min)))
+         (from (point))
+         (comstyle 0) (comnested nil) (count1 count)
+         c c1 code syntax other-syntax comstart-first found res quoted
+         (fence-found nil) ini)
+    (catch '--fc--
+      (while (> count1 0)
+        (setq code nil)
+        (while (or (null code) (= code 0) (and (= code 12) (eq c ?\n)))
+          (when (= from stop) (goto-char from) (throw '--fc-- nil))
+          (setq c (char-after from))
+          (setq syntax (--syntax-flags-at-- from c))
+          (setq code (logand syntax 255))
+          (setq comstart-first (--syn-comstart-first-- syntax))
+          (setq comnested (--syn-nested-- syntax))
+          (setq comstyle (--syn-comment-style-- syntax 0))
+          (setq from (1+ from))
+          (when (and (< from stop) comstart-first)
+            (setq c1 (char-after from))
+            (setq other-syntax (--syntax-flags-at-- from c1))
+            (when (--syn-comstart-second-- other-syntax)
+              (setq code 11)
+              (setq comstyle (--syn-comment-style-- other-syntax syntax))
+              (setq comnested (or comnested (--syn-nested-- other-syntax)))
+              (setq from (1+ from)))))
+        (cond ((= code 14) (setq comstyle --st-comment-style--))
+              ((/= code 11)
+               (setq from (1- from))
+               (goto-char from)
+               (throw '--fc-- nil)))
+        (setq res (--forw-comment-- from stop (if comnested 1 0) comstyle 0))
+        (setq from (nth 1 res))
+        (unless (nth 0 res) (goto-char from) (throw '--fc-- nil))
+        (setq from (1+ from))
+        (setq count1 (1- count1)))
+
+      (while (< count1 0)
+        (catch '--fc-one--
+          (while t
+            (when (<= from stop) (goto-char (point-min)) (throw '--fc-- nil))
+            (setq from (1- from))
+            (setq quoted (--char-quoted-- from))
+            (setq c (char-after from))
+            (setq syntax (--syntax-flags-at-- from c))
+            (setq code (logand syntax 255))
+            (setq comstyle 0)
+            (setq comnested (--syn-nested-- syntax))
+            (when (= code 12) (setq comstyle (--syn-comment-style-- syntax 0)))
+            (when (and (> from stop) (--syn-comend-second-- syntax)
+                       (--prev-char-comend-first-- from)
+                       (not (--char-quoted-- (1- from))))
+              (setq from (1- from))
+              (setq code 12)
+              (setq c1 (char-after from))
+              (setq other-syntax (--syntax-flags-at-- from c1))
+              (setq comstyle (--syn-comment-style-- other-syntax syntax))
+              (setq comnested (or comnested (--syn-nested-- other-syntax))))
+            (cond
+             ((= code 14)                        ; Scomment_fence
+              (setq fence-found nil)
+              (setq ini from)
+              (when (> from stop)
+                (catch '--fc-fence--
+                  (while t
+                    (setq from (1- from))
+                    (setq c (char-after from))
+                    (cond ((and (= (--syntax-code-at-- from c) 14)
+                                (not (--char-quoted-- from)))
+                           (setq fence-found t)
+                           (throw '--fc-fence-- nil))
+                          ((= from stop) (throw '--fc-fence-- nil))))))
+              (if fence-found
+                  (throw '--fc-one-- nil)
+                (setq from ini)
+                (setq from (1+ from))
+                (goto-char from)
+                (throw '--fc-- nil)))
+             ((= code 12)                        ; Sendcomment
+              (setq found (and (or (not quoted) (not comment-end-can-be-escaped))
+                               (--back-comment-- from stop comnested comstyle)))
+              (if (and found (nth 0 found))
+                  (progn (setq from (nth 1 found)) (throw '--fc-one-- nil))
+                (unless (eq c ?\n)
+                  ;; Go back to the end of this not-quite-endcomment.
+                  (when (/= (--syntax-code-at-- from (char-after from)) code)
+                    (setq from (1+ from)))
+                  (setq from (1+ from))
+                  (goto-char from)
+                  (throw '--fc-- nil))))
+             ((or (/= code 0) quoted)
+              (setq from (1+ from))
+              (goto-char from)
+              (throw '--fc-- nil)))))
+        (setq count1 (1+ count1)))
+      (goto-char from)
+      t)))
+
+;; ---- parse-partial-sexp (syntax.c Fparse_partial_sexp) ----
+(defun parse-partial-sexp (from to &optional targetdepth stopbefore oldstate commentstop)
+  "Parse Lisp syntax starting at FROM until TO; return status of parse at TO.
+Parsing stops at TO or when certain criteria are met;
+ point is set to where parsing stops.
+
+If OLDSTATE is omitted or nil, parsing assumes that FROM is the
+ beginning of a function.  If not, OLDSTATE should be the state at FROM."
+  (let ((target (if targetdepth
+                    (progn
+                      (unless (integerp targetdepth)
+                        (signal 'wrong-type-argument (list 'fixnump targetdepth)))
+                      targetdepth)
+                  --pps-no-target--))
+        (f (if (markerp from) (marker-position from) from))
+        (t2 (if (markerp to) (marker-position to) to))
+        state)
+    (when (< t2 f) (error "End position is smaller than start position"))
+    ;; `validate_region' (editfns.c) rejects an out-of-range pair outright --
+    ;; it does not clamp -- and names the buffer and the arguments AS PASSED:
+    ;;   (parse-partial-sexp 1 40) in an empty buffer
+    ;;     => (args-out-of-range #<buffer *scratch*> 1 40)
+    ;; Clamping instead makes the call answer a plausible state for a region
+    ;; that does not exist.
+    (unless (and (<= (point-min) f) (<= t2 (point-max)))
+      (signal 'args-out-of-range (list (current-buffer) from to)))
+    (setq state (--pps-internalize-- oldstate))
+    (--scan-sexps-forward-- state f t2 target (and stopbefore t)
+                            (cond ((null commentstop) 0)
+                                  ((eq commentstop 'syntax-table) -1)
+                                  (t 1)))
+    (goto-char (--pps-location-- state))
+    (list (--pps-depth-- state)
+          (if (< (--pps-prevlevelstart-- state) 0) nil (--pps-prevlevelstart-- state))
+          (if (< (--pps-thislevelstart-- state) 0) nil (--pps-thislevelstart-- state))
+          (if (>= (--pps-instring-- state) 0)
+              (if (= (--pps-instring-- state) --st-string-style--)
+                  t
+                (--pps-instring-- state))
+            nil)
+          (cond ((< (--pps-incomment-- state) 0) t)
+                ((= (--pps-incomment-- state) 0) nil)
+                (t (--pps-incomment-- state)))
+          (and (--pps-quoted-- state) t)
+          (--pps-mindepth-- state)
+          (if (= (--pps-comstyle-- state) 0)
+              nil
+            (if (= (--pps-comstyle-- state) --st-comment-style--)
+                'syntax-table
+              (--pps-comstyle-- state)))
+          (if (or (/= (--pps-incomment-- state) 0)
+                  (>= (--pps-instring-- state) 0))
+              (--pps-comstr-start-- state)
+            nil)
+          (--pps-levelstarts-- state)
+          (if (= (--pps-prev-syntax-- state) --syn-smax--)
+              nil
+            (--pps-prev-syntax-- state)))))
+
+;; ---- syntax.el: the ppss accessors, syntax-propertize and syntax-ppss ----
+(cl-defstruct (ppss (:constructor make-ppss) (:copier nil) (:type list))
+  (depth nil) (innermost-start nil) (last-complete-sexp-start nil)
+  (string-terminator nil) (comment-depth nil) (quoted-p nil)
+  (min-depth nil) (comment-style nil) (comment-or-string-start nil)
+  (open-parens nil) (two-character-syntax nil))
+
+(defvar-local syntax-propertize-function nil
+  "Mode-specific function to apply `syntax-table' text properties.")
+(defvar-local syntax-propertize--done -1
+  "Position up to which syntax-table properties have been set.")
+(defvar-local syntax-ppss-table nil
+  "Syntax-table to use during `syntax-ppss', if any.")
+
+(defun syntax-propertize (pos)
+  "Ensure that syntax-table properties are set until POS (a buffer point)."
+  (when (and syntax-propertize-function
+             (< syntax-propertize--done pos))
+    (let ((start (max (point-min) syntax-propertize--done))
+          (end (min (point-max) pos)))
+      (setq syntax-propertize--done end)
+      (save-excursion (funcall syntax-propertize-function start end))))
+  nil)
+
+(defun syntax-ppss-depth (ppss) (nth 0 ppss))
+
+(defun syntax-ppss-toplevel-pos (ppss)
+  "Get the latest syntactically outermost position found in a syntactic scan.
+PPSS is a scan state, as returned by `parse-partial-sexp' or `syntax-ppss'."
+  (or (car (nth 9 ppss)) (nth 8 ppss)))
+
+(defun syntax-ppss-context (ppss)
+  "Say whether PPSS is a string, a comment, or something else."
+  (cond ((nth 3 ppss) 'string) ((nth 4 ppss) 'comment) (t nil)))
+
+(defun syntax-ppss-flush-cache (_beg &rest _ignored)
+  "Flush the `syntax-ppss' cache from BEG onward."
+  nil)
+
+;; NAMED boundary: Emacs memoizes the parse in `syntax-ppss-last' and
+;; `syntax-ppss-cache' and restarts from the nearest cached position, so its
+;; elements 2 and 6 depend on where the cache happened to have an entry -- which
+;; is exactly why its docstring says those two "cannot be relied upon".  This
+;; parses from `point-min' every time, which is what Emacs itself does on a cold
+;; cache, so every element including 2 and 6 matches a first call in a fresh
+;; buffer.  The difference is speed, and element 2/6 drift that Emacs already
+;; disclaims.
+(defun syntax-ppss (&optional pos)
+  "Parse-Partial-Sexp State at POS, defaulting to point.
+If POS is given, this function moves point to POS.
+
+The returned value is the same as that of `parse-partial-sexp'
+run from `point-min' to POS except that values at positions 2 and 6
+in the returned list (counting from 0) cannot be relied upon."
+  (unless pos (setq pos (point)))
+  (syntax-propertize pos)
+  (with-syntax-table (or syntax-ppss-table (syntax-table))
+    (parse-partial-sexp (point-min) pos)))
+
+;; ---- lisp.el: sexp and list motion ----
+(defvar forward-sexp-function nil
+  "If non-nil, `forward-sexp' delegates to this function.
+Should take the same arguments and behave similarly to `forward-sexp'.")
+
+(defun forward-sexp-default-function (&optional arg)
+  "Default function for `forward-sexp-function'."
+  (goto-char (or (scan-sexps (point) arg) (buffer-end arg)))
+  (if (< arg 0) (backward-prefix-chars)))
+
+(defun forward-sexp (&optional arg interactive)
+  "Move forward across one balanced expression (sexp).
+With ARG, do it that many times.  Negative arg -N means move
+backward across N balanced expressions.  This command assumes
+point is not in a string or comment.  Calls
+`forward-sexp-function' to do the work, if that is non-nil."
+  (if interactive
+      (condition-case _
+          (forward-sexp arg nil)
+        (scan-error (user-error (if (> arg 0) "No next sexp" "No previous sexp"))))
+    (or arg (setq arg 1))
+    (if forward-sexp-function
+        (funcall forward-sexp-function arg)
+      (forward-sexp-default-function arg))))
+
+(defun backward-sexp (&optional arg interactive)
+  "Move backward across one balanced expression (sexp).
+With ARG, do it that many times.  Negative arg -N means
+move forward across N balanced expressions."
+  (or arg (setq arg 1))
+  (forward-sexp (- arg) interactive))
+
+(defun forward-list (&optional arg interactive)
+  "Move forward across one balanced group of parentheses.
+With ARG, do it that many times.
+Negative arg -N means move backward across N groups of parentheses."
+  (if interactive
+      (condition-case _
+          (forward-list arg nil)
+        (scan-error (user-error (if (> arg 0) "No next group" "No previous group"))))
+    (or arg (setq arg 1))
+    (goto-char (or (scan-lists (point) arg 0) (buffer-end arg)))))
+
+(defun backward-list (&optional arg interactive)
+  "Move backward across one balanced group of parentheses.
+With ARG, do it that many times.
+Negative arg -N means move forward across N groups of parentheses."
+  (or arg (setq arg 1))
+  (forward-list (- arg) interactive))
+
+(defun down-list (&optional arg interactive)
+  "Move forward down one level of parentheses.
+With ARG, do this that many times.
+A negative argument means move backward but still go down a level."
+  (when (ppss-comment-or-string-start (syntax-ppss))
+    (user-error "This command doesn't work in strings or comments"))
+  (if interactive
+      (condition-case _
+          (down-list arg nil)
+        (scan-error (user-error "At bottom level")))
+    (or arg (setq arg 1))
+    (let ((inc (if (> arg 0) 1 -1)))
+      (while (/= arg 0)
+        (goto-char (or (scan-lists (point) inc -1) (buffer-end arg)))
+        (setq arg (- arg inc))))))
+
+(defun backward-up-list (&optional arg escape-strings no-syntax-crossing)
+  "Move backward out of one level of parentheses.
+With ARG, do this that many times.  A negative argument means move
+forward but still to a less deep spot."
+  (up-list (- (or arg 1)) escape-strings no-syntax-crossing))
+
+(defun up-list (&optional arg escape-strings no-syntax-crossing)
+  "Move forward out of one level of parentheses.
+With ARG, do this that many times.  A negative argument means move
+backward but still to a less deep spot."
+  (or arg (setq arg 1))
+  (let ((inc (if (> arg 0) 1 -1))
+        (pos nil))
+    (while (/= arg 0)
+      (condition-case err
+          (save-restriction
+            ;; If we've been asked not to cross string boundaries and we're
+            ;; inside a string, narrow to that string so that scan-lists
+            ;; doesn't find a match in a different string.
+            (when no-syntax-crossing
+              (let* ((syntax (syntax-ppss))
+                     (string-comment-start (nth 8 syntax)))
+                (when string-comment-start
+                  (save-excursion
+                    (goto-char string-comment-start)
+                    (narrow-to-region
+                     (point)
+                     (if (nth 3 syntax)
+                         (condition-case nil
+                             (progn (forward-sexp) (point))
+                           (scan-error (point-max)))
+                       (forward-comment 1)
+                       (point)))))))
+            (if (null forward-sexp-function)
+                (goto-char (or (scan-lists (point) inc 1) (buffer-end arg)))
+              (condition-case err2
+                  (while (progn (setq pos (point))
+                                (forward-sexp inc)
+                                (/= (point) pos)))
+                (scan-error (goto-char (nth (if (> arg 0) 3 2) err2))))
+              (if (= (point) pos)
+                  (signal 'scan-error
+                          (list "Unbalanced parentheses" (point) (point))))))
+        (scan-error
+         (let ((syntax nil))
+           (or
+            (and escape-strings
+                 (or syntax (setq syntax (syntax-ppss)))
+                 (nth 3 syntax)
+                 (goto-char (nth 8 syntax))
+                 (progn (when (> inc 0) (forward-sexp)) t))
+            (and no-syntax-crossing
+                 (or syntax (setq syntax (syntax-ppss)))
+                 (nth 4 syntax)
+                 (goto-char (nth 8 syntax))
+                 (or (< inc 0) (forward-comment 1))
+                 (setq arg (+ arg inc)))
+            (if no-syntax-crossing
+                (user-error "At top level")
+              (signal (car err) (cdr err)))))))
+      (setq arg (- arg inc)))))
 
 ;; ---- Lisp-mode syntax tables (lisp-mode.el / elisp-mode.el) ----
 ;; Pure make-syntax-table + modify-syntax-entry constructions; ported verbatim so

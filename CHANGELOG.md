@@ -6,6 +6,58 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`syntax.c`'s sexp/comment scanner.** `scan-lists`, `scan-sexps`,
+  `parse-partial-sexp`, `syntax-ppss`, `forward-comment`,
+  `backward-prefix-chars`, `matching-paren`, `syntax-after`, and the motion
+  commands `forward-sexp` / `backward-sexp` / `forward-list` / `backward-list` /
+  `down-list` / `up-list` / `backward-up-list` — all previously void. This is
+  one port, not eleven: `Fforward_sexp` *is* `scan_lists`, and `scan_lists` and
+  `Fparse_partial_sexp` share the comment/string state machine
+  (`scan_sexps_forward`, `forw_comment`, `back_comment`, `char_quoted`,
+  `find_defun_start`, `in_2char_comment_start`). Two-character comment
+  delimiters, comment styles `a`/`b`/`c`, nested comments, generic string and
+  comment fences, the `$` math class, escape runs,
+  `parse-sexp-ignore-comments`, `comment-end-can-be-escaped`,
+  `multibyte-syntax-as-symbol`, `open-paren-in-column-0-is-defun-start`, and the
+  `syntax-table` text property under `parse-sexp-lookup-properties` are all in.
+  A partial state can be resumed, including one captured *between* the two
+  halves of a comment delimiter (element 10 of the state). 236 differential
+  probes against Emacs 30.2 agree exactly, and the three `forward-sexp` /
+  `scan-sexps` / `parse-partial-sexp` rows that the round-17 entry-point table
+  marked void now match on both entry points.
+  - Named boundary: `syntax-ppss` parses from `point-min` on every call rather
+    than memoizing in `syntax-ppss-cache`. That is what Emacs itself does on a
+    cold cache; the difference is speed, plus the elements 2 and 6 that Emacs's
+    own docstring already disclaims.
+- **`buffer-end`, `case-symbols-as-words`, `parse-sexp-ignore-comments`,
+  `parse-sexp-lookup-properties`, `comment-end-can-be-escaped`,
+  `multibyte-syntax-as-symbol`, `open-paren-in-column-0-is-defun-start`,
+  `words-include-escapes`, `forward-sexp-function`, `syntax-propertize`,
+  `syntax-propertize-function`, `syntax-ppss-table`, `syntax-ppss-context`,
+  `syntax-ppss-toplevel-pos`, `syntax-ppss-depth`, `syntax-prefix-flag-p`** and
+  the `ppss` accessors — the surface `syntax.el` and `lisp.el` expect.
+- **`cl-defstruct`'s `:type` and `:named` options.** `(:type list)` and
+  `(:type vector)` were parsed and thrown away, so both produced a *record* and
+  every accessor was off by the tag slot: `(cl-defstruct (foo (:type list)) a b)`
+  then `(foo-a '(1 2))` signalled `(wrong-type-argument arrayp (1 2))` instead of
+  answering 1. Constructors now build the requested representation, accessors use
+  `nth` for a list, `setf` on a list slot expands to `(setcar (nthcdr I S) V)`,
+  `cl-struct-slot-offset` counts from 0 when there is no tag, and a predicate is
+  generated only for a named struct — as in `cl-macs.el`. Found because
+  `syntax.el`'s `ppss` struct is `(:type list)`.
+- **Function cells for the intercepted higher-order primitives.** `funcall`,
+  `apply`, `mapcar`, `mapc`, `sort`, `maphash`, `mapatoms`, `load`, `eval`,
+  `macroexpand`, `macroexpand-1` and `macroexpand-all` run inside
+  `host::call_function`, which matches them by name before any function-cell
+  lookup — so they had no cell at all, and `(fboundp 'mapcar)`,
+  `(functionp 'eval)`, `(func-arity 'funcall)`, `(indirect-function 'apply)` and
+  `(symbol-function 'load)` all answered as though the name were undefined.
+  Calling them always worked; only introspection was wrong. `call_function` now
+  also matches a *subr object*, so `(funcall (symbol-function 'mapcar) …)`
+  reaches the intercept too.
+  - Named boundary: `macroexpand-1` and `macroexpand-all` are byte-compiled Lisp
+    in Emacs, so `(subrp (symbol-function 'macroexpand-1))` is nil there and t
+    here. The other four observables agree.
 - **`elisp --script FILE`** — Emacs's other file entry point. `emacs -l FILE` and
   `emacs --script FILE` evaluate the file in *different buffers*, so they read
   different syntax tables and disagree on every `char-syntax` / `\sC` /
@@ -62,6 +114,35 @@ All notable changes to elisprs are documented here. The format follows
   a prelude name-prefix check could not express.
 
 ### Fixed
+- **`string-to-syntax` dropped the `c` flag, mis-handled `@`, and consed.**
+  `Fstring_to_syntax` accepts eight flag characters; `c` (bit 23, the third
+  comment style) was the one missing, so `(string-to-syntax ". c")` answered
+  `(1)` where Emacs answers `(8388609)`. The inherit class `@` returns nil in
+  Emacs, not `(13)`. The error is `"Invalid syntax description letter: %c"`, not
+  a `%S` of the whole string. And a flagless, matchless descriptor returns the
+  shared `Vsyntax_code_object` cell, so `(eq (string-to-syntax "w")
+  (string-to-syntax "w"))` is t, where elisprs consed a fresh cons and answered
+  nil.
+- **`parse-partial-sexp` clamped an out-of-range region instead of signalling.**
+  `validate_region` (editfns.c) rejects the pair and names the buffer and both
+  arguments as passed: `(parse-partial-sexp 1 40)` in a three-character buffer is
+  `(args-out-of-range #<buffer …> 1 40)`. Clamping answered a plausible state for
+  a region that does not exist. Eight probes including narrowing now agree.
+- **`capitalize` / `upcase-initials` used the wrong word test and the wrong
+  case.** Two bugs in one function, both surfaced by a locale sweep.
+  `casefiddle.c` asks the *syntax table* — `case_ch_is_word (SYNTAX (ch))` —
+  where elisprs asked "is this a digit or a cased letter". `ﬁ` has no one-to-one
+  upper case, so that test called it a non-word character and made the *next*
+  letter a word start: `(capitalize "ﬁnd")` answered `"ﬁNd"` where Emacs answers
+  `"Find"`. And a word's first character is TITLE-cased, not upper-cased, which
+  is one-to-many for some characters and a distinct code point for the Latin
+  digraphs: `(capitalize "ßäöü")` is `"Ssäöü"` (not `"ẞäöü"`) and
+  `(capitalize "ǳa")` is `"ǲa"` (not `"Ǳa"`). `case_character`'s Greek rule is in
+  too — a capital sigma that ends a word down-cases to ς, so `(capitalize "ΟΔΟΣ")`
+  is `"Οδος"`. `case-symbols-as-words` is honored. Measured character by
+  character over the whole BMP: 55,295 characters, 0 remaining differences in
+  what the two engines *do*, and 8 characters where Emacs 30.2's case table has
+  no entry at all (see the Unicode-version note in BUGS.md).
 - **An integer and a float compared through `f64`, losing Emacs's exact rule.**
   `(expt 3 34)` is 16677181699666569 — a fixnum, and past 2^53, where an `f64`
   runs out of mantissa — so its float image is 16677181699666568.0, a different
