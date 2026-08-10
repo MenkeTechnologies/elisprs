@@ -3341,6 +3341,24 @@ could see it — which is precisely why it survived. (The warning itself is not
 emitted: `macroexp-warn-and-return` needs the byte-compiler's diagnostic
 channel, which this tree does not model.)
 
+### R18-K. Differential fuzz, after the round's changes
+
+`scripts/fuzz_parity.sh -n 1200 -s 18` and `-n 1500 -s 181`, against the pinned
+GNU Emacs 30.2 oracle. The second seed found one regression from this round's
+`capitalize` work and nothing else:
+
+```text
+#1431  (string-width (capitalize -1))
+  emacs: !(wrong-type-argument char-or-string-p -1)
+  elisp: !(wrong-type-argument characterp -1)
+```
+
+Routing a *character* argument through the title-case table first reported
+`characterp` where `upcase` reports `char-or-string-p`, and would also have
+rejected the above-range integers Emacs returns unchanged (it reads their high
+bits as event modifiers). Fixed, with a regression test. Both seeds then report
+**1200/1200** and **1500/1500** forms agreeing with Emacs.
+
 ### R18-J. Doc-claim audit
 
 Every behavioral claim in README.md, CHANGELOG.md and BUGS.md was extracted and

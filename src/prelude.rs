@@ -7532,8 +7532,14 @@ listed in the documentation of `modify-syntax-entry'."
 back to `upcase' -- so `(capitalize ?\u01f3)' is the title digraph
 \u01f2, while `(capitalize ?\u00df)', whose title case is two characters,
 is the upper-case \u1e9e."
-  (let ((tc (--char-titlecase-- c)))
-    (if (= (length tc) 1) (aref tc 0) (upcase c))))
+  ;; Out-of-range integers keep `upcase''s own casefiddle.c handling: a negative
+  ;; fixnum is not a character (`char-or-string-p'), and one above the character
+  ;; range comes back unchanged because Emacs reads the high bits as event
+  ;; modifiers. Asking for a title case first would report `characterp' instead.
+  (if (or (< c 0) (> c #x3FFFFF))
+      (upcase c)
+    (let ((tc (--char-titlecase-- c)))
+      (if (= (length tc) 1) (aref tc 0) (upcase c)))))
 
 (defun --case-ch-is-word-- (c)
   "casefiddle.c `case_ch_is_word': is C a word constituent for casing?"

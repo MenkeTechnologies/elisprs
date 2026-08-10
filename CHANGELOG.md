@@ -128,6 +128,21 @@ All notable changes to elisprs are documented here. The format follows
   arguments as passed: `(parse-partial-sexp 1 40)` in a three-character buffer is
   `(args-out-of-range #<buffer …> 1 40)`. Clamping answered a plausible state for
   a region that does not exist. Eight probes including narrowing now agree.
+- **`capitalize` / `upcase-initials` rejected an out-of-range integer.** Found
+  by the fuzzer immediately after the fix below: routing a character argument
+  through the title-case table first reported `(wrong-type-argument characterp
+  -1)` where `upcase` reports `char-or-string-p`, and would have rejected the
+  above-range integers Emacs returns unchanged.
+- **`when` / `unless` with an EMPTY body expanded wrongly.** subr.el has a second
+  arm for that case, `(progn COND nil)`; only the first was ported, so
+  `(macroexpand '(when x))` answered `(if x (progn))`. The value is the same
+  either way, which is why only `macroexpand` could see it.
+- **The initial buffer's syntax table did not survive a cache hit.** The
+  prelude's `(set-syntax-table emacs-lisp-mode-syntax-table)` is a buffer-local
+  binding, and buffer locals are not in the heap image, so a warm cache left the
+  buffer on `standard-syntax-table`: `(char-syntax ?.)` was 95 cold and 46 warm.
+  Every syntax-derived observable followed. Re-installed per run in
+  `install_entry_point_state`, the one place both cache paths run through.
 - **`capitalize` / `upcase-initials` used the wrong word test and the wrong
   case.** Two bugs in one function, both surfaced by a locale sweep.
   `casefiddle.c` asks the *syntax table* — `case_ch_is_word (SYNTAX (ch))` —

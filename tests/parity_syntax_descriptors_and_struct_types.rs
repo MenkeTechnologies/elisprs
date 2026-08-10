@@ -251,3 +251,20 @@ fn capitalize_keeps_text_properties_when_no_character_expands() {
         r##"#("Abc Def" 0 7 (p 1))"##
     );
 }
+
+#[test]
+fn an_out_of_range_integer_keeps_upcases_own_handling() {
+    // Found by the fuzzer: routing a character argument through the title-case
+    // table first reported `characterp` where `upcase` reports
+    // `char-or-string-p`, and would have rejected the above-range integers
+    // Emacs returns unchanged (it reads their high bits as event modifiers).
+    assert_eq!(
+        eval("(condition-case e (capitalize -1) (error e))"),
+        "(wrong-type-argument char-or-string-p -1)"
+    );
+    assert_eq!(
+        eval("(condition-case e (upcase-initials -1) (error e))"),
+        "(wrong-type-argument char-or-string-p -1)"
+    );
+    assert_eq!(eval("(capitalize 4194304)"), "4194304");
+}
