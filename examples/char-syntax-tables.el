@@ -115,10 +115,20 @@
                        (aref (standard-syntax-table) ?\()
                        (aref (standard-syntax-table) ?0))
                  '((2) (4 . 41) (2))))
-  ;; char-syntax designators in the standard table (word, digit=word, space,
-  ;; punctuation, open-paren, symbol).  emacs -Q temp buffer: (?w ?w ?\s ?. ?\( ?_).
+  ;; `char-syntax' reads the CURRENT BUFFER's table, which is not the standard
+  ;; one: `emacs -Q --batch -l FILE' -- the invocation this script models -- runs
+  ;; in *scratch* under `lisp-interaction-mode', whose table makes `?.' a symbol
+  ;; constituent.  Ground truth, GNU Emacs 30.2:
+  ;;   emacs -Q --batch -l probe.el
+  ;;     buffer table   => (119 119 32 95 40 95)   i.e. (?w ?w ?\s ?_ ?\( ?_)
+  ;;     standard table => (119 119 32 46 40 95)   i.e. (?w ?w ?\s ?. ?\( ?_)
+  ;; Both are pinned so the two tables cannot silently collapse back into one.
   (should (equal (list (char-syntax ?a) (char-syntax ?0) (char-syntax ?\s)
                        (char-syntax ?.) (char-syntax ?\() (char-syntax ?-))
+                 '(?w ?w ?\s ?_ ?\( ?_)))
+  (should (equal (with-syntax-table (standard-syntax-table)
+                   (list (char-syntax ?a) (char-syntax ?0) (char-syntax ?\s)
+                         (char-syntax ?.) (char-syntax ?\() (char-syntax ?-)))
                  '(?w ?w ?\s ?. ?\( ?_))))
 
 ;; ---- make-syntax-table parents the standard table; with-syntax-table scopes ----

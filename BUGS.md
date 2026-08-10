@@ -2543,15 +2543,24 @@ a tie on equal integer parts; a NaN is incomparable and an infinity is beyond
 every integer. Arithmetic is deliberately left alone — Emacs is float-contagious
 there, so `(+ L 0.0)` is 16677181699666568.0 and rounding is the right answer.
 
-One case is not closed by this crate. A **two-argument** comparison is lowered to
-a fusevm op (`compiler.rs`, `try_native_op`), and fusevm 0.17.0 answers a mixed
-`Int`/`Float` pair natively — on the rounded images — without ever consulting the
-hook (`vm.rs`, `cmp_int_fast`: both operands are "native nums"). So `(= L F)`
-still answers `t` here, as does `(/= L F)`, which the prelude defines as
-`(not (= a b))`. The fusevm release after 0.17.0 delegates exactly this pair
-(when reading the integer as `f64` would round it) and the hook fixed here is
-what answers it. Everything that reaches the subrs — `funcall`, `apply`, three or
-more arguments, `sort`, `max`, `min` — is correct now.
+One case was not closed by this crate alone. A **two-argument** comparison is
+lowered to a fusevm op (`compiler.rs`, `try_native_op`), and fusevm 0.17.0
+answered a mixed `Int`/`Float` pair natively — on the rounded images — without
+ever consulting the hook (`vm.rs`, `cmp_int_fast`: both operands are "native
+nums"), so `(= L F)` still answered `t`, as did `(/= L F)`, which the prelude
+defines as `(not (= a b))`. Everything reaching the subrs — `funcall`, `apply`,
+three or more arguments, `sort`, `max`, `min` — was already correct.
+
+**Closed by the fusevm 0.22.0 bump** (round 16 rebased onto it): fusevm now
+delegates exactly that pair, and the hook above answers it. Re-measured on the
+bumped tree, `L` = `(expt 3 34)` and `F` = `(float L)` — every column agrees with
+`emacs -Q --batch` on GNU Emacs 30.2:
+
+```text
+(= L F)  => nil   (/= L F) => t     (< L F)  => nil   (> L F)  => t
+(<= L F) => nil   (>= L F) => t
+(max L F) => 16677181699666569      (min L F) => 16677181699666568.0
+```
 
 ---
 
@@ -2719,7 +2728,31 @@ to nil in both.
   first and stores the expanded body, and the pruned environment *is* the runtime
   environment, so a reference the free-variable walk misses turns a working
   closure into `void-variable`. Half of it is worse than none of it.
-- **`other-buffer`.** Suggested as the observable for R15-D, but it is not
+- **Loading a file does not create Emacs's ` *load*` buffer.** Turned up while
+  re-checking R16-D. `emacs -Q --batch --eval` reports the clean three, but
+  `emacs -Q --batch -l FILE` reports
+  `("*scratch*" " *Minibuf-0*" "*Messages*" " *load*")` — `load` reads the file
+  through a buffer of its own — and elisprs reports the three either way. Same
+  family as the `ert` entry below: buffers created by machinery rather than by
+  the program.
+- **`elisp FILE` models `emacs -l FILE`, not `emacs --script FILE`.** Same
+  family, and it is observable through `char-syntax`. The two Emacs entry points
+  evaluate the file in different buffers, so they read different syntax tables:
+
+  ```text
+  $ emacs -Q --batch -l probe.el     => buf " *scratch*" lisp-interaction-mode
+                                        (char-syntax ?.) => 95  (?_)
+  $ emacs --script probe.el          => buf " *load*"    fundamental-mode
+                                        (char-syntax ?.) => 46  (?.)
+  ```
+
+  elisprs answers 95, i.e. the `-l` column, which is the invocation
+  `scripts/fuzz_parity.sh` compares against. A script that reads the buffer's
+  syntax table and is run under `emacs --script` will therefore disagree;
+  wrapping the read in `(with-syntax-table (standard-syntax-table) …)` makes both
+  agree. Closing it needs the entry point to select the initial buffer's table,
+  which in turn needs the buffer machinery the ` *load*` entry above describes.
+- **`other-buffer`.** Suggested as the observable for R16-D, but it is not
   implemented at all here — `src/host.rs` only mentions it in a comment — and its
   result is not a function of `buffer-list`. Measured on 30.2, with
   `(buffer-list)` = `("*scratch*" " *Minibuf-0*" "*Messages*" " *load*" "aaa")`

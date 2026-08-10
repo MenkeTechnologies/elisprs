@@ -124,3 +124,41 @@ fn max_and_min_decide_a_mixed_pair_exactly() {
     assert_eq!(eval("(max 1 0.0e+NaN)"), "0.0e+NaN");
     assert_eq!(eval("(min 1 0.0e+NaN)"), "0.0e+NaN");
 }
+
+/// The *directly lowered* two-argument comparison is exact too.
+///
+/// This is the path the test above deliberately avoids by going through
+/// `funcall`: `(= L F)` written literally is lowered to a fusevm op
+/// (`compiler.rs`, `try_native_op`) rather than reaching the `cmp` subr. fusevm
+/// 0.17.0 answered a mixed `Int`/`Float` pair natively, on the rounded images,
+/// so `(= L F)` was `t` where Emacs says nil; 0.22.0 delegates the pair to the
+/// host hook, which compares exact values.
+///
+/// Nothing else pins this — a fusevm downgrade would silently reintroduce the
+/// wrong answer while every `funcall`-routed row above stayed green. Ground
+/// truth, `emacs -Q --batch` (GNU Emacs 30.2), L = `(expt 3 34)`, F = `(float L)`:
+///
+/// ```text
+/// (=  L F) => nil   (/= L F) => t     (<  L F) => nil   (>  L F) => t
+/// (<= L F) => nil   (>= L F) => t
+/// ```
+#[test]
+fn the_lowered_two_argument_comparison_is_exact_too() {
+    let l = "(expt 3 34)";
+    let f = "(float (expt 3 34))";
+    assert_eq!(eval(&format!("(= {l} {f})")), "nil");
+    assert_eq!(eval(&format!("(/= {l} {f})")), "t");
+    assert_eq!(eval(&format!("(< {l} {f})")), "nil");
+    assert_eq!(eval(&format!("(> {l} {f})")), "t");
+    assert_eq!(eval(&format!("(<= {l} {f})")), "nil");
+    assert_eq!(eval(&format!("(>= {l} {f})")), "t");
+    // Mirrored, float first.
+    assert_eq!(eval(&format!("(= {f} {l})")), "nil");
+    assert_eq!(eval(&format!("(< {f} {l})")), "t");
+    assert_eq!(eval(&format!("(> {f} {l})")), "nil");
+    // A value an f64 does represent exactly must still compare equal, so the
+    // fix cannot be "call every mixed pair unequal".
+    assert_eq!(eval("(= (expt 2 53) (float (expt 2 53)))"), "t");
+    assert_eq!(eval("(= 0 -0.0)"), "t");
+    assert_eq!(eval("(< 1 1.5)"), "t");
+}

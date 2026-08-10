@@ -43,9 +43,9 @@ All notable changes to elisprs are documented here. The format follows
   float. All three now use `host::num_cmp`, which compares exact values and
   treats a NaN as incomparable. Arithmetic is unchanged and stays
   float-contagious, as in Emacs. A *two-argument* comparison is lowered to a
-  fusevm op that 0.17.0 still answers natively on rounded images, so that path
-  waits on the fusevm release which delegates the pair; the hook fixed here is
-  what will answer it.
+  fusevm op that 0.17.0 answered natively on rounded images; the 0.22.0 bump
+  delegates that pair to the hook, so `(= L F)` and `(/= L F)` are correct too
+  and the whole family now matches `emacs -Q --batch`.
 - **`nil`, `t`, and keywords were writable.** `(set :kw 1)` and `(setq :a 1)`
   performed the write and returned the value; `(set nil 1)` signalled
   `(set "not a symbol")` — a made-up condition naming the builtin rather than
