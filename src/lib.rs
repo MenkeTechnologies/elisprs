@@ -245,6 +245,33 @@ pub enum EntryPoint {
 ///   script path, matching `emacs -l FILE a b c` => `("a" "b" "c")`;
 ///   `command-line-args` is the whole invocation.
 fn install_entry_point_state(path: &str, src: &str, entry: EntryPoint) {
+    // The initial buffer's syntax table, re-installed on EVERY run.
+    //
+    // The prelude ends with `(set-syntax-table emacs-lisp-mode-syntax-table)`,
+    // which models `emacs -Q --batch` starting in `*scratch*` under
+    // `lisp-interaction-mode`. That is a BUFFER-LOCAL binding, and buffer locals
+    // live in the buffer struct, not in the arena — so the heap image does not
+    // carry it and a cache hit, which skips the prelude entirely, left the
+    // initial buffer on `standard-syntax-table`. The whole `char-syntax` /
+    // `\sC` / `skip-syntax-*` / `forward-sexp` family then answered the
+    // `--script` column on a warm cache and the `-l` column on a cold one:
+    //
+    //   $ elisp probe.el   # cold: (char-syntax ?.) => 95   (correct)
+    //   $ elisp probe.el   # warm: (char-syntax ?.) => 46   (the standard table)
+    //
+    // Setting it here — the one place both cache paths run through — is the
+    // same treatment `command-line-args` gets below, and for the same reason:
+    // per-run state must never be reconstructed from the image. It happens
+    // before the ` *load*` buffer is opened or selected, so it lands on the
+    // initial buffer; `--script` then selects ` *load*`, whose own local is
+    // unset, and correctly reads the standard table.
+    host::with_host(|h| {
+        let tbl_sym = h.intern("emacs-lisp-mode-syntax-table");
+        if let Ok(tbl) = h.get_value(&tbl_sym) {
+            let cur = h.intern("--current-syntax-table--");
+            let _ = h.set_value(&cur, tbl);
+        }
+    });
     let load_buf = host::with_host(|h| h.open_load_buffer(src, true));
     if entry == EntryPoint::Script {
         host::with_host(|h| {

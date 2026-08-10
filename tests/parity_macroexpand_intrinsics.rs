@@ -1,10 +1,18 @@
 //! `macroexpand`/`macroexpand-1`/`macroexpand-all` unfolding the intrinsic
 //! `when`/`unless` macros that elisprs lowers as compiler special forms.
 //!
-//! Every expectation matches GNU Emacs 30.2 (`emacs -Q --batch`), whose
-//! `subr.el` defines:
-//!   (defmacro when   (cond &rest body) (list 'if cond (cons 'progn body)))
-//!   (defmacro unless (cond &rest body) (cons 'if (cons cond (cons nil body))))
+//! Every expectation is re-measured against GNU Emacs 30.2 (`emacs -Q --batch`),
+//! whose `subr.el` defines:
+//!
+//!   (defmacro when (cond &rest body)
+//!     (if body (list 'if cond (cons 'progn body))
+//!       (macroexp-warn-and-return … (list 'progn cond nil) '(empty-body when) t)))
+//!
+//! The header used to quote only the first arm and call it the whole
+//! definition, which is why the two EMPTY-BODY rows below were pinned as
+//! `(if x (progn))` and `(if x nil)`. GNU Emacs 30.2 answers `(progn x nil)`
+//! for both — no version of Emacs produced the pinned strings, and the code
+//! matched them. Corrected in both places: the expansion, and the expectation.
 
 use elisprs::{eval_str, print, reset_host};
 
@@ -19,8 +27,13 @@ fn eval(src: &str) -> String {
 fn macroexpand_when() {
     assert_eq!(eval("(macroexpand '(when t 1))"), "(if t (progn 1))");
     assert_eq!(eval("(macroexpand '(when t 1 2))"), "(if t (progn 1 2))");
-    // Degenerate no-body form still expands like Emacs.
-    assert_eq!(eval("(macroexpand '(when x))"), "(if x (progn))");
+    // An empty body takes subr.el's OTHER arm: COND is still evaluated and the
+    // form is still nil, but the expansion is `(progn COND nil)` — the shape
+    // that carries the "`when' with empty body" warning upstream.
+    assert_eq!(eval("(macroexpand '(when x))"), "(progn x nil)");
+    assert_eq!(eval("(macroexpand-all '(when x))"), "(progn x nil)");
+    // …and it still evaluates COND exactly once.
+    assert_eq!(eval("(let ((n 0)) (list (when (setq n 1)) n))"), "(nil 1)");
 }
 
 /// `unless` -> `(if COND nil BODY...)`.
@@ -28,7 +41,11 @@ fn macroexpand_when() {
 fn macroexpand_unless() {
     assert_eq!(eval("(macroexpand '(unless c a))"), "(if c nil a)");
     assert_eq!(eval("(macroexpand '(unless c a b))"), "(if c nil a b)");
-    assert_eq!(eval("(macroexpand '(unless x))"), "(if x nil)");
+    assert_eq!(eval("(macroexpand '(unless x))"), "(progn x nil)");
+    assert_eq!(
+        eval("(let ((n 0)) (list (unless (setq n 1)) n))"),
+        "(nil 1)"
+    );
 }
 
 /// `macroexpand-1` performs exactly one step and yields the same shape here

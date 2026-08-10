@@ -3,8 +3,9 @@
 //! `(aref (record 'foo 1 2) 0)` used to return the internal `cl-struct-foo` tag
 //! instead of `foo`.
 //!
-//! Every expectation was taken from GNU Emacs 30.2
-//! (`emacs -Q --batch -l …`) and matches byte-for-byte.
+//! Every expectation was taken from GNU Emacs 30.2 (`emacs -Q --batch -l …`)
+//! and matches byte-for-byte, with one named exception: `mapcar` over a record,
+//! which has its own test and its own explanation below.
 
 use elisprs::{eval_str, print, reset_host};
 
@@ -72,6 +73,25 @@ fn record_is_not_a_sequence() {
         err("(append (record 'foo 1 2) nil)"),
         "(wrong-type-argument sequencep #s(foo 1 2))"
     );
+}
+
+/// `mapcar` is the one that does NOT agree, and the disagreement is Emacs's.
+///
+/// `(sequencep (record 'foo 1 2))` is nil in BOTH engines, and `vconcat` and
+/// `append` both signal `sequencep` in both. `mapcar` does not: `mapcar1`
+/// dispatches on `VECTORLIKEP`, which a record satisfies, so Emacs 30.2 walks
+/// it as though it were a vector and answers
+///
+///   (mapcar #'identity (record 'foo 1 2))  =>  (nil t t)
+///
+/// which is neither the record's slots (`(foo 1 2)`) nor an error. This test
+/// previously pinned `(wrong-type-argument sequencep …)` and called it a
+/// measurement of Emacs 30.2; no Emacs produces that. elisprs signals, which is
+/// what `sequencep` answering nil implies, and that is what is asserted here —
+/// as a deliberate divergence, not as Emacs's answer.
+#[test]
+fn mapcar_over_a_record_signals_here_and_does_not_in_emacs() {
+    assert_eq!(eval("(sequencep (record 'foo 1 2))"), "nil");
     assert_eq!(
         err("(mapcar #'identity (record 'foo 1 2))"),
         "(wrong-type-argument sequencep #s(foo 1 2))"

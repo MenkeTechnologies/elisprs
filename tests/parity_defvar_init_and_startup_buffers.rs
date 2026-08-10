@@ -79,7 +79,19 @@ fn the_startup_buffers_are_live_and_addressable() {
         eval("(buffer-name (get-buffer \" *Minibuf-0*\"))"),
         "\" *Minibuf-0*\""
     );
-    // Writable like any other buffer.
+    // NOT an Emacs measurement, and named as such. `*Messages*` is READ-ONLY in
+    // Emacs — `(with-current-buffer (get-buffer "*Messages*") buffer-read-only)`
+    // is t, and the insert below signals
+    // `(buffer-read-only #<buffer *Messages*>)` on GNU Emacs 30.2. This row used
+    // to pin `"hi"` under the comment "Writable like any other buffer", which is
+    // elisprs's answer, not Emacs's: `buffer-read-only` is bound here but
+    // nothing enforces it. Kept, because the buffer being addressable and
+    // insertable-into is what the test is for, and re-labelled so the
+    // divergence is visible rather than recorded as parity.
+    assert_eq!(
+        eval("(with-current-buffer (get-buffer \"*Messages*\") buffer-read-only)"),
+        "nil"
+    );
     assert_eq!(
         eval(
             "(with-current-buffer (get-buffer \"*Messages*\") \

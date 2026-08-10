@@ -176,3 +176,29 @@ fn warm_cache_preserves_closure_printed_source() {
         "warm cache lost the closures' printed source (arglist/body)"
     );
 }
+
+/// The initial buffer's syntax table is buffer-local, so the heap image does not
+/// carry it — and a cache hit, which skips the prelude, used to leave the buffer
+/// on `standard-syntax-table`. Every syntax-derived observable followed:
+///
+/// ```text
+/// $ elisp probe.el   # cold: (char-syntax ?.) => 95   (emacs-lisp-mode table)
+/// $ elisp probe.el   # warm: (char-syntax ?.) => 46   (standard table)
+/// ```
+///
+/// 95 is what `emacs -Q --batch -l FILE` answers, because it evaluates the file
+/// in `*scratch*` under `lisp-interaction-mode`. `scan-sexps` is in the probe
+/// because it is the family that made the drift load-bearing: `.` being
+/// punctuation instead of a symbol constituent ends a sexp early.
+#[test]
+fn warm_cache_keeps_the_initial_buffers_syntax_table() {
+    let script = r#"
+(insert "foo.bar ;c")
+(princ (format "%s %s %s %s\n"
+               (char-syntax ?.) (char-syntax ?\;)
+               (scan-sexps 1 1) (eq (syntax-table) (standard-syntax-table))))
+"#;
+    let (cold, warm) = run_cold_then_warm("syntax-table", script);
+    assert_eq!(cold, "95 60 8 nil\n", "cold run");
+    assert_eq!(warm, cold, "a warm cache must not change the syntax table");
+}

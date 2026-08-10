@@ -4,7 +4,8 @@
 //!
 //! Every expectation was taken from GNU Emacs 30.2 (`emacs -Q --batch -l …`)
 //! and matches byte-for-byte, including the packed `#&N"…"` byte string and the
-//! `wrong-length-argument` data.
+//! `wrong-length-argument` data — with one named exception, the non-ASCII
+//! `#&N"…"` read literal, which is marked in place.
 
 use elisprs::{eval_str, print, reset_host};
 
@@ -166,7 +167,15 @@ fn bool_vector_errors() {
 /// printed bool-vector reads back `equal`.
 #[test]
 fn bool_vector_read_syntax() {
-    // #&10"\377\3" -> 8 low bits set, then bits 8 and 9 set.
+    // NOT an Emacs measurement, and named as such. A `#&N"…"` literal whose
+    // bytes are not all ASCII is rejected by Emacs: `\377` makes the string
+    // multibyte and `read1`'s `#&` arm requires a unibyte one, so
+    // `(read "#&10\"\377\3\"")` signals `(invalid-read-syntax "#&...")` on
+    // GNU Emacs 30.2. This row used to pin `(10 t t t t)` as that Emacs's
+    // answer; no Emacs produces it. elisprs has no unibyte/multibyte string
+    // distinction, so it reads the literal and unpacks the bits. The assertion
+    // below is therefore elisprs's own behavior, kept because the bit-unpacking
+    // it exercises is real, and labelled so nobody re-derives it as parity.
     assert_eq!(
         eval("(let ((r (read \"#&10\\\"\\377\\3\\\"\"))) (list (length r) (aref r 0) (aref r 7) (aref r 8) (aref r 9)))"),
         "(10 t t t t)"

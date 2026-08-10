@@ -5017,9 +5017,27 @@ pub fn expand_intrinsic_macro(form: &Value) -> Option<Value> {
         let name = h.sym_name(&elems[0])?;
         let body = &elems[2.min(elems.len())..];
         let cond = elems.get(1).cloned().unwrap_or(Value::Undef);
+        // An EMPTY body is a different expansion in both macros. subr.el:
+        //
+        //   (if body (list 'if cond (cons 'progn body))
+        //     (macroexp-warn-and-return … (list 'progn cond nil) …))
+        //
+        // so `(macroexpand '(when x))` is `(progn x nil)`, not `(if x (progn))`,
+        // and `(macroexpand '(unless x))` is `(progn x nil)`, not `(if x nil)`.
+        // The value is the same either way — the point is that COND is still
+        // evaluated and the form answers nil — but the expansion is observable
+        // through `macroexpand`, and the warning is what tells a reader the
+        // empty body was a mistake. (The warning itself is not emitted here:
+        // `macroexp-warn-and-return` needs the byte-compiler's diagnostic
+        // channel, which this tree does not model.)
+        let empty_body = body.is_empty();
         match name.as_str() {
-            // (if COND (progn BODY...))
+            // (if COND (progn BODY...)), or (progn COND nil) with no body.
             "when" => {
+                if empty_body {
+                    let progn_sym = h.intern("progn");
+                    return Some(h.list_from(vec![progn_sym, cond, Value::Undef]));
+                }
                 let if_sym = h.intern("if");
                 let mut progn = vec![h.intern("progn")];
                 progn.extend_from_slice(body);
@@ -5028,6 +5046,10 @@ pub fn expand_intrinsic_macro(form: &Value) -> Option<Value> {
             }
             // (if COND nil BODY...) — nil is `Value::Undef`.
             "unless" => {
+                if empty_body {
+                    let progn_sym = h.intern("progn");
+                    return Some(h.list_from(vec![progn_sym, cond, Value::Undef]));
+                }
                 let mut out = vec![h.intern("if"), cond, Value::Undef];
                 out.extend_from_slice(body);
                 Some(h.list_from(out))

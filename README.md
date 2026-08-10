@@ -137,7 +137,7 @@ elisp --version
 (format "%s = %d (hex %x)" 'count 255 255); => "count = 255 (hex ff)"
 
 (condition-case e (/ 1 0)
-  (arith-error (format "caught %s" e)))   ; => "caught (arith-error division by zero)"
+  (arith-error (format "caught %s" e)))   ; => "caught (arith-error)"
 ```
 
 **Now supported** (own cons model — `Obj::Cons(Value, Value)` heap cells, not `rust_lisp`'s list-only cdr):

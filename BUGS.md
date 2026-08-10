@@ -629,7 +629,11 @@ Third deep pass against the current binary. Ground truth = bare `emacs -Q --batc
 
 ### R3-A. ✅ FIXED — String/char `\` escapes: named-control, hex, and octal all wrong
 `?\a` → 7, `?\x41` → 65, `"\x41"` → `"A"`, `(string-to-list "\x41\x42")` → `(65 66)`,
-`?\N{LATIN SMALL LETTER A}` → 97 — all match emacs 30.2. The original report follows.
+`?\N{U+41}` → 65 — match emacs 30.2. **The by-NAME form does not**, and the
+"all match" claim above was wrong when it was written: `?\N{LATIN SMALL LETTER A}`
+is 97 in Emacs and `(unsupported-character-name "LATIN SMALL LETTER A")` here,
+because the Unicode name table is not carried. Re-measured in round 18. The
+original report follows.
 - `?\a`→Emacs `7`, elisprs `97`; likewise `?\b`/`?\f`/`?\v`/`?\s`/`?\d` give the ASCII
   of the letter instead of the control code
 - `?\x41`→Emacs `65`, elisprs `41`; `?\101` (octal)→`65` vs `1`
@@ -999,7 +1003,9 @@ Areas probed in round 4 that PASSED: `while-let`, `dlet` (was R3-missing — now
   was wrongly `t`. Added a real `Obj::Record` variant (slot 0 = the bare type symbol): `aref`/
   `aset`/`length`/`equal`/`copy-sequence`/`type-of`/`recordp`/print (`#s(…)`) and the `#s(NAME …)`
   reader all handle it; `record`/`make-record` are now primitives; `vectorp` is `nil` and a record
-  is not a sequence (`vconcat`/`append`/`mapcar` signal `sequencep`). cl-defstruct builds records
+  is not a sequence (`vconcat`/`append` signal `sequencep`; `mapcar` signals here but
+  NOT in Emacs, whose `mapcar1` dispatches on `VECTORLIKEP` and walks the record —
+  see round 18). cl-defstruct builds records
   (bare-NAME tag; predicate walks the bare-name parent chain). This resolves the R5-I "STILL TODO"
   above. Verified vs Emacs 30.2 (14 cases, byte-for-byte).
 - **`bool-vector`.** Was type-name-only. Added `Obj::BoolVector`, `make-bool-vector`/`bool-vector`,
@@ -1729,12 +1735,9 @@ confirmed against Emacs 30.2 here rather than taken on trust.
 
 ### Still open after round 9
 
-- **`string-version-lessp`'s ORDERING** (2 of the 6 remaining fuzz divergences).
-  The type contract is fixed (R9-I's sibling, `src/prelude.rs:2740`), but the
-  comparison is still an ad-hoc paraphrase where `Fstring_version_lessp` calls
-  gnulib's `filenvercmp`. `(string-version-lessp "quote\"d" "  padded  ")` is `t`
-  in Emacs and `nil` here. Closing it means porting `filevercmp` — a separate
-  change with its own algorithm to be faithful to, not a patch to the paraphrase.
+- ~~**`string-version-lessp`'s ORDERING**~~ — CLOSED by round 10's `filevercmp`
+  port; this list was never updated. Re-measured in round 18:
+  `(string-version-lessp "quote\"d" "  padded  ")` is `t` in both engines.
 - **`[:graph:]` and `[:print:]`.** The manual defines both by COMPLEMENT ("any
   character except whitespace, control characters, surrogates, and unassigned
   codepoints"), and a complement is not expressible as character-class BODY text.
@@ -1935,9 +1938,9 @@ across line boundaries. It now translates to the standard table's whitespace set
 
 ### Still open after round 11
 
-- **An empty-name uninterned symbol prints over-escaped** — `(make-symbol "")` is
-  `##` in Emacs and `\#\#` here. Found by the fuzzer (seed 7, form #1633); present
-  identically on the pre-round-11 tree, so it is not a regression.
+- ~~**An empty-name uninterned symbol prints over-escaped**~~ — CLOSED; this list
+  was never updated. Re-measured in round 18:
+  `(prin1-to-string (make-symbol ""))` is `"##"` in both engines.
 
 ## Round 12 — a subr's arity is checked before its arguments run
 
@@ -2804,9 +2807,13 @@ Both reproduce byte-identically at the round's start commit
 work above. Neither the tests nor the examples were touched to hide them.
 
 - **`ert` runs a test body in `*scratch*`; Emacs runs it in a temp buffer.**
-  This is what fails `examples/char-syntax-tables.el` (`st-standard-table`) under
-  `cargo test --test examples`, and the example passes under
-  `emacs -Q --batch -l` — so the expectation is right and elisprs is wrong. The
+  The mechanism is right and is still open (see round 18 for the `ert.el`
+  citation), but the conclusion drawn here was wrong on both halves, and
+  re-measured in round 18: `emacs -Q --batch -l examples/char-syntax-tables.el`
+  **FAILS** `st-standard-table` — the pinned 95 is the answer for a TOP-LEVEL
+  form under `-l`, not for an ERT body, which Emacs runs in ` *temp*` where
+  `(char-syntax ?.)` is 46. So the expectation is wrong too, and the example
+  passed here only because elisprs's ERT does not switch buffers. The
   whole difference is which buffer is current inside the body:
 
   ```elisp
@@ -3094,9 +3101,10 @@ consecutive runs of the same cached script with different arguments.
   `(skip-syntax-forward "w_")` and would work today; the rest of the library is
   built on `forward-sexp` and the `*-at-point` provider table, so it waits on the
   entry above.
-- **`buffer-modified-p` and `buffer-file-name`** are void, so two rows of the
-  ` *load*` probe cannot be compared at all. Not attempted here; they are buffer
-  bookkeeping rather than entry-point state.
+- **`buffer-modified-p`** is void, so one row of the ` *load*` probe cannot be
+  compared at all. Not attempted here; it is buffer bookkeeping rather than
+  entry-point state. (This entry also named `buffer-file-name`; re-measured in
+  round 18, that one is bound and answers `nil`, as Emacs's does in batch.)
 
 ---
 
@@ -3286,3 +3294,157 @@ elisp -e '(dotimes (c 55296) (princ (format "%d %d %d\n" c (upcase c) (downcase 
   | grep -v '^nil$' > /tmp/b
 diff /tmp/a /tmp/b | grep -c '^<'
 ```
+
+### R18-H. The initial buffer's syntax table did not survive a cache hit — ✅ FIXED
+
+The worst thing found this round, and exactly the failure mode the cache rules
+exist for. The prelude ends with `(set-syntax-table emacs-lisp-mode-syntax-table)`,
+modelling `emacs -Q --batch` starting in `*scratch*` under `lisp-interaction-mode`.
+That is a **buffer-local** binding, and buffer locals live in the buffer struct,
+not in the arena — so the heap image does not carry it, and a cache hit, which
+skips the prelude entirely, left the initial buffer on `standard-syntax-table`:
+
+```text
+$ elisp probe.el   # run 1, cold
+top buffer="*scratch*" table-is-standard=nil char-syntax(.)=95
+$ elisp probe.el   # run 2, warm
+top buffer="*scratch*" table-is-standard=t   char-syntax(.)=46
+$ emacs -Q --batch -l probe.el
+top buffer="*scratch*" table-is-standard=nil char-syntax(.)=95
+```
+
+Every syntax-derived observable followed: `char-syntax`, `\sC` regexps,
+`skip-syntax-*`, `forward-word`, and this round's whole scanner family answered
+the `--script` column on a warm cache and the `-l` column on a cold one. It also
+defeated the twice-per-example guard in `scripts/run_examples.sh`, and it is why
+`examples/char-syntax-tables.el` was observed both passing and failing.
+
+Fixed in `install_entry_point_state`, the one place both cache paths run through
+— the same treatment `command-line-args` got in R17-I, and for the same reason:
+per-run state must never be reconstructed from the image. Verified over three
+consecutive runs of the same cached file on both entry points.
+
+### R18-I. `when` / `unless` with an EMPTY body expanded wrongly — ✅ FIXED
+
+subr.el's `when` has two arms, and only the first was ported:
+
+```elisp
+(defmacro when (cond &rest body)
+  (if body (list 'if cond (cons 'progn body))
+    (macroexp-warn-and-return … (list 'progn cond nil) '(empty-body when) t)))
+```
+
+so `(macroexpand '(when x))` is `(progn x nil)` in Emacs 30.2 and was
+`(if x (progn))` here; `(macroexpand '(unless x))` is `(progn x nil)` and was
+`(if x nil)`. The value is the same either way, so nothing but `macroexpand`
+could see it — which is precisely why it survived. (The warning itself is not
+emitted: `macroexp-warn-and-return` needs the byte-compiler's diagnostic
+channel, which this tree does not model.)
+
+### R18-J. Doc-claim audit
+
+Every behavioral claim in README.md, CHANGELOG.md and BUGS.md was extracted and
+run under both engines: **266 probes**, ~340 individual assertions.
+
+| verdict | count |
+| --- | --- |
+| TRUE | 255 |
+| FALSE — the code is wrong | 4 |
+| FALSE — the doc is stale or was never true | 7 |
+
+Separately, all **3,338** `assert_eq!` pairs in `tests/*.rs` were extracted and
+re-run against the live oracle. 3,278 matched exactly; 55 of the 60 mismatches
+are harness artifacts (a function Emacs 30.2 does not have, a cwd-relative
+filesystem test, a stdout side effect, or a file whose own header says its
+expectations were captured from the running interpreter rather than from Emacs).
+
+**Five were fabricated** — in files that state "Every expectation was taken from
+GNU Emacs 30.2", pinning a string no version of Emacs produces. A stale pin at
+least described some real version; a fabricated one never did, and a version
+gate on the oracle cannot catch it, because gating the oracle does not check
+that the expectation ever came from the oracle.
+
+| pin | claimed as Emacs 30.2 | Emacs 30.2 actually says | disposition |
+| --- | --- | --- | --- |
+| `tests/parity_macroexpand_intrinsics.rs:23` `(macroexpand '(when x))` | `(if x (progn))` | `(progn x nil)` | code fixed (R18-I), pin corrected |
+| `tests/parity_macroexpand_intrinsics.rs:31` `(macroexpand '(unless x))` | `(if x nil)` | `(progn x nil)` | code fixed (R18-I), pin corrected |
+| `tests/parity_record_type.rs:76` `(mapcar #'identity (record 'foo 1 2))` | `(wrong-type-argument sequencep #s(foo 1 2))` | `(nil t t)` — no signal | pin kept, relabelled as a deliberate divergence with its own test |
+| `tests/parity_bool_vector.rs:170` `(read "#&10\"\377\3\"")` | `(10 t t t t)` | `(invalid-read-syntax "#&...")` | pin kept, relabelled; elisprs has no unibyte/multibyte string distinction |
+| `tests/parity_defvar_init_and_startup_buffers.rs:83` inserting into `*Messages*` | `"hi"` | `(buffer-read-only #<buffer *Messages*>)` | pin kept, relabelled; `buffer-read-only` is bound here but unenforced |
+
+The macroexpand file also carried a stale *provenance* note quoting only the
+first arm of subr.el's `when` and calling it the whole definition — which is what
+made the fabricated value look derivable. Corrected.
+
+Stale doc claims, each re-measured and corrected in place:
+
+- `BUGS.md` R3-A claimed the named-character escape was fixed; `?\N{U+41}` is 65
+  in both, but `?\N{LATIN SMALL LETTER A}` is 97 in Emacs and
+  `(unsupported-character-name …)` here — the Unicode name table is not carried.
+- `BUGS.md` R5-U's record entry and `CHANGELOG.md`'s copy said `mapcar` signals
+  `sequencep` for a record. It does here; Emacs does not.
+- "Still open after round 9" listed `string-version-lessp`'s ordering; round 10's
+  `filevercmp` port closed it and the list was never updated. Both engines now
+  answer `t` for the cited probe.
+- "Still open after round 11" listed `(make-symbol "")` printing `\#\#`. Both
+  engines print `##`.
+- Round 17's "still open" listed `buffer-file-name` as void. It is bound and
+  answers `nil`, as Emacs's does in batch. `buffer-modified-p` really is void.
+- Round 16's note on `examples/char-syntax-tables.el` said the example "passes
+  under `emacs -Q --batch -l`". It **fails** — see below.
+- `README.md`'s `condition-case` example showed `arith-error`'s data as
+  `(arith-error division by zero)`. It is `(arith-error)`; that string is the
+  *message*, never the data.
+
+Twenty `/// Port of` doc comments name a concrete C function. Every one was read
+against its body and twelve were probed behaviorally. **No stub, no rename, no
+body that fails to implement the function it names.** One deviation is
+self-declared at `src/builtins.rs:5027`: `decode-char` for a charset Emacs
+registers but this tree does not takes the unknown-charset path, so
+`(decode-char 'japanese-jisx0208 13185)` signals `charsetp` where Emacs answers
+nil. The adjacent phrase "exactly as Emacs does for an unknown charset" is true
+only for genuinely unknown names.
+
+### Still open after round 18, with the evidence
+
+- **`ert` runs a test body in the current buffer; Emacs runs it in ` *temp*`.**
+  `ert--run-test-internal` (ert.el:796) wraps the body in
+  `(with-temp-buffer (save-window-excursion …))`. Measured:
+
+  ```text
+  emacs:   TOP buf="*scratch*" cs.=95   BODY buf=" *temp*"  cs.=46
+  elisprs: TOP buf="*scratch*" cs.=95   BODY buf="*scratch*" cs.=95
+  ```
+
+  The fix is two lines. It is declined this round because it changes the current
+  buffer for every `ert-deftest` body in all 71 examples, and measuring that
+  blast radius costs a full `cargo test --test examples` run (~70 minutes at ~60
+  seconds per example, dominated by the rkyv shard, not by evaluation) — twice,
+  for a before and an after. Landing it blind could break the example gate.
+  `examples/char-syntax-tables.el` is the one example known to depend on it, and
+  its pinned `95` is wrong in the same place: Emacs fails that test.
+- **Advising a Rust subr corrupts it.** `advice-add` on a prelude-defined
+  function works (all 18 pins in `tests/parity_nadvice.rs` advise a `defun` and
+  all 18 match Emacs). On a subr it does not:
+  `(progn (advice-add 'car :filter-return #'1+) (car '(1 2)))` is 2 in Emacs and
+  `(wrong-type-argument number-or-marker-p …)` here, and `car` stays broken for
+  the rest of the process. `README.md`, `CHANGELOG.md` and BUGS.md R5-U all say
+  the combinators are verified against 30.2; that is true only of the `defun`
+  case, which is the one every test exercises.
+- **`condition-case` matches a handler symbol that carries no
+  `error-conditions`.** `(condition-case nil (signal 'my-err '(1 2)) (my-err
+  'caught) (t 'top))` is `top` in Emacs — `my-err` has no condition list, so the
+  handler cannot match — and `caught` here.
+- **`(pcase nil (nil 'n))`** answers `n` here; Emacs signals
+  `Unknown pattern ‘nil’`.
+- **`(regexp-opt '("a" "b"))`** is `"[ab]"` in Emacs and
+  `"\\(?:a\\|b\\)"` here.
+- **`unibyte-string` is void**, which is what `BUGS.md`'s round-13 note on
+  `(string-width (unibyte-string 200))` actually measures.
+- **`%x` / `%X` / `%Ec` / `%EX` / `%Ex` / `%Om` / `%Od`** in
+  `format-time-string`, and `locale-info`, `system-time-locale`,
+  `system-messages-locale`, `locale-coding-system` — see R18-E.
+- **README's subr count** is given as "~90" in one place and "~80" in another;
+  `grep -c 's("' src/builtins.rs` reports 351. All three are inconsistent, and
+  a count that has to be maintained by hand will go stale again — it should be
+  generated, not typed.
