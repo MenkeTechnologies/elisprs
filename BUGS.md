@@ -2831,3 +2831,269 @@ work above. Neither the tests nor the examples were touched to hide them.
   start commit: `[[:alpha:]]` is expected to pass through unchanged and is
   rewritten to `[\p{Alphabetic}\p{M}]`. Untouched here; it is the unit-test
   counterpart of the R9-H `[:class:]` work already recorded above.
+
+---
+
+## Round 17 — the entry point's own state, and the `format-message` family
+
+Round 16 closed with two entries in "declined": the ` *load*` buffer, and
+`elisp FILE` modeling `emacs -l FILE` rather than `emacs --script FILE`. Both
+turned out to be the same missing piece, and it was small. This round is the
+sweep that finished the audit and the fixes that fell out of it.
+
+The observable × entry-point table, all measured on **GNU Emacs 30.2** with one
+probe file run three ways (`--eval '(load FILE)'`, `-l FILE`, `--script FILE`),
+against `elisp FILE` on the tree at the end of this round. `--eval` and `-l`
+agreed on every row, so they share a column.
+
+| observable | `--eval` / `-l` | `--script` | `elisp FILE` | `elisp --script FILE` |
+| --- | --- | --- | --- | --- |
+| `(buffer-name)` | `"*scratch*"` | `" *load*"` | `"*scratch*"` ✅ | `" *load*"` ✅ |
+| `major-mode` | `lisp-interaction-mode` | `fundamental-mode` | `fundamental-mode` ❌ | `fundamental-mode` ✅ |
+| `(buffer-list)` | 3 + `" *load*"` | 3 + `" *load*"` | 3 + `" *load*"` ✅ | 3 + `" *load*"` ✅ |
+| `load-file-name` | the file | the file | the file ✅ | the file ✅ |
+| `noninteractive` | `t` | `t` | `t` ✅ | `t` ✅ |
+| `command-line-args-left` / `argv` | args after the file | args after the file | args after the file ✅ | args after the file ✅ |
+| `(eq (syntax-table) (standard-syntax-table))` | `nil` | `t` | `nil` ✅ | `t` ✅ |
+| `(char-syntax ?.)` | `95` | `46` | `95` ✅ | `46` ✅ |
+| `(char-syntax ?\;)` | `60` | `46` | `60` ✅ | `46` ✅ |
+| `(aref (syntax-table) ?.)` | `(3)` | `(1)` | `(3)` ✅ | `(1)` ✅ |
+| `(string-match "\\s_" ".")` | `0` | `nil` | `0` ✅ | `nil` ✅ |
+| `(skip-syntax-forward "w_")` over `"foo.bar ;c"` | `7` | `3` | `7` ✅ | `3` ✅ |
+| `(forward-word 1)` | `4` | `4` | `4` ✅ | `4` ✅ |
+| `(forward-sexp 1)` | `8` | `4` | void ❌ | void ❌ |
+| `(scan-sexps 1 1)` | `8` | `4` | void ❌ | void ❌ |
+| `(parse-partial-sexp …)` / `syntax-ppss` | `t` / `nil` | `nil` / `nil` | void ❌ | void ❌ |
+| `thing-at-point` / `forward-symbol` | `"foo.bar"` / `8` | `"foo"` / `4` | no `thingatpt` ❌ | no `thingatpt` ❌ |
+
+Everything not marked ❌ agreed. The three ❌ rows are described under "still
+open" at the end of this section.
+
+### R17-A. `elisp --script FILE` — ✅ ADDED (the R16 boundary, closed)
+
+The two Emacs file entry points evaluate the file in different buffers, so they
+read different syntax tables, and every `char-syntax` / `\sC` / `skip-syntax-*`
+answer follows:
+
+```text
+$ emacs -Q --batch -l probe.el   => buf "*scratch*", lisp-interaction-mode, (char-syntax ?.) => 95
+$ emacs --script    probe.el     => buf " *load*",   fundamental-mode,      (char-syntax ?.) => 46
+```
+
+R16 declined this because "closing it needs the entry point to select the initial
+buffer's table, which in turn needs the buffer machinery the ` *load*` entry
+describes." Building that buffer (R17-B) is what made it cheap: with ` *load*`
+live, `--script` is `set-buffer` to it, and `--current-syntax-table--` is
+buffer-local — unset there — so the standard table falls out with no table
+plumbing at all. `elisp FILE` is unchanged and still the `-l` column, which is
+what `scripts/fuzz_parity.sh` compares against.
+
+The entry point is folded into `cache::schema_key`, because a top-level form that
+reads the buffer can change how a *later* form macro-expands; chunks compiled
+under one entry point must not be replayed under the other.
+
+### R17-B. Loading a file did not create Emacs's ` *load*` buffer — ✅ FIXED
+
+`emacs -Q --batch --eval` reports the clean three; `emacs -Q --batch -l FILE`
+reports four. mule.el `load-with-code-conversion` is explicit about why:
+
+```elisp
+(let ((buffer (generate-new-buffer " *load*")) …)
+  (unwind-protect (with-current-buffer buffer … (insert-file-contents fullname)) …
+    (kill-buffer buffer)))
+```
+
+so the buffer exists for the duration of the load, holds the file's text, and is
+killed on the way out. Measured on 30.2, a nested load nests:
+
+```text
+outer during: ("*scratch*" " *Minibuf-0*" "*Messages*" " *load*")
+inner during: ("*scratch*" " *Minibuf-0*" "*Messages*" " *load*" " *load*-711551")
+outer after:  ("*scratch*" " *Minibuf-0*" "*Messages*" " *load*")
+```
+
+elisprs reproduces all three lines now, including the random suffix (R17-C).
+
+The slot is reserved in `ElispHost::new` — inside the built-in arena prefix — and
+left *dead*, so `elisp -e` (the `--eval` model) still reports three. `eval_file`
+revives it. Reserving rather than allocating is what keeps the bytecode cache
+honest: a cache hit skips the prelude entirely, so an arena handle allocated on
+the miss path would not exist on the hit path. Both paths now see the same
+handle, and the source is read on both (a hit that skipped the read would make
+`(buffer-size)` depend on whether the cache was warm).
+
+**Named boundary:** point in ` *load*` is 1, where `insert-file-contents` leaves
+it. Emacs's is the reader's *current* position (176 partway through a 1043-char
+probe file). elisprs reads every top-level form before running any of them, so
+there is no meaningful "the read is here" position while the file's own code
+observes it.
+
+### R17-C. `generate-new-buffer-name` ignored both of its special cases — ✅ FIXED
+
+`Fgenerate_new_buffer_name` (buffer.c) is not a `<N>` counter:
+
+```c
+  if ((!NILP (ignore) && !NILP (Fstring_equal (name, ignore)))
+      || NILP (Fget_buffer (name)))
+    return name;
+  if (SREF (name, 0) != ' ') /* See bug#1229.  */
+    genbase = name;
+  else
+    { int i = get_random () % 1000000;
+      genbase = concat2 (name, "-<i>");
+      if (NILP (Fget_buffer (genbase))) return genbase; }
+  for (ptrdiff_t count = 2; ; count++)
+    { gentemp = concat2 (genbase, "<count>");
+      if (!NILP (Fstring_equal (gentemp, ignore)) || NILP (Fget_buffer (gentemp)))
+        return gentemp; }
+```
+
+Two behaviors were missing. Measured on 30.2:
+
+```text
+(generate-new-buffer-name " *hid*")           ; taken => " *hid*-368192", not " *hid*<2>"
+(generate-new-buffer-name "abc" "abc")        ; => "abc",     elisprs "abc<2>"
+(generate-new-buffer-name "abc" "abc<2>")     ; => "abc<2>",  elisprs "abc<3>"
+```
+
+The IGNORE argument was declared (`s("generate-new-buffer-name", 1, Some(2), …)`)
+and dropped on the floor, which silently disabled `rename-buffer`'s UNIQUE
+argument (R17-D) — the only in-tree caller that passes one.
+
+### R17-D. `rename-buffer` ignored UNIQUE, and accepted the empty name — ✅ FIXED
+
+`Frename_buffer` (buffer.c) uses IGNORE = the current buffer's own name, which is
+why renaming a buffer to a name it already holds succeeds in *both* spellings.
+Measured on 30.2, with a live buffer `taken`:
+
+| form | Emacs 30.2 | elisprs before |
+| --- | --- | --- |
+| `(rename-buffer "taken" t)` | `"taken<2>"` | error, "is in use" |
+| `(rename-buffer "taken")` | error | error ✅ |
+| `(rename-buffer "s2")` twice | `"s2"` | `"s2"` ✅ |
+| `(rename-buffer "s2" t)` on itself | `"s2"` | error |
+| `(rename-buffer "")` | error, "Empty string is invalid as a buffer name" | `""` |
+
+The error text also gains its curved quotes: `error()` in C runs its template
+through `format-message` (R17-F), so Emacs reports
+`Buffer name ‘taken’ is in use`.
+
+### R17-E. `skip-syntax-forward` / `skip-syntax-backward` were void — ✅ ADDED
+
+The syntax-class counterparts of `skip-chars-*`, and the base of most word and
+symbol motion. Ported from `skip_syntaxes` (syntax.c): the C builds a 256-entry
+fastmap over syntax *class codes*, complemented in place when SYNTAX begins with
+`^`; the port carries the accepted classes as a list and flips the membership
+test, which is the same thing without the array. `syntax_spec_code` is the
+inverse of `--syntax-code-spec--` plus `-` as an alias for whitespace; every
+other unlisted character addresses a slot no real class can match, so
+`(skip-syntax-forward "Z")` skips nothing rather than signalling.
+
+All 22 rows of the edge-case probe match `emacs -Q --batch -l` byte for byte,
+including LIM clamping to `[point-min, point-max]`, a marker LIM, narrowing, the
+negated form, and `(wrong-type-argument stringp 5)` for a non-string SYNTAX.
+
+### R17-F. `error`, `user-error` and `message` used `format`, not `format-message` — ✅ FIXED
+
+`Ferror` is literally `Fsignal (Qerror, list1 (Fformat_message (nargs, args)))`,
+and `Fmessage` is `styled_format (nargs, args, true)`, so the default
+`text-quoting-style` of `curve` applies to all three. Only the *template* is
+translated — a substituted argument is not re-scanned. Measured on 30.2:
+
+```elisp
+(error "a `b' c")          ; "a ‘b’ c"      elisprs "a `b' c"
+(error "a %s" "x `y'")     ; "a x `y'"      (argument untouched — control)
+(user-error "a `b'")       ; "a ‘b’"        elisprs "a `b'"
+(message "a `b' c")        ; "a ‘b’ c"      elisprs "a `b' c"
+(signal 'error '("a `b'")) ; "a `b'"        (signal does not format — control)
+(format "a `b' c")         ; "a `b' c"      (format never curves — control)
+```
+
+### R17-G. `substitute-command-keys` did not honor `\=` — ✅ FIXED
+
+The mirror image of R17-F, and the reason the two cannot share an implementation:
+`substitute-command-keys` treats `\=` as an escape that quotes the next character
+and is discarded, and `format-message` does not. elisprs implemented both as the
+same plain `string-replace` pair, so both were wrong in opposite directions.
+Measured on 30.2:
+
+| input | `substitute-command-keys` | `format-message` |
+| --- | --- | --- |
+| `"a \\=`b"` | `"a `b"` | `"a \\=‘b"` |
+| `"a \\=\\= b"` | `"a \\= b"` | — |
+| `"a \\=\\[f] b"` | `"a \\[f] b"` | — |
+| `"a \\=' b"` | `"a ' b"` | — |
+| `"a \\="` (nothing follows) | `"a \\="` | — |
+
+### R17-H. `(message nil)` signalled, and batch `message` skipped the pending newline — ✅ FIXED
+
+Two things in `Fmessage`'s batch path. First, a nil or empty template clears the
+echo area and answers the argument unchanged:
+
+```c
+  if (NILP (args[0]) || (STRINGP (args[0]) && SBYTES (args[0]) == 0))
+    { message1 (0); return args[0]; }
+```
+
+so `(message nil)` is nil in Emacs and was `(wrong-type-argument stringp nil)`
+here — the error `(message t)` is supposed to have exclusively.
+
+Second, `message_to_stderr` (xdisp.c) flushes `noninteractive_need_newline`,
+which print.c's `printchar`/`strout` set on *every* batch write to stdout:
+
+```c
+  if (noninteractive_need_newline)
+    { noninteractive_need_newline = false; errputc ('\n'); }
+  if (STRINGP (m)) errwrite (SDATA (s), SBYTES (s));
+  if (STRINGP (m) || !cursor_in_echo_area) errputc ('\n');
+```
+
+That is what keeps a `princ` on stdout and a following `message` on stderr off
+the same line, and — since `cursor_in_echo_area` is always false in batch — it is
+why `(message nil)` emits *two* newlines. A probe mixing `princ` and `message`
+now produces byte-identical stderr under `emacs -Q --batch -l` and `elisp`
+(`\n a ‘b’ c \n \n a `b' \n \n \n`); before, elisprs emitted neither the leading
+flush nor the blanks. `with-output-to-string` captures instead of writing to
+stdout, so it correctly does not set the flag.
+
+### R17-I. `command-line-args`, `command-line-args-left` and `argv` were void — ✅ ADDED
+
+`emacs -l FILE a b c` gives `argv` = `command-line-args-left` = `("a" "b" "c")`
+(startup.el makes `argv` a `defvaralias` of the other, so `(setq argv …)` is
+visible through both names) and `command-line-args` = the whole invocation.
+All three were unbound here, so a script could not see its own arguments at all.
+
+They are (re)set by the entry point on both cache paths, never baked into the
+heap image: the clean prelude snapshot is captured *before* they are installed,
+so a cache hit cannot replay the previous run's arguments. Verified across three
+consecutive runs of the same cached script with different arguments.
+
+### Still open, with the evidence
+
+- **`major-mode` is `fundamental-mode` under `elisp FILE`; Emacs's `-l` column is
+  `lisp-interaction-mode`.** Only the initial buffer's syntax *table* is modeled
+  (`src/prelude.rs`, `(set-syntax-table emacs-lisp-mode-syntax-table)`); the mode
+  chain `prog-mode → lisp-data-mode → emacs-lisp-mode → lisp-interaction-mode` is
+  not ported, and `define-derived-mode` bodies pull in font-lock, keymaps and
+  hook variables that nothing else here needs. Every syntax-derived observable
+  already agrees, so the symbol itself is the whole divergence. Note that
+  `elisp --script FILE` is correct — `--script` really is `fundamental-mode`.
+- **`forward-sexp` / `backward-sexp` / `scan-sexps` / `scan-lists` / `up-list` /
+  `down-list` / `forward-list`, and `parse-partial-sexp` / `syntax-ppss`.** All
+  void. These are one port, not seven: `Fforward_sexp` is `scan_lists`, and
+  `scan_lists` and `Fparse_partial_sexp` share `syntax.c`'s comment/string state
+  machine (`scan_sexps_forward`, `forw_comment`, `back_comment`) including the
+  two-character comment delimiters, nested comments, `syntax-propertize`
+  properties and the `parse-sexp-ignore-comments` flag. `skip-syntax-*` (R17-E)
+  needs none of that, which is why it is done and these are not. Doing a subset —
+  `forward-sexp` over balanced parens with no comment handling — would answer
+  plausibly on the common case and wrongly inside a string or comment, which is
+  worse than void.
+- **`thingatpt` is not available**, so `thing-at-point`, `bounds-of-thing-at-point`
+  and `forward-symbol` are unreachable. `forward-symbol` is
+  `(skip-syntax-forward "w_")` and would work today; the rest of the library is
+  built on `forward-sexp` and the `*-at-point` provider table, so it waits on the
+  entry above.
+- **`buffer-modified-p` and `buffer-file-name`** are void, so two rows of the
+  ` *load*` probe cannot be compared at all. Not attempted here; they are buffer
+  bookkeeping rather than entry-point state.

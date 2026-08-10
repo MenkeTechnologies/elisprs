@@ -78,6 +78,9 @@ The build produces the `elisp` binary:
 
 ```sh
 elisp FILE.el            # evaluate a file
+elisp --script FILE.el   # evaluate a file as `emacs --script` does: the forms run in the
+                         #   ` *load*` buffer, so they read the STANDARD syntax table.
+                         #   Plain `elisp FILE.el` is the `emacs -l FILE` column.
 elisp -e "(+ 1 2)"       # evaluate an expression, print its value
 elisp                    # REPL — reedline editor on a TTY, plain line reader when piped
 elisp --repl             # force the reedline REPL: Tab-completion, live stats banner, ~/.elisprs/history

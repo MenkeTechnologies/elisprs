@@ -39,6 +39,13 @@ path.
 .I FILE
 Evaluate the forms in \fIFILE\fR (typically a \fB.el\fR file) in order.
 .TP
+.B \-\-script " " \fIFILE\fR
+Evaluate \fIFILE\fR the way \fBemacs \-\-script\fR does: the forms run inside the
+\fB\ *load*\fR buffer, so they read the standard syntax table. Without this
+option \fBelisp\fR \fIFILE\fR models \fBemacs \-l\fR \fIFILE\fR, whose forms run in
+\fB*scratch*\fR and read the Emacs Lisp mode table \(em the two disagree on, for
+example, \fB(char\-syntax ?.)\fR (46 vs 95).
+.TP
 .BR \-e ", " \-\-eval " " \fIPROGRAM\fR
 Evaluate \fIPROGRAM\fR and print the value of the last form.
 .TP

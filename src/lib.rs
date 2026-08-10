@@ -204,10 +204,87 @@ fn with_load_file_name<T>(
     r
 }
 
+/// Which Emacs invocation `elisp FILE` is standing in for.
+///
+/// The two differ in the buffer the file's forms run in, and therefore in the
+/// syntax table every `char-syntax` / `\sC` / `skip-syntax-*` answer comes from.
+/// Measured on GNU Emacs 30.2 with the same probe file:
+///
+/// ```text
+/// emacs -Q --batch -l probe.el  => buffer "*scratch*", lisp-interaction-mode,
+///                                  (char-syntax ?.) => 95 (?_)
+/// emacs --script    probe.el    => buffer " *load*",   fundamental-mode,
+///                                  (char-syntax ?.) => 46 (?.)
+/// ```
+///
+/// [`EntryPoint::Load`] is the default and the column `scripts/fuzz_parity.sh`
+/// compares against.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EntryPoint {
+    /// `emacs -l FILE`: the file is loaded, `*scratch*` stays current.
+    Load,
+    /// `emacs --script FILE`: the file is evaluated *in* the ` *load*` buffer, so
+    /// it reads the standard syntax table rather than the elisp-mode one.
+    Script,
+}
+
+/// Entry-point state that depends on *this* invocation rather than on the
+/// prelude, applied to a host that is ready to run the script's forms.
+///
+/// All of it must be applied on the cache-hit path as well as the cache-miss
+/// path: a hit skips the prelude entirely, and the argument list is different on
+/// every run, so none of it can be baked into the heap image.
+///
+/// - ` *load*` is the buffer `load` reads the file through. `emacs -Q --batch
+///   --eval` reports three buffers, `emacs -Q --batch -l FILE` reports four; the
+///   slot is reserved in the built-in prefix (see `ElispHost::open_load_buffer`)
+///   precisely so both cache paths see the same arena handle. Under
+///   [`EntryPoint::Script`] it also becomes *current*, which is the whole
+///   observable difference between the two entry points.
+/// - `command-line-args-left` (and its alias `argv`) is everything after the
+///   script path, matching `emacs -l FILE a b c` => `("a" "b" "c")`;
+///   `command-line-args` is the whole invocation.
+fn install_entry_point_state(path: &str, src: &str, entry: EntryPoint) {
+    let load_buf = host::with_host(|h| h.open_load_buffer(src, true));
+    if entry == EntryPoint::Script {
+        host::with_host(|h| {
+            let obj = h.buffer_object(load_buf);
+            let _ = h.set_buffer(&obj);
+        });
+    }
+    let args: Vec<String> = std::env::args().collect();
+    // Everything after the script argument. `main` picks the first non-flag
+    // argument as the file, so find that same one rather than assuming a slot.
+    let left: Vec<Value> = match args.iter().position(|a| a == path) {
+        Some(i) => args[i + 1..].iter().cloned().map(Value::str).collect(),
+        None => Vec::new(),
+    };
+    host::with_host(|h| {
+        let all: Vec<Value> = args.iter().cloned().map(Value::str).collect();
+        let all = h.list_from(all);
+        let left = h.list_from(left);
+        let cla = h.intern("command-line-args");
+        let left_sym = h.intern("command-line-args-left");
+        let _ = h.set_value(&cla, all);
+        let _ = h.set_value(&left_sym, left);
+    });
+}
+
+/// Run a `.el` file as `emacs -l FILE` would. See [`eval_file_as`].
+pub fn eval_file(path: &str) -> Result<Value, String> {
+    eval_file_as(path, EntryPoint::Load)
+}
+
+/// Run a `.el` file as `emacs --script FILE` would: the forms are evaluated in
+/// the ` *load*` buffer, whose syntax table is the standard one.
+pub fn eval_script(path: &str) -> Result<Value, String> {
+    eval_file_as(path, EntryPoint::Script)
+}
+
 /// Run a `.el` file, using the rkyv bytecode cache at `~/.elisprs/scripts.rkyv`.
 /// On a fresh hit, the per-form chunks + a clean heap image are loaded and run
 /// directly — skipping read / macro-expand / lower AND the prelude rebuild.
-pub fn eval_file(path: &str) -> Result<Value, String> {
+pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
     let mtime_ns = std::fs::metadata(path)
         .ok()
         .and_then(|m| m.modified().ok())
@@ -218,10 +295,24 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
     // Schema key folds the builtin layout + prelude into the version, so editing
     // either invalidates stale bytecode without a manual version bump. Computed
     // on a builtins-only host (no user file loaded yet) so it's stable per build.
+    // The entry point is folded in: it selects the buffer the forms run in, and a
+    // top-level form that reads the buffer can change how a *later* form
+    // macro-expands, so chunks compiled under one entry point must not be
+    // replayed under the other.
     let schema_key = {
         host::reset_host();
-        cache::schema_key(host::with_host(|h| h.builtin_fingerprint()))
+        let base = cache::schema_key(host::with_host(|h| h.builtin_fingerprint()));
+        match entry {
+            EntryPoint::Load => base,
+            EntryPoint::Script => format!("{base}-script"),
+        }
     };
+
+    // The source is needed on BOTH paths, not just the miss: ` *load*` holds the
+    // file's text in Emacs, so skipping the read on a hit would make `buffer-size`
+    // depend on whether the cache was warm. Reading a script is negligible next to
+    // the parse + macro-expand + lower + prelude rebuild the cache actually skips.
+    let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
 
     let debug = std::env::var_os("ELISPRS_CACHE_DEBUG").is_some();
     if let Some((chunks, heap, oclosure_meta)) = cache::get(path, mtime_ns, &schema_key) {
@@ -236,6 +327,7 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
             // closure.
             h.import_oclosure_meta(oclosure_meta);
         });
+        install_entry_point_state(path, &src, entry);
         return with_load_file_name(path, || {
             let mut last = Value::Undef;
             for chunk in chunks {
@@ -250,14 +342,17 @@ pub fn eval_file(path: &str) -> Result<Value, String> {
 
     // Cache miss: compile + run form-by-form (so an in-file defmacro is in effect
     // before later forms), capturing each chunk and a clean heap image.
-    let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     host::reset_host();
     load_prelude();
     let builtin_count = host::with_host(|h| h.builtin_count());
     let prelude_end = host::with_host(|h| h.arena_len());
     // The clean prelude heap, captured BEFORE the file runs: this is the state the
     // cached chunks replay onto, so it must not contain any of their effects.
+    // Also before `install_entry_point_state`, so THIS run's argv never reaches
+    // the cached image and the next run's `install_entry_point_state` is the only
+    // thing that sets it.
     let clean_prelude = host::with_host(|h| h.export_heap_range(builtin_count, prelude_end));
+    install_entry_point_state(path, &src, entry);
 
     // Bind load-file-name only while the forms run; unbind before the clean heap
     // image is captured so the cached image carries no transient load binding.

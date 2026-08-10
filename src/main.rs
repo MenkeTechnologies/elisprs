@@ -1,6 +1,7 @@
 //! The `elisp` binary — a fusevm frontend driver.
 //!
 //!   elisp FILE.el            evaluate a file (lowered to fusevm, run on fusevm)
+//!   elisp --script FILE.el   evaluate a file as `emacs --script` does
 //!   elisp -e "EXPR"          evaluate an expression, print its value
 //!   elisp                    REPL
 //!   elisp --lsp / --dap      language server (stub) / line-level debug adapter
@@ -109,7 +110,18 @@ fn run() -> ExitCode {
     }
 
     if let Some(file) = args.iter().find(|a| !a.starts_with('-')) {
-        return match elisprs::eval_file(file) {
+        // `--script` selects Emacs's other file entry point. The two evaluate the
+        // file in different buffers, so they read different syntax tables:
+        // `emacs -l FILE` runs in `*scratch*` (lisp-interaction-mode, `?.` is a
+        // symbol constituent) and `emacs --script FILE` runs in ` *load*`
+        // (fundamental-mode, the standard table). Plain `elisp FILE` is the `-l`
+        // column, which is what `scripts/fuzz_parity.sh` compares against.
+        let entry = if args.iter().any(|a| a == "--script") {
+            elisprs::EntryPoint::Script
+        } else {
+            elisprs::EntryPoint::Load
+        };
+        return match elisprs::eval_file_as(file, entry) {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {}", elisprs::format_error(&e));
@@ -331,6 +343,7 @@ fn print_help() {
                 "\n",
                 "\x1b[36m  ── MODES ──────────────────────────────────────────────\x1b[0m\n",
                 "  elisp FILE.el            \x1b[32m//\x1b[0m evaluate a file\n",
+                "  elisp --script FILE.el   \x1b[32m//\x1b[0m evaluate a file as `emacs --script` does (standard syntax table)\n",
                 "  elisp -e EXPR            \x1b[32m//\x1b[0m evaluate an expression and print its value\n",
                 "  elisp                    \x1b[32m//\x1b[0m start a REPL\n",
                 "  elisp --repl             \x1b[32m//\x1b[0m start the reedline REPL (Tab-completion + stats banner)\n",

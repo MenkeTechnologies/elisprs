@@ -55,6 +55,20 @@ pub const PRELUDE: &str = r#"
 ;; No GUI and non-interactive batch execution, matching `emacs -Q --batch'.
 (defvar window-system nil)
 (defvar noninteractive t)
+;; The command line.  `elisp FILE a b c' models `emacs -l FILE a b c', where
+;; `command-line-args' is the whole invocation and `command-line-args-left' is
+;; what follows the script.  Both are (re)set per run by the entry point, since
+;; the bytecode cache would otherwise replay the *previous* run's arguments; the
+;; values here are the `emacs --eval' answers (nil args-left), which is what
+;; `elisp -e' models.  `argv' is an alias, not a copy -- startup.el does
+;; `(defvaralias 'argv 'command-line-args-left)', so `(setq argv ...)' is visible
+;; through both names.
+(defvar command-line-args nil
+  "List of command line arguments, as they were given to this process.")
+(defvar command-line-args-left nil
+  "List of command line arguments not yet processed.")
+(defvaralias 'argv 'command-line-args-left
+  "List of command line arguments not yet processed.")
 ;; `temporary-file-directory' is defined below, right after
 ;; `file-name-as-directory', which its initializer depends on.
 
@@ -2757,21 +2771,42 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
       (setq r (cons (apply fn (mapcar (function car) seqs)) r))
       (setq seqs (mapcar (function cdr) seqs)))
     (reverse r)))
-;; Like `format' (we don't translate `...' to curved quotes).
+;; Curve-quote a format TEMPLATE: grave accent => left single quote, apostrophe
+;; => right single quote.  This is `styled_format's message half (editfns.c), and
+;; it is NOT `substitute-command-keys': the two differ on `\=', which
+;; `substitute-command-keys' honors as an escape and `format-message' does not.
+;; Measured on GNU Emacs 30.2:
+;;   (format-message "a \\=`b")        => "a \\=‘b"
+;;   (substitute-command-keys "a \\=`b") => "a `b"
+(defun --curve-quotes-- (string)
+  (and string (string-replace "'" "’" (string-replace "`" "‘" string))))
 (defun format-message (fmt &rest args)
-  ;; Curve-quote the format string (default `text-quoting-style' is 'curve):
-  ;; grave accent => left single quote, apostrophe => right single quote.
-  (apply (function format) (substitute-command-keys fmt) args))
+  (apply (function format) (--curve-quotes-- fmt) args))
 ;; `substitute-command-keys' without a keymap database: the key-substitution
 ;; constructs need `where-is-internal' (no interactive keymaps here), but the
-;; quote translation half is what callers and `format-message' actually rely on,
+;; quote translation half is what callers and error reporting actually rely on,
 ;; and it is exactly the default `text-quoting-style' of `curve'.
+;;
+;; `\=' quotes the following character and is discarded, so `\=\=' yields `\=',
+;; `\=\[' yields `\[', and `\=' + apostrophe yields a plain apostrophe rather
+;; than a curved one.  A trailing `\=' with nothing after it stays literal.
 ;; NAMED limitation: \\[COMMAND] / \\{MAP} / \\<MAP> are passed through unchanged.
 (defun substitute-command-keys (string &optional _no-face _include-menus)
   ;; A nil STRING comes back as nil, never as an error: `print_error_message'
   ;; funnels `(get ERRNAME 'error-message)' through here unconditionally, and an
   ;; unregistered error symbol has none.
-  (and string (string-replace "'" "’" (string-replace "`" "‘" string))))
+  (when string
+    (let ((i 0) (n (length string)) (out nil) c)
+      (while (< i n)
+        (setq c (aref string i))
+        (cond
+         ((and (eq c ?\\) (< (+ i 2) n) (eq (aref string (1+ i)) ?=))
+          (push (aref string (+ i 2)) out)
+          (setq i (+ i 3)))
+         ((eq c ?`) (push ?‘ out) (setq i (1+ i)))
+         ((eq c ?') (push ?’ out) (setq i (1+ i)))
+         (t (push c out) (setq i (1+ i)))))
+      (apply (function string) (nreverse out)))))
 (defun cl--digitp (c) (and (>= c ?0) (<= c ?9)))
 ;; value<: a canonical total order within a type (numbers/strings/symbols/lists/
 ;; vectors); cross-type comparison signals an error, like Emacs 30.
@@ -7405,6 +7440,83 @@ For example, if CHARACTER is a word constituent, the character `?w' is
 returned.  The characters that correspond to various syntax codes are
 listed in the documentation of `modify-syntax-entry'."
   (syntax-class-to-char (syntax-class (aref (syntax-table) character))))
+
+;; ---- skip-syntax-forward / skip-syntax-backward (syntax.c `skip_syntaxes') ----
+;; The C builds a 256-entry fastmap over syntax CLASS CODES:
+;;
+;;   if (i_byte < size_byte && SREF (string, 0) == '^') { negate = 1; i_byte++; }
+;;   while (i_byte < size_byte) { c = str[i_byte++]; fastmap[syntax_spec_code[c]] = 1; }
+;;   if (negate) for (i = 0; i < sizeof fastmap; i++) fastmap[i] ^= 1;
+;;
+;; then walks while `fastmap[SYNTAX (c)]' holds, stopping at LIM, and returns
+;; `PT - start_point'.  Here the set of accepted classes is carried as a list of
+;; class indices instead of a 256-byte array; `negate' flips the membership test,
+;; which is the same thing without the array.
+;;
+;; `syntax_spec_code' is the inverse of `--syntax-code-spec--' with one extra
+;; entry: `-' is an alias for whitespace.  Every other unlisted spec character
+;; maps to 0377, a code no real class has -- so `(skip-syntax-forward "Z")' skips
+;; nothing rather than signalling, and `(skip-syntax-forward "wZ")' behaves like
+;; `"w"'.  That is exactly what dropping the character from the list does.
+(defun --syntax-spec-classes-- (spec)
+  "The list of syntax class indices SPEC's characters name (see `syntax_spec_code').
+Characters that name no class contribute nothing, as in the C, where they
+address a fastmap slot that no real syntax class can match."
+  (let ((i 0) (len (length spec)) (out nil) c class)
+    (while (< i len)
+      (setq c (aref spec i))
+      (setq class (if (eq c ?-) 0
+                    (let ((j 0) (found nil) (n (length --syntax-code-spec--)))
+                      (while (and (not found) (< j n))
+                        (when (eq (aref --syntax-code-spec-- j) c) (setq found j))
+                        (setq j (1+ j)))
+                      found)))
+      (when class (push class out))
+      (setq i (1+ i)))
+    out))
+
+(defun --skip-syntaxes-- (forwardp syntax lim)
+  "Common body of `skip-syntax-forward' and `skip-syntax-backward'."
+  (unless (stringp syntax) (signal 'wrong-type-argument (list 'stringp syntax)))
+  (let* ((negate (and (> (length syntax) 0) (eq (aref syntax 0) ?^)))
+         (spec (if negate (substring syntax 1) syntax))
+         (classes (--syntax-spec-classes-- spec))
+         (start (point))
+         ;; "In any case, don't allow scan outside bounds of buffer."
+         (lim (max (point-min) (min (point-max)
+                                    (cond ((null lim) (if forwardp (point-max) (point-min)))
+                                          ((markerp lim) (marker-position lim))
+                                          (t lim)))))
+         (ch nil))
+    (if forwardp
+        (while (and (< (point) lim)
+                    (setq ch (char-after))
+                    (let ((in (and (memq (syntax-class (aref (syntax-table) ch)) classes) t)))
+                      (if negate (not in) in)))
+          (goto-char (1+ (point))))
+      (while (and (> (point) lim)
+                  (setq ch (char-before))
+                  (let ((in (and (memq (syntax-class (aref (syntax-table) ch)) classes) t)))
+                    (if negate (not in) in)))
+        (goto-char (1- (point)))))
+    (- (point) start)))
+
+(defun skip-syntax-forward (syntax &optional lim)
+  "Move point forward across chars in specified syntax classes.
+SYNTAX is a string of syntax code characters.
+Stop before a char whose syntax is not in SYNTAX, or at position LIM.
+If SYNTAX starts with ^, skip characters whose syntax is NOT in SYNTAX.
+This function returns the distance traveled, either zero or positive."
+  (--skip-syntaxes-- t syntax lim))
+
+(defun skip-syntax-backward (syntax &optional lim)
+  "Move point backward across chars in specified syntax classes.
+SYNTAX is a string of syntax code characters.
+Stop on reaching a char whose syntax is not in SYNTAX, or at position LIM.
+If SYNTAX starts with ^, skip characters whose syntax is NOT in SYNTAX.
+This function returns either zero or a negative number, and the absolute value
+of this is the distance traveled."
+  (--skip-syntaxes-- nil syntax lim))
 
 (defmacro with-syntax-table (table &rest body)
   "Evaluate BODY with syntax table TABLE as the current syntax table.

@@ -6,6 +6,38 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **`elisp --script FILE`** — Emacs's other file entry point. `emacs -l FILE` and
+  `emacs --script FILE` evaluate the file in *different buffers*, so they read
+  different syntax tables and disagree on every `char-syntax` / `\sC` /
+  `skip-syntax-*` answer: `-l` runs in `*scratch*` under the Emacs Lisp mode
+  table (`(char-syntax ?.)` => 95), `--script` runs in ` *load*` under the
+  standard one (=> 46). Plain `elisp FILE` is unchanged and still models `-l`,
+  the column `scripts/fuzz_parity.sh` compares against. The entry point is folded
+  into the bytecode cache key, since a top-level form that reads the buffer can
+  change how a later form macro-expands.
+- **The ` *load*` buffer.** `emacs -Q --batch --eval` reports three buffers;
+  `emacs -Q --batch -l FILE` reports four, because `load` reads the file through
+  a buffer of its own (mule.el, `(generate-new-buffer " *load*")`), holds the
+  file's text in it, and kills it on the way out. elisprs reported three either
+  way. A nested `(load …)` now nests the same way Emacs does, down to the
+  ` *load*-NNNNNN` name. The slot is reserved inside the built-in arena prefix so
+  the cache-hit and cache-miss paths see the same handle.
+- **`command-line-args`, `command-line-args-left` and `argv`.** All three were
+  void, so a script could not see its own arguments. `elisp FILE a b c` now
+  answers `("a" "b" "c")` for the latter two — `argv` is a `defvaralias`, as in
+  startup.el, not a copy — and they are re-installed per run on both cache paths
+  rather than baked into the heap image.
+- **`skip-syntax-forward` / `skip-syntax-backward`.** Ported from `skip_syntaxes`
+  (syntax.c): the syntax-class counterparts of `skip-chars-*`, with the leading
+  `^` negation, LIM clamped to the accessible portion, a marker LIM, and an
+  unrecognized spec character contributing nothing rather than signalling.
+- **A version gate on the fuzz oracle.** `scripts/fuzz_parity.sh` took its ground
+  truth from `EMACS="${EMACS:-emacs}"` and checked only that the binary existed.
+  A different Emacs does not fail loudly — it reports a different set of
+  diverging forms, which reads as a regression. The script now prints the
+  resolved oracle path and version on every run and exits 2 when the version is
+  not the one BUGS.md's header pins (single-sourced from that line;
+  `EMACS_VERSION_EXPECT` overrides for a deliberate cross-version run).
 - **A guard against silent identifier collisions.** Extension-op IDs
   (`host::ops`) are hand-assigned `u16` constants and subr names go through
   `defsubr`, which ends in `set_function` — so two registrations sharing a number

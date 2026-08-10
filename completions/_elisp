@@ -14,6 +14,7 @@ _elisp() {
     '--dump-ast[print the read s-expression forms (AST)]:Emacs Lisp file:_files -g "*.el"' \
     '--dump-bytecode[print the compiled fusevm ops]:Emacs Lisp file:_files -g "*.el"' \
     '--disasm[print a fusevm bytecode disassembly]:Emacs Lisp file:_files -g "*.el"' \
+    '--script[evaluate a file as `emacs --script` does (standard syntax table)]' \
     {-e,--eval}'[evaluate an expression and print its value]:expression' \
     '*:Emacs Lisp file:_files -g "*.el"'
 }

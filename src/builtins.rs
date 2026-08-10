@@ -1581,9 +1581,43 @@ fn throw_fn(h: &mut ElispHost, a: &[Value]) -> R {
         Err(msg)
     }
 }
+/// Apply the default `text-quoting-style` (`curve`) to a format *template*:
+/// a grave accent becomes a left single quotation mark and an apostrophe a right
+/// one. This is the message half of `styled_format` (`src/editfns.c`), which
+/// `Ferror`, `Fuser_error` and `Fmessage` all route through — `Ferror` is
+/// literally `Fsignal (Qerror, list1 (Fformat_message (nargs, args)))`.
+///
+/// Only the template is translated, never a substituted argument: the scan
+/// happens while walking the format string, and `%s` output is not re-scanned.
+/// `\=` is NOT an escape here — that is `substitute-command-keys`, a different
+/// function. Measured on GNU Emacs 30.2: `(error "a %s" "x `y'")` keeps the
+/// argument's quotes, and `(error "a \\=`b c")` still curves the backtick.
+fn curve_quotes(fmt: &str) -> String {
+    fmt.chars()
+        .map(|c| match c {
+            '`' => '\u{2018}',
+            '\'' => '\u{2019}',
+            other => other,
+        })
+        .collect()
+}
+
+/// `el_format` with the format template curve-quoted (`format-message`).
+fn el_format_message(h: &mut ElispHost, a: &[Value]) -> Result<String, String> {
+    match a.first() {
+        Some(Value::Str(s)) => {
+            let mut args = a.to_vec();
+            args[0] = Value::str(curve_quotes(s));
+            el_format(h, &args)
+        }
+        // A non-string template is el_format's error to report, unchanged.
+        _ => el_format(h, a),
+    }
+}
+
 fn error_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // Error object: (error "MESSAGE"). Keep it for condition-case.
-    let msg = el_format(h, a)?;
+    let msg = el_format_message(h, a)?;
     let esym = h.intern("error");
     let mstr = Value::str(msg.clone());
     let data = h.list_from(vec![mstr]);
@@ -1594,7 +1628,7 @@ fn error_fn(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn user_error_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // Like `error`, but signals the `user-error` condition.
-    let msg = el_format(h, a)?;
+    let msg = el_format_message(h, a)?;
     let esym = h.intern("user-error");
     let mstr = Value::str(msg.clone());
     let data = h.list_from(vec![mstr]);
@@ -2250,10 +2284,55 @@ fn format_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(out)
 }
+/// `(message FORMAT-STRING &rest ARGS)`. Port of `Fmessage` (`src/xdisp.c`) plus
+/// the batch tail it reaches, `message_to_stderr`:
+///
+/// ```c
+///   if (NILP (args[0]) || (STRINGP (args[0]) && SBYTES (args[0]) == 0))
+///     { message1 (0); return args[0]; }
+///   else { val = Fformat_message (nargs, args); message3 (val); return val; }
+///
+///   /* message_to_stderr (m) */
+///   if (noninteractive_need_newline)
+///     { noninteractive_need_newline = false; errputc ('\n'); }
+///   if (STRINGP (m)) errwrite (SDATA (s), SBYTES (s));
+///   if (STRINGP (m) || !cursor_in_echo_area) errputc ('\n');
+/// ```
+///
+/// Three things that a bare `eprintln!("{}", format(...))` gets wrong:
+///
+/// - nil (and "") clear the echo area and answer the argument unchanged, so
+///   `(message nil)` is nil, not `(wrong-type-argument stringp nil)`.
+/// - the template is curve-quoted (`format-message`, not `format`).
+/// - a pending `noninteractive_need_newline` — set by any batch write to stdout —
+///   is flushed to stderr first, so a `princ` and a following `message` do not
+///   share a line. `cursor_in_echo_area` is always false in batch, so the
+///   trailing newline is unconditional and nil therefore emits *two*.
 fn message_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let s = el_format(h, a)?;
-    eprintln!("{s}");
-    Ok(Value::str(s))
+    let blank = match a.first() {
+        Some(v) if is_nil(v) => true,
+        Some(Value::Str(s)) => s.is_empty(),
+        _ => false,
+    };
+    let text = if blank {
+        None
+    } else {
+        Some(el_format_message(h, a)?)
+    };
+    if h.need_newline {
+        h.need_newline = false;
+        eprint!("\n");
+    }
+    match text {
+        Some(s) => {
+            eprintln!("{s}");
+            Ok(Value::str(s))
+        }
+        None => {
+            eprintln!();
+            Ok(a.first().cloned().unwrap_or(Value::Undef))
+        }
+    }
 }
 fn princ_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let s = h.print_checked(&a[0], false)?;
@@ -5234,7 +5313,7 @@ fn rng_seed() -> u64 {
         .unwrap_or(0x9e3779b97f4a7c15);
     nanos | 1
 }
-fn rng_next() -> u64 {
+pub(crate) fn rng_next() -> u64 {
     RNG_STATE.with(|s| {
         let mut x = s.get();
         if x == 0 {
@@ -5824,13 +5903,22 @@ fn get_buffer_create(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn generate_new_buffer(h: &mut ElispHost, a: &[Value]) -> R {
     let base = as_string(h, &a[0])?;
-    let name = h.generate_new_buffer_name(&base);
+    let name = h.generate_new_buffer_name(&base, None);
     // generate-new-buffer always makes a fresh buffer (the unique name is free).
     Ok(h.get_buffer_create(&name))
 }
 fn generate_new_buffer_name(h: &mut ElispHost, a: &[Value]) -> R {
     let base = as_string(h, &a[0])?;
-    Ok(Value::str(h.generate_new_buffer_name(&base)))
+    // IGNORE (a name that may be reused even if taken) is only honored when it is
+    // a string; `Fstring_equal` is guarded by `!NILP (ignore)` for NAME itself and
+    // simply never matches a nil IGNORE inside the `<N>` loop.
+    let ignore = match a.get(1) {
+        Some(v) if !is_nil(v) => Some(as_string(h, v)?),
+        _ => None,
+    };
+    Ok(Value::str(
+        h.generate_new_buffer_name(&base, ignore.as_deref()),
+    ))
 }
 fn buffer_name(h: &mut ElispHost, a: &[Value]) -> R {
     let idx = match a.first() {
@@ -5855,7 +5943,8 @@ fn kill_buffer(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn rename_buffer(h: &mut ElispHost, a: &[Value]) -> R {
     let newname = as_string(h, &a[0])?;
-    h.rename_buffer(&newname)
+    let unique = a.get(1).is_some_and(|v| !is_nil(v));
+    h.rename_buffer(&newname, unique)
 }
 fn buffer_list(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(h.buffer_list())

@@ -571,6 +571,15 @@ pub struct ElispHost {
     pub(crate) buffers: Vec<EditBuffer>,
     /// Index into `buffers` of the current buffer (`current-buffer`/`set-buffer`).
     pub(crate) current: usize,
+    /// xdisp.c `noninteractive_need_newline`: stdout has been written since the
+    /// last `message`, so the next one owes stderr a leading newline. See
+    /// [`ElispHost::emit`] and the `message` builtin.
+    pub(crate) need_newline: bool,
+    /// Index into `buffers` of the reserved ` *load*` slot — the buffer `load`
+    /// reads the top-level script through (see [`ElispHost::open_load_buffer`]).
+    /// Dead until a file is loaded, so `elisp -e` (which models `emacs --eval`)
+    /// still reports only the three startup buffers.
+    pub(crate) load_buf: usize,
     /// Text properties for strings. `Value::Str` is an `Arc<String>` value with no
     /// room for interval storage, so a propertized string's per-char plists live in
     /// this side table keyed by the `Arc`'s pointer identity. The stored `Weak`
@@ -781,6 +790,8 @@ impl ElispHost {
                 local_map: Value::Undef,
             }],
             current: 0,
+            need_newline: false,
+            load_buf: 0, // fixed below, once the slot exists
             string_props: HashMap::new(),
             oclosure_meta: HashMap::new(),
             intercepts: Vec::new(),
@@ -805,6 +816,18 @@ impl ElispHost {
         // never serialized as user heap.
         h.new_buffer(" *Minibuf-0*".to_string());
         h.new_buffer("*Messages*".to_string());
+        // The ` *load*` slot, reserved here (in the built-in prefix) but left dead
+        // so it stays invisible to `buffer-list` until a file is actually loaded.
+        // `emacs -Q --batch --eval` reports three buffers; `emacs -Q --batch -l
+        // FILE` reports four, because `load` reads the file through a buffer of
+        // its own (mule.el `load-with-code-conversion`: `(generate-new-buffer
+        // " *load*")`). Reserving the slot up front rather than allocating it in
+        // `eval_file` is what keeps the bytecode cache honest: the arena handle is
+        // below `builtin_count`, so it is identical on the cache-hit and
+        // cache-miss paths and is never serialized into the heap image.
+        let load_slot = h.new_buffer(" *load*".to_string());
+        h.load_buf = h.buffer_slot(&load_slot).expect("reserved load slot");
+        h.buffers[h.load_buf].name = None;
         // The global obarray object — the value of the `obarray` variable. Its
         // symbol set lives in `self.obarray` (the HashMap), so its own `symbols`
         // map stays empty and `global` routes every lookup there. Allocated in
@@ -3012,6 +3035,12 @@ impl ElispHost {
             use std::io::Write;
             print!("{s}");
             let _ = std::io::stdout().flush();
+            // print.c `printchar` / `strout`: every batch write to stdout sets
+            // `noninteractive_need_newline = 1`, and the next `message` flushes
+            // it as a newline on *stderr* so the two streams do not collide on
+            // one line. Captured output (`with-output-to-string`) never reaches
+            // stdout, so it must not set the flag.
+            self.need_newline = true;
         }
     }
 
@@ -3131,19 +3160,65 @@ impl ElispHost {
             None => self.new_buffer(name.to_string()),
         }
     }
-    /// `(generate-new-buffer-name STARTING)` — STARTING if free, else the first
-    /// `STARTING<N>` (N≥2) that is free.
-    pub fn generate_new_buffer_name(&self, starting: &str) -> String {
-        if self.find_buffer_by_name(starting).is_none() {
-            return starting.to_string();
+    /// `(generate-new-buffer-name NAME &optional IGNORE)`. Port of
+    /// `Fgenerate_new_buffer_name` (`src/buffer.c`):
+    ///
+    /// ```c
+    ///   if ((!NILP (ignore) && !NILP (Fstring_equal (name, ignore)))
+    ///       || NILP (Fget_buffer (name)))
+    ///     return name;
+    ///
+    ///   if (SREF (name, 0) != ' ') /* See bug#1229.  */
+    ///     genbase = name;
+    ///   else
+    ///     {
+    ///       int i = get_random () % 1000000;
+    ///       sprintf (number, "-%d", i);
+    ///       genbase = concat2 (name, lnumber);
+    ///       if (NILP (Fget_buffer (genbase)))
+    ///         return genbase;
+    ///     }
+    ///
+    ///   for (ptrdiff_t count = 2; ; count++)
+    ///     {
+    ///       sprintf (number, "<%"pD"d>", count);
+    ///       Lisp_Object gentemp = concat2 (genbase, lnumber);
+    ///       if (!NILP (Fstring_equal (gentemp, ignore))
+    ///           || NILP (Fget_buffer (gentemp)))
+    ///         return gentemp;
+    ///     }
+    /// ```
+    ///
+    /// Two behaviors that a plain `NAME<N>` counter gets wrong:
+    ///
+    /// - a **hidden** name (leading space, e.g. ` *load*` / ` *temp*`) that is
+    ///   taken gets a random `-NNNNNN` suffix *first*, so nested `with-temp-buffer`
+    ///   / `load` do not walk a `<2>`, `<3>`, … chain. This is observable:
+    ///   `(buffer-name (generate-new-buffer " *load*"))` under a load is
+    ///   ` *load*-711551` in Emacs 30.2, not ` *load*<2>`.
+    /// - IGNORE names a buffer that may be reused even though it exists — the
+    ///   check applies both to NAME itself and to every `<N>` candidate, which is
+    ///   what lets `rename-buffer` accept the current buffer's own name.
+    pub fn generate_new_buffer_name(&self, name: &str, ignore: Option<&str>) -> String {
+        if ignore == Some(name) || self.find_buffer_by_name(name).is_none() {
+            return name.to_string();
         }
-        let mut n = 2;
-        loop {
-            let cand = format!("{starting}<{n}>");
+        let genbase = if !name.starts_with(' ') {
+            name.to_string()
+        } else {
+            let cand = format!("{name}-{}", crate::builtins::rng_next() % 1_000_000);
             if self.find_buffer_by_name(&cand).is_none() {
                 return cand;
             }
-            n += 1;
+            cand
+        };
+        let mut count = 2;
+        loop {
+            let cand = format!("{genbase}<{count}>");
+            if ignore == Some(cand.as_str()) || self.find_buffer_by_name(&cand).is_none() {
+                return cand;
+            }
+            count += 1;
         }
     }
     /// `(set-buffer BUFFER-OR-NAME)` — make it current, returning its object.
@@ -3229,15 +3304,95 @@ impl ElispHost {
         }
         Value::Bool(true)
     }
-    /// `(rename-buffer NEWNAME)` — rename the current buffer. Returns the new name.
-    pub fn rename_buffer(&mut self, newname: &str) -> Result<Value, String> {
-        if let Some(other) = self.find_buffer_by_name(newname) {
-            if other != self.current {
-                return Err(format!("error: Buffer name '{newname}' is in use"));
+    /// `(rename-buffer NEWNAME &optional UNIQUE)` — rename the current buffer.
+    /// Returns the name actually given. Port of `Frename_buffer` (`src/buffer.c`):
+    ///
+    /// ```c
+    ///   if (SCHARS (newname) == 0)
+    ///     error ("Empty string is invalid as a buffer name");
+    ///   tem = Fget_buffer (newname);
+    ///   if (!NILP (tem))
+    ///     {
+    ///       if (NILP (unique) && XBUFFER (tem) == current_buffer)
+    ///         return BVAR (current_buffer, name);
+    ///       if (!NILP (unique))
+    ///         newname = Fgenerate_new_buffer_name (newname,
+    ///                                              BVAR (current_buffer, name));
+    ///       else
+    ///         error ("Buffer name `%s' is in use", SDATA (newname));
+    ///     }
+    /// ```
+    ///
+    /// UNIQUE is not decoration: `(rename-buffer NAME t)` on a taken NAME is the
+    /// documented way to free NAME up, and it stays meaningful even when the
+    /// current buffer *already* holds NAME (IGNORE is the current name, so the
+    /// `<N>` loop can hand it straight back — hence `(rename-buffer "s2" t)`
+    /// answering `"s2"`, not `"s2<2>"`).
+    pub fn rename_buffer(&mut self, newname: &str, unique: bool) -> Result<Value, String> {
+        if newname.is_empty() {
+            return Err("error: Empty string is invalid as a buffer name".to_string());
+        }
+        let mut newname = newname.to_string();
+        if let Some(other) = self.find_buffer_by_name(&newname) {
+            if unique {
+                let ignore = self.buffers[self.current].name.clone();
+                newname = self.generate_new_buffer_name(&newname, ignore.as_deref());
+            } else if other == self.current {
+                return Ok(Value::str(newname));
+            } else {
+                // The C is `error ("Buffer name `%s' is in use", …)`, and `error`
+                // runs its template through `format-message`, so Emacs 30.2 (default
+                // `text-quoting-style' of `curve') reports curved quotes here.
+                return Err(format!(
+                    "error: Buffer name \u{2018}{newname}\u{2019} is in use"
+                ));
             }
         }
-        self.buffers[self.current].name = Some(newname.to_string());
-        Ok(Value::str(newname.to_string()))
+        self.buffers[self.current].name = Some(newname.clone());
+        Ok(Value::str(newname))
+    }
+    /// Open the buffer `load` reads a file through, and make it the *only* live
+    /// ` *load*`-family buffer for this load.
+    ///
+    /// `load-with-code-conversion` (mule.el) does `(generate-new-buffer " *load*")`,
+    /// `insert-file-contents` into it, evaluates the file with the *original*
+    /// buffer current, then kills it in an `unwind-protect`. `top_level` selects
+    /// between the two callers:
+    ///
+    /// - `true` (the `elisp FILE` entry point) reuses the reserved slot, so the
+    ///   name is exactly ` *load*` and no arena object is allocated — the cache-hit
+    ///   and cache-miss paths must agree on every handle.
+    /// - `false` (a nested `(load …)`) allocates a fresh buffer, so its name goes
+    ///   through `generate_new_buffer_name`, which for a hidden name already taken
+    ///   answers ` *load*-NNNNNN`, exactly as Emacs does.
+    ///
+    /// Point stays at 1 (where `insert-file-contents` leaves it). Emacs's ` *load*`
+    /// point is the reader's *current* position, which elisprs cannot reproduce:
+    /// it reads every top-level form before running any of them, so there is no
+    /// meaningful "read is here" position while the file's own code observes it.
+    pub fn open_load_buffer(&mut self, src: &str, top_level: bool) -> usize {
+        let idx = if top_level {
+            let idx = self.load_buf;
+            self.buffers[idx].name = Some(" *load*".to_string());
+            idx
+        } else {
+            let name = self.generate_new_buffer_name(" *load*", None);
+            let handle = self.get_buffer_create(&name);
+            self.buffer_slot(&handle).expect("fresh load buffer slot")
+        };
+        let text: Vec<char> = src.chars().collect();
+        let len = text.len();
+        let b = &mut self.buffers[idx];
+        b.props = vec![Value::Undef; len];
+        b.text = text;
+        b.point = 1;
+        b.begv = 1;
+        b.zv = len + 1;
+        idx
+    }
+    /// The buffer object for slot `idx` (used to kill a load buffer afterward).
+    pub fn buffer_object(&self, idx: usize) -> Value {
+        self.buffers[idx].self_obj.clone()
     }
     /// `(buffer-list)` — live buffer objects, in creation order.
     pub fn buffer_list(&mut self) -> Value {
@@ -5212,8 +5367,16 @@ fn intrinsic_load(args: &[Value]) -> Result<Value, String> {
         d
     });
 
+    // `load-with-code-conversion` reads the file through a buffer of its own and
+    // kills it on the way out (`unwind-protect`), so a nested load is visible in
+    // `(buffer-list)` while it runs and gone afterward.
+    let load_buf = with_host(|h| h.open_load_buffer(&src, false));
     let result = crate::run_top_forms(&src);
-    with_host(|h| h.unbind_to(depth));
+    with_host(|h| {
+        let obj = h.buffer_object(load_buf);
+        h.kill_buffer(Some(&obj));
+        h.unbind_to(depth);
+    });
 
     result.map(|_| Value::Bool(true))
 }
