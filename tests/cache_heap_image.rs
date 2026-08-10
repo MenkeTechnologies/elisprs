@@ -202,3 +202,51 @@ fn warm_cache_keeps_the_initial_buffers_syntax_table() {
     assert_eq!(cold, "95 60 8 nil\n", "cold run");
     assert_eq!(warm, cold, "a warm cache must not change the syntax table");
 }
+
+/// Round 19 baked *subr values* into the prelude's chunks: inside the prelude, a
+/// call to one of the primitives Emacs's byte compiler open-codes loads the subr
+/// itself rather than the symbol, so `advice-add` on that symbol cannot reach the
+/// advice machinery's own internals. Those constants ride the heap image, so the
+/// behaviour has to survive a cache hit — a warm run skips the prelude entirely
+/// and never re-lowers a single one of those calls.
+///
+/// `cdr` and `nth` are in the probe as the negative control: advice on `car` must
+/// not reach them, cold or warm. Matches `emacs -Q --batch -l` exactly.
+#[test]
+fn warm_cache_keeps_advice_working_on_an_open_coded_subr() {
+    let script = r#"
+(advice-add 'car :filter-return #'1+)
+(princ (format "%S %S %S\n" (car '(1 2)) (cdr '(1 2)) (nth 0 '(5 6))))
+(advice-remove 'car #'1+)
+(princ (format "%S\n" (car '(1 2))))
+"#;
+    let (cold, warm) = run_cold_then_warm("advice-subr", script);
+    assert_eq!(cold, "2 (2) 5\n1\n", "cold run");
+    assert_eq!(warm, cold, "a warm cache must not change advice on a subr");
+}
+
+/// ERT's own two round-19 behaviours cross the same boundary: `ert-run-tests-batch`
+/// is a prelude `defun`, so a cache hit restores it from the image instead of
+/// re-compiling it. Tests must still run in *name* order (`aaa-a` before `zzz-b`)
+/// and each body inside `with-temp-buffer` — where `(char-syntax ?.)` is 46,
+/// against 95 at top level in `*scratch*`.
+///
+/// Measured identical under `emacs -Q --batch -l`.
+#[test]
+fn warm_cache_keeps_ert_ordering_and_its_temp_buffer() {
+    let script = r#"
+(princ (format "top %S %S\n" (buffer-name) (char-syntax ?.)))
+(ert-deftest zzz-b () (princ (format "zzz-b %S %S\n" (buffer-name) (char-syntax ?.))))
+(ert-deftest aaa-a () (princ "aaa-a\n"))
+(ert-run-tests-batch)
+"#;
+    let (cold, warm) = run_cold_then_warm("ert-order", script);
+    assert_eq!(
+        cold, "top \"*scratch*\" 95\naaa-a\nzzz-b \" *temp*\" 46\n",
+        "cold run"
+    );
+    assert_eq!(
+        warm, cold,
+        "a warm cache must not change ERT's ordering or buffer"
+    );
+}

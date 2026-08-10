@@ -3598,6 +3598,49 @@ effects and pass here while failing under `emacs -Q --batch -l`.
 `examples/script-demo.el`'s cleanup test was exactly that, and it is now
 self-sufficient.
 
+### R19-F. ERT's `with-temp-buffer` wrapping — ✅ FIXED, and measured
+
+Round 18 declined this because measuring the blast radius meant a
+`cargo test --test examples` run, twice, at ~70 minutes each. That estimate was
+right about the cost and wrong about the cause: the ~60 s per example is the
+**rkyv cache write**, not the evaluation. `ELISPRS_CACHE=0` takes one example
+from ~15 s (cold, with a 238 MB shard to rewrite) to **3.1 s**, so the whole gate
+— exit status, a `Ran N tests:` summary, `ran == declared`, `unexpected == 0`,
+not-all-skipped, i.e. every check `tests/examples.rs` makes — runs in about four
+minutes:
+
+```text
+$ ELISPRS_CACHE=0 sweep.sh          # all 71 examples, the examples.rs checks
+### examples=71 failing=0
+```
+
+So the item is landed measured, not blind. `ert--run-test-internal` (ert.el:796)
+wraps the body in `(with-temp-buffer (save-window-excursion …))`, and both
+engines now answer:
+
+```text
+top   buf="*scratch*"  (char-syntax ?.)=95
+body  buf=" *temp*"    (char-syntax ?.)=46
+```
+
+Exactly one example moved: `examples/char-syntax-tables.el`, the one round 18
+named. Its pin was `?_` — the *scratch* value — and **GNU Emacs 30.2 fails that
+assertion today**:
+
+```text
+:form (equal (119 119 32 46 40 95) (119 119 32 95 40 95))
+(list-elt 3 (different-atoms (46 "#x2e" "?.") (95 "#x5f" "?_")))
+```
+
+The pin is corrected to `?.`, with the buffer name and the *scratch* value
+pinned alongside it so the two tables still cannot collapse. Both engines now
+run that example 11/11.
+
+The cache paths are covered by two new tests in `tests/cache_heap_image.rs`
+(open-coded-subr advice, and ERT's ordering + temp buffer), each asserting the
+cold value against Emacs and then `warm == cold`. Verified independently over
+three consecutive runs of one script on a fresh cache.
+
 ### R19-E. Assertions that could not fail
 
 Swept 45 `tests/*.rs` files (672 `#[test]` fns, 3,633 assertion macros, all 42
@@ -3640,8 +3683,6 @@ shared helper panics. Nine assertions were strengthened; none deleted:
   `(condition-case e (cl-incf 5) (error e))` catches `(gv-invalid-place 5)` in
   Emacs; here the expansion runs before the handler is established and the error
   reaches top level. The *condition* is right now; the timing is not.
-- **`ert` runs a test body in the current buffer; Emacs runs it in ` *temp*`.**
-  See the round-18 entry; still open, and see the verdict below.
 - **`condition-case` matches a handler symbol that carries no
   `error-conditions`.** `(condition-case nil (signal 'my-err '(1 2)) (my-err
   'caught) (t 'top))` is `top` in Emacs and `caught` here.
@@ -3674,6 +3715,9 @@ shared helper panics. Nine assertions were strengthened; none deleted:
   for a before and an after. Landing it blind could break the example gate.
   `examples/char-syntax-tables.el` is the one example known to depend on it, and
   its pinned `95` is wrong in the same place: Emacs fails that test.
+  **Closed in round 19 — see R19-F.** The 70-minute figure was the rkyv cache
+  write, not the evaluation: with `ELISPRS_CACHE=0` the whole 71-example gate
+  runs in about four minutes, so the change was landed measured.
 - **Advising a Rust subr corrupts it.** Closed in round 19 — see R19-A. The
   claim in `README.md`, `CHANGELOG.md` and R5-U that the combinators are
   verified against 30.2 was true only of the `defun` case until then.

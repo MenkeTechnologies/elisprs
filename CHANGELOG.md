@@ -157,10 +157,16 @@ All notable changes to elisprs are documented here. The format follows
   `CHECK_FIXNUM`: `(string-to-number "1" 2.0)` truncated the float to base 2 and
   answered 1 where Emacs signals `(wrong-type-argument fixnump 2.0)`, and a
   symbol, bignum or marker said `integerp` instead of `fixnump`.
-- **ERT ran tests in definition order.** Emacs runs them by name (measured over
-  ten deliberately unsorted names). Definition order let a test depend on an
-  earlier test's side effects and pass here while failing under
-  `emacs -Q --batch -l`.
+- **ERT ran tests in definition order, and ran each body in the current
+  buffer.** Emacs orders by name (measured over ten deliberately unsorted names)
+  and wraps every body in `with-temp-buffer` (ert.el:796), so a body runs in
+  ` *temp*` under the standard syntax table — `(char-syntax ?.)` is 46 there,
+  against 95 at top level in `*scratch*`. Definition order let a test depend on
+  an earlier test's side effects and pass here while failing under
+  `emacs -Q --batch -l`. Both changes were measured across all 71 examples
+  before landing: `ELISPRS_CACHE=0` turns the ~60 s per example (which is the
+  rkyv cache write, not the evaluation) into 3.1 s, so the full gate runs in
+  about four minutes — 71 examples, 0 failing.
 - **Error DATA dropped any value with no read syntax.** The data list is rebuilt
   by re-reading the rendered message, so a marker, buffer or closure — printed as
   `#<…>` / `#[…]` — vanished, leaving `(wrong-type-argument fixnump)` with no
