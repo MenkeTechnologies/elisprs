@@ -114,6 +114,62 @@ All notable changes to elisprs are documented here. The format follows
   a prelude name-prefix check could not express.
 
 ### Fixed
+- **`\(?N:RE\)` named the wrong capture group.** `fancy_regex` numbers groups
+  positionally and the translator dropped the explicit number, so
+  `(string-match "\\(?2:a\\)" "a")` left `(match-data)` as `(0 1 0 1)` against
+  Emacs's `(0 1 nil nil 0 1)`, `match-beginning` was inverted, and `\N` in a
+  `replace-regexp-in-string` replacement read an empty group. Emacs continues
+  counting from `N + 1` (`regnum = N`), so `\(?5:a\)\(b\)` has groups 5 and 6.
+  `\(?0:` and `\(?i:` now report Emacs's `(invalid-regexp "Invalid regular
+  expression")` rather than the regex crate's parser text.
+- **Special forms had no function cell.** `(fboundp 'if)` was nil,
+  `(symbol-function 'if)` was nil, and `(funcall 'if 1 2)` reported
+  `(void-function if)`. In Emacs they are subrs with `max_args == UNEVALLED`:
+  `#<subr if>`, `subrp` t, `subr-name` `"if"`, and `(invalid-function #<subr
+  if>)` on a call. `(functionp 'if)` stays nil.
+- **A warm script cache lost the introspection function cells.**
+  `(fboundp 'when)` answered `t` on a cold run and nil on every run after, since
+  the `(macro . FUNCTION)` cells live in a host side table the heap image never
+  carried. Shard format v8 carries it.
+- **base64 encoded the UTF-8 expansion instead of the bytes**
+  (`"\303\251"` → `"w4PCqQ=="`, not `"w6k="`, and it did not round-trip through
+  the decoder), and the decoder accepted `"YWJ"`, `"="`, `"===="`, `"A==="`,
+  `"AB=C"` and the base64url alphabet, all of which Emacs rejects with
+  `(error "Invalid base64 data")`. A character above 255 now signals
+  `(error "Multibyte character in data for base64 encoding")`.
+- **`url-unhex-string` decoded UTF-8** — `"%CE%B1"` came back as one character
+  instead of two, and a string with no escapes at all came back longer than it
+  went in. `url-hexify-string` now takes any sequence, as Emacs's `mapconcat`
+  implementation does.
+- **The digest range arguments indexed characters and were clamped.** They are
+  byte offsets into the encoded text, must be integers, count from the end when
+  negative, and signal `(args-out-of-range OBJECT START END)` outside —
+  `(md5 "abc" 5 nil)` used to answer the digest of `""`. An unknown algorithm now
+  reports Emacs's `(error "Invalid algorithm arg: bogus")`.
+- **Seven argument checks named the wrong predicate or none at all**:
+  `(string "a")` and `(format "%c" -1)` (`characterp`), `(copysign 1 2.0)`
+  (`floatp`), `(lsh "" 6)` (`number-or-marker-p`, where COUNT still reports
+  `integerp`), `(atan -2 'car)` (`numberp`), `(member-ignore-case "a" 1.5)`
+  (`listp`, which used to answer nil), and `(upcase (symbol-function '+))`, whose
+  datum was dropped because `#<subr +>` has no read syntax.
+- **`(logb 2305843009213693951)`** answered 61 for lack of an exact integer path
+  (2^61-1 rounds up to 2^61 in `f64`); Emacs answers 60. A NaN now passes through
+  with its own sign and payload.
+- **The time ZONE argument was never validated.** A float, a vector, a
+  one-element list and any symbol other than `wall` are
+  `(error "Invalid time zone specification" ZONE)`; all were accepted and read as
+  UTC, and `wall` — which means *local* — was read as UTC too.
+- **A bool-vector's packed bytes ignored `print-escape-control-characters`** —
+  the flag was applied to plain strings only, so a zero byte printed as a raw NUL
+  where Emacs writes `\0`.
+- **`end-of-file` dropped its datum.** Inside a loaded file Emacs signals
+  `(end-of-file "/path/to/file.el")`; only a bare `--eval` gets `(end-of-file)`.
+  `examples/error-data.el` pinned the old empty form and called it
+  oracle-verified — `emacs -Q --batch -l` fails that assertion — so the example
+  now asserts the shape Emacs actually produces.
+- **`(intern "nil")` built a new symbol** that printed as `nil` but was not `eq`
+  to it, so `(and (intern "nil") 1)` answered 1. Same root as `(intern-soft t)`
+  answering nil and `(indirect-function t)` answering `t` instead of nil.
 - **`advice-add` on a Rust subr corrupted it for the rest of the process.**
   `(advice-add 'car :filter-return #'1+)` did not just fail — every later `car`,
   including `(symbol-function 'car)`, raised

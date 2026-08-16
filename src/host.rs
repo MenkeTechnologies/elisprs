@@ -1564,6 +1564,57 @@ impl ElispHost {
             self.intrinsic_macro_cells.insert(id, cell);
         }
     }
+    /// The `#<subr NAME>` object behind `v` when `v` designates a *special form* —
+    /// either the symbol (`(funcall 'if …)`) or the subr itself
+    /// (`(funcall (symbol-function 'if) …)`).
+    ///
+    /// A special form is fbound but not callable: Emacs's `funcall` refuses a subr
+    /// whose `max_args` is `UNEVALLED` with `(invalid-function #<subr if>)`.
+    pub fn special_form_object(&self, v: &Value) -> Option<Value> {
+        if let Some(Obj::Subr { name, .. }) = self.obj(v) {
+            return crate::builtins::is_special_form(name).then(|| v.clone());
+        }
+        let cell = self
+            .sym_handle(v)
+            .and_then(|id| self.intrinsic_macro_cells.get(&id))?;
+        match self.obj(cell) {
+            Some(Obj::Subr { name, .. }) if crate::builtins::is_special_form(name) => {
+                Some(cell.clone())
+            }
+            _ => None,
+        }
+    }
+    /// Signal `(invalid-function FUNCTION)` carrying FUNCTION as the *object*.
+    /// A subr prints as `#<subr if>`, which no reader can turn back into the
+    /// subr, so the datum has to travel out of band like `signal_wrong_type`'s.
+    pub fn signal_invalid_function(&mut self, fun: &Value) -> String {
+        let msg = format!("invalid-function: {}", self.print(fun, true));
+        let sym = self.intern("invalid-function");
+        let data = self.list_from(vec![fun.clone()]);
+        let obj = self.cons(sym, data);
+        self.set_pending_error(&msg, obj);
+        msg
+    }
+    /// The introspection side table (special-form and intrinsic-macro function
+    /// cells), for serialization into the script cache.
+    pub fn export_intrinsic_macro_cells(&self) -> Vec<(u32, Value)> {
+        let mut out: Vec<(u32, Value)> = self
+            .intrinsic_macro_cells
+            .iter()
+            .map(|(&id, v)| (id, v.clone()))
+            .collect();
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+    /// Restore cells captured by [`Self::export_intrinsic_macro_cells`].
+    ///
+    /// Only entries the current `install` did not already provide are taken, so a
+    /// stale cached special-form cell can never displace the live one.
+    pub fn import_intrinsic_macro_cells(&mut self, cells: Vec<(u32, Value)>) {
+        for (id, v) in cells {
+            self.intrinsic_macro_cells.entry(id).or_insert(v);
+        }
+    }
     /// Look up an already-interned symbol by name without creating one
     /// (`intern-soft`); returns `None` if absent.
     pub fn find_symbol(&self, name: &str) -> Option<Value> {
@@ -2810,11 +2861,20 @@ impl ElispHost {
                             packed[i / 8] |= 1 << (i % 8);
                         }
                     }
+                    // The packed bytes go through print.c's string rules, which
+                    // include `print-escape-control-characters`: with it set a
+                    // zero byte prints as `\0` rather than as a raw NUL, so
+                    // `(prin1-to-string (make-bool-vector 4 nil))` is
+                    // `"#&4\"\\0\""` under the flag and `"#&4\"^@\""` without it.
+                    let esc_ctl = self.print_flag("print-escape-control-characters");
                     let mut inner = String::new();
                     for &byte in &packed {
                         match byte {
                             b'"' => inner.push_str("\\\""),
                             b'\\' => inner.push_str("\\\\"),
+                            0..=0x1f | 0x7f if esc_ctl => {
+                                inner.push_str(&format!("\\{byte:o}"))
+                            }
                             0..=127 => inner.push(byte as char),
                             _ => inner.push_str(&format!("\\{byte:o}")),
                         }
@@ -4184,6 +4244,23 @@ impl ElispHost {
         msg
     }
 
+    /// Signal Emacs's `(error "MESSAGE" DATUM)` — `xsignal2 (Qerror,
+    /// build_string (MESSAGE), DATUM)`, the shape `secure_hash` and `tzlookup`
+    /// use.
+    ///
+    /// The message-only path renders DATUM into the message text and re-reads it,
+    /// which for a plain `error` produces the one-element data `("MESSAGE DATUM")`
+    /// — the datum fused into the message string rather than standing beside it.
+    pub fn signal_error_with(&mut self, message: &str, datum: &Value) -> String {
+        let msg = format!("error: {message} {}", self.print(datum, true));
+        let sym = self.intern("error");
+        let m = Value::str(message.to_string());
+        let data = self.list_from(vec![m, datum.clone()]);
+        let obj = self.cons(sym, data);
+        self.set_pending_error(&msg, obj);
+        msg
+    }
+
     /// Record the error object that belongs to `msg` (the string the failing call
     /// returns as its `Err`). See [`Self::take_pending_error`].
     pub fn set_pending_error(&mut self, msg: &str, obj: Value) {
@@ -4217,6 +4294,19 @@ impl ElispHost {
         let sym_candidate = trimmed.split_once(':').map_or(trimmed, |(s, _)| s.trim());
         if NIL_DATA_ERRORS.contains(&sym_candidate) {
             let s = self.intern(sym_candidate);
+            // `end-of-file` is the one exception: Emacs's `end_of_file_error`
+            // (lread.c) signals it *with* `load-true-file-name` when there is one,
+            // so a truncated `read` inside a loaded file reports
+            // `(end-of-file "/path/to/file.el")` and only a bare
+            // `emacs --batch --eval` reports `(end-of-file)`.
+            if sym_candidate == "end-of-file" {
+                if let Some(file @ Value::Str(_)) = self
+                    .find_symbol("load-true-file-name")
+                    .and_then(|s| self.get_value(&s).ok())
+                {
+                    return self.list_from(vec![s, file]);
+                }
+            }
             return self.list_from(vec![s]);
         }
         let (sym, msg) = match e.split_once(':') {
@@ -4439,6 +4529,14 @@ pub fn set_prelude_compiling(b: bool) {
 /// re-entrant entry point: it never holds the host borrow across a callee, so a
 /// closure body (run on a nested fusevm VM) can re-borrow the host freely.
 pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
+    // A special form is fbound but not callable. Emacs's `funcall` sees a subr
+    // with `max_args == UNEVALLED` and signals `(invalid-function #<subr if>)`
+    // before looking at the arguments at all, so `(funcall 'if 1 2)` and
+    // `(apply 'quote '(1))` both land here rather than reporting the form as
+    // undefined.
+    if let Some(subr) = with_host(|h| h.special_form_object(f)) {
+        return Err(with_host(|h| h.signal_invalid_function(&subr)));
+    }
     // Higher-order primitives are intercepted here so they don't run inside a
     // host borrow (which would deadlock the nested call).
     //

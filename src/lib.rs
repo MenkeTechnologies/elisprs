@@ -346,7 +346,13 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
     let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
 
     let debug = std::env::var_os("ELISPRS_CACHE_DEBUG").is_some();
-    if let Some((chunks, heap, oclosure_meta)) = cache::get(path, mtime_ns, &schema_key) {
+    if let Some(cached) = cache::get(path, mtime_ns, &schema_key) {
+        let cache::CachedScript {
+            chunks,
+            heap,
+            oclosure_meta,
+            introspection_cells,
+        } = cached;
         if debug {
             eprintln!("elisprs: cache HIT  {path} ({} chunks)", chunks.len());
         }
@@ -357,6 +363,10 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
             // skips — restore it or every prelude OClosure comes back as a plain
             // closure.
             h.import_oclosure_meta(oclosure_meta);
+            // Same for the introspection function cells: `when`/`unless` register
+            // theirs from the prelude, so without this a warm run answers
+            // `(fboundp 'when)` nil where a cold one answers `t`.
+            h.import_intrinsic_macro_cells(introspection_cells);
         });
         install_entry_point_state(path, &src, entry);
         return with_load_file_name(path, || {
@@ -390,6 +400,15 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
     let (chunks, last) = with_load_file_name(path, || run_top_forms(&src))?;
     let heap = host::with_host(|h| h.export_heap_image_clean(prelude_end, &clean_prelude));
     let oclosure_meta = host::with_host(|h| h.export_oclosure_meta());
-    cache::put(path, mtime_ns, &schema_key, &chunks, &heap, &oclosure_meta);
+    let introspection_cells = host::with_host(|h| h.export_intrinsic_macro_cells());
+    cache::put(
+        path,
+        mtime_ns,
+        &schema_key,
+        &chunks,
+        &heap,
+        &oclosure_meta,
+        &introspection_cells,
+    );
     Ok(last)
 }

@@ -68,7 +68,13 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// is exactly why the bump is needed. A v6 chunk carries no guard, so replaying
 /// it would evaluate a wrong-arity subr's arguments before signalling, silently
 /// serving the pre-fix behaviour to anyone with a warm cache.
-pub const SHARD_FORMAT_VERSION: u32 = 7;
+/// v8 adds `Entry::introspection_cells`: the special-form / intrinsic-macro
+/// function cells (`when`, `unless`) live in a side table on the host, not in the
+/// arena, so a cache hit — which skips the prelude that registers them — used to
+/// come back with `(fboundp 'when)` nil and `(symbol-function 'when)` nil where a
+/// cold run answered `t` and the `(macro . FUNCTION)` pair. `Entry` gained a field,
+/// which shifts the rkyv layout, so a v7 shard must be rejected outright.
+pub const SHARD_FORMAT_VERSION: u32 = 8;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next
@@ -114,6 +120,12 @@ struct Entry {
     /// (`closure-handle, type, slots`). Not derivable from `heap`: it is built
     /// when the prelude runs, which a cache hit skips.
     oclosure_meta: Vec<u8>,
+    /// bincode `Vec<(u32, Value)>` — the introspection function cells
+    /// (`symbol-handle, cell`) of the forms elisprs lowers in the compiler. Like
+    /// `oclosure_meta` this is host state outside the arena that the prelude
+    /// builds, so a cache hit has to restore it or `(fboundp 'when)` answers nil
+    /// on a warm run and `t` on a cold one.
+    introspection_cells: Vec<u8>,
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize)]
@@ -262,15 +274,20 @@ fn write_shard(shard: &Shard) -> std::io::Result<()> {
 // ── public API ───────────────────────────────────────────────────────────────
 
 /// Cache lookup. Returns the per-form chunks + clean heap image on a fresh hit.
+/// Everything a cache hit has to replay: the compiled chunks plus the host state
+/// that building them produced but the arena does not hold.
+pub struct CachedScript {
+    pub chunks: Vec<Chunk>,
+    pub heap: Vec<SerObj>,
+    pub oclosure_meta: Vec<(u32, u32, Vec<u32>)>,
+    pub introspection_cells: Vec<(u32, fusevm::Value)>,
+}
+
 /// `schema_key` must match the key the entry was written under (see `schema_key`).
 /// Misses on: cache disabled, format/schema drift, mtime mismatch, or a binary
 /// newer than the cached entry.
 #[allow(clippy::type_complexity)]
-pub fn get(
-    path: &str,
-    mtime_ns: i64,
-    schema_key: &str,
-) -> Option<(Vec<Chunk>, Vec<SerObj>, Vec<(u32, u32, Vec<u32>)>)> {
+pub fn get(path: &str, mtime_ns: i64, schema_key: &str) -> Option<CachedScript> {
     if !cache_enabled() {
         return None;
     }
@@ -299,7 +316,14 @@ pub fn get(
     let heap: Vec<SerObj> = bincode::deserialize(&entry.heap).ok()?;
     let oclosure_meta: Vec<(u32, u32, Vec<u32>)> =
         bincode::deserialize(&entry.oclosure_meta).ok()?;
-    Some((chunks, heap, oclosure_meta))
+    let introspection_cells: Vec<(u32, fusevm::Value)> =
+        bincode::deserialize(&entry.introspection_cells).ok()?;
+    Some(CachedScript {
+        chunks,
+        heap,
+        oclosure_meta,
+        introspection_cells,
+    })
 }
 
 /// Store a compiled script. Best-effort — any failure just skips caching. Takes
@@ -311,6 +335,7 @@ pub fn put(
     chunks: &[Chunk],
     heap: &[SerObj],
     oclosure_meta: &[(u32, u32, Vec<u32>)],
+    introspection_cells: &[(u32, fusevm::Value)],
 ) {
     if !cache_enabled() {
         return;
@@ -326,6 +351,9 @@ pub fn put(
         return;
     };
     let Ok(oclosure_blob) = bincode::serialize(oclosure_meta) else {
+        return;
+    };
+    let Ok(introspection_blob) = bincode::serialize(introspection_cells) else {
         return;
     };
 
@@ -350,6 +378,7 @@ pub fn put(
             forms,
             heap: heap_blob,
             oclosure_meta: oclosure_blob,
+            introspection_cells: introspection_blob,
         },
     );
     shard.header.built_at_secs = now_secs() as u64;
@@ -420,6 +449,7 @@ mod tests {
                 forms: vec![vec![9, 9, 9]],
                 heap: vec![1, 2],
                 oclosure_meta: vec![3, 4],
+                introspection_cells: vec![5, 6],
             },
         );
         let bytes = rkyv::to_bytes::<_, 4096>(&shard).unwrap();
@@ -428,6 +458,10 @@ mod tests {
         assert!(!header_ok(&archived.header, "v-other"));
         let back: Shard = archived.deserialize(&mut rkyv::Infallible).unwrap();
         assert_eq!(back.entries["/tmp/x.el"].forms, vec![vec![9, 9, 9]]);
+        // The v8 side table has to survive the round trip too: it is the only
+        // record of the special-form / intrinsic-macro function cells, which a
+        // cache hit cannot rebuild (it skips the prelude that registers them).
+        assert_eq!(back.entries["/tmp/x.el"].introspection_cells, vec![5, 6]);
         assert_eq!(back.header.magic, SHARD_MAGIC);
     }
 

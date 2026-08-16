@@ -63,17 +63,48 @@ pub fn translate(pat: &str) -> Result<String, String> {
 
 /// [`translate`], resolving `\sC` / `\SC` against `syn`.
 pub fn translate_with(pat: &str, syn: &dyn SyntaxLookup) -> Result<String, String> {
+    translate_groups(pat, syn).map(|(re, _)| re)
+}
+
+/// [`translate_with`], additionally reporting how the emitted capture groups map
+/// back to the *Emacs* group numbers.
+///
+/// The two numberings only coincide when the pattern uses nothing but plain
+/// `\(`. Emacs's `\(?N:RE\)` names a group explicitly and then continues
+/// counting from `N + 1` (`regex-emacs.c` sets `regnum = N`), so
+/// `\(?5:a\)\(b\)` has groups 5 and 6 and `(match-data)` reports
+/// `(0 2 nil nil nil nil nil nil nil nil 0 1 1 2)`. `fancy_regex` has no
+/// explicit-numbering syntax and numbers positionally, so the same pattern
+/// compiles to two groups numbered 1 and 2 there.
+///
+/// The returned vector is that correspondence: element `i` is the Emacs group
+/// number of the compiled pattern's group `i + 1`. It is the identity vector
+/// `[1, 2, 3, …]` whenever the pattern uses no explicit numbering, which is the
+/// case callers can skip the remap for.
+pub fn translate_groups(pat: &str, syn: &dyn SyntaxLookup) -> Result<(String, Vec<u32>), String> {
     let mut out = String::with_capacity(pat.len() + 8);
     let mut it = pat.chars().peekable();
     // Depth of open `\(` groups, so a stray `\)` is diagnosed like Emacs's.
     let mut depth: i32 = 0;
+    // Emacs group number the next `\(` will take, and the number each emitted
+    // capture group carries, in emission order.
+    let mut next_group: u32 = 1;
+    let mut groups: Vec<u32> = Vec::new();
     // Whether a repetition operator here has something to repeat. False at the
     // start of the pattern and just after `\(` or `\|`, where Emacs reads
     // `*`/`+`/`?` as ordinary characters.
     let mut can_repeat = false;
     while let Some(c) = it.next() {
         match c {
-            '\\' => translate_escape(&mut it, &mut out, &mut depth, &mut can_repeat, syn)?,
+            '\\' => translate_escape(
+                &mut it,
+                &mut out,
+                &mut depth,
+                &mut can_repeat,
+                syn,
+                &mut next_group,
+                &mut groups,
+            )?,
             // Literal in elisp, special in the crate → escape.
             '(' | ')' | '{' | '}' | '|' => {
                 out.push('\\');
@@ -108,7 +139,7 @@ pub fn translate_with(pat: &str, syn: &dyn SyntaxLookup) -> Result<String, Strin
     if depth > 0 {
         return Err(UNMATCHED_OPEN.into());
     }
-    Ok(out)
+    Ok((out, groups))
 }
 
 /// The largest scalar value a Rust `char` can hold. Emacs's character space runs
@@ -163,6 +194,9 @@ const UNMATCHED_BRACKET: &str = "Unmatched [ or [^";
 const UNMATCHED_BRACE: &str = "Unmatched \\{";
 const INVALID_BRACE_CONTENT: &str = "Invalid content of \\{\\}";
 const TRAILING_BACKSLASH: &str = "Trailing backslash";
+/// Emacs's catch-all for a malformed construct it has no specific message for —
+/// what `\(?0:…\)` and `\(?a:…\)` report.
+const INVALID_REGEXP: &str = "Invalid regular expression";
 
 fn translate_escape(
     it: &mut std::iter::Peekable<std::str::Chars>,
@@ -170,6 +204,8 @@ fn translate_escape(
     depth: &mut i32,
     can_repeat: &mut bool,
     syn: &dyn SyntaxLookup,
+    next_group: &mut u32,
+    groups: &mut Vec<u32>,
 ) -> Result<(), String> {
     let Some(e) = it.next() else {
         return Err(TRAILING_BACKSLASH.into());
@@ -180,36 +216,55 @@ fn translate_escape(
         // Grouping / alternation / bounds: drop the backslash.
         '(' => {
             // `\(?…` is either a shy group `\(?:` or an explicitly-numbered group
-            // `\(?N:RE\)`. fancy-regex has no explicit-numbering syntax, but it
-            // numbers capture groups positionally — so an explicit group becomes a
-            // plain capture `(`, which gives the right match-data index whenever the
-            // explicit numbers are sequential (the common case, e.g. font-lock's
-            // `\(?1:…\)\(?2:…\)`). Non-sequential numbering isn't preserved.
+            // `\(?N:RE\)`. fancy-regex has no explicit-numbering syntax and numbers
+            // capture groups positionally, so an explicit group still emits a plain
+            // capture — the Emacs number it stands for is recorded in `groups`
+            // instead, and the caller remaps the spans after the match.
             if it.peek() == Some(&'?') {
                 it.next(); // consume '?'
                 if matches!(it.peek(), Some(d) if d.is_ascii_digit()) {
-                    // `\(?N:` — drop the digits and the ':' , emit a plain capture.
-                    while matches!(it.peek(), Some(d) if d.is_ascii_digit()) {
-                        it.next();
-                    }
-                    if it.peek() == Some(&':') {
-                        it.next();
-                    }
-                    out.push('(');
-                } else {
-                    // Shy group `\(?:` (or any other `?`-modifier run up to ':').
-                    out.push('(');
-                    out.push('?');
-                    while let Some(&n) = it.peek() {
-                        out.push(n);
-                        it.next();
-                        if n == ':' {
+                    // `\(?N:` — read N, drop the digits and the ':', emit a plain
+                    // capture, and continue Emacs's counter from N + 1 (regnum = N).
+                    let mut n: u32 = 0;
+                    while let Some(&d) = it.peek() {
+                        if !d.is_ascii_digit() {
                             break;
                         }
+                        it.next();
+                        // Emacs's `regnum` is a plain int; a number this large
+                        // cannot name a real group, and its own reader rejects the
+                        // whole construct rather than overflowing.
+                        n = n
+                            .saturating_mul(10)
+                            .saturating_add(d as u32 - '0' as u32)
+                            .min(u32::MAX / 16);
                     }
+                    // Group 0 is the whole match and cannot be named, and anything
+                    // that is not `\(?DIGITS:` is not an explicit group at all —
+                    // Emacs rejects both with its generic message.
+                    if n == 0 || it.peek() != Some(&':') {
+                        return Err(INVALID_REGEXP.into());
+                    }
+                    it.next(); // consume ':'
+                    *next_group = n + 1;
+                    groups.push(n);
+                    out.push('(');
+                } else {
+                    // Shy group `\(?:`. Emacs's reader accepts exactly two things
+                    // after `\(?` — a digit run ending in `:`, handled above, and a
+                    // bare `:` — so a `\(?i:…`-style inline flag is not elisp
+                    // syntax and must report Emacs's message, not the regex
+                    // crate's parse error.
+                    if it.peek() != Some(&':') {
+                        return Err(INVALID_REGEXP.into());
+                    }
+                    it.next();
+                    out.push_str("(?:");
                 }
             } else {
                 out.push('(');
+                groups.push(*next_group);
+                *next_group += 1;
             }
             *depth += 1;
         }

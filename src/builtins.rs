@@ -656,10 +656,7 @@ fn case_fold(h: &mut ElispHost, a: &[Value], upper: bool) -> R {
         // casefiddle.c: a negative fixnum is not a character (char-or-string-p),
         // but one above the character range is returned UNCHANGED — Emacs treats
         // the high bits as event modifiers, so (upcase 4194304) => 4194304.
-        Value::Int(c) if *c < 0 => Err(format!(
-            "wrong-type-argument: char-or-string-p {}",
-            h.print(&a[0], true)
-        )),
+        Value::Int(c) if *c < 0 => Err(h.signal_wrong_type("char-or-string-p", &a[0])),
         Value::Int(c) if *c > 0x3F_FFFF => Ok(Value::Int(*c)),
         Value::Int(c) => Ok(Value::Int(simple_case(*c, upper))),
         Value::Str(s) => {
@@ -678,10 +675,15 @@ fn case_fold(h: &mut ElispHost, a: &[Value], upper: bool) -> R {
             }
             Ok(folded)
         }
-        v => Err(format!(
-            "wrong-type-argument: char-or-string-p {}",
-            h.print(v, true)
-        )),
+        // The datum has to travel as the *object*: a subr prints `#<subr +>` and
+        // a closure `#[…]`, neither of which the reader can turn back into what
+        // it came from, so rendering it into the message and re-reading it (which
+        // is what the message-only path does) silently dropped it and left a bare
+        // `(wrong-type-argument char-or-string-p)`.
+        v => {
+            let v = v.clone();
+            Err(h.signal_wrong_type("char-or-string-p", &v))
+        }
     }
 }
 /// `(--char-titlecase-- CHAR)` — the Unicode *title-case* mapping of CHAR, as a
@@ -1524,6 +1526,14 @@ fn intern_fn(h: &mut ElispHost, a: &[Value]) -> R {
         v => return Err(format!("wrong-type-argument: stringp {}", h.print(v, true))),
     };
     match obarray_arg(h, a.get(1))? {
+        // `nil` and `t` are already in the global obarray in Emacs, so interning
+        // their names hands back those very objects. elisprs represents them as
+        // `Value::Undef`/`Value::Bool(true)` rather than heap symbols, and
+        // creating a heap symbol *named* "nil" produced something that prints as
+        // `nil`, is `symbolp`, and is not `eq` to nil — so `(and (intern "nil")
+        // 1)` answered 1 where Emacs answers nil.
+        None if name == "nil" => Ok(Value::Undef),
+        None if name == "t" => Ok(Value::Bool(true)),
         None => Ok(h.intern(&name)),
         Some(id) => Ok(h.obarray_intern(id, &name)),
     }
@@ -1625,6 +1635,13 @@ fn fboundp(h: &mut ElispHost, a: &[Value]) -> R {
 fn indirect_function(h: &mut ElispHost, a: &[Value]) -> R {
     let mut cur = a[0].clone();
     for _ in 0..64 {
+        // `t` and `nil` ARE symbols in Emacs, with no function cell — so
+        // `(indirect-function t)` is nil, not `t`. elisprs represents them as
+        // `Value::Bool`/`Value::Undef` rather than heap symbols, so they miss the
+        // symbol arm below and used to be returned unchanged, as if a non-symbol.
+        if is_nil(&cur) || matches!(cur, Value::Bool(true)) {
+            return Ok(Value::Undef);
+        }
         match h.obj(&cur) {
             Some(Obj::Symbol(_)) => match h.introspect_function_cell(&cur) {
                 Some(def) => cur = def,
@@ -2336,6 +2353,14 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>
                 if is_float {
                     return Err(BAD_TYPE.to_string());
                 }
+                // Emacs applies `CHECK_CHARACTER` to the argument (editfns.c
+                // `styled_format`), so an integer outside `0 … #x3FFFFF` signals
+                // `(wrong-type-argument characterp N)` — it is not silently
+                // dropped, and the error is `wrong-type-argument`, not the
+                // "Format specifier doesn't match argument type" a float gets.
+                if !(0..=0x3F_FFFF).contains(&i) {
+                    return Err(format!("wrong-type-argument: characterp {i}"));
+                }
                 char::from_u32(i as u32)
                     .map(String::from)
                     .unwrap_or_default()
@@ -2956,10 +2981,16 @@ fn make_string(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(Value::str(s))
 }
+/// `(string &rest CHARACTERS)` — a string of CHARACTERS.
+///
+/// Emacs `Fstring` runs `CHECK_CHARACTER` over every argument, so a non-character
+/// signals `(wrong-type-argument characterp ARG)` — not `integerp`, which is what
+/// reading the argument as a plain integer reports.
 fn string_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let mut s = String::new();
     for v in a {
-        if let Some(c) = char::from_u32(as_int(h, v)? as u32) {
+        let c = as_char(h, v)?;
+        if let Some(c) = char::from_u32(c) {
             s.push(c);
         }
     }
@@ -3040,20 +3071,46 @@ impl crate::regexp::SyntaxLookup for HostSyntax<'_> {
 /// Compile an elisp regexp to a `fancy_regex::Regex` (optionally case-insensitively,
 /// for `case-fold-search`), surfacing translation and compilation failures as
 /// elisp-style `invalid-regexp` errors.
+/// A compiled elisp regexp: the `fancy_regex` program plus, when the pattern
+/// used `\(?N:…\)`, the Emacs group number of each of its capture groups.
+///
+/// The map is `None` for the overwhelmingly common case of a pattern built only
+/// from plain `\(`, where the two numberings already agree and `run_match` can
+/// hand the spans straight through.
+pub(crate) struct CompiledRe {
+    re: fancy_regex::Regex,
+    /// Element `i` is the Emacs group number of compiled group `i + 1`.
+    emacs_groups: Option<Vec<u32>>,
+}
+
+impl std::ops::Deref for CompiledRe {
+    type Target = fancy_regex::Regex;
+    fn deref(&self) -> &fancy_regex::Regex {
+        &self.re
+    }
+}
+
 pub(crate) fn compile_cf(
     h: &ElispHost,
     pat: &str,
     case_insensitive: bool,
-) -> Result<fancy_regex::Regex, String> {
+) -> Result<CompiledRe, String> {
     // `translate` reports Emacs's own diagnostics ("Unmatched [ or [^", …); they
     // ride under the `invalid-regexp` error symbol, as in Emacs.
-    let translated = crate::regexp::translate_with(pat, &HostSyntax(h))
+    let (translated, groups) = crate::regexp::translate_groups(pat, &HostSyntax(h))
         .map_err(|e| format!("invalid-regexp: {e}"))?;
     // Elisp `^`/`$` always match line boundaries, so compile in multiline mode;
     // `\``/`\'` (translated to \A/\z) keep matching the absolute start/end.
     let flags = if case_insensitive { "(?mi)" } else { "(?m)" };
     let pat = format!("{flags}{translated}");
-    fancy_regex::Regex::new(&pat).map_err(|e| format!("invalid-regexp: {e}"))
+    let re = fancy_regex::Regex::new(&pat).map_err(|e| format!("invalid-regexp: {e}"))?;
+    // Identity numbering needs no remap, and skipping it keeps every ordinary
+    // pattern on exactly the path it was on before explicit numbering existed.
+    let identity = groups.iter().enumerate().all(|(i, &g)| g as usize == i + 1);
+    Ok(CompiledRe {
+        re,
+        emacs_groups: (!identity).then_some(groups),
+    })
 }
 /// Read the dynamic `case-fold-search` (default t) — string matching folds case
 /// unless it is bound to nil.
@@ -3069,14 +3126,10 @@ pub(crate) fn case_fold_search(h: &ElispHost) -> bool {
 
 /// Run `re` against `subject` starting at char index `start`, returning the
 /// capture spans in *char* positions (group 0 = whole match).
-fn run_match(
-    re: &fancy_regex::Regex,
-    subject: &str,
-    start: usize,
-) -> Option<Vec<Option<(usize, usize)>>> {
+fn run_match(re: &CompiledRe, subject: &str, start: usize) -> Option<Vec<Option<(usize, usize)>>> {
     let start_byte = byte_of_char(subject, start);
     let caps = re.captures_from_pos(subject, start_byte).ok().flatten()?;
-    let spans = (0..caps.len())
+    let spans: Vec<Option<(usize, usize)>> = (0..caps.len())
         .map(|i| {
             caps.get(i).map(|m| {
                 (
@@ -3086,7 +3139,25 @@ fn run_match(
             })
         })
         .collect();
-    Some(spans)
+    let Some(map) = &re.emacs_groups else {
+        return Some(spans);
+    };
+    // Scatter the positional spans onto their Emacs group numbers. Groups the
+    // pattern never names stay nil, which is what `(match-data)` reports for the
+    // holes an explicit number leaves behind.
+    let width = map.iter().copied().max().unwrap_or(0) as usize + 1;
+    let mut out = vec![None; width];
+    out[0] = spans.first().copied().flatten();
+    for (i, &g) in map.iter().enumerate() {
+        let Some(span) = spans.get(i + 1).copied().flatten() else {
+            // Two groups may share one Emacs number (`\(?1:a\)\|\(?1:b\)`); in
+            // Emacs they share one register, so the branch that did not match
+            // must not erase the one that did.
+            continue;
+        };
+        out[g as usize] = Some(span);
+    }
+    Some(out)
 }
 
 /// `(string-match REGEXP STRING &optional START)` — search STRING for REGEXP,
@@ -3628,6 +3699,21 @@ fn ash_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// = 2^61-1), so mask to 62 bits before the unsigned shift.
 fn lsh_fn(h: &mut ElispHost, a: &[Value]) -> R {
     const FIXNUM_MASK: u64 = (1u64 << 62) - 1;
+    // VALUE goes through `CHECK_NUMBER` before its integer check, so a
+    // non-number reports `number-or-marker-p` and a float reports `integerp`;
+    // COUNT goes straight through `CHECK_INTEGER` and always reports `integerp`.
+    // Measured on GNU Emacs 30.2:
+    //
+    //   (lsh ""  6)  => (wrong-type-argument number-or-marker-p "")
+    //   (lsh 1.5 2)  => (wrong-type-argument integerp 1.5)
+    //   (lsh 1  "")  => (wrong-type-argument integerp "")
+    //
+    // The check has to come first: the exact-shift path below reports `integerp`
+    // on its own and would answer for VALUE with the wrong predicate.
+    if as_number_p(h, &a[0], true).is_err() {
+        let v = a[0].clone();
+        return Err(h.signal_wrong_type("number-or-marker-p", &v));
+    }
     // A left shift is exact, like `ash` — `(lsh 1 70)` is 2^70.
     if let Ok(c) = as_integer(h, &a[1]) {
         if c >= 0 {
@@ -3639,6 +3725,9 @@ fn lsh_fn(h: &mut ElispHost, a: &[Value]) -> R {
             return Ok(h.make_integer(r));
         }
     }
+    // `Flsh` runs `CHECK_NUMBER` first (data.c), so a non-number reports
+    // `number-or-marker-p` — `ash`, which runs `CHECK_INTEGER`, reports
+    // `integerp`. The two differ and elisp code reads the predicate.
     let n = as_integer(h, &a[0])?;
     let c = as_integer(h, &a[1])?;
     Ok(Value::Int(if c >= 0 {
@@ -3720,7 +3809,14 @@ fn acos_fn(h: &mut ElispHost, a: &[Value]) -> R {
 fn atan_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let y = as_number_p(h, &a[0], false)?.to_f64();
     Ok(Value::Float(match a.get(1) {
-        Some(x) => y.atan2(as_num(h, x)?.1),
+        // X takes the same `CHECK_NUMBER` as Y (floatfns.c `Fatan`), so it reports
+        // `numberp` — `as_num` reports `number-or-marker-p`, which is the
+        // predicate the arithmetic ops use, not this one.
+        Some(x) => {
+            let xv = as_number_p(h, x, false)
+                .map_err(|_| format!("wrong-type-argument: numberp {}", h.print(x, true)))?;
+            y.atan2(xv.to_f64())
+        }
         None => y.atan(),
     }))
 }
@@ -3763,12 +3859,21 @@ fn ldexp_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let e = as_num(h, &a[1])?.0;
     Ok(Value::Float(scalbn(m, e)))
 }
+/// `(copysign X Y)` — X with Y's sign.
+///
+/// Both arguments must be *floats*: Emacs `Fcopysign` uses `CHECK_TYPE (FLOATP …)`
+/// rather than the number check the rest of the float library uses, so an integer
+/// signals `(wrong-type-argument floatp N)` instead of being coerced.
 fn copysign_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Float(
-        as_number_p(h, &a[0], false)?
-            .to_f64()
-            .copysign(as_number_p(h, &a[1], false)?.to_f64()),
-    ))
+    let f = |h: &mut ElispHost, v: &Value| -> Result<f64, String> {
+        match v {
+            Value::Float(x) => Ok(*x),
+            _ => Err(h.signal_wrong_type("floatp", v)),
+        }
+    };
+    let x = f(h, &a[0])?;
+    let y = f(h, &a[1])?;
+    Ok(Value::Float(x.copysign(y)))
 }
 /// Decompose V into (SIGNIFICAND . EXPONENT) with the significand in [0.5,1).
 /// Bit-level port of C `frexp` (musl): exact for all values including subnormals
@@ -4275,6 +4380,11 @@ fn set_intrinsic_macro_cell(h: &mut ElispHost, a: &[Value]) -> R {
 fn intern_soft(h: &mut ElispHost, a: &[Value]) -> R {
     let name = match &a[0] {
         Value::Str(s) => s.to_string(),
+        // `t` and `nil` ARE interned symbols in Emacs; elisprs represents them as
+        // `Value::Bool`/`Value::Undef` rather than heap symbols, so `sym_name`
+        // misses them and `(intern-soft t)` answered nil where Emacs answers `t`.
+        Value::Bool(true) => "t".to_string(),
+        v if is_nil(v) => "nil".to_string(),
         // A symbol argument is looked up by its own name; anything else names
         // itself in the error data, as Emacs's `CHECK_STRING` does.
         v => h
@@ -4282,7 +4392,13 @@ fn intern_soft(h: &mut ElispHost, a: &[Value]) -> R {
             .ok_or_else(|| format!("wrong-type-argument: stringp {}", h.print(v, true)))?,
     };
     match obarray_arg(h, a.get(1))? {
-        None => Ok(h.find_symbol(&name).unwrap_or(Value::Undef)),
+        None => match name.as_str() {
+            // Not heap symbols here, but interned symbols in Emacs, so they must
+            // answer themselves rather than "no such symbol".
+            "t" => Ok(Value::Bool(true)),
+            "nil" => Ok(Value::Undef),
+            _ => Ok(h.find_symbol(&name).unwrap_or(Value::Undef)),
+        },
         Some(id) => Ok(h.obarray_intern_soft(id, &name)),
     }
 }
@@ -4344,10 +4460,15 @@ fn macrop(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(special-form-p OBJECT)` — non-nil if OBJECT names a special form (per
 /// Emacs's classification, not elisprs's internal lowering).
 fn special_form_p(h: &mut ElispHost, a: &[Value]) -> R {
-    let ok = h
-        .sym_name(&a[0])
-        .map(|n| SPECIAL_FORMS.iter().any(|(sf, _)| *sf == n.as_str()))
-        .unwrap_or(false);
+    // Emacs `Fspecial_form_p` dereferences a symbol to its function and then asks
+    // the *subr* whether its `max_args` is `UNEVALLED`, so the subr object answers
+    // `t` just as the symbol naming it does: `(special-form-p (symbol-function
+    // 'if))` is `t`, not nil.
+    let name = match h.obj(&a[0]) {
+        Some(Obj::Subr { name, .. }) => Some(name.clone()),
+        _ => h.sym_name(&a[0]),
+    };
+    let ok = name.is_some_and(|n| SPECIAL_FORMS.iter().any(|(sf, _)| *sf == n.as_str()));
     Ok(nil_or(ok))
 }
 fn char_uppercase_p(h: &mut ElispHost, a: &[Value]) -> R {
@@ -4821,19 +4942,57 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 /// The string argument's bytes between optional char START/END.
-fn hash_input(h: &ElispHost, a: &[Value], obj_idx: usize) -> Result<Vec<u8>, String> {
-    let s = as_string(h, &a[obj_idx])?;
-    let chars: Vec<char> = s.chars().collect();
-    let start = match a.get(obj_idx + 1) {
-        Some(v) if !is_nil(v) => as_int(h, v)?.max(0) as usize,
-        _ => 0,
+fn hash_input(h: &mut ElispHost, a: &[Value], obj_idx: usize) -> Result<Vec<u8>, String> {
+    // Emacs's `secure_hash` accepts a string or a buffer and rejects anything
+    // else with `xsignal2 (Qerror, "Invalid object argument", OBJECT)` — a plain
+    // `error` carrying the object beside the message, not the
+    // `wrong-type-argument` a string accessor reports.
+    let s = match as_string(h, &a[obj_idx]) {
+        Ok(s) => s,
+        Err(_) => {
+            let v = a[obj_idx].clone();
+            return Err(h.signal_error_with("Invalid object argument", &v));
+        }
     };
-    let end = match a.get(obj_idx + 2) {
-        Some(v) if !is_nil(v) => (as_int(h, v)?.max(0) as usize).min(chars.len()),
-        _ => chars.len(),
+    // START and END index the *encoded bytes*, not the characters: Emacs hashes
+    // the string's byte representation, so `(md5 "αβγ" 0 3)` covers three of its
+    // six UTF-8 bytes and is NOT the whole three-character string.
+    let bytes = s.as_bytes();
+    let len = bytes.len() as i64;
+    let idx = |h: &mut ElispHost, v: &Value| -> Result<i64, String> {
+        // A float index is `(wrong-type-argument integerp F)` — `as_int` would
+        // truncate it and hash some other range instead.
+        match v {
+            Value::Int(n) => Ok(*n),
+            _ if as_integer(h, v).is_ok() => as_integer(h, v),
+            _ => Err(h.signal_wrong_type("integerp", v)),
+        }
     };
-    let sub: String = chars[start.min(end)..end].iter().collect();
-    Ok(sub.into_bytes())
+    let raw_start = match a.get(obj_idx + 1) {
+        Some(v) if !is_nil(v) => Some(idx(h, &v.clone())?),
+        _ => None,
+    };
+    let raw_end = match a.get(obj_idx + 2) {
+        Some(v) if !is_nil(v) => Some(idx(h, &v.clone())?),
+        _ => None,
+    };
+    // A negative bound counts from the end (`validate_subarray` adds the length
+    // once), so `(md5 "abc" -1)` hashes "c".
+    let adj = |n: i64| if n < 0 { n + len } else { n };
+    let start = raw_start.map_or(0, adj);
+    let end = raw_end.map_or(len, adj);
+    // Emacs `validate_subarray`: START and END must bracket a real subrange, and
+    // one that does not is `(args-out-of-range OBJECT START END)` with the two
+    // bounds *as written* (nil included). Clamping them instead quietly hashed
+    // the empty string — `(secure-hash 'md5 "abc" 5 nil)` answered the digest of
+    // "" rather than signalling.
+    if start < 0 || end > len || start > end {
+        let obj = h.print(&a[obj_idx], true);
+        let sv = raw_start.map_or("nil".to_string(), |n| n.to_string());
+        let ev = raw_end.map_or("nil".to_string(), |n| n.to_string());
+        return Err(format!("args-out-of-range: {obj} {sv} {ev}"));
+    }
+    Ok(bytes[start as usize..end as usize].to_vec())
 }
 fn sha1_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::str(to_hex(&sha1_bytes(&hash_input(h, a, 0)?))))
@@ -4856,7 +5015,9 @@ fn secure_hash(h: &mut ElispHost, a: &[Value]) -> R {
         "sha256" => sha256_bytes(&bytes),
         "sha384" => sha384_bytes(&bytes),
         "sha512" => sha512_bytes(&bytes),
-        other => return Err(format!("error: unsupported secure-hash algorithm {other}")),
+        // Emacs `secure_hash` (fns.c): `error ("Invalid algorithm arg: %s", …)`,
+        // with the argument rendered by `prin1` (a symbol prints bare).
+        other => return Err(format!("error: Invalid algorithm arg: {other}")),
     };
     // BINARY (4th optional, index 4): return the raw bytes as a string.
     if a.get(4).is_some_and(|v| !is_nil(v)) {
@@ -4914,59 +5075,152 @@ fn b64_wrap(s: &str) -> String {
     }
     out
 }
-fn b64_decode(input: &str) -> Result<Vec<u8>, String> {
+/// Emacs's own diagnostic (fns.c `base64_decode_string`), capitalised as it is
+/// there — elisp code catches this error and prints the string.
+const INVALID_B64: &str = "error: Invalid base64 data";
+
+/// Decode base64 (`url` selects the `-_` alphabet and the unpadded reading Emacs
+/// uses for its BASE64URL argument).
+///
+/// The padded form is *strict*, as `base64_decode_1` is: whitespace is ignored
+/// anywhere, but what is left must be whole 4-character quadruples over the
+/// `+/` alphabet, `=` may only trail inside a quadruple, and a quadruple
+/// carrying fewer than two data characters is rejected. Reading the input as a
+/// loose bit stream instead accepted `"YWJ"` (which Emacs rejects) and `"-_-_"`
+/// (whose alphabet belongs to the other mode).
+fn b64_decode(input: &str, url: bool) -> Result<Vec<u8>, String> {
     let val = |c: u8| -> Option<u32> {
         match c {
             b'A'..=b'Z' => Some((c - b'A') as u32),
             b'a'..=b'z' => Some((c - b'a' + 26) as u32),
             b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-            b'+' | b'-' => Some(62),
-            b'/' | b'_' => Some(63),
+            b'+' if !url => Some(62),
+            b'/' if !url => Some(63),
+            b'-' if url => Some(62),
+            b'_' if url => Some(63),
             _ => None,
         }
     };
-    let (mut bits, mut nbits, mut out) = (0u32, 0u32, Vec::new());
-    for c in input.bytes() {
-        if c == b'=' || c.is_ascii_whitespace() {
+    let chars: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(chars.len() / 4 * 3);
+    // BASE64URL padding is optional, but everything else about a quadruple still
+    // holds: a short final group may carry no `=` at all (`"YWJ"` decodes,
+    // `"YQ="` does not), and no group may hold fewer than two data characters
+    // (`"A==="` and `"===="` are errors even here).
+    if !url && !chars.len().is_multiple_of(4) {
+        return Err(INVALID_B64.into());
+    }
+    for quad in chars.chunks(4) {
+        if quad.len() < 4 {
+            if quad.len() < 2 || quad.contains(&b'=') {
+                return Err(INVALID_B64.into());
+            }
+            let mut v = [0u32; 3];
+            for (i, &c) in quad.iter().enumerate() {
+                v[i] = val(c).ok_or(INVALID_B64)?;
+            }
+            out.push(((v[0] << 2) | (v[1] >> 4)) as u8);
+            if quad.len() == 3 {
+                out.push((((v[1] & 0x0F) << 4) | (v[2] >> 2)) as u8);
+            }
             continue;
         }
-        let v = val(c).ok_or("error: invalid base64 data")?;
-        bits = (bits << 6) | v;
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((bits >> nbits) as u8);
+        let mut v = [0u32; 4];
+        let mut n = 0usize;
+        let mut padded = false;
+        for (i, &c) in quad.iter().enumerate() {
+            if c == b'=' {
+                padded = true;
+                continue;
+            }
+            // `"AB=C"`: once a quadruple has started padding, everything after it
+            // must be padding too.
+            if padded {
+                return Err(INVALID_B64.into());
+            }
+            v[i] = val(c).ok_or(INVALID_B64)?;
+            n += 1;
+        }
+        // `"===="` carries no data and `"A==="` carries too few bits to make even
+        // one byte; both are errors, not empty output.
+        if n < 2 {
+            return Err(INVALID_B64.into());
+        }
+        out.push(((v[0] << 2) | (v[1] >> 4)) as u8);
+        if n >= 3 {
+            out.push((((v[1] & 0x0F) << 4) | (v[2] >> 2)) as u8);
+        }
+        if n == 4 {
+            out.push((((v[2] & 0x03) << 6) | v[3]) as u8);
         }
     }
     Ok(out)
+}
+
+/// The bytes Emacs's base64 encoders see for STRING.
+///
+/// Emacs encodes a *unibyte* string one byte per character and refuses a
+/// multibyte one outright (`error ("Multibyte character in data for base64
+/// encoding")`), so the input's characters are the bytes — not their UTF-8
+/// expansion, which is what `str::as_bytes` yields and which made
+/// `(base64-encode-string "\303\251")` answer `"w4PCqQ=="` where Emacs answers
+/// `"w6k="`.
+fn b64_input_bytes(s: &str) -> Result<Vec<u8>, String> {
+    s.chars()
+        .map(|c| {
+            u8::try_from(c as u32)
+                .map_err(|_| "error: Multibyte character in data for base64 encoding".to_string())
+        })
+        .collect()
 }
 /// Render decoded bytes as a string with each byte a char 0–255 (unibyte-ish).
 fn bytes_to_str(bytes: &[u8]) -> Value {
     Value::str(bytes.iter().map(|&b| b as char).collect::<String>())
 }
 fn base64_encode_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let raw = b64_encode(as_string(h, &a[0])?.as_bytes(), B64_STD, true);
+    let raw = b64_encode(&b64_input_bytes(&as_string(h, &a[0])?)?, B64_STD, true);
     let no_break = a.get(1).is_some_and(|v| !is_nil(v));
     Ok(Value::str(if no_break { raw } else { b64_wrap(&raw) }))
 }
+/// `(base64-decode-string STRING &optional BASE64URL IGNORE-INVALID)`.
 fn base64_decode_string(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(bytes_to_str(&b64_decode(&as_string(h, &a[0])?)?))
+    let url = a.get(1).is_some_and(|v| !is_nil(v));
+    Ok(bytes_to_str(&b64_decode(&as_string(h, &a[0])?, url)?))
 }
 fn base64url_encode_string(h: &mut ElispHost, a: &[Value]) -> R {
     let no_pad = a.get(1).is_some_and(|v| !is_nil(v));
     Ok(Value::str(b64_encode(
-        as_string(h, &a[0])?.as_bytes(),
+        &b64_input_bytes(&as_string(h, &a[0])?)?,
         B64_URL,
         !no_pad,
     )))
 }
 fn base64url_decode_string(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(bytes_to_str(&b64_decode(&as_string(h, &a[0])?)?))
+    Ok(bytes_to_str(&b64_decode(&as_string(h, &a[0])?, true)?))
 }
 /// `(url-hexify-string STRING)` — percent-encode all but `[A-Za-z0-9-._~]`.
 fn url_hexify_string(h: &mut ElispHost, a: &[Value]) -> R {
+    // Emacs's `url-hexify-string` is a `mapconcat` over its argument, so it takes
+    // any *sequence* — `[1 2]` hexifies to "%01%02" and nil to "" — and a
+    // non-sequence reports `sequencep`, not `stringp`.
+    let src = match &a[0] {
+        Value::Str(s) => s.to_string(),
+        v => {
+            let items = h
+                .seq_vec(v)
+                .ok_or_else(|| h.signal_wrong_type("sequencep", v))?;
+            let mut acc = String::new();
+            for it in &items {
+                match char::from_u32(as_char(h, it)?) {
+                    Some(c) => acc.push(c),
+                    None => return Err(h.signal_wrong_type("characterp", it)),
+                }
+            }
+            acc
+        }
+    };
     let mut out = String::new();
-    for b in as_string(h, &a[0])?.as_bytes() {
+    for b in src.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             out.push(*b as char);
         } else {
@@ -4978,25 +5232,32 @@ fn url_hexify_string(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(url-unhex-string STRING)` — decode `%XX` escapes.
 fn url_unhex_string(h: &mut ElispHost, a: &[Value]) -> R {
     let s = as_string(h, &a[0])?;
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    // Character-wise, not byte-wise: only `%XX` names a byte; every other
+    // character is copied through as itself. Walking the UTF-8 bytes expanded
+    // each non-ASCII character into its encoding, so `(url-unhex-string "αβγ")`
+    // — which contains no escape at all — came back six characters long.
+    let chars: Vec<char> = s.chars().collect();
+    let hex = |c: char| c.is_ascii_hexdigit();
+    let mut out = String::with_capacity(s.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) =
-                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
-            {
-                out.push(v);
+    while i < chars.len() {
+        if chars[i] == '%' && i + 2 < chars.len() && hex(chars[i + 1]) && hex(chars[i + 2]) {
+            let pair: String = chars[i + 1..i + 3].iter().collect();
+            if let Ok(v) = u8::from_str_radix(&pair, 16) {
+                // An escape names one *byte*, and it stays one byte: Emacs hands
+                // the raw bytes back and leaves decoding to the caller, so
+                // `(url-unhex-string "%CE%B1")` is two characters (206 177), not
+                // the one character those bytes happen to spell in UTF-8.
+                // Re-assembling them made it answer `(945)`, with length 1.
+                out.push(v as char);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i]);
+        out.push(chars[i]);
         i += 1;
     }
-    Ok(Value::str(String::from_utf8(out).unwrap_or_else(|e| {
-        e.into_bytes().iter().map(|&b| b as char).collect()
-    })))
+    Ok(Value::str(out))
 }
 /// `(string-to-vector STRING)` — a vector of STRING's character codes.
 fn string_to_vector(h: &mut ElispHost, a: &[Value]) -> R {
@@ -5014,12 +5275,26 @@ fn string_to_vector(h: &mut ElispHost, a: &[Value]) -> R {
 /// NaN) falls through to C `logb`, which returns a *float* — `-inf` for zero,
 /// `+inf` for either infinity, and NaN for NaN.
 fn logb_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let f = as_number_p(h, &a[0], false)?.to_f64();
+    let n = as_number_p(h, &a[0], false)?;
+    // An integer answer is exact in Emacs (`Flogb` takes the integer path for an
+    // integer argument), and converting through `f64` first rounds: 2^61-1 rounds
+    // UP to 2^61, so `(logb 2305843009213693951)` answered 61 where Emacs answers
+    // 60. The exponent is the bit length of |N| minus one.
+    if let crate::host::Num::Int(i) = &n {
+        let bits = i.bits();
+        if bits > 0 {
+            return Ok(Value::Int(bits as i64 - 1));
+        }
+    }
+    let f = n.to_f64();
     if f.is_finite() && f != 0.0 {
         return Ok(Value::Int(f.abs().log2().floor() as i64));
     }
     let val = if f.is_nan() {
-        f64::NAN
+        // A NaN passes through unchanged, sign and payload included — Emacs
+        // prints `-0.0e+NaN` for `(logb -0.0e+NaN)`, and a freshly built
+        // `f64::NAN` is a different NaN.
+        f
     } else if f == 0.0 {
         f64::NEG_INFINITY
     } else {
@@ -5433,7 +5708,13 @@ fn member_ignore_case(h: &mut ElispHost, a: &[Value]) -> R {
         // before the mutable `compare_strings` call below.
         let (car, cdr) = match h.obj(&cur) {
             Some(Obj::Cons(car, cdr)) => (car.clone(), cdr.clone()),
-            _ => return Ok(Value::Undef),
+            // Emacs walks LIST with `CHECK_LIST_END`, so running off a non-nil
+            // tail is `(wrong-type-argument listp TAIL)` — reaching the end only
+            // answers nil when the end is actually nil. `(member-ignore-case "a"
+            // 1.5)` answered nil here where Emacs signals, and so did every
+            // improper list whose match was not found before the tail.
+            _ if is_nil(&cur) => return Ok(Value::Undef),
+            _ => return Err(h.signal_wrong_type("listp", &cur)),
         };
         if let Value::Str(_) = &car {
             let cmp = compare_strings(
@@ -5541,7 +5822,52 @@ fn time_arg_secs(h: &ElispHost, v: Option<&Value>) -> Result<f64, String> {
 
 /// Decompose epoch seconds into a `struct tm` for the given ZONE (nil = local,
 /// non-nil non-number = UTC, integer = fixed offset seconds east of UTC).
-fn time_decompose(secs: f64, zone: Option<&Value>) -> libc::tm {
+/// Validate Emacs's ZONE argument (`tzlookup`, editfns.c).
+///
+/// The accepted spellings are exactly: `nil` and the symbol `wall` (local time),
+/// `t` (UTC), an integer offset in seconds, a TZ string, and a two-element
+/// `(OFFSET ABBR)` list. Everything else — including any *other* symbol, a
+/// float, a vector, and a one-element list — is
+/// `(error "Invalid time zone specification" ZONE)`. Measured on GNU Emacs 30.2:
+///
+/// ```text
+/// (format-time-string "%Y" 0 'wall)      => "1969"
+/// (format-time-string "%Y" 0 'utc)       => error, `utc' is not a spelling
+/// (format-time-string "%Y" 0 '(3600 "X")) => "1970"
+/// (format-time-string "%Y" 0 '(3600))    => error
+/// ```
+///
+/// A float ZONE used to be accepted silently here and read as UTC.
+fn check_time_zone(h: &mut ElispHost, zone: Option<&Value>) -> Result<bool, String> {
+    let Some(z) = zone else { return Ok(false) };
+    let mut wall = false;
+    let ok = match z {
+        Value::Undef | Value::Bool(_) | Value::Int(_) | Value::Str(_) => true,
+        v => match h.obj(v) {
+            Some(Obj::Symbol(s)) => {
+                wall = s.name == "wall";
+                wall
+            }
+            // `(OFFSET ABBR)`: two elements, an integer and a string.
+            Some(Obj::Cons(_, _)) => {
+                let items = h.seq_vec(v);
+                items.is_some_and(|it| {
+                    it.len() == 2
+                        && matches!(it[0], Value::Int(_))
+                        && matches!(it[1], Value::Str(_))
+                })
+            }
+            _ => false,
+        },
+    };
+    if ok {
+        return Ok(wall);
+    }
+    let z = z.clone();
+    Err(h.signal_error_with("Invalid time zone specification", &z))
+}
+
+fn time_decompose(secs: f64, zone: Option<&Value>, local: bool) -> libc::tm {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     match zone {
         None | Some(Value::Undef) | Some(Value::Bool(false)) => {
@@ -5553,6 +5879,15 @@ fn time_decompose(secs: f64, zone: Option<&Value>) -> libc::tm {
             let t = (secs.floor() as libc::time_t) + *off as libc::time_t;
             unsafe { libc::gmtime_r(&t, &mut tm) };
             tm.tm_gmtoff = *off as libc::c_long;
+        }
+        // `wall` is the *local* zone, the same as nil — the spelling for
+        // "whatever the wall clock says", not another name for UTC. It is a heap
+        // symbol, so `check_time_zone` (which holds the host) reports it rather
+        // than this function reaching for the thread-local and re-entering the
+        // borrow it is already inside.
+        _ if local => {
+            let t = secs.floor() as libc::time_t;
+            unsafe { libc::localtime_r(&t, &mut tm) };
         }
         _ => {
             let t = secs.floor() as libc::time_t;
@@ -5741,13 +6076,15 @@ fn current_time(_h: &mut ElispHost, _a: &[Value]) -> R {
 fn format_time_string(h: &mut ElispHost, a: &[Value]) -> R {
     let fmt = as_string(h, &a[0])?;
     let secs = time_arg_secs(h, a.get(1))?;
-    let tm = time_decompose(secs, a.get(2));
+    let local = check_time_zone(h, a.get(2))?;
+    let tm = time_decompose(secs, a.get(2), local);
     Ok(Value::str(fmt_time_string(&fmt, &tm, secs)))
 }
 
 fn current_time_string(h: &mut ElispHost, a: &[Value]) -> R {
     let secs = time_arg_secs(h, a.first())?;
-    let tm = time_decompose(secs, a.get(1));
+    let local = check_time_zone(h, a.get(1))?;
+    let tm = time_decompose(secs, a.get(1), local);
     Ok(Value::str(fmt_time_string(
         "%a %b %e %H:%M:%S %Y",
         &tm,
@@ -5759,7 +6096,8 @@ fn current_time_string(h: &mut ElispHost, a: &[Value]) -> R {
 #[allow(clippy::useless_conversion)]
 fn decode_time(h: &mut ElispHost, a: &[Value]) -> R {
     let secs = time_arg_secs(h, a.first())?;
-    let tm = time_decompose(secs, a.get(1));
+    let local = check_time_zone(h, a.get(1))?;
+    let tm = time_decompose(secs, a.get(1), local);
     let dst = match tm.tm_isdst {
         0 => Value::Undef,
         n if n > 0 => Value::Bool(true),
@@ -7979,9 +8317,55 @@ pub fn install(h: &mut ElispHost) {
     // registering a second subr so both render exactly that way.
     let null_sym = h.intern("null");
     h.set_function("not", null_sym);
+    install_special_form_cells(h);
     // AOP pattern-intercept layer (elisprs extension, ported from zshrs). Registers
     // the `intercept*` subrs and marks its context variables special.
     crate::intercepts::install(h);
+}
+
+/// Whether NAME is one of Emacs's special forms.
+pub(crate) fn is_special_form(name: &str) -> bool {
+    SPECIAL_FORMS.iter().any(|(sf, _)| *sf == name)
+}
+
+/// The body of the subr that stands for a special form.
+///
+/// Unreachable: evaluating `if`/`let`/`progn` goes through the compiler, and
+/// calling one goes through `host::call_function`, which refuses it exactly as
+/// Emacs's `funcall` refuses a subr whose `max_args` is `UNEVALLED`. Getting here
+/// means a call site bypassed that check.
+fn special_form_body(_h: &mut ElispHost, _a: &[Value]) -> R {
+    Err(
+        "internal: a special form's subr body was called; host::call_function \
+         should have signalled invalid-function"
+            .to_string(),
+    )
+}
+
+/// Give every special form the `#<subr NAME>` function cell Emacs gives it.
+///
+/// In Emacs a special form is an ordinary subr whose `max_args` is `UNEVALLED`,
+/// so it answers `fboundp`, `symbol-function`, `indirect-function`, `subrp` and
+/// `subr-name` exactly like `car` does — `(fboundp 'if)` is `t` and
+/// `(symbol-function 'if)` prints `#<subr if>`. elisprs lowers these forms in the
+/// compiler and so had no function cell at all for them, which made all five
+/// answer as though `if` were undefined.
+///
+/// The cell goes in the introspection side table rather than the symbol's real
+/// function cell: `resolve_function` must keep failing for it, because
+/// `(functionp 'if)` is nil in Emacs and `(funcall 'if …)` is an error, not a
+/// call.
+fn install_special_form_cells(h: &mut ElispHost) {
+    for (name, min) in SPECIAL_FORMS {
+        let subr = h.alloc(Obj::Subr {
+            name: (*name).to_string(),
+            min: *min as usize,
+            max: None,
+            f: special_form_body,
+        });
+        let sym = h.intern(name);
+        h.set_intrinsic_macro_cell(&sym, subr);
+    }
 }
 
 #[cfg(test)]

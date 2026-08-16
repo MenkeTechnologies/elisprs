@@ -3737,3 +3737,213 @@ shared helper panics. Nine assertions were strengthened; none deleted:
 - **README's subr count** was given as "~90" in one place and "~80" in another,
   both stale. Round 19 removed both rather than typing a third: a hand-kept
   count goes stale again, so README names the one-liner that computes it.
+
+---
+
+## Round 20 — the surface the fuzz corpus never generated
+
+Round 19 closed the areas the harnesses could see. This round started from the
+other end: enumerate the registered subrs (`grep -oE '^\s+s\("([^"]+)"' src/builtins.rs`),
+diff that against the names `scripts/fuzz/gen.el` can produce, and drive the
+difference through the *existing* harness with `fuzz_parity.sh -c`. Everything
+below was reproduced against `emacs -Q --batch` on GNU Emacs 30.2 before it was
+touched, and the corpus generator now covers the area permanently.
+
+### R20-A — `\(?N:RE\)` named a group that was not the group Emacs names
+
+elisprs compiles elisp regexps to `fancy_regex`, which has no explicit-numbering
+syntax and numbers capture groups positionally. The translator dropped the `N:`
+and emitted a plain `(`, on the assumption that explicit numbers are always
+sequential. `regex-emacs.c` sets `regnum = N`, so counting *continues from
+N + 1*:
+
+```text
+(progn (string-match "\\(?2:a\\)" "a") (match-data))
+  emacs: (0 1 nil nil 0 1)      elisp: (0 1 0 1)
+(progn (string-match "\\(?5:a\\)\\(b\\)" "ab") (match-data))
+  emacs: (0 2 nil nil nil nil nil nil nil nil 0 1 1 2)
+  elisp: (0 2 0 1 1 2)
+(replace-regexp-in-string "\\(?2:a\\)" "[\\2]" "a")
+  emacs: "[a]"                  elisp: "[]"
+```
+
+`regexp::translate_groups` now reports the Emacs number of every emitted group
+and `run_match` scatters the spans onto them; two groups sharing a number share
+one register, so a branch that did not match cannot erase one that did. `\(?0:`
+and `\(?i:` now report Emacs's `(invalid-regexp "Invalid regular expression")`
+instead of `fancy_regex`'s parser text. Tests:
+`tests/parity_explicit_group_numbers.rs`.
+
+### R20-B — special forms had no function cell
+
+In Emacs `if`, `let`, `progn` … are ordinary subrs whose `max_args` is
+`UNEVALLED`. elisprs lowers all of them in the compiler and had no function cell
+for any of them, so every introspective question about one answered as though it
+were undefined:
+
+```text
+(fboundp 'if)                    emacs: t            elisp: nil
+(symbol-function 'if)            emacs: #<subr if>   elisp: nil
+(subr-name (symbol-function 'if)) emacs: "if"        elisp: (wrong-type-argument subrp nil)
+(special-form-p (symbol-function 'if)) emacs: t      elisp: nil
+(funcall 'if 1 2)  emacs: (invalid-function #<subr if>)  elisp: (void-function if)
+```
+
+The cell goes in the host's introspection side table, not the symbol's real
+function cell: `(functionp 'if)` is nil in Emacs, and resolving `if` to something
+callable would make it `t`. `host::call_function` refuses the call up front the
+way Emacs's `funcall` refuses an `UNEVALLED` subr, and the `invalid-function`
+datum carries the subr object rather than its printed text. Tests:
+`tests/parity_special_form_cells.rs`.
+
+### R20-C — a warm cache lost the introspection cells
+
+The same side table is where `when`/`unless` register the `(macro . FUNCTION)`
+pair round 17 added. It is host state outside the arena, so the heap image never
+carried it and a cache hit — which skips the prelude that registers it — came
+back with nothing:
+
+```text
+$ elisp script.el     # cold: (t t (macro . #[(cond &rest body) …]))
+$ elisp script.el     # warm: (nil t nil)
+```
+
+`macrop` was right on both runs (it reads a name table), which is what made the
+split show up as two answers about the same symbol disagreeing. Shard format v8
+adds `Entry::introspection_cells`. Test: `warm_cache_keeps_the_introspection_function_cells`
+in `tests/cache_heap_image.rs`.
+
+### R20-D — encoders, decoders and the checks around them
+
+- **base64 encoded the UTF-8 expansion, not the bytes.** Emacs encodes one byte
+  per character; `(base64-encode-string "\303\251")` was `"w4PCqQ=="` against
+  Emacs's `"w6k="`, and did not round-trip through `base64-decode-string`, which
+  already decoded one character per byte. A character above 255 now signals
+  `(error "Multibyte character in data for base64 encoding")` as Emacs does.
+- **The decoder read the input as a bit stream.** `"YWJ"`, `"YWJj="`, `"="`,
+  `"===="`, `"A==="`, `"AB=C"` and `"-_-_"` all decoded silently; every one is
+  `(error "Invalid base64 data")` in Emacs. The padded form is now whole
+  quadruples over the `+/` alphabet with trailing-only `=`, and the BASE64URL
+  form allows a short final group but still rejects a misplaced `=`.
+- **`url-unhex-string` decoded UTF-8.** `(url-unhex-string "%CE%B1")` came back
+  as one character (945) rather than two (206 177), and `(url-unhex-string
+  "αβγ")` — which has no escape at all — came back six characters long. It is
+  character-wise now: an escape names one byte, everything else passes through.
+- **`url-hexify-string` required a string.** Emacs's is a `mapconcat`, so it
+  takes any sequence: `[1 2]` is `"%01%02"` and nil is `""`.
+- **`secure-hash` reported its own message** for an unknown algorithm instead of
+  Emacs's `(error "Invalid algorithm arg: bogus")`, and the digests' START/END
+  indexed *characters* and were clamped. They are byte offsets into the encoded
+  text, must be integers, count from the end when negative, and are
+  `(args-out-of-range OBJECT START END)` outside — `(md5 "abc" 5 nil)` used to
+  answer the digest of `""`.
+
+Tests: `tests/parity_encoding_and_char_checks.rs`,
+`tests/parity_numeric_and_time_checks.rs`.
+
+### R20-E — argument checks that named the wrong predicate
+
+Emacs's choice of predicate is part of the contract and elisp code reads it.
+
+| form | emacs | elisprs (before) |
+| --- | --- | --- |
+| `(string "a")` | `(wrong-type-argument characterp "a")` | `(wrong-type-argument integerp "a")` |
+| `(format "%c" -1)` | `(wrong-type-argument characterp -1)` | `""` |
+| `(copysign 1 2.0)` | `(wrong-type-argument floatp 1)` | `1.0` |
+| `(lsh "" 6)` | `(wrong-type-argument number-or-marker-p "")` | `(wrong-type-argument integerp "")` |
+| `(atan -2 'car)` | `(wrong-type-argument numberp car)` | `(wrong-type-argument number-or-marker-p car)` |
+| `(member-ignore-case "a" 1.5)` | `(wrong-type-argument listp 1.5)` | `nil` |
+| `(upcase (symbol-function '+))` | `(wrong-type-argument char-or-string-p #<subr +>)` | `(wrong-type-argument char-or-string-p)` |
+
+The last one is the pattern round 16 named: a datum with no read syntax has to
+travel as the object, because rendering it into the message and re-reading it
+drops it. `lsh` is the subtle one — VALUE takes `CHECK_NUMBER` and COUNT takes
+`CHECK_INTEGER`, so the two operands report *different* predicates and a float
+VALUE reports the second.
+
+### R20-F — `logb`, the time ZONE, `end-of-file`, and `intern`
+
+- **`(logb 2305843009213693951)`** answered 61; Emacs answers 60. The integer
+  went through `f64` first and 2^61-1 rounds *up* to 2^61. It is exact now (the
+  bit length of |N| minus one), and a NaN passes through with its own sign and
+  payload rather than being rebuilt: `(logb -0.0e+NaN)` is `-0.0e+NaN`.
+- **ZONE was never validated.** A float, a vector, a one-element list and any
+  symbol other than `wall` are all
+  `(error "Invalid time zone specification" ZONE)`; elisprs accepted them and
+  read them as UTC. `wall` itself means *local* time and was being read as UTC
+  too.
+- **A bool-vector's packed bytes ignored `print-escape-control-characters`.**
+  `(let ((print-escape-control-characters t)) (prin1-to-string (make-bool-vector
+  4 nil)))` is `"#&4\"\\0\""` in Emacs and emitted a raw NUL here; the flag was
+  applied to plain strings only, not to the `#&N"…"` payload, which goes through
+  the same print.c string rules.
+- **`end-of-file` dropped its datum.** `end_of_file_error` (lread.c) signals it
+  with `load-true-file-name` when there is one, so a truncated `read` inside a
+  loaded file is `(end-of-file "/path/to/file.el")` and only a bare `--eval` is
+  `(end-of-file)`. Test: `tests/parity_end_of_file_data.rs`.
+  `examples/error-data.el` pinned the empty `(end-of-file)` here and claimed to be
+  oracle-verified; `emacs -Q --batch -l examples/error-data.el` fails that
+  assertion, so the example was corrected to the shape Emacs actually produces
+  (both engines pass it now).
+- **`(intern "nil")` built a new symbol** that printed as `nil`, was `symbolp`,
+  and was not `eq` to nil — so `(and (intern "nil") 1)` answered 1. `nil` and
+  `t` are already in the global obarray in Emacs. Same root as
+  `(intern-soft t)` answering nil and `(indirect-function t)` answering `t`
+  instead of nil: they are symbols in Emacs and `Value::Undef`/`Value::Bool`
+  here.
+
+### Corpus coverage added
+
+`scripts/fuzz/gen.el` gained the hashes, the base64 and URL encoders, the float
+library beyond the elementary functions, function introspection, the character
+predicates, the mutable arrays, bool-vectors, the time formatters and
+`read-from-string` — with bounded pools for the slots whose meaning nesting or
+chaos-filling would destroy (`fname`, `algo`, `b64`, `astr`, `bstr`, `tfmt`,
+`time`, `bv`, `freshvec`). Nine seeds × 2000 forms now report 0–2 divergences,
+all of them listed below.
+
+### Still open after round 20
+
+- **No unibyte string flag.** elisprs stores every string as characters, so it
+  cannot tell Emacs's `"\303\251"` (two raw bytes, encodable) from `"é"` (one
+  multibyte character, rejected). The *values* agree — `string-to-list` matches
+  on both sides — but Emacs prints a unibyte string's bytes as octal escapes and
+  elisprs prints the characters, so `(secure-hash 'sha256 "abc" nil nil t)`,
+  `(url-unhex-string "%CE%B1")` and any base64 decode above 127 differ in
+  `prin1` output only. `multibyte-string-p` is unconditionally `t` here. This is
+  the substrate for `base64-encode-string` rejecting a Latin-1 character, which
+  is why the fuzz pool for the encoders is ASCII.
+- **Strings are not mutable arrays.** `Value::Str` is an `Arc<String>` with no
+  identity, so `(aset "abc" 0 ?Z)` and `(fillarray (copy-sequence "abc") ?z)`
+  signal `(wrong-type-argument arrayp …)` where Emacs mutates in place. Closing
+  it means a heap `Obj::Str` with identity.
+- **`sxhash-equal` is not Emacs's hash.** `(sxhash-equal "abc")` is 8059383
+  there and 302266944369876780 here. Emacs's value for a *symbol* is derived
+  from its address, so the function is not portable as a whole; only the
+  string/number/list cases could be ported and they have no caller that depends
+  on the exact number.
+- **`(fboundp 'lambda)` / `'defun` / `'defmacro`** are `t` in Emacs and nil here.
+  Giving them cells needs their real `subr.el` / `byte-run.el` macro
+  definitions; writing approximations would put a body in `symbol-function` that
+  is not the one Emacs has.
+- **`symbol-function` of anything Emacs defines in Lisp** answers a byte-code
+  object there and a source closure here. elisprs has no byte compiler; this is
+  why the fuzz corpus's function-name pool is C-level only.
+- **`(md5 '(1 2))`'s error data.** `(error "Invalid object argument" 1 2)` in
+  Emacs — a proper list is spliced into the data, an improper one is not, and
+  `nil` arrives as the *string* `"nil"`. No rule fitting all four measurements
+  was found without the C source, so the datum is `("Invalid object argument"
+  OBJECT)` here, which matches every scalar, symbol, vector and hash-table case.
+- **`intern-soft` after a long corpus.** `(intern-soft "!")` answers `!` here and
+  nil in Emacs at index 1788 of `bash scripts/fuzz_parity.sh -n 2000 -s 99`, but
+  the form is nil under both engines in isolation and no `(intern "!")` precedes
+  it in the corpus. Something earlier in a 2000-form run puts the name in the
+  obarray; the bisection did not converge on a single form.
+- **`,x` reads as `(unquote x)`, not `(\, x)`.** Emacs's reader builds a list
+  whose head is the symbol named `,`, so `(read-from-string "Hello, World" 5)`
+  prints as `((\, World) . 12)` there and `((unquote World) . 12)` here.
+- **`(ash 0 2305843009213693951)`** is `(overflow-error)` in Emacs and `0` here;
+  `(seq-empty-p (cons 1 2))` and `(seq-elt (append '("") 'sym) 2)` still differ
+  in their error datum; a closure's printed form inside
+  `wrong-number-of-arguments` carries its captured environment where Emacs's
+  byte-code object carries `(t)`.

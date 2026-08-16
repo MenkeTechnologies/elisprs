@@ -250,3 +250,36 @@ fn warm_cache_keeps_ert_ordering_and_its_temp_buffer() {
         "a warm cache must not change ERT's ordering or buffer"
     );
 }
+
+/// The introspection function cells of the compiler intrinsics live in a side
+/// table on the host, not in the arena — so the heap image alone does not carry
+/// them, and a cache hit (which skips the prelude that registers them) used to
+/// come back with none:
+///
+/// ```text
+/// $ elisp script.el     # cold: (t t (macro . #[(cond &rest body) …]))
+/// $ elisp script.el     # warm: (nil t nil)
+/// ```
+///
+/// `Entry::introspection_cells` (shard format v8) now carries it, so `fboundp`
+/// and `symbol-function` answer the same on both runs. `macrop` was already
+/// right on both — it reads a name table, not the cell — which is why the split
+/// showed up as an *inconsistency* between two answers about the same symbol.
+///
+/// The special forms are covered too, from the other direction: their cells are
+/// installed by `builtins::install`, which runs on every startup, so they must be
+/// present on a warm run without the image having to carry them.
+#[test]
+fn warm_cache_keeps_the_introspection_function_cells() {
+    let script = r#"
+(princ (format "%S %S %S %S %S\n"
+               (fboundp 'when) (macrop 'when) (consp (symbol-function 'when))
+               (fboundp 'if) (subr-name (symbol-function 'if))))
+"#;
+    let (cold, warm) = run_cold_then_warm("introspection-cells", script);
+    assert_eq!(cold, "t t t t \"if\"\n", "cold run");
+    assert_eq!(
+        warm, cold,
+        "a warm cache must not lose the intrinsic-macro / special-form cells"
+    );
+}

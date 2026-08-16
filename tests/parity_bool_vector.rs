@@ -191,3 +191,35 @@ fn bool_vector_read_syntax() {
         "t"
     );
 }
+
+/// The packed bytes go through print.c's *string* rules, which include
+/// `print-escape-control-characters`. elisprs applied that flag to plain strings
+/// but not to a bool-vector's payload, so a zero byte came out as a raw NUL
+/// where Emacs writes `\0`. Measured on GNU Emacs 30.2:
+///
+/// ```text
+/// (let ((print-escape-control-characters t))
+///   (prin1-to-string (make-bool-vector 4 nil)))   => "#&4\"\\0\""
+/// (prin1-to-string (make-bool-vector 4 nil))      => "#&4\"^@\""   (raw NUL)
+/// ```
+#[test]
+fn packed_bytes_honour_print_escape_control_characters() {
+    assert_eq!(
+        eval(
+            "(let ((print-escape-control-characters t))
+               (prin1-to-string (make-bool-vector 4 nil)))"
+        ),
+        "\"#&4\\\"\\\\0\\\"\""
+    );
+    assert_eq!(
+        eval(
+            "(let ((print-escape-control-characters t))
+               (prin1-to-string (bool-vector t nil t)))"
+        ),
+        "\"#&3\\\"\\\\5\\\"\""
+    );
+    // Without the flag the byte stays raw, so the printed form is two characters
+    // shorter than the escaped one — checked by length so the NUL itself does not
+    // have to be spelled in the expectation.
+    assert_eq!(eval("(length (prin1-to-string (make-bool-vector 4 nil)))"), "6");
+}
