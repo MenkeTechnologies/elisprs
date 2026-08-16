@@ -75,6 +75,51 @@
     "1e+INF" "1.e+INF" ".5e+INF" "1.0e-INF" "1.0eINF" "1.0E+INF" "1.0e+inf"
     "1.0e+NAN" "e+INF" "+1.0e+INF" "1.0e+INFx" "0e+NaN" "1." ".5" "1e5"))
 (defvar fz-symbols '(foo bar baz nil t car - + a))
+;; Symbols in *function* position for the introspection subrs (`func-arity',
+;; `fboundp', `symbol-function', `indirect-function', `special-form-p',
+;; `macrop'). A subr, a special form, an alias, a name nothing defines, and the
+;; two symbols that are symbols in Emacs but not heap symbols here (`t'/`nil')
+;; each take a different branch — and elisprs lowers every special form in the
+;; compiler, which is exactly where it had no function cell at all.
+;;
+;; Deliberately all C-level: `symbol-function' of anything Emacs defines in Lisp
+;; answers a *byte-code object*, which elisprs (having no byte compiler) prints
+;; as its source closure. That difference is real but it is not what these calls
+;; are here to measure, and it would make every run report it.
+(defvar fz-fnames
+  '(car cons list + not if let progn quote while catch unwind-protect
+    no-such-function-xyz nil t))
+;; Pure-ASCII strings for the base64 encoders. Their contract for a character in
+;; 128-255 turns on whether the string is unibyte, which elisprs does not track:
+;; Emacs reads "\303\251" as two raw bytes (encodable) and "\351" as one
+;; multibyte character (rejected), and both are two-character/one-character
+;; strings of the same codes here. Above 255 there is no ambiguity and elisprs
+;; signals with Emacs, so the pool stays below 128 rather than measuring a gap
+;; the fuzzer cannot act on.
+(defvar fz-ascii-strings
+  '("" "a" "ab" "abc" "abcd" "Hello, World" "hello world" "  padded  " "a,b,,c"
+    "line\nbreak" "tab\there" "quote\"d" "back\\slash" "123" "-4.5" "aAbB" "a1b2"))
+;; `secure-hash' algorithm names, plus one it does not have: the rejection
+;; message is as much of the contract as the digest.
+(defvar fz-algos '(md5 sha1 sha224 sha256 sha384 sha512 bogus))
+;; base64 tokens. The malformed ones are the point: Emacs's decoder is strict
+;; about quadruple length and about where `=' may appear, and a decoder written
+;; as a loose bit stream accepts every one of them silently.
+;; Every token here decodes to ASCII, because a decoded byte above 127 lands in
+;; the unibyte-string gap: the value is right (`string-to-list' agrees) but Emacs
+;; prints such a string as octal escapes and elisprs prints the characters.
+;; `"-_-_"' is still present for the alphabet check — in the padded mode it is an
+;; error, which is ASCII either way.
+(defvar fz-b64
+  '("" "YWJj" "YQ==" "YWI=" "YWJjZA==" "AAAA" "YQ==YQ==" "  YWJj  " "YWJj\n"
+    "YWJ" "YWJj=" "=" "====" "A===" "AB=C" "!!!!" "SGVsbG8=" "MTIz"))
+;; `format-time-string' formats. Every call passes an explicit time and a
+;; non-nil ZONE (UTC), so nothing here reads the clock or the local zone.
+(defvar fz-tfmts
+  '("%Y-%m-%d" "%H:%M:%S" "%Y-%m-%dT%H:%M:%S" "%j" "%A %B" "%s" "%%" "%F" "%T"
+    "%y" "%m/%d" "%e" "%p" "%Z" "%a %b %e %H:%M:%S %Y"))
+;; Bounded absolute times (seconds since the epoch) for the time formatters.
+(defvar fz-times '(0 1 86399 86400 1000000000 -1 951782400 2147483647))
 ;; Emacs regexp syntax, not the `regex`-crate dialect: grouping and alternation
 ;; are backslashed. A few are deliberately malformed — an invalid regexp is a
 ;; parity case of its own (`invalid-regexp` and its message text).
@@ -113,6 +158,28 @@
    ((eq kind 'char) (fz-pick '(?a ?z ?A ?0 ?\s ?\n ?\t ?é)))
    ((eq kind 're) (fz-pick fz-regexps))
    ((eq kind 'ftok) (fz-pick fz-float-tokens))
+   ((eq kind 'fname) (list 'quote (fz-pick fz-fnames)))
+   ((eq kind 'algo) (list 'quote (fz-pick fz-algos)))
+   ((eq kind 'b64) (fz-pick fz-b64))
+   ((eq kind 'astr) (fz-pick fz-ascii-strings))
+   ((eq kind 'bstr) (fz-pick fz-strings))
+   ((eq kind 'tfmt) (fz-pick fz-tfmts))
+   ((eq kind 'time) (fz-pick fz-times))
+   ;; A bool-vector, built inline so the corpus stays a single expression.
+   ((eq kind 'bv)
+    (cons 'bool-vector
+          (let ((n (fz-int 4)) (acc nil) (i 0))
+            (while (< i n) (push (fz-pick '(t nil)) acc) (setq i (1+ i)))
+            acc)))
+   ;; A freshly-allocated vector: `aset' and `fillarray' mutate their argument,
+   ;; so they must never be handed a literal shared with a later form.
+   ((eq kind 'freshvec)
+    (cons 'vector
+          (let ((n (1+ (fz-int 4))) (acc nil) (i 0))
+            (while (< i n)
+              (push (fz-atom (fz-pick '(int str sym bool))) acc)
+              (setq i (1+ i)))
+            acc)))
    ;; An improper list. A search that finds its item before the tail must return
    ;; normally; one that runs off the end must signal `(wrong-type-argument listp
    ;; TAIL)'. Both halves of that are parity surface, and a proper list tests
@@ -259,6 +326,49 @@
     (compare-strings str any any str any any) (string-version-lessp str str)
     (string-pad str small char) (string-pad str small char bool)
     (assoc-string any list bool) (split-string str re bool str)
+    ;; hashing / encoding. Pure and deterministic, and the whole area was
+    ;; unreached by the call table: the digests, the strict base64 reader, and
+    ;; the byte-per-character contract both encoders and `url-unhex-string' owe.
+    ;; The digest object slot is bounded rather than chaos-filled: Emacs's
+    ;; `Invalid object argument' data for a *list* object splices oddly (a proper
+    ;; list is spliced, an improper one is not, and `nil' arrives as the string
+    ;; "nil"), which is recorded in BUGS.md as an unclosed gap. The digests, the
+    ;; algorithm rejection and the START/END range check are what these measure.
+    (md5 bstr) (sha1 bstr) (secure-hash algo bstr)
+    (secure-hash algo astr small small) (secure-hash algo astr small any)
+    (md5 astr small small) (sha1 astr small small)
+    (base64-encode-string astr) (base64-encode-string astr bool)
+    (base64-decode-string b64) (base64-decode-string b64 bool)
+    (base64url-encode-string astr) (base64url-encode-string astr bool)
+    ;; `url-hexify-string' is a Lisp `mapconcat' over `url-unreserved-chars', so
+    ;; a bad element reports that bool-vector's own `aref' error (`fixnump' /
+    ;; `args-out-of-range' naming the table). That surface is the library's
+    ;; internals rather than the function's contract, so the slot stays a string.
+    (url-hexify-string bstr) (url-unhex-string bstr)
+    ;; The float library beyond the elementary functions. `copysign' type-checks
+    ;; with `floatp', not the number check every neighbour uses.
+    (frexp float) (ldexp float small) (ldexp num small) (logb num)
+    (copysign float float) (copysign num num) (tan num) (asin num) (acos num)
+    (atan num) (atan num num) (lsh int small) (byteorder)
+    ;; Function introspection. A special form, a compiler-lowered macro and an
+    ;; undefined name each answer differently, and elisprs lowers the first two.
+    (func-arity fname) (fboundp fname) (subrp fname) (macrop fname)
+    (special-form-p fname) (indirect-function fname) (symbol-function fname)
+    (functionp fname) (keywordp any) (bare-symbol-p any) (subr-name any)
+    ;; Characters and byte strings.
+    (char-width char) (char-uppercase-p char) (text-char-description char)
+    (string char) (string char char) (char-or-string-p any) (max-char)
+    ;; Mutable arrays: `aset'/`fillarray' return and mutate, so both the value
+    ;; and the mutated array are compared.
+    (make-vector small any) (aset freshvec small any) (fillarray freshvec any)
+    (bool-vector-not bv) (bool-vector-subsetp bv bv) (bool-vector-p any)
+    (make-bool-vector small bool) (length bv) (append bv list)
+    ;; Time formatting, always with an explicit time and UTC so nothing here
+    ;; reads the clock or the ambient zone.
+    (format-time-string tfmt time bool) (decode-time time bool) (float-time time)
+    ;; The reader as a function, including its `end-of-file' data.
+    (read-from-string str) (read-from-string str small)
+    (string-to-number str small) (member-ignore-case any list)
     ;; predicates
     (consp any) (listp any) (atom any) (null any) (not any) (stringp any) (symbolp any)
     (vectorp any) (arrayp any) (sequencep any) (functionp any) (booleanp any)
@@ -270,7 +380,12 @@
 ;; but that chaos-filling or nesting them would destroy the only thing they test.
 ;; A `dotted' slot holding a proper list, or an `ftok' slot holding "abc", is a
 ;; slot that has stopped covering improper tails and non-finite float syntax.
-(defvar fz-bounded '(small char re ht dotted ftok))
+;; `fname', `algo', `b64', `tfmt', `time', `bv' and `freshvec' join for the same
+;; reason `dotted' and `ftok' did: chaos-filling or nesting them destroys the only
+;; thing they test (a function designator, a digest name, a base64 token, a time
+;; format, a bounded epoch second, a bool-vector, an unshared vector).
+(defvar fz-bounded
+  '(small char re ht dotted ftok fname algo b64 astr bstr tfmt time bv freshvec))
 
 (defvar fz-chaos-rate 12
   "Percent of argument slots filled with a deliberately wrong-typed value.")
