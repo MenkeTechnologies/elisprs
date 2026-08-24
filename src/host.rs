@@ -1747,7 +1747,7 @@ impl ElispHost {
     /// Bind `id` to `val` in the current scope — lexically, unless the symbol is
     /// special (`defvar`'d), in which case dynamically (saved on the specstack).
     ///
-    /// Under `lexical-binding` nil ([`Self::dynamic_binding`]) *every* symbol takes
+    /// Under `lexical-binding` nil (`Self::dynamic_binding`) *every* symbol takes
     /// the dynamic path, which is what makes a `lambda` made in that mode see the
     /// caller's bindings and not its birthplace's.
     pub fn bind_here(&mut self, id: u32, val: Value) {
@@ -1822,7 +1822,7 @@ impl ElispHost {
     /// Instantiate a closure from a compile-time template, capturing the current
     /// lexical environment. Templates are stored with `env: None`.
     ///
-    /// Under dynamic binding (`lexical-binding` nil — see [`Self::dynamic_binding`])
+    /// Under dynamic binding (`lexical-binding` nil — see `Self::dynamic_binding`)
     /// nothing is captured: Emacs's `eval` returns the `lambda` form itself, whose
     /// free variables are looked up in the symbols' value cells when it is *called*.
     /// The instance records the mode so its body and parameters run dynamically too,
@@ -2455,7 +2455,7 @@ impl ElispHost {
     }
 
     /// Record that elisp-level `fset`/`defalias` pointed `sym` at a subr. See
-    /// [`Self::subr_aliased`].
+    /// `Self::subr_aliased`.
     pub fn note_subr_alias(&mut self, sym: &Value, def: &Value) {
         if matches!(self.fn_kind(def), FnKind::Subr(..)) {
             if let Some(id) = self.sym_handle(sym) {
@@ -2464,7 +2464,7 @@ impl ElispHost {
         }
     }
 
-    /// Whether `sym` has ever been `fset` to a subr. See [`Self::subr_aliased`].
+    /// Whether `sym` has ever been `fset` to a subr. See `Self::subr_aliased`.
     pub fn is_subr_aliased(&self, sym: &Value) -> bool {
         self.sym_handle(sym)
             .is_some_and(|id| self.subr_aliased.contains(&id))
@@ -2872,9 +2872,7 @@ impl ElispHost {
                         match byte {
                             b'"' => inner.push_str("\\\""),
                             b'\\' => inner.push_str("\\\\"),
-                            0..=0x1f | 0x7f if esc_ctl => {
-                                inner.push_str(&format!("\\{byte:o}"))
-                            }
+                            0..=0x1f | 0x7f if esc_ctl => inner.push_str(&format!("\\{byte:o}")),
                             0..=127 => inner.push(byte as char),
                             _ => inner.push_str(&format!("\\{byte:o}")),
                         }
@@ -4088,10 +4086,7 @@ impl ElispHost {
         let class_at = |c: u32| -> char {
             let v = self.char_table_ref(&table, c);
             let code = match self.obj(&v) {
-                Some(Obj::Cons(car, _)) => match car {
-                    Value::Int(n) => (*n as u64 & 0xFFFF) as usize,
-                    _ => 0,
-                },
+                Some(Obj::Cons(Value::Int(n), _)) => (*n as u64 & 0xFFFF) as usize,
                 _ => 0,
             };
             *Self::SYNTAX_CODE_SPEC.get(code).unwrap_or(&b' ') as char

@@ -206,7 +206,7 @@ pub fn check_line(line: u32) {
 /// function breakpoint **arms step mode** rather than pausing here — ported from
 /// awkrs `src/vm.rs:3226`, where the same choice makes the stop land on the
 /// function's first real statement instead of on the call itself. The match rule
-/// lives in the one place, [`Dap::should_stop_at_sub`].
+/// lives in the one place, `Dap::should_stop_at_sub`.
 ///
 /// Deviation from awkrs, stated explicitly: awkrs arms step mode and nothing
 /// else, so the stop it produces is indistinguishable from a `next`. The cause

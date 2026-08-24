@@ -373,11 +373,7 @@ fn try_native_op(
             //               argument N+1 is ever evaluated. Emacs evaluates
             //               *every* argument first and folds afterwards, so
             //               `(* 1 t (setq n 9))' must still leave `n' at 9.
-            let native = match (name, args.len()) {
-                (_, 0) | (_, 2) => true,
-                ("-", 1) => true,
-                _ => false,
-            };
+            let native = matches!((name, args.len()), (_, 0) | (_, 2) | ("-", 1));
             if !native {
                 return Ok(false);
             }

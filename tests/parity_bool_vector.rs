@@ -221,5 +221,8 @@ fn packed_bytes_honour_print_escape_control_characters() {
     // Without the flag the byte stays raw, so the printed form is two characters
     // shorter than the escaped one — checked by length so the NUL itself does not
     // have to be spelled in the expectation.
-    assert_eq!(eval("(length (prin1-to-string (make-bool-vector 4 nil)))"), "6");
+    assert_eq!(
+        eval("(length (prin1-to-string (make-bool-vector 4 nil)))"),
+        "6"
+    );
 }

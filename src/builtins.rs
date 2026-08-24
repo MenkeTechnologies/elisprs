@@ -2484,7 +2484,7 @@ fn message_fn(h: &mut ElispHost, a: &[Value]) -> R {
     };
     if h.need_newline {
         h.need_newline = false;
-        eprint!("\n");
+        eprintln!();
     }
     match text {
         Some(s) => {

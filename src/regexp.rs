@@ -30,7 +30,7 @@
 /// force where the regexp is compiled.
 ///
 /// A trait object rather than a direct host call because this module is a pure
-/// translator with no arena access; [`crate::builtins::compile_cf`] supplies the
+/// translator with no arena access; `crate::builtins::compile_cf` supplies the
 /// live table and [`translate`] keeps a no-table path for the unit tests.
 pub trait SyntaxLookup {
     /// Ascending, non-overlapping `[lo, hi]` character ranges in class `class`.
@@ -602,7 +602,11 @@ mod tests {
     fn classes_pass_through() {
         assert_eq!(t(r"[a-z]+"), "[a-z]+");
         assert_eq!(t(r"[]ab]"), "[]ab]");
-        assert_eq!(t(r"[[:alpha:]]"), "[[:alpha:]]");
+        // A POSIX class does NOT pass through: the regex crate's own
+        // `[:alpha:]` is ASCII-only, so `posix_class` rewrites it to the
+        // Unicode properties. Without that rewrite
+        // `(string-match "[[:alpha:]]" "Ü")` was nil where Emacs answers 0.
+        assert_eq!(t(r"[[:alpha:]]"), r"[\p{Alphabetic}\p{M}]");
         assert_eq!(t(r"[^()]"), "[^()]");
         // A bare `[` is a literal class member in elisp (`\{[` keymap check in
         // derived.el's `derived-mode-make-docstring`); the crate needs it escaped.
