@@ -22,6 +22,25 @@ All notable changes to elisprs are documented here. The format follows
   object handle rather than an inline value, so the cache shard format is v10
   and a v9 shard is rejected.
 - **`store-substring`, `clear-string`**, and `fillarray` on a string.
+- **`define-hash-table-test`**, so `make-hash-table :test MY=` calls the elisp
+  test and hash functions it declares instead of silently falling back to
+  `eql`. The missing builtin was not the obstacle: those functions are elisp,
+  so a lookup on such a table has to call elisp, and `hash_eq`/`hash_key` ran
+  inside the host borrow a subr body holds. `gethash`/`puthash`/`remhash`/
+  `make-hash-table` therefore join `mapcar`/`sort`/`maphash`/`mapatoms` on the
+  intercepted path — registered with `defsubr`, so `subrp` and `#'NAME` are
+  unchanged, but dispatched from `call_function` OUTSIDE the borrow. A built-in
+  test still runs in one borrow; only a user test re-enters. The table carries
+  its own `(NAME TESTFN HASHFN)`, which the heap image serializes, so the shard
+  format is v11.
+- **`pcase-lambda`**, whose parameters may be patterns:
+  `(funcall (pcase-lambda (`(,a ,b)) (+ a b)) '(1 2))` is 3.
+- **`string-pixel-width`** and the `tab-width` it reads. Not `string-width`: in
+  batch a character is one pixel per display column, and a TAB advances to the
+  next multiple of `tab-width` rather than counting a flat `tab-width` columns,
+  so `(string-pixel-width "ab\tc")` is 9 where `(string-width "ab\tc")` is 11.
+- **`rx`: `(category …)`, `*?`/`+?`**, and the `not` spellings
+  `(not (syntax X))`, `(not (not X))` and `(not CLASS)`.
 - **The hook API's missing four.** `remove-hook` (subr.el:2186, including the
   depth-alist cleanup of bug#46414), `run-hook-with-args-until-success`,
   `run-hook-with-args-until-failure` and `run-hook-wrapped` — all previously
@@ -57,6 +76,30 @@ All notable changes to elisprs are documented here. The format follows
   value of the wrong type fails the clause instead of signalling out of it.
 
 ### Fixed
+- **`rx`'s character alternatives were concatenation.** Emacs sorts the
+  characters, merges adjacent ones into ranges, moves `]` to the front and
+  `^`/`-` to the back, and drops the brackets for a single character:
+  `(rx (in ?a ?b "0-9"))` is `"[0-9ab]"` not `"[ab0-9]"`, `(rx (in "abc"))` is
+  `"[a-c]"`, `(rx (any ?a))` is `"a"`. `rx--string-to-intervals`,
+  `rx--condense-intervals`, `rx--parse-any` and `rx--generate-alt` are ported
+  from rx.el. `(rx (or))` is the never-matching `regexp-unmatchable` rather
+  than `"\(?:\)"`, and `minimal-match`/`maximal-match` now set the greediness
+  of every quantifier in their body — of the LONG spellings only, since
+  `*`/`+`/`?` and `*?`/`+?`/`??` state their own.
+- **The elisp call path could not reach `max-lisp-eval-depth`.** One nested
+  elisp call is several Rust frames deep, and elisp recursion is bounded by
+  `max-lisp-eval-depth` (1600), not by the OS stack — so on a thread with the
+  platform default stack the process aborted on a hardware stack overflow
+  before the limit could signal, which no `condition-case` can catch.
+  `run_closure` grows the stack on demand, as the reader already did.
+- **`(head SYMBOL)` was an evaluated specializer.**
+  `(cl-defmethod g ((x (head foo))) …)` was a `void-variable foo`, and where
+  the name happened to be bound it dispatched on that value instead.
+- **`cl-defgeneric` answered its own name** where Emacs answers nil.
+- **`pcase`'s `cl-type` rejected a compound specifier.**
+  `(pcase 3 ((cl-type (integer 0 5)) 'in) (_ 'out))` was
+  `(wrong-type-argument symbolp (integer 0 5))`; it routes through `cl-typep`
+  now, as `cl-typecase` already did.
 - **An interpreted closure captured its whole enclosing scope.**
   `(let ((n 1) (m 2)) (format "%S" (lambda () n)))` printed
   `"#[nil (n) ((m . 2) (n . 1))]"` where Emacs prints `"#[nil (n) ((n . 1))]"`,

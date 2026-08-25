@@ -4356,3 +4356,336 @@ a real change with a real payoff and it is not in this round.
 - **`cl-defgeneric` answers its own name** where Emacs answers `nil`, and the
   `(head SYMBOL)` specializer is unsupported.
 - **`string-pixel-width`** is void.
+
+## Round 23 — the `rx` translator, a user-defined hash test, and the float decision
+
+Reference: **GNU Emacs 31.1** (`/opt/homebrew/bin/emacs`), the installed
+binary; see round 22's header for why it is not 30.2 and for the cross-check
+that the rules exercised here did not move between the two. Every form below
+was run through the same two-process driver (one `emacs -Q --batch -l` and one
+`elisp` over the same generated file, one `(princ (format "%S" FORM))` per
+line, with a `lexical-binding: t` cookie and `(require 'cl-lib)` /
+`(require 'generator)` where the form needs them).
+
+### R23-A. `rx`'s character alternatives were concatenation — ✅ FIXED
+
+The four gaps round 21 listed were one gap and three neighbours of it.
+`rx--charset` concatenated its arguments in the order given, which is only
+accidentally right: Emacs sorts the characters, merges adjacent ones into
+ranges, moves `]` to the front and `^`/`-` to the back, and drops the brackets
+entirely for a single character.
+
+```text
+                          emacs 31.1      elisprs (before)
+(rx (in ?a ?b "0-9"))     "[0-9ab]"       "[ab0-9]"
+(rx (in "abc"))           "[a-c]"         "[abc]"
+(rx (any ?a))             "a"             "[a]"
+(rx (any "]"))            "]"             "[]]"
+(rx (any "^"))            "\^"            "[^]"
+(rx (any "^-a"))          "[_-a^]"        "[^-a]"
+(rx (any "--/"))          "[./-]"         "[--/]"
+(rx (any alpha ?z))       "[z[:alpha:]]"  "[[:alpha:]z]"
+(rx (any))                "\`a\`"         "[]"
+(rx (not (any "\n")))     "."             "[^\n]"
+```
+
+`rx--string-to-intervals`, `rx--condense-intervals`, `rx--parse-any` and
+`rx--generate-alt` are ported from rx.el and now back `any`/`in`/`char` and
+`not`. One piece is deliberately not ported and is named in the code rather
+than silently dropped: rx.el also re-expresses an interval set covering the
+raw-byte boundary `#x3fff7f` in complemented form, and elisprs has no raw-byte
+model, so nothing the reader can build reaches that case.
+
+The other three:
+
+- `(rx (category latin))` errored. `rx--categories` is ported, so it is `"\cl"`
+  and `(rx (not (category latin)))` is `"\Cl"`. `not` also learned
+  `(syntax X)`, `(not (not X))` and the character-class symbols, which were an
+  error or bracket-string surgery before.
+- `(rx (or))` answered `"\(?:\)"` where Emacs answers the never-matching
+  `regexp-unmatchable`, and `(rx (or "a"))` bracketed a single branch.
+- `minimal-match`/`maximal-match` were ignored. They set the greediness of
+  every quantifier in their body (`rx--control-greedy`), so
+  `(rx (minimal-match (one-or-more "a") (zero-or-more "b")))` is `"a+?b*?"`.
+  Only the LONG spellings consult it — rx.el's dispatch gives `*`/`+`/`?` their
+  own greediness and `*?`/`+?`/`??` their own — which is why
+  `(rx (minimal-match (+ "a")))` stays `"a+"` while
+  `(rx (minimal-match (opt "a")))` is `"a??"`. `*?` and `+?` were missing.
+
+66 probe forms across five sets, 0 divergences.
+
+### R23-B. The elisp call path could not reach `max-lisp-eval-depth` — ✅ FIXED
+
+Not a parity bug against a form; a structural one, found because a test began
+overflowing a test thread's 2 MiB stack after the round's prelude grew.
+
+One nested elisp call is several Rust frames deep — `run_closure`, the nested
+`VM::run`, its dispatch loop, `ext_dispatch`, `call_function` — and elisp
+recursion is bounded by `max-lisp-eval-depth` (1600), not by the OS stack. On a
+thread with the platform default stack that limit is unreachable: the process
+aborts on a hardware stack overflow first, which is not a signal any
+`condition-case` can catch. `run_closure` now grows the stack on demand
+(`stacker::maybe_grow`), which the reader already did for the same reason
+(`reader.rs`'s `read_form`). `excessive-lisp-nesting` is now what fires, on any
+thread — verified for both the default limit and `(let ((max-lisp-eval-depth
+200)) …)`.
+
+### R23-C. `(head X)`, `cl-defgeneric`'s value, `string-pixel-width` — ✅ FIXED
+
+```text
+                                                    emacs 31.1  elisprs (before)
+(cl-defmethod g ((x (head foo))) …) then (g '(foo 1))  headfoo  (void-variable foo)
+(cl-defgeneric gz (x))                                 nil      gz
+(string-pixel-width "ab\tc")                           9        (void-function …)
+```
+
+`(head SYMBOL)` is not an evaluated specializer — it names the symbol the
+argument's car must be `eq` to — but `cl--method-spec` built a form that
+evaluated it. Where the name happened to be bound it dispatched on THAT value
+instead, so `(let ((foo 'bar)) … (g '(foo 1)))` is `hf` in Emacs and was
+`cl-no-applicable-method` here. `(eql EXPR)` keeps evaluating EXPR, which
+Emacs 30 allows.
+
+`string-pixel-width` is not `string-width`: in batch a character is one pixel
+per display column, so the pixel width is the column ADVANCE, and a TAB
+advances to the next multiple of `tab-width` rather than counting a flat
+`tab-width` columns — `(string-pixel-width "ab\tc")` is 9 where
+`(string-width "ab\tc")` is 11. `window-text-pixel-size` reports the widest
+line, so `(string-pixel-width "a\nb")` is 1. `tab-width` itself was void and is
+now a global defaulting to 8 (buffer-local in Emacs; elisprs has no per-buffer
+display model).
+
+### R23-D. `pcase-lambda` and a compound `cl-type` — ✅ FIXED
+
+```text
+                                                        emacs 31.1  elisprs (before)
+(funcall (pcase-lambda (`(,a ,b)) (+ a b)) '(1 2))      3           (invalid-function (cons a (cons b nil)))
+(pcase 3 ((cl-type (integer 0 5)) 'in) (_ 'out))        in          (wrong-type-argument symbolp (integer 0 5))
+```
+
+Emacs's `pcase-lambda` tests each parameter for a `` \` `` head, because there
+a backquote pattern survives macroexpansion as a `` (\` PAT) `` form. This
+reader expands backquote EAGERLY, so `` `(,a ,b) `` arrives already as the
+`(cons a (cons b nil))` pattern — which is exactly the structural pattern
+`pcase--compile` takes. The test here is therefore "is the parameter a cons":
+a symbol (`&optional`/`&rest` included) is an ordinary parameter, anything else
+is a pattern that a `pcase-let*` destructures around the body. The error above
+is the same fact seen from the other side — the pattern was being used as the
+parameter LIST.
+
+`pcase`'s `cl-type` named a predicate by mangling the type's symbol name, which
+a compound specifier has none of. It routes through `cl-typep` now, which
+already handled compound types — what `cl-typecase` had been doing all along.
+
+### R23-E. `define-hash-table-test` — ✅ FIXED, and the obstacle was the borrow
+
+```text
+(define-hash-table-test 'ci (lambda (a b) (string= (downcase a) (downcase b)))
+                            (lambda (a) (sxhash-equal (downcase a))))
+(let ((h (make-hash-table :test 'ci)))
+  (puthash "Foo" 1 h) (list (gethash "foo" h) (gethash "FOO" h)))
+  emacs 31.1   (1 1)
+  elisprs      (nil nil)          ; :test MY= silently fell back to eql
+```
+
+Round 21 named the obstacle correctly and it is not the missing builtin.
+TESTFN and HASHFN are elisp, so a lookup on such a table has to CALL elisp —
+and `hash_eq`/`hash_key` ran inside the `&mut ElispHost` that a subr body
+holds, where a nested call cannot happen.
+
+The shape that solves it already existed in the tree: `mapcar`, `sort`,
+`maphash` and `mapatoms` are registered with `defsubr` — so `subrp` and
+`#'NAME` stay right — but carry an `intercepted_subr` body, and
+`host::call_function` matches them by name and runs them OUTSIDE the borrow.
+`gethash`/`puthash`/`remhash`/`make-hash-table` join them. A built-in test
+still runs the whole operation in ONE borrow, because the intercept delegates
+straight to the old body; only a user test re-enters, and it takes the host in
+short bursts — read the candidate slots out, drop the borrow, run TESTFN.
+`make-hash-table` is intercepted for the same reason: the declaration lives on
+the symbol's `hash-table-test` property, an elisp plist, so resolving
+`:test NAME` reads elisp.
+
+Four details were measured rather than assumed:
+
+- Emacs hashes the value HASHFN *returns* with the ordinary `equal` hash
+  (`hashfn_user_defined`, fns.c), so two keys HASHFN maps to `equal` values
+  share a bucket and TESTFN decides.
+- A `puthash` onto a key the test already matches keeps the ORIGINAL key object
+  and replaces only the value: after `(puthash "Foo" 1 h)` and
+  `(puthash "FOO" 2 h)` the count is 1 and `maphash` still reports `"Foo"`.
+- `hash-table-test` answers the declared NAME, not one of the three built-in
+  test symbols.
+- An undeclared name is `(error "Invalid hash table test" NAME)`, not a silent
+  `eql`.
+
+The table carries its own `(NAME TESTFN HASHFN)`, which the heap image now
+serializes: a v10 shard would replay such a table with NO user test, silently
+answering `eql` and missing every key it used to find, so
+`cache::SHARD_FORMAT_VERSION` is 11.
+
+### R23-F. `eq` on floats — NOT FIXED, and here is the measurement
+
+The gap is real and wider than the one form round 21 recorded — it is every
+identity primitive, exactly as it was for strings before round 22:
+
+```text
+                                            emacs 31.1   elisprs
+(let ((f 1.5)) (eq f f))                    t            nil
+(let ((l (list 1.5))) (eq (car l) (car l))) t            nil
+(let ((f 1.5)) (memq f (list f)))           (1.5)        nil
+(let ((f 1.5)) (assq f (list (cons f 1))))  (1.5 . 1)    nil
+(let ((v (make-vector 1 1.5))) (eq (aref v 0) (aref v 0)))  t   nil
+(progn (defun g () 1.5) (eq (g) (g)))       t            nil
+(let ((f 1.5) (g 1.5)) (eq f g))            nil          nil    ; already right
+(let ((f 1.5)) (eql f f))                   t            t      ; already right
+```
+
+Round 22 fixed the same class for strings by making them arena objects, so the
+obvious move is to do it again. The measurement says the trade is not the same
+one, for two reasons.
+
+**Cost 1 — it ends the native lowering of arithmetic.** The compiler emits
+fusevm's own `Op::Add`/`Op::Sub`/`Op::Mul`/`Op::NumLt` for two-argument
+arithmetic; with boxed floats both operands would be `Value::Obj` handles and
+every one of them would become a host subr call. That difference is directly
+measurable today, because a THREE-argument `+` already takes the host path
+(`(+ s 1.5)` lowers to `Op::Add`, `(+ s 1.5 0.0)` to `Extended(1, 3)` — the
+`--disasm` output shows both). Over an empty 300 000-iteration `while` loop,
+best of three runs, debug build:
+
+```text
+empty loop                       0.99 s
++ one native float add           1.14 s   -> +0.15 s, 0.50 us per add
++ one hosted float add           1.49 s   -> +0.50 s, 1.67 us per add
++ one allocating host call       1.56 s   -> +0.57 s, 1.90 us per call
+```
+
+So a float arithmetic operation costs **3.3x** more off the native op than on
+it (the same pair measured 2.7x on an earlier run; the direction is stable, the
+exact factor is not). Boxing forces every float operation onto the slower side
+AND adds the allocation, which is the third line.
+
+**Cost 2 — the arena has no collector.** `ElispHost::alloc` pushes onto
+`arena: Vec<Obj>` and nothing ever removes an entry: there is no
+`garbage_collect`, no sweep, no `arena.truncate` anywhere in the tree. Every
+elisp heap type already pays this — a 400 000-iteration loop that conses once
+per iteration peaks at 772 MB against 235 MB for the same loop allocating
+nothing — and round 22 signed strings up for it too (the same loop binding a
+fresh string per iteration peaks at 754 MB, where an `Arc<String>` was freed at
+its last reference). That was worth it: a string is an aggregate a program
+holds a bounded number of, and the identity is what `aset` needs to be visible
+at all. A float is the payload of every arithmetic step, so boxing would retain
+one cell per arithmetic RESULT, and a numeric loop would grow the arena without
+bound. That is not a slowdown, it is a leak proportional to the loop count.
+
+**What the gap actually costs.** `eql` and `equal` on floats are already
+correct, and `eql` is what `memql`, `cl-member`, `pcase`'s literal patterns and
+an `eql`-test hash table all use — so the only reachable difference is a
+program that puts a float through an `eq`-keyed structure and expects to find
+it, which in Emacs's own tree is what `eql` is for.
+
+**Decision: not boxed.** Revisit if elisprs grows a collector, which removes
+cost 2 and is the precondition that makes cost 1 the only question.
+
+### R23-G. `--tiers`: which gate applies, and it is not loop shape
+
+```text
+$ elisp --tiers loop.el            # (while (< i 200000) (setq s (+ s i)) (setq i (1+ i)))
+ops                     32
+block-JIT eligible      false
+block-JIT compiled      false
+largest eligible region 0..4 (4 ops)
+loop @5                trace-eligible=false traced=false blacklisted=false
+block-ineligible ops
+  Extended              8
+  ExtendedWide          2
+  LoadUndef             1
+reaches native code     false
+```
+
+`dolist` and `dotimes` expand to `let` + `while`, lower to the same op mix, and
+report the same thing (`Extended` 11 / 10, `ExtendedWide` 6, one `LoadUndef`,
+`trace-eligible=false`). Three candidate explanations, checked against the
+disassembly rather than assumed:
+
+1. **`Op::CallBuiltin` (`jit.rs:6670`) — does not apply.** elisprs emits no
+   `Op::CallBuiltin` at all; `grep -c CallBuiltin src/compiler.rs src/host.rs`
+   is 0 in both. An elisp function call is `Op::Extended(CALL, argc)`.
+2. **Loop shape — does not apply either.** elisprs's `while` already ends its
+   body with a backward branch onto its own header (`Jump(5)` onto op 5, and
+   `Jump(6)`/`Jump(8)` for `dolist`/`dotimes`), which is exactly what
+   `is_trace_eligible` accepts (`Op::Jump(t) | Op::JumpIfTrue(t) |
+   Op::JumpIfFalse(t) if *t == anchor_ip`, `jit.rs:7013`). Rotating the
+   lowering, which is what fixed a sibling frontend, would change nothing here.
+   The stack-imbalance variant does not apply either: a statement-position `if`
+   with no else lowers to `JumpIfFalse` / then-branch / `Jump` / `LoadUndef` /
+   `Pop`, so both paths leave exactly one value for one `Pop`.
+3. **The op KIND is the gate.** `is_block_eligible_op_at` opens with
+   `if let Op::Extended(id, _) = op { return global_extension_for(*id).is_some() }`
+   (`jit.rs:4546`), and `is_trace_op_allowed_at` falls through to it for
+   anything it does not name (`jit.rs:6684`). fusevm has a documented seam for
+   a frontend to lower its own extended ops to Cranelift IR — implement
+   `JitExtension::emit_extended`, register it with `register_global_extension`,
+   and reach the host through `ExtJitCtx::call_host` — and **elisprs registers
+   none** (`grep -c register_global_extension src/` is 0). So every
+   `Op::Extended` is refused by both tiers, and there are 8–11 of them in each
+   loop body: `Extended(2, 0)` is GETVAR, `Extended(3, 0)` SETVAR,
+   `Extended(0, 0)` TRUTHY, `Extended(1, N)` CALL, `ExtendedWide(6/7, N)`
+   LETBIND/UNBIND. Every elisp variable read and write is one, because an elisp
+   variable lives in the `ElispHost` — a symbol value cell, or a `Scope` node in
+   the lexical chain — not in a fusevm slot or global.
+
+`LoadUndef` is listed too, and it is a real second gate: the tool asks fusevm
+per op (a one-op chunk through `is_block_eligible`), and fusevm refuses it. In
+a plain `while`, in `dolist` and in `dotimes` the `LoadUndef` sits AFTER the
+loop, outside the traced body; a statement-position `if` with no else puts one
+INSIDE it, so that shape would still be refused even with the `Extended` gate
+gone.
+
+The reporter itself is honest about which thread it measures: `main` wraps
+everything, `--tiers` included, in `with_interpreter_stack`, so the run and the
+inspection happen on the same `elisprs-interp` thread and fusevm's caches are
+the ones the run just filled.
+
+Reaching native code therefore means one of two things, neither of them a loop
+rotation: implement `JitExtension` for elisprs's extended ops, or lower lexical
+variables to fusevm SLOTS (`Op::GetSlot`/`Op::SetSlot`, which both tiers
+accept) instead of host GETVAR/SETVAR — a lexical-slot allocator in the
+compiler. Both are real work with a real payoff and neither is in this round.
+
+### Still open
+
+- **Generators.** `iter-defun`, `iter-lambda`, `iter-next`, `iter-do` and
+  `iter-end-of-sequence` are still void. The semantics were measured and are
+  recorded here so the next attempt starts from them: `(iter-next IT)` answers
+  the yielded values in order; exhaustion signals `iter-end-of-sequence` with
+  the body's RETURN value as data (`(iter-defun f () (iter-yield 1) 99)` ends
+  with `99`, a body ending in nil with `nil`); `(iter-next IT VALUE)` makes
+  VALUE the value of the suspended `iter-yield`, so
+  `(iter-defun f () (iter-yield (+ 1 (iter-yield 0))))` answers `0` then `11`
+  for `(iter-next it 10)`; an empty body signals immediately.
+  What it needs is not a builtin but `generator.el`'s CPS transform, and the
+  size is worth stating rather than guessing at: the file is 802 lines, of
+  which `cps--transform-1` is a ~270-line `pcase` over every special form
+  (lines 199–470), plus `cps--make-catch-wrapper`,
+  `cps--make-condition-wrapper`, `cps--make-unwind-wrapper` and the
+  `cl-loop` integration. A PARTIAL transform is the wrong answer here: a
+  special form it does not handle does not error, it silently produces a
+  generator that resumes in the wrong place.
+- **`(or CHAR CHAR)` does not sort.** `(rx (or ?b ?a))` is `"[ab]"` in Emacs
+  and `"[ba]"` here. Not one of the four gaps and not the charset machinery
+  either: Emacs routes an all-strings `or` through `regexp-opt`, whose
+  rendering is deliberately NOT the `any` one — `(rx (or "a" "b" "c"))` is
+  `"[abc]"` where `(rx (in "abc"))` is `"[a-c]"`, so it sorts but does not
+  condense into ranges. Closing it means porting `regexp-opt`, not reusing
+  `rx--generate-alt`.
+- **`eq` on floats** — see R23-F. Decided, not deferred: the measurement is
+  above and the precondition for revisiting it is a collector.
+- **No unibyte/multibyte string distinction** — unchanged from round 22.
+- **The arena has no collector.** Named here because R23-F turns on it and
+  because round 22 enlarged its reach: `alloc` only ever pushes, so every
+  string, cons, vector and hash table a program allocates is retained for the
+  process lifetime. Measured above (772 MB for 400 000 conses against 235 MB
+  for the same loop allocating nothing). Pre-existing for every other heap
+  type; new for strings as of round 22, which is the price of the identity
+  `aset` needs.
