@@ -84,17 +84,24 @@ fn the_declaration_and_the_reported_test_name() {
     // The declaration goes on the symbol's `hash-table-test` property as the
     // two-element list `(TESTFN HASHFN)`.
     assert_eq!(
-        eval("(progn (define-hash-table-test 'my= (lambda (a b) (= a b)) (lambda (a) (floor a))) \
-              (length (get 'my= 'hash-table-test)))"),
+        eval(
+            "(progn (define-hash-table-test 'my= (lambda (a b) (= a b)) (lambda (a) (floor a))) \
+              (length (get 'my= 'hash-table-test)))"
+        ),
         "2"
     );
     assert_eq!(
-        eval("(progn (define-hash-table-test 'my2 (lambda (a b) (= a b)) (lambda (a) (floor a))) \
-              (mapcar #'functionp (get 'my2 'hash-table-test)))"),
+        eval(
+            "(progn (define-hash-table-test 'my2 (lambda (a b) (= a b)) (lambda (a) (floor a))) \
+              (mapcar #'functionp (get 'my2 'hash-table-test)))"
+        ),
         "(t t)"
     );
     // The built-in tests are untouched.
-    assert_eq!(eval("(hash-table-test (make-hash-table :test 'equal))"), "equal");
+    assert_eq!(
+        eval("(hash-table-test (make-hash-table :test 'equal))"),
+        "equal"
+    );
     assert_eq!(eval("(hash-table-test (make-hash-table :test 'eq))"), "eq");
     assert_eq!(eval("(hash-table-test (make-hash-table))"), "eql");
 }
@@ -118,15 +125,19 @@ fn the_intercepted_names_are_still_subrs() {
     assert_eq!(eval("(subrp (symbol-function 'remhash))"), "t");
     assert_eq!(eval("(subrp (symbol-function 'make-hash-table))"), "t");
     assert_eq!(
-        eval("(let ((h (make-hash-table :test 'equal))) \
+        eval(
+            "(let ((h (make-hash-table :test 'equal))) \
               (funcall (symbol-function 'puthash) \"k\" 7 h) \
-              (funcall #'gethash \"k\" h))"),
+              (funcall #'gethash \"k\" h))"
+        ),
         "7"
     );
     // A built-in test still answers exactly as before.
     assert_eq!(
-        eval("(let ((h (make-hash-table :test 'equal))) \
-              (puthash (list 1 2) 'v h) (gethash (list 1 2) h))"),
+        eval(
+            "(let ((h (make-hash-table :test 'equal))) \
+              (puthash (list 1 2) 'v h) (gethash (list 1 2) h))"
+        ),
         "v"
     );
     assert_eq!(

@@ -3376,9 +3376,7 @@ impl ElispHost {
             Value::Obj(id) => match self.arena.get(*id as usize) {
                 // Unreachable: `print_body` replaced a string object with a view
                 // of its text before this match. Here for exhaustiveness.
-                Some(Obj::Str(s)) => {
-                    self.print_body(&Value::Str(Arc::clone(s)), readable, depth)
-                }
+                Some(Obj::Str(s)) => self.print_body(&Value::Str(Arc::clone(s)), readable, depth),
                 Some(Obj::Symbol(s)) => {
                     if readable {
                         print_symbol_readable(&s.name)
@@ -5321,10 +5319,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             "gethash" | "puthash" | "remhash" => {
                 let table_at = if name == "puthash" { 2 } else { 1 };
                 let Some(table) = args.get(table_at) else {
-                    return Err(format!(
-                        "wrong-number-of-arguments: {name} {}",
-                        args.len()
-                    ));
+                    return Err(format!("wrong-number-of-arguments: {name} {}", args.len()));
                 };
                 if let Some(t) = crate::builtins::ht_user_test(table) {
                     return match name.as_str() {
@@ -6169,7 +6164,10 @@ pub(crate) fn load_abspath(candidate: &str) -> std::path::PathBuf {
 /// `load-in-progress` are dynamically bound and restored afterward — even if a
 /// form errors (the specstack is unwound to the pre-load depth).
 fn intrinsic_load(args: &[Value]) -> Result<Value, String> {
-    let file = match args.first().map(|v| (v, with_host(|h| h.str_text(v).map(str::to_string)))) {
+    let file = match args
+        .first()
+        .map(|v| (v, with_host(|h| h.str_text(v).map(str::to_string))))
+    {
         Some((_, Some(s))) => s,
         Some((other, None)) => {
             return Err(format!(

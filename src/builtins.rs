@@ -1458,10 +1458,7 @@ fn store_substring(h: &mut ElispHost, a: &[Value]) -> R {
             // shows the partial result exactly as Emacs's does.
             let text: String = chars.into_iter().collect();
             h.set_string_text(&a[0], text);
-            return Err(format!(
-                "args-out-of-range: {} {pos}",
-                h.print(&a[0], true)
-            ));
+            return Err(format!("args-out-of-range: {} {pos}", h.print(&a[0], true)));
         }
         chars[pos as usize] = c;
     }
@@ -2912,7 +2909,7 @@ pub(crate) fn ht_find_user(
     hashfn: &Value,
 ) -> Result<(u64, Option<u32>), String> {
     use crate::host::{call_function, with_host};
-    let hv = call_function(hashfn, &[key.clone()])?;
+    let hv = call_function(hashfn, std::slice::from_ref(key))?;
     let hk = with_host(|h| hash_key(h, 2, &hv));
     let cands: Vec<(u32, Value)> = with_host(|h| {
         let t = ht_ref(h, table)?;
@@ -3387,9 +3384,7 @@ fn string_join(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn char_to_string(h: &mut ElispHost, a: &[Value]) -> R {
     let n = as_char(h, &a[0])?;
-    Ok(h.new_string(
-        char::from_u32(n).map(|c| c.to_string()).unwrap_or_default(),
-    ))
+    Ok(h.new_string(char::from_u32(n).map(|c| c.to_string()).unwrap_or_default()))
 }
 fn string_to_char(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Int(
@@ -3435,7 +3430,10 @@ fn string_fn(h: &mut ElispHost, a: &[Value]) -> R {
 fn string_to_list(h: &mut ElispHost, a: &[Value]) -> R {
     // Emacs defines this as `(append STRING nil)`, so it accepts any sequence and
     // signals `sequencep` — not `stringp` — on anything else.
-    match h.str_text(&a[0]).map(|st| st.chars().map(|c| Value::Int(c as i64)).collect()) {
+    match h
+        .str_text(&a[0])
+        .map(|st| st.chars().map(|c| Value::Int(c as i64)).collect())
+    {
         Some(items) => Ok(h.list_from(items)),
         None => match h.seq_vec(&a[0]) {
             Some(items) => Ok(h.list_from(items)),
@@ -5033,7 +5031,10 @@ fn vconcat_fn(h: &mut ElispHost, a: &[Value]) -> R {
         }
         match h.obj(v) {
             Some(Obj::Vector(items)) => out.extend(items.clone()),
-            _ => match h.str_text(v).map(|s| s.chars().map(|c| Value::Int(c as i64)).collect::<Vec<_>>()) {
+            _ => match h
+                .str_text(v)
+                .map(|s| s.chars().map(|c| Value::Int(c as i64)).collect::<Vec<_>>())
+            {
                 Some(chars) => out.extend(chars),
                 // Fvconcat's list walk names a dotted TAIL with listp
                 // ((vconcat '(t . 9)) => listp 9) and a non-sequence with
@@ -5540,9 +5541,7 @@ fn secure_hash(h: &mut ElispHost, a: &[Value]) -> R {
     };
     // BINARY (4th optional, index 4): return the raw bytes as a string.
     if a.get(4).is_some_and(|v| !is_nil(v)) {
-        Ok(h.new_string(
-            digest.iter().map(|&b| b as char).collect::<String>(),
-        ))
+        Ok(h.new_string(digest.iter().map(|&b| b as char).collect::<String>()))
     } else {
         Ok(h.new_string(to_hex(&digest)))
     }
@@ -6607,11 +6606,7 @@ fn current_time_string(h: &mut ElispHost, a: &[Value]) -> R {
     let secs = time_arg_secs(h, a.first())?;
     let local = check_time_zone(h, a.get(1))?;
     let tm = time_decompose(secs, a.get(1), local);
-    Ok(h.new_string(fmt_time_string(
-        "%a %b %e %H:%M:%S %Y",
-        &tm,
-        secs,
-    )))
+    Ok(h.new_string(fmt_time_string("%a %b %e %H:%M:%S %Y", &tm, secs)))
 }
 
 // `tm_gmtoff` is `c_long`; `i64::from` is needed on 32-bit but a no-op here.
@@ -6775,9 +6770,7 @@ fn system_name(h: &mut ElispHost, _a: &[Value]) -> R {
     if end == 0 {
         return Ok(h.new_string("unknown"));
     }
-    Ok(h.new_string(
-        String::from_utf8_lossy(&buf[..end]).into_owned(),
-    ))
+    Ok(h.new_string(String::from_utf8_lossy(&buf[..end]).into_owned()))
 }
 
 /// Raw temp-dir string behind Emacs C `Vtemporary_file_directory`
@@ -6951,9 +6944,7 @@ fn generate_new_buffer_name(h: &mut ElispHost, a: &[Value]) -> R {
         Some(v) if !is_nil(v) => Some(as_string(h, v)?),
         _ => None,
     };
-    Ok(h.new_string(
-        h.generate_new_buffer_name(&base, ignore.as_deref()),
-    ))
+    Ok(h.new_string(h.generate_new_buffer_name(&base, ignore.as_deref())))
 }
 fn buffer_name(h: &mut ElispHost, a: &[Value]) -> R {
     let idx = match a.first() {

@@ -122,6 +122,9 @@ fn greediness_control_reaches_only_the_long_spellings() {
     assert_eq!(eval("(rx (*? \"a\"))"), "\"a*?\"");
     assert_eq!(eval("(rx (+? \"a\"))"), "\"a+?\"");
     // A counted repetition takes no greediness suffix at all.
-    assert_eq!(eval("(rx (minimal-match (** 2 3 \"a\")))"), "\"a\\\\{2,3\\\\}\"");
+    assert_eq!(
+        eval("(rx (minimal-match (** 2 3 \"a\")))"),
+        "\"a\\\\{2,3\\\\}\""
+    );
     assert_eq!(eval("(rx (minimal-match (= 2 \"a\")))"), "\"a\\\\{2\\\\}\"");
 }

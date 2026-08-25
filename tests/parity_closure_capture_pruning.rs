@@ -48,7 +48,10 @@ fn an_unreferenced_binding_is_not_captured() {
 /// bound, empty environment" — not the enclosing bindings.
 #[test]
 fn a_closure_capturing_nothing_prints_the_lexical_marker() {
-    assert_eq!(eval("(let ((n 1)) (format \"%S\" (lambda () 5)))"), "\"#[nil (5) (t)]\"");
+    assert_eq!(
+        eval("(let ((n 1)) (format \"%S\" (lambda () 5)))"),
+        "\"#[nil (5) (t)]\""
+    );
     // A parameter of the same name shadows the outer binding.
     assert_eq!(
         eval("(let ((n 1)) (format \"%S\" (lambda (n) n)))"),
@@ -89,13 +92,22 @@ fn the_kept_bindings_stay_in_environment_order() {
 /// `'n`, `#'n`, and a call head `(n)` all leave the environment empty.
 #[test]
 fn a_symbol_that_is_not_a_variable_reference_captures_nothing() {
-    assert_eq!(eval("(let ((n 1)) (format \"%S\" (lambda () 'n)))"), "\"#[nil ('n) (t)]\"");
+    assert_eq!(
+        eval("(let ((n 1)) (format \"%S\" (lambda () 'n)))"),
+        "\"#[nil ('n) (t)]\""
+    );
     assert_eq!(
         eval("(let ((n 1)) (format \"%S\" (lambda () '(n))))"),
         "\"#[nil ('(n)) (t)]\""
     );
-    assert_eq!(eval("(let ((n 1)) (format \"%S\" (lambda () #'n)))"), "\"#[nil (#'n) (t)]\"");
-    assert_eq!(eval("(let ((n 1)) (format \"%S\" (lambda () (n))))"), "\"#[nil ((n)) (t)]\"");
+    assert_eq!(
+        eval("(let ((n 1)) (format \"%S\" (lambda () #'n)))"),
+        "\"#[nil (#'n) (t)]\""
+    );
+    assert_eq!(
+        eval("(let ((n 1)) (format \"%S\" (lambda () (n))))"),
+        "\"#[nil ((n)) (t)]\""
+    );
 }
 
 /// Writing a variable captures it exactly as reading it does, and a reference

@@ -30,21 +30,27 @@ fn eval(src: &str) -> String {
 #[test]
 fn the_head_specializer_does_not_evaluate_its_symbol() {
     assert_eq!(
-        eval("(progn (cl-defgeneric gh (x)) \
-              (cl-defmethod gh ((x (head foo))) 'headfoo) (gh '(foo 1)))"),
+        eval(
+            "(progn (cl-defgeneric gh (x)) \
+              (cl-defmethod gh ((x (head foo))) 'headfoo) (gh '(foo 1)))"
+        ),
         "headfoo"
     );
     assert_eq!(
-        eval("(let ((foo 'bar)) (progn (cl-defgeneric gq (x)) \
-              (cl-defmethod gq ((x (head foo))) 'hf) (gq '(foo 1))))"),
+        eval(
+            "(let ((foo 'bar)) (progn (cl-defgeneric gq (x)) \
+              (cl-defmethod gq ((x (head foo))) 'hf) (gq '(foo 1))))"
+        ),
         "hf"
     );
     // `head` is more specific than the type it also matches.
     assert_eq!(
-        eval("(progn (cl-defgeneric gh2 (x)) \
+        eval(
+            "(progn (cl-defgeneric gh2 (x)) \
               (cl-defmethod gh2 ((x (head foo))) 'hf) \
               (cl-defmethod gh2 ((x list)) 'lst) \
-              (list (gh2 '(foo 1)) (gh2 '(bar 1))))"),
+              (list (gh2 '(foo 1)) (gh2 '(bar 1))))"
+        ),
         "(hf lst)"
     );
 }
@@ -62,7 +68,10 @@ fn cl_defgeneric_answers_nil_and_still_takes_a_default_body() {
 /// which is why the old error reported that cons as the function.
 #[test]
 fn pcase_lambda_destructures_its_parameters() {
-    assert_eq!(eval("(funcall (pcase-lambda (`(,a ,b)) (+ a b)) '(1 2))"), "3");
+    assert_eq!(
+        eval("(funcall (pcase-lambda (`(,a ,b)) (+ a b)) '(1 2))"),
+        "3"
+    );
     assert_eq!(
         eval("(funcall (pcase-lambda (`(,a . ,b)) (list a b)) '(1 . 2))"),
         "(1 2)"
@@ -87,9 +96,18 @@ fn pcase_lambda_destructures_its_parameters() {
 /// which a COMPOUND specifier has none of. It routes through `cl-typep`.
 #[test]
 fn pcase_cl_type_takes_a_compound_specifier() {
-    assert_eq!(eval("(pcase 3 ((cl-type (integer 0 5)) 'in) (_ 'out))"), "in");
-    assert_eq!(eval("(pcase 9 ((cl-type (integer 0 5)) 'in) (_ 'out))"), "out");
-    assert_eq!(eval("(pcase 3.5 ((cl-type (float 0 5)) 'in) (_ 'out))"), "in");
+    assert_eq!(
+        eval("(pcase 3 ((cl-type (integer 0 5)) 'in) (_ 'out))"),
+        "in"
+    );
+    assert_eq!(
+        eval("(pcase 9 ((cl-type (integer 0 5)) 'in) (_ 'out))"),
+        "out"
+    );
+    assert_eq!(
+        eval("(pcase 3.5 ((cl-type (float 0 5)) 'in) (_ 'out))"),
+        "in"
+    );
     // The plain symbol spellings still work.
     assert_eq!(eval("(pcase 3 ((cl-type integer) 'i) (_ 'o))"), "i");
     assert_eq!(eval("(pcase \"x\" ((cl-type string) 's) (_ 'o))"), "s");
@@ -109,7 +127,10 @@ fn string_pixel_width_measures_display_columns_with_tab_stops() {
     assert_eq!(eval("(string-pixel-width \"\\t\")"), "8");
     assert_eq!(eval("(string-pixel-width \"\\t\\t\")"), "16");
     assert_eq!(eval("(string-pixel-width \"abcdefgh\\tx\")"), "17");
-    assert_eq!(eval("(let ((tab-width 4)) (string-pixel-width \"ab\\tc\"))"), "5");
+    assert_eq!(
+        eval("(let ((tab-width 4)) (string-pixel-width \"ab\\tc\"))"),
+        "5"
+    );
     // A newline starts a new line; the widest one wins.
     assert_eq!(eval("(string-pixel-width \"a\\nb\")"), "1");
     // Double-width characters count 2; text properties count 0.

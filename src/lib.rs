@@ -175,7 +175,9 @@ pub fn format_error(e: &str) -> String {
     let obj = host::with_host(|h| h.make_error_object(e));
     let func = host::with_host(|h| h.intern("error-message-string"));
     match host::call_function(&func, &[obj]) {
-        Ok(v) => host::with_host(|h| h.str_text(&v).map(str::to_string)).unwrap_or_else(|| e.to_string()),
+        Ok(v) => {
+            host::with_host(|h| h.str_text(&v).map(str::to_string)).unwrap_or_else(|| e.to_string())
+        }
         _ => e.to_string(),
     }
 }

@@ -42,7 +42,10 @@ fn eval(src: &str) -> String {
 /// function returns is one cell, not a fresh copy per call).
 #[test]
 fn aset_writes_through_every_reference_without_losing_eq() {
-    assert_eq!(eval("(let ((s (copy-sequence \"ab\"))) (aset s 0 ?z) s)"), "\"zb\"");
+    assert_eq!(
+        eval("(let ((s (copy-sequence \"ab\"))) (aset s 0 ?z) s)"),
+        "\"zb\""
+    );
     assert_eq!(eval("(let ((s \"abc\")) (eq s s))"), "t");
     assert_eq!(
         eval("(let* ((a (copy-sequence \"ab\")) (b a)) (aset a 0 ?z) b)"),
@@ -85,7 +88,10 @@ fn a_stored_string_sees_a_later_write() {
 /// character it stored rather than the string.
 #[test]
 fn aset_argument_checks_are_in_emacs_order() {
-    assert_eq!(eval("(let ((s (copy-sequence \"ab\"))) (aset s 0 ?z))"), "122");
+    assert_eq!(
+        eval("(let ((s (copy-sequence \"ab\"))) (aset s 0 ?z))"),
+        "122"
+    );
     assert_eq!(
         eval("(condition-case e (let ((s (copy-sequence \"ab\"))) (aset s 5 'x)) (error e))"),
         "(args-out-of-range \"ab\" 5)"
@@ -157,7 +163,10 @@ fn clear_string_nulls_in_place_and_fillarray_takes_a_string() {
         eval("(let ((s (copy-sequence \"abc\"))) (clear-string s) (append s nil))"),
         "(0 0 0)"
     );
-    assert_eq!(eval("(let ((s (copy-sequence \"abc\"))) (clear-string s))"), "nil");
+    assert_eq!(
+        eval("(let ((s (copy-sequence \"abc\"))) (clear-string s))"),
+        "nil"
+    );
     assert_eq!(
         eval("(let ((s (copy-sequence \"abc\"))) (clear-string s) (length s))"),
         "3"
