@@ -4822,6 +4822,14 @@ PAREN controls the surrounding group: a string is used as the opening bracket,
 ;; yet: parallel `for` clauses, `across`, `with`, `into`, `when`/`unless`/`if`
 ;; conditionals, destructuring.
 (defun cl-loop--kw (x) (and (symbolp x) (symbol-name x)))
+(defun cl-loop--hash-pairs (h)
+  "The (KEY . VALUE) pairs of hash table H, in the table's own slot order.
+Built with `maphash' rather than `hash-table-keys' so it depends only on a
+subr, and so the order is the one `maphash' walks -- which is the order Emacs
+reports and the one a hash table's slots are observable in."
+  (let ((acc nil))
+    (maphash (lambda (k v) (setq acc (cons (cons k v) acc))) h)
+    (nreverse acc)))
 (defun cl-loop--clause-p (x)
   (member (cl-loop--kw x)
           '("for" "as" "repeat" "while" "until" "with" "collect" "collecting"
@@ -4904,6 +4912,7 @@ PAREN controls the surrounding group: a string is used as the opening bracket,
             (setq steps (cons (list 'setq tv (list 'cdr tv)) steps))
             (setq c (nthcdr 4 c))))
          ;; for V being [the|each] KIND of SOURCE  (elements / hash-keys / hash-values)
+         ;; (`cl-loop--hash-pairs' is defined below, next to the other helpers.)
          ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "being"))
           (let ((var (nth 1 c)) (tv (make-symbol "tail")) (ht (make-symbol "ht")) (r (nthcdr 3 c)))
             (when (member (cl-loop--kw (car r)) '("the" "each")) (setq r (cdr r)))
@@ -4913,8 +4922,12 @@ PAREN controls the surrounding group: a string is used as the opening bracket,
               (let* ((source (car r))
                      (hashp (member kind '("hash-keys" "hash-key" "hash-values" "hash-value")))
                      (keysp (member kind '("hash-keys" "hash-key")))
-                     (listform (cond (keysp (list 'hash-table-keys ht))
-                                     ((member kind '("hash-values" "hash-value")) (list 'hash-table-values ht))
+                     ;; Walk (KEY . VALUE) PAIRS, whichever of the two is the
+                     ;; loop variable: `using (hash-keys K)' on a value
+                     ;; iteration has to reach the key, and a key cannot be
+                     ;; recovered from a value the way `gethash' recovers a
+                     ;; value from a key.
+                     (listform (cond (hashp (list 'cl-loop--hash-pairs ht))
                                      (t (list 'append source nil))))
                      (usevar nil) (usekind nil))
                 (setq r (cdr r))
@@ -4927,10 +4940,19 @@ PAREN controls the surrounding group: a string is used as the opening bracket,
                 (when usevar
                   (setq binds (cons (list usevar (if (equal usekind "index") 0 nil)) binds)))
                 (setq test (if (eq test t) tv (list 'and test tv)))
-                (setq pre (cons (list 'setq var (list 'car tv)) pre))
-                ;; companion: value for a key-iteration (the common form).
-                (when (and usevar keysp (member usekind '("hash-values" "hash-value")))
-                  (setq pre (cons (list 'setq usevar (list 'gethash var ht)) pre)))
+                (setq pre
+                      (cons (list 'setq var
+                                  (cond ((not hashp) (list 'car tv))
+                                        (keysp (list 'car (list 'car tv)))
+                                        (t (list 'cdr (list 'car tv)))))
+                            pre))
+                ;; companion: the OTHER half of the pair, in either direction.
+                (when (and usevar hashp)
+                  (cond
+                   ((and keysp (member usekind '("hash-values" "hash-value")))
+                    (setq pre (cons (list 'setq usevar (list 'cdr (list 'car tv))) pre)))
+                   ((and (not keysp) (member usekind '("hash-keys" "hash-key")))
+                    (setq pre (cons (list 'setq usevar (list 'car (list 'car tv))) pre)))))
                 ;; using (index V): V counts iterations from 0.
                 (when (and usevar (equal usekind "index"))
                   (setq steps (cons (list 'setq usevar (list '1+ usevar)) steps)))
