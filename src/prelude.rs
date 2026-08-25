@@ -3333,6 +3333,60 @@ COMPARE-FN with side effects, and through how many times it is called."
           (setq res p)
         (setq p (1+ p))))
     (or res (if limit lim nil))))
+;; `Ftext_property_any' / `Ftext_property_not_all' (textprop.c): the first
+;; position in [START, END) where PROP is -- or is not -- `eq' to VALUE, nil if
+;; there is none.  OBJECT is a buffer or a string, defaulting to the current
+;; buffer.  An empty range answers nil for both, and a range outside OBJECT is
+;; `(args-out-of-range START END)' -- which `get-text-property' already reports.
+(defun text-property--validate-range (start end object)
+  "Signal unless [START, END] lies within OBJECT, as `validate_interval_range' does.
+The datum names START and END as GIVEN, which is why the walk cannot just let
+`get-text-property' report the first bad position it reaches."
+  (let ((lo 0) (hi 0))
+    (if (stringp object)
+        (setq lo 0 hi (length object))
+      ;; `set-buffer' + `unwind-protect' rather than `with-current-buffer':
+      ;; that macro is defined further down this file, and a macro used before
+      ;; its definition compiles as a CALL ("macro called as a function").
+      (if (bufferp object)
+          (let ((old (current-buffer)))
+            (unwind-protect
+                (progn (set-buffer object) (setq lo (point-min) hi (point-max)))
+              (set-buffer old)))
+        (setq lo (point-min) hi (point-max))))
+    (unless (and (<= lo (min start end)) (<= (max start end) hi))
+      (signal 'args-out-of-range (list start end)))))
+(defun text-property-any (start end prop value &optional object)
+  "Return the first position in [START, END) where PROP is `eq' to VALUE."
+  (text-property--validate-range start end object)
+  (let ((pos start) (found nil))
+    (while (and (null found) (< pos end))
+      (if (eq (get-text-property pos prop object) value)
+          (setq found pos)
+        (setq pos (1+ pos))))
+    found))
+(defun text-property-not-all (start end prop value &optional object)
+  "Return the first position in [START, END) where PROP is not `eq' to VALUE."
+  (text-property--validate-range start end object)
+  (let ((pos start) (found nil))
+    (while (and (null found) (< pos end))
+      (if (eq (get-text-property pos prop object) value)
+          (setq pos (1+ pos))
+        (setq found pos)))
+    found))
+
+;; `listify-key-sequence' (subr.el).  A key sequence may be a vector of events
+;; or a string of characters; a UNIBYTE string encodes the meta bit as the high
+;; bit, so a character above 127 is converted back to the meta modifier.  A
+;; multibyte string holds real characters and is taken as-is.
+(defconst listify-key-sequence-1 (logior 128 ?\M-\C-@))
+(defun listify-key-sequence (key)
+  "Convert the key sequence KEY to a list of events."
+  (if (or (vectorp key) (multibyte-string-p key))
+      (append key nil)
+    (mapcar (lambda (c) (if (> c 127) (logxor c listify-key-sequence-1) c))
+            key)))
+
 (defun next-property-change (pos &optional object limit)
   (let* ((end (if (stringp object) (length object) (point-max)))
          (lim (if limit (min limit end) end))
