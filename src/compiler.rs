@@ -409,14 +409,77 @@ fn try_native_op(
             b.emit(Op::LoadInt(1), 0);
             b.emit(Op::Sub, 0);
         }
-        "<" if args.len() == 2 => binop(h, b, Op::NumLt)?,
-        ">" if args.len() == 2 => binop(h, b, Op::NumGt)?,
-        "<=" if args.len() == 2 => binop(h, b, Op::NumLe)?,
-        ">=" if args.len() == 2 => binop(h, b, Op::NumGe)?,
-        "=" if args.len() == 2 => binop(h, b, Op::NumEq)?,
+        // The comparisons. `native_cmp_op` is the ONE definition of which names
+        // these are, shared with `lowers_to_native_bool` so the two cannot drift
+        // — saying "this pushes a Bool" when the lowering did not would drop a
+        // conversion that IS needed.
+        _ if native_cmp_op(name).is_some() && args.len() == NATIVE_CMP_ARITY => {
+            binop(h, b, native_cmp_op(name).expect("checked"))?
+        }
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+/// Arity at which a comparison lowers natively; both operands are evaluated
+/// before the op runs, so the type check the host would do is not skipped.
+const NATIVE_CMP_ARITY: usize = 2;
+
+/// The fusevm comparison op `name` lowers to, if any.
+///
+/// These are the only ops elisprs emits that push a `Value::Bool` rather than
+/// an elisp value, which is what makes [`lowers_to_native_bool`] answerable.
+fn native_cmp_op(name: &str) -> Option<Op> {
+    Some(match name {
+        "<" => Op::NumLt,
+        ">" => Op::NumGt,
+        "<=" => Op::NumLe,
+        ">=" => Op::NumGe,
+        "=" => Op::NumEq,
+        _ => return None,
+    })
+}
+
+/// Whether `form` lowers to one of those comparisons — i.e. whether compiling it
+/// leaves a `Value::Bool` on the stack rather than an arbitrary elisp value.
+///
+/// Mirrors the three conditions the lowering itself applies, in
+/// `compile_call` and `try_native_op`: the operator resolves to a primitive
+/// (a user `defun` shadowing `<` must NOT take this path), the name is one
+/// `native_cmp_op` knows, and the arity is the native one.
+fn lowers_to_native_bool(h: &mut ElispHost, form: &Value) -> bool {
+    let Some(elems) = h.list_vec(form) else {
+        return false;
+    };
+    if elems.len() != NATIVE_CMP_ARITY + 1 {
+        return false;
+    }
+    let Some(name) = h.sym_name(&elems[0]) else {
+        return false;
+    };
+    native_cmp_op(&name).is_some() && h.is_primitive_fn(&name)
+}
+
+/// Compile CONDITION so that a fusevm boolean is left on the stack.
+///
+/// `TRUTHY` maps an arbitrary elisp value to `Bool(non-nil)`. When the
+/// condition's own lowering already produced a `Value::Bool` — exactly the
+/// native comparisons — that conversion is the identity, and emitting it costs
+/// a host round-trip on every evaluation of the condition, which for a `while`
+/// test is every iteration.
+///
+/// It also cost the JIT. fusevm requires a boolean to be consumed by the very
+/// next op (`bool_is_consumed_in_place`, jit.rs): with `TRUTHY` sitting between
+/// the comparison and the branch, the comparison was refused, and with it the
+/// whole loop body — every elisprs loop reported `trace-eligible=false`. Eliding
+/// the redundant op is what makes the body eligible.
+fn compile_condition(h: &mut ElispHost, b: &mut ChunkBuilder, cond: &Value) -> Result<(), String> {
+    let already_bool = lowers_to_native_bool(h, cond);
+    compile_form(h, b, cond)?;
+    if !already_bool {
+        b.emit(Op::Extended(ops::TRUTHY, 0), 0);
+    }
+    Ok(())
 }
 
 fn is_unsupported_special(kw: &str) -> bool {
@@ -683,8 +746,7 @@ fn compile_prog1(h: &mut ElispHost, b: &mut ChunkBuilder, forms: &[Value]) -> Re
 fn compile_if(h: &mut ElispHost, b: &mut ChunkBuilder, parts: &[Value]) -> Result<(), String> {
     let cond = parts.first().cloned().unwrap_or(Value::Undef);
     let then = parts.get(1).cloned().unwrap_or(Value::Undef);
-    compile_form(h, b, &cond)?;
-    b.emit(Op::Extended(ops::TRUTHY, 0), 0);
+    compile_condition(h, b, &cond)?;
     let jf = b.emit(Op::JumpIfFalse(0), 0);
     compile_form(h, b, &then)?;
     let jend = b.emit(Op::Jump(0), 0);
@@ -703,8 +765,7 @@ fn compile_when(
     polarity: bool,
 ) -> Result<(), String> {
     let cond = parts.first().cloned().unwrap_or(Value::Undef);
-    compile_form(h, b, &cond)?;
-    b.emit(Op::Extended(ops::TRUTHY, 0), 0);
+    compile_condition(h, b, &cond)?;
     let jmp = if polarity {
         b.emit(Op::JumpIfFalse(0), 0)
     } else {
@@ -754,8 +815,7 @@ fn compile_andor(
 
 fn compile_while(h: &mut ElispHost, b: &mut ChunkBuilder, parts: &[Value]) -> Result<(), String> {
     let start = b.current_pos();
-    compile_form(h, b, parts.first().unwrap_or(&Value::Undef))?;
-    b.emit(Op::Extended(ops::TRUTHY, 0), 0);
+    compile_condition(h, b, parts.first().unwrap_or(&Value::Undef))?;
     let jexit = b.emit(Op::JumpIfFalse(0), 0);
     compile_progn(h, b, parts.get(1..).unwrap_or(&[]))?;
     b.emit(Op::Pop, 0); // discard each iteration's body value
@@ -785,7 +845,11 @@ fn compile_cond(h: &mut ElispHost, b: &mut ChunkBuilder, clauses: &[Value]) -> R
             b.patch_jump(jnext, next);
             b.emit(Op::Pop, 0); // falsy: drop test value, continue
         } else {
-            b.emit(Op::Extended(ops::TRUTHY, 0), 0);
+            // The test value is consumed, so the same elision applies; the
+            // one-body form above must keep its `Dup`ped value and cannot.
+            if !lowers_to_native_bool(h, &parts[0]) {
+                b.emit(Op::Extended(ops::TRUTHY, 0), 0);
+            }
             let jnext = b.emit(Op::JumpIfFalse(0), 0);
             compile_progn(h, b, &parts[1..])?;
             let jend = b.emit(Op::Jump(0), 0);
