@@ -5005,9 +5005,17 @@ If all LST elements are zeros or LST is nil, return zero."
           (if arounds (cl--chain arounds core args) (funcall core args)))))))
 (defun cl--method-spec (sp)
   ;; Build a FORM that evaluates to the runtime specializer for arglist entry SP.
-  (cond ((and (consp sp) (memq (car sp) '(eql head)))
-         (list 'list (list 'quote (car sp)) (car (cdr sp))))
-        (t (list 'quote sp))))
+  (cond
+   ;; `(eql EXPR)' evaluates EXPR (Emacs 30 lifted the literal-only rule)...
+   ((and (consp sp) (eq (car sp) 'eql))
+    (list 'list (list 'quote 'eql) (car (cdr sp))))
+   ;; ...but `(head SYMBOL)' does NOT: it names the symbol the argument's car
+   ;; must be `eq' to.  Evaluating it made `(cl-defmethod g ((x (head foo))) …)'
+   ;; a `void-variable foo', and where `foo' happened to be bound it dispatched
+   ;; on that value instead: `(let ((foo 'bar)) …(g '(foo 1)))' is `hf' in Emacs.
+   ((and (consp sp) (eq (car sp) 'head))
+    (list 'quote (list 'head (car (cdr sp)))))
+   (t (list 'quote sp))))
 (defmacro cl-defmethod (name &rest body)
   ;; (cl-defmethod NAME [QUALIFIER] ARGLIST BODY...) — QUALIFIER is an optional
   ;; :before/:after/:around keyword.
@@ -5042,9 +5050,11 @@ If all LST elements are zeros or LST is nil, return zero."
      (when real
        (list (list 'cl--add-method (list 'quote name) nil nil
                    (cons 'lambda (cons arglist real)))))
+     ;; `cl-defgeneric' answers nil, not its own name: the trailing `defun'
+     ;; would otherwise leave the symbol as the `progn''s value.
      (list (list 'defun name '(&rest --args--)
                  (list 'cl--generic-dispatch (list 'quote name) '--args--))
-           (list 'quote name)))))
+           nil))))
 (defmacro cl-typecase (expr &rest clauses)
   `(let ((--ct-v-- ,expr))
      (cond ,@(mapcar
@@ -5811,6 +5821,34 @@ NEGATED non-nil negates it."
 `minimal-match'/`maximal-match' rebind it around their body; only the
 `zero-or-more'/`one-or-more'/`zero-or-one' spellings consult it, because the
 `*'/`+'/`?' and `*?'/`+?'/`??' spellings state their own greediness.")
+
+(defvar tab-width 8
+  "Distance between tab stops (for display of tab characters), in columns.
+A buffer-local variable in Emacs; a plain global here, since elisprs has no
+per-buffer display model.  `string-pixel-width' and `char-width' read it.")
+
+;; `string-pixel-width' (lisp/emacs-lisp/subr-x.el) renders STRING in a temp
+;; buffer and asks `window-text-pixel-size' for its width.  In batch every
+;; character is one pixel wide per display column, so the pixel width IS the
+;; display-column advance -- which is NOT `string-width': a TAB advances to the
+;; next multiple of `tab-width' rather than counting a flat `tab-width' columns,
+;; so `(string-pixel-width "ab\tc")' is 9 where `(string-width "ab\tc")' is 11.
+;; A newline starts a new line and the widest line wins, so
+;; `(string-pixel-width "a\nb")' is 1.
+(defun string-pixel-width (string &optional _buffer)
+  "Return the width of STRING in pixels, as `emacs -Q --batch' measures it."
+  (let ((widest 0) (col 0) (i 0) (n (length string)) (c nil))
+    (while (< i n)
+      (setq c (aref string i))
+      (cond ((eq c ?\n)
+             (when (> col widest) (setq widest col))
+             (setq col 0))
+            ((eq c ?\t)
+             (setq col (* tab-width (1+ (/ col tab-width)))))
+            (t (setq col (+ col (char-width c)))))
+      (setq i (1+ i)))
+    (when (> col widest) (setq widest col))
+    widest))
 
 (defun rx--symbol (s)
   (cond
