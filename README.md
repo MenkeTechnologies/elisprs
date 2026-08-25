@@ -117,7 +117,7 @@ elisp --version
 | Strings | `concat string= string-equal string< upcase downcase number-to-string string-to-number string-split` |
 | IO/format | `format message princ prin1 prin1-to-string print terpri` |
 | Functional | `funcall apply mapcar mapc sort identity` |
-| Regexp | `string-match string-match-p match-beginning match-end match-string match-data set-match-data replace-regexp-in-string regexp-quote` (+ `save-match-data`) |
+| Regexp | `string-match string-match-p match-beginning match-end match-string match-data set-match-data replace-regexp-in-string regexp-quote regexp-opt regexp-opt-charset regexp-opt-depth looking-at looking-back re-search-forward re-search-backward` (+ `save-match-data`; `regexp-opt` and `rx` reproduce Emacs's *output*, not just its language) |
 | Markers | `make-marker point-marker copy-marker set-marker move-marker marker-position marker-buffer markerp marker-insertion-type set-marker-insertion-type` |
 | Text properties | `propertize put-text-property get-text-property set-text-properties add-text-properties remove-text-properties text-properties-at next-single-property-change next-property-change previous-single-property-change get-char-property` |
 

@@ -4689,3 +4689,182 @@ compiler. Both are real work with a real payoff and neither is in this round.
   for the same loop allocating nothing). Pre-existing for every other heap
   type; new for strings as of round 22, which is the price of the identity
   `aset` needs.
+
+## Round 24 — sweeping the surfaces the parity files had not reached
+
+Reference: **GNU Emacs 31.1** (`/opt/homebrew/bin/emacs`); see round 22's
+header. Round 23 closed the items earlier rounds had listed, so this one went
+looking instead: the 43 `parity_*.rs` files were enumerated first, and the
+sweep aimed at what they do NOT cover. Six probe sets, 250 forms:
+
+```text
+file-name functions                        54 forms   1 divergence
+buffers / narrowing / markers              30 forms   1
+errors / loops / setf places / printer     40 forms   2
+obarrays / char-tables / sort / plists     40 forms   0
+map.el / subr-x threading / seq.el         46 forms   1
+regexp / replacement / key sequences       40 forms   4
+```
+
+Two of those readings were WRONG on the first pass and are worth recording as
+method rather than as findings. `(progn (string-match "z" "abc") (match-data))`
+looked like a divergence and is not: a failed match leaves the previous match
+data alone, so the answer depends on whatever ran earlier IN THE SAME PROCESS,
+and the two engines had run different earlier forms — `regexp-opt` itself calls
+`string-match`. Re-run in isolation, every match-data form agrees. Separately, a
+whole probe set reported as divergent because Emacs needs `(require 'map)` and
+elisprs preloads it; the driver now requires the libraries on the Emacs side.
+
+### R24-A. Compiler macros were never applied — ✅ FIXED
+
+A function may declare a rewrite for its own call sites. Emacs applies it in
+`macroexp--expand-all`, which is why the same form answers differently through
+`load` and through plain `eval`:
+
+```text
+(eval '(let ((l nil)) (add-to-list 'l 1) l) t)          ; (void-variable l)
+(macroexpand-all '(let ((l nil)) (add-to-list 'l 1) l))
+  => (let ((l nil)) (if (member 1 l) l (setq l (cons 1 l))) l)
+```
+
+elisprs had the storage (`function-put 'compiler-macro`) and the `declare`
+bridge, but nothing consulted them, so `add-to-list` on a lexical variable was
+`(void-variable l)` on both paths. `macroexpand_all` applies them now and the
+`eval` builtin deliberately does not — that difference is the mechanism, not an
+accident of it.
+
+The lookup lives in an elisp plist, so asking would cost an elisp call on every
+call form in every file. `ElispHost::compiler_macros` is the pre-filter: the one
+place the property is written records the symbol handle, and the elisp lookup
+runs only for a head that really has one. A handler that errors, or that answers
+its own argument, leaves the form alone, as `macroexp--compiler-macro` does.
+
+`add-to-list` gets subr.el's handler, registered by hand rather than through
+`declare`: this prelude is ONE file and the bridge is defined far below
+`add-to-list`, so a `declare` there is silently dropped. Its body is the
+faithful one too — `member` / `memq` / `memql` / a hand walk, chosen by
+COMPARE-FN — which is observable through a COMPARE-FN with side effects and
+through how many times it is called.
+
+### R24-B. `expand-file-name` did not always answer an absolute name — ✅ FIXED
+
+```text
+                                        emacs 31.1                elisprs (before)
+(expand-file-name "b" "a")              "<default-directory>/a/b"  "a/b"
+(expand-file-name "x" "")               "<default-directory>/x"    "x"
+(expand-file-name "a" "~")              "/h/a"                     "~/a"
+(expand-file-name "" "/a")              "/a"                       "/a/"
+```
+
+DIR is itself expanded when it is relative, empty or `~`-prefixed. Separately
+the trailing slash was read off the JOINED path rather than off NAME — DIR
+always has one — while `(expand-file-name "b/" "/a")` still keeps it. The one
+degenerate call Emacs's C leaves alone, `("" "")` answering `""`, is
+implemented as the special case it is rather than left divergent.
+
+### R24-C. `narrow-to-region` clamped where Emacs signals — ✅ FIXED
+
+`(narrow-to-region 0 3)` silently narrowed from 1; it is
+`(args-out-of-range 0 3)`, naming the arguments in the order GIVEN rather than
+the swapped order. An inverted but in-range pair is still accepted and swapped,
+and the check is against the BUFFER rather than the current restriction —
+narrowing wider than the current restriction is legal and must not signal.
+
+### R24-D. Three void functions — ✅ FIXED
+
+`text-property-any` and `text-property-not-all` (textprop.c). The range check
+is separate from the walk on purpose: the datum names START and END as given,
+so letting `get-text-property` report the first bad position it reached would
+answer `(args-out-of-range 8 8)` where Emacs answers `(args-out-of-range 0 9)`.
+
+`listify-key-sequence` (subr.el). A UNIBYTE string encodes the meta bit as the
+high bit, so a character above 127 converts back to the meta modifier, while a
+vector or a MULTIBYTE string holds real events and is taken as-is — which is
+why `(listify-key-sequence (string 200 201))` is `(200 201)` and not two meta
+characters.
+
+`looking-back` (subr.el) — `looking-at` for the text before point. Writing it
+is what exposed R24-F.
+
+### R24-E. `let-alist` did not descend, and `.foo` printed escaped — ✅ FIXED
+
+`(let-alist '((a . 1) (b . ((c . 2)))) .b.c)` answered nil: the macro bound the
+whole `.b.c` name as one key. A dotted chain descends, which is also why an
+intermediate that is not a list signals `listp` rather than answering nil.
+Ported from let-alist.el including the escape hatch — a SECOND leading dot
+means the ordinary symbol, so `..a` is the lexical variable `.a` — and the
+expansion now matches Emacs's byte for byte, gensym included.
+
+Underneath it was a printer bug: `(prin1-to-string (intern ".foo"))` was
+`"\.foo"` where Emacs prints `".foo"`. A leading dot needs an escape only when
+the name would otherwise read as something else — `.` is the dotted-pair
+separator, `.5` is a number — so the condition is "the whole name is dots".
+Verified three ways: `--eval`, a loaded file, and a read round-trip.
+`tests/eval.rs::emacs_parity_symbol_read_print_escapes` had asserted the
+escaped form; that assertion never matched the oracle, so it is corrected there
+rather than worked around, with `.`, `..`, `.5` and a round-trip added beside
+it.
+
+### R24-F. `regexp-opt` built the right language in the wrong shape — ✅ FIXED
+
+```text
+                                    emacs 31.1              elisprs (before)
+(regexp-opt '("a" "b" "c"))         "[abc]"                 "\(?:a\|b\|c\)"
+(regexp-opt '("ab" "ac"))           "\(?:a[bc]\)"           "\(?:ab\|ac\)"
+(regexp-opt '("cat" "cot" "cut"))   "\(?:c\(?:[aou]t\)\)"   "\(?:cat\|cot\|cut\)"
+(regexp-opt '("foo" "foobar"))      "\(?:foo\(?:bar\)?\)"   "\(?:foo\|foobar\)"
+(regexp-opt '("ad" "d"))            "\(?:a?d\)"             "\(?:ad\|d\)"
+```
+
+Joining with `\|` matches the same strings, so nothing failed — but the output
+is observable wherever a caller inspects or composes it. `regexp-opt-group` and
+`regexp-opt-charset` are ported from regexp-opt.el. The charset walk goes over
+the sorted character list rather than a char-table, which is the same traversal
+(`map-char-table` does not exist here) and keeps the rule that a run becomes a
+RANGE only above three characters — `(?a ?b ?c)` is `"[abc]"`, `(?a ?b ?c ?d)`
+is `"[a-d]"`.
+
+That closes the `rx` `or` gap R23 left open, and two more came with it. Nested
+`or`s flatten, and branches that all denote character SETS merge into one, so
+`(rx (or (any "a-z") (any "0-9")))` is `"[0-9a-z]"`. The `or` rendering is
+deliberately NOT the `any` one: `(rx (or "a" "b" "c"))` is `"[abc]"` where
+`(rx (in "abc"))` is `"[a-c]"` — `regexp-opt` sorts but does not condense.
+
+Making that visible needed the precedence rule too: alternation binds loosest,
+so it is BARE when alone — as the whole `rx`, inside `group`, under
+`rx-to-string` with NO-GROUP, however deeply nested in single-element sequences
+— and takes a shy group only when it has a sibling or a quantifier.
+
+### R24-G. `re-search-backward` searched forwards — ✅ FIXED
+
+```text
+(with-temp-buffer (insert "aaa") (goto-char 4)
+  (list (re-search-backward "a+" nil t) (match-beginning 0) (match-end 0)))
+  emacs 31.1   (3 3 4)
+  elisprs      (1 1 4)
+
+… the same from (goto-char 3)
+  emacs 31.1   (2 2 3)
+  elisprs      (nil …)          ; no match found at all
+```
+
+It collected non-overlapping FORWARD matches and kept the last one ending at or
+before point. Emacs tries START positions from point downwards and takes the
+first that matches, and bounds the match END at the position the search started
+from — the second line is that bound: at start 2 an unbounded `a+` would reach
+4, past where the search began. BOUND was ignored entirely, where
+`search-backward` already honoured it for a literal search.
+
+### Still open
+
+- **Generators** — unchanged from R23, including the measured size of what a
+  faithful `generator.el` CPS transform costs and why a partial one is the
+  wrong answer.
+- **`eq` on floats** — decided in R23-F with the measurement; the precondition
+  for revisiting is a collector.
+- **No unibyte/multibyte string distinction** — unchanged from R22.
+- **The arena has no collector** — unchanged from R23.
+- **`(expand-file-name "~user/x")`** — `~` expands through `$HOME`, but a
+  `~USER` prefix needs a passwd lookup and is left as-is. Named here because
+  the rest of `expand-file-name` is now exact, so this is the only remaining
+  hole in it.

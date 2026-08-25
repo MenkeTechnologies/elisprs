@@ -41,6 +41,15 @@ All notable changes to elisprs are documented here. The format follows
   so `(string-pixel-width "ab\tc")` is 9 where `(string-width "ab\tc")` is 11.
 - **`rx`: `(category …)`, `*?`/`+?`**, and the `not` spellings
   `(not (syntax X))`, `(not (not X))` and `(not CLASS)`.
+- **`looking-back`**, **`text-property-any`**, **`text-property-not-all`** and
+  **`listify-key-sequence`** — all previously void.
+- **`regexp-opt-charset`**, and `regexp-opt`/`regexp-opt-group` ported from
+  regexp-opt.el.
+- **Compiler macros are applied by `macroexpand-all`.** A function may declare
+  a rewrite for its own call sites; elisprs had the storage and the `declare`
+  bridge but nothing consulted them. `eval` deliberately does not apply them,
+  which is why `(add-to-list 'l 1)` on a lexical `l` works in a loaded file and
+  signals through `eval` — in Emacs too.
 - **The hook API's missing four.** `remove-hook` (subr.el:2186, including the
   depth-alist cleanup of bug#46414), `run-hook-with-args-until-success`,
   `run-hook-with-args-until-failure` and `run-hook-wrapped` — all previously
@@ -76,6 +85,31 @@ All notable changes to elisprs are documented here. The format follows
   value of the wrong type fails the clause instead of signalling out of it.
 
 ### Fixed
+- **`regexp-opt` built the right language in the wrong shape.** It joined the
+  strings with `\|`; Emacs factors common prefixes and suffixes and folds
+  one-character alternatives into a character set, so
+  `(regexp-opt '("cat" "cot" "cut"))` is `"\(?:c\(?:[aou]t\)\)"` and
+  `(regexp-opt '("a" "b" "c"))` is `"[abc]"`. That also closes `rx`'s `or`:
+  literal branches go through `regexp-opt` (which sorts but does not condense,
+  unlike `(any …)`), nested `or`s flatten, branches that all denote character
+  sets merge into one, and an alternation is bare unless a sibling or a
+  quantifier needs it grouped.
+- **`re-search-backward` searched forwards.** It kept the last non-overlapping
+  forward match before point; Emacs tries START positions from point downwards,
+  takes the first that matches, and bounds the match end at the position the
+  search started from — so `a+` in `"aaa"` from point 4 is a one-character
+  match at 3, not the three-character match at 1. BOUND was ignored entirely.
+- **`expand-file-name` did not always answer an absolute name.** A relative,
+  empty or `~`-prefixed DIR is now expanded first, and the trailing slash comes
+  from NAME rather than from the joined path.
+- **`narrow-to-region` clamped where Emacs signals** — `(narrow-to-region 0 3)`
+  is `(args-out-of-range 0 3)`, naming the arguments in the order given.
+- **`let-alist` did not descend a dotted chain.** `.b.c` was bound as one key;
+  it reads `(cdr (assq 'c (cdr (assq 'b ALIST))))`, and `..a` is the escape
+  hatch for the ordinary symbol `.a`.
+- **A leading-dot symbol printed escaped.** `(prin1-to-string (intern ".foo"))`
+  was `"\.foo"`; the escape is needed only when the name would otherwise read
+  as something else (`.` is the dotted-pair separator, `.5` is a number).
 - **`rx`'s character alternatives were concatenation.** Emacs sorts the
   characters, merges adjacent ones into ranges, moves `]` to the front and
   `^`/`-` to the back, and drops the brackets for a single character:
