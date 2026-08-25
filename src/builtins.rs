@@ -2843,7 +2843,18 @@ fn ht_find(h: &mut ElispHost, table: &Value, key: &Value) -> Result<(u64, Option
     Ok((hk, slot))
 }
 
-fn make_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
+/// `(make-hash-table &rest KEYWORD-ARGS)`.
+///
+/// `user` is the `(NAME TESTFN HASHFN)` of a `define-hash-table-test` test, when
+/// the `:test` argument named one. Resolving that lives in
+/// [`crate::host::call_function`] rather than here, because the declaration is
+/// kept on the symbol's `hash-table-test` property — an elisp plist, so reading
+/// it CALLS elisp, which cannot happen inside this host borrow.
+pub(crate) fn make_hash_table_with(
+    h: &mut ElispHost,
+    a: &[Value],
+    user: Option<(Value, Value, Value)>,
+) -> R {
     let mut test = 1u8; // eql default
     let mut size = 0usize;
     let mut weakness = Value::Undef;
@@ -2854,6 +2865,9 @@ fn make_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
                 test = match h.sym_name(&a[i + 1]).as_deref() {
                     Some("eq") => 0,
                     Some("equal") => 2,
+                    // A name the caller resolved to a user test; anything else
+                    // is `eql` (including the `eql` spelling itself).
+                    Some(other) if other != "eql" && user.is_some() => 3,
                     _ => 1,
                 };
             }
@@ -2869,9 +2883,94 @@ fn make_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
         }
         i += 2;
     }
-    Ok(h.alloc(Obj::HashTable(ElHashTable::new(test, size, weakness))))
+    let mut t = ElHashTable::new(test, size, weakness);
+    if test == 3 {
+        t.user_test = user;
+    }
+    Ok(h.alloc(Obj::HashTable(t)))
 }
-fn gethash(h: &mut ElispHost, a: &[Value]) -> R {
+/// The `(NAME TESTFN HASHFN)` of TABLE's user-defined test, if it has one.
+pub(crate) fn ht_user_test(table: &Value) -> Option<(Value, Value, Value)> {
+    crate::host::with_host(|h| ht_ref(h, table).ok().and_then(|t| t.user_test.clone()))
+}
+
+/// [`ht_find`] for a table whose test is elisp.
+///
+/// This is the whole reason `gethash`/`puthash`/`remhash` are dispatched from
+/// [`crate::host::call_function`]: HASHFN and TESTFN are elisp functions, and
+/// calling one needs the host borrow released. So the walk takes the host in
+/// short bursts — read the candidate slots out, drop the borrow, run the test —
+/// rather than holding a `&mut ElispHost` across the probe.
+///
+/// Emacs (`hashfn_user_defined`, fns.c) hashes the value HASHFN *returns* with
+/// the ordinary `equal` hash, so two keys HASHFN maps to `equal` values land in
+/// one bucket and TESTFN then decides.
+pub(crate) fn ht_find_user(
+    table: &Value,
+    key: &Value,
+    testfn: &Value,
+    hashfn: &Value,
+) -> Result<(u64, Option<u32>), String> {
+    use crate::host::{call_function, with_host};
+    let hv = call_function(hashfn, &[key.clone()])?;
+    let hk = with_host(|h| hash_key(h, 2, &hv));
+    let cands: Vec<(u32, Value)> = with_host(|h| {
+        let t = ht_ref(h, table)?;
+        Ok::<_, String>(
+            t.candidates(hk)
+                .iter()
+                .filter_map(|&i| t.key_at(i).map(|k| (i, k.clone())))
+                .collect(),
+        )
+    })?;
+    for (i, k) in cands {
+        if crate::host::el_truthy(&call_function(testfn, &[key.clone(), k])?) {
+            return Ok((hk, Some(i)));
+        }
+    }
+    Ok((hk, None))
+}
+
+/// `gethash` on a user-test table (see [`ht_find_user`]).
+pub(crate) fn gethash_user(a: &[Value], t: &(Value, Value, Value)) -> R {
+    let (_, slot) = ht_find_user(&a[1], &a[0], &t.1, &t.2)?;
+    crate::host::with_host(|h| match slot {
+        Some(i) => Ok(ht_ref(h, &a[1])?
+            .value_at(i)
+            .cloned()
+            .unwrap_or(Value::Undef)),
+        None => Ok(a.get(2).cloned().unwrap_or(Value::Undef)),
+    })
+}
+
+/// `puthash` on a user-test table. A key the test already matches keeps the
+/// ORIGINAL key object and only its value is replaced, exactly as for the
+/// built-in tests.
+pub(crate) fn puthash_user(a: &[Value], t: &(Value, Value, Value)) -> R {
+    let (hk, slot) = ht_find_user(&a[2], &a[0], &t.1, &t.2)?;
+    crate::host::with_host(|h| {
+        if let Some(tbl) = ht_mut(h, &a[2]) {
+            match slot {
+                Some(i) => tbl.set_value_at(i, a[1].clone()),
+                None => tbl.insert(hk, a[0].clone(), a[1].clone()),
+            }
+        }
+    });
+    Ok(a[1].clone())
+}
+
+/// `remhash` on a user-test table.
+pub(crate) fn remhash_user(a: &[Value], t: &(Value, Value, Value)) -> R {
+    let (hk, slot) = ht_find_user(&a[1], &a[0], &t.1, &t.2)?;
+    crate::host::with_host(|h| {
+        if let (Some(i), Some(tbl)) = (slot, ht_mut(h, &a[1])) {
+            tbl.remove(hk, i);
+        }
+    });
+    Ok(Value::Undef)
+}
+
+pub(crate) fn gethash(h: &mut ElispHost, a: &[Value]) -> R {
     let (_, slot) = ht_find(h, &a[1], &a[0])?;
     match slot {
         Some(i) => Ok(ht_ref(h, &a[1])?
@@ -2881,7 +2980,7 @@ fn gethash(h: &mut ElispHost, a: &[Value]) -> R {
         None => Ok(a.get(2).cloned().unwrap_or(Value::Undef)),
     }
 }
-fn puthash(h: &mut ElispHost, a: &[Value]) -> R {
+pub(crate) fn puthash(h: &mut ElispHost, a: &[Value]) -> R {
     let (hk, slot) = ht_find(h, &a[2], &a[0])?;
     if let Some(t) = ht_mut(h, &a[2]) {
         match slot {
@@ -2891,7 +2990,7 @@ fn puthash(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(a[1].clone())
 }
-fn remhash(h: &mut ElispHost, a: &[Value]) -> R {
+pub(crate) fn remhash(h: &mut ElispHost, a: &[Value]) -> R {
     let (hk, slot) = ht_find(h, &a[1], &a[0])?;
     if let (Some(i), Some(t)) = (slot, ht_mut(h, &a[1])) {
         t.remove(hk, i);
@@ -2912,7 +3011,13 @@ fn hash_table_p(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// `(hash-table-test TABLE)` — the symbol naming TABLE's comparison test.
 fn hash_table_test(h: &mut ElispHost, a: &[Value]) -> R {
-    let name = match ht_ref(h, &a[0])?.test {
+    let t = ht_ref(h, &a[0])?;
+    // A `define-hash-table-test` table reports the NAME it was made with, not
+    // one of the three built-in test symbols.
+    if let Some((name, _, _)) = &t.user_test {
+        return Ok(name.clone());
+    }
+    let name = match t.test {
         0 => "eq",
         1 => "eql",
         _ => "equal",
@@ -8385,10 +8490,14 @@ pub fn install(h: &mut ElispHost) {
     s("user-error", 1, None, user_error_fn);
     s("signal", 2, Some(2), signal_fn);
     // hash tables (maphash is intercepted in host::call_function)
-    s("make-hash-table", 0, None, make_hash_table);
-    s("gethash", 2, Some(3), gethash);
-    s("puthash", 3, Some(3), puthash);
-    s("remhash", 2, Some(2), remhash);
+    // Intercepted: resolving a `define-hash-table-test` name reads an elisp
+    // plist, which cannot happen inside a host borrow.
+    s("make-hash-table", 0, None, intercepted_subr);
+    // Intercepted: a `define-hash-table-test` table's test and hash functions
+    // are elisp, so a lookup on one has to run outside the host borrow.
+    s("gethash", 2, Some(3), intercepted_subr);
+    s("puthash", 3, Some(3), intercepted_subr);
+    s("remhash", 2, Some(2), intercepted_subr);
     s("clrhash", 1, Some(1), clrhash);
     s("hash-table-count", 1, Some(1), hash_table_count);
     s("hash-table-test", 1, Some(1), hash_table_test);

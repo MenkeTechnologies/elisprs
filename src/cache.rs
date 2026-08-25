@@ -82,7 +82,11 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// string objects at all: they would print correctly and then signal
 /// `arrayp` on the first write, which is the pre-fix behaviour served from a
 /// warm cache.
-pub const SHARD_FORMAT_VERSION: u32 = 10;
+/// v11 adds a hash table's `define-hash-table-test` functions
+/// (`SerObj::HashTable::user_test`). A v10 shard replays such a table as one
+/// with NO user test, which is worse than rejecting it: the table would come
+/// back answering `eql` and silently miss every key it used to find.
+pub const SHARD_FORMAT_VERSION: u32 = 11;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next

@@ -3153,6 +3153,16 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (defun get (sym prop)
   (symbol-plist--check sym)
   (plist-get (gethash sym symbol-plist--table) prop))
+;; `Fdefine_hash_table_test' (fns.c) is exactly this `put': the declaration
+;; lives on NAME's `hash-table-test' property as (TESTFN HASHFN), and
+;; `make-hash-table' reads it back.  The value is the property list `put'
+;; returns, not NAME.
+(defun define-hash-table-test (name test hash)
+  "Define a new hash table test named NAME.
+TEST compares two keys; HASH maps a key to a hash value.  A table made with
+`:test NAME' calls them -- so both are ordinary elisp and may do anything a
+function may, `gethash' on such a table included."
+  (put name 'hash-table-test (list test hash)))
 (defun symbol-plist (sym)
   (symbol-plist--check sym)
   (gethash sym symbol-plist--table))

@@ -70,6 +70,12 @@ pub enum SerObj {
         free: Vec<u32>,
         size: usize,
         weakness: Value,
+        /// `(NAME TESTFN HASHFN)` for a `define-hash-table-test` table.
+        /// Appended at the END of the variant on purpose: bincode encodes a
+        /// struct variant's fields in declaration order, so inserting one
+        /// mid-variant misdecodes an older image (`cache::SHARD_FORMAT_VERSION`
+        /// is bumped alongside it anyway).
+        user_test: Option<(Value, Value, Value)>,
     },
     CharTable {
         subtype: Value,
@@ -431,8 +437,15 @@ pub struct MarkerData {
 /// behaviour too (`(puthash k 'v h)` then `(setcar k 2)` then `(gethash k h)`
 /// answers nil in both).
 pub struct ElHashTable {
-    /// Comparison test: 0 = `eq`, 1 = `eql`, 2 = `equal`.
+    /// Comparison test: 0 = `eq`, 1 = `eql`, 2 = `equal`, 3 = a
+    /// `define-hash-table-test` test (whose functions are in `user_test`).
     pub test: u8,
+    /// `(NAME TESTFN HASHFN)` when `test` is 3.
+    ///
+    /// The functions are elisp, so every lookup on such a table has to CALL
+    /// elisp — which is why `gethash`/`puthash`/`remhash` are dispatched from
+    /// [`crate::host::call_function`] rather than run inside a host borrow.
+    pub user_test: Option<(Value, Value, Value)>,
     /// Slots in allocation order; `None` is a freed slot.
     pub slots: Vec<Option<(Value, Value)>>,
     /// Freed slot indices, popped LIFO — Emacs's `next_free` chain.
@@ -458,6 +471,7 @@ impl ElHashTable {
     pub fn new(test: u8, size: usize, weakness: Value) -> ElHashTable {
         ElHashTable {
             test,
+            user_test: None,
             slots: Vec::new(),
             free: Vec::new(),
             index: HashMap::new(),
@@ -480,6 +494,7 @@ impl ElHashTable {
         let live = slots.iter().flatten().count();
         ElHashTable {
             test,
+            user_test: None,
             slots,
             free,
             index: HashMap::new(),
@@ -2520,6 +2535,7 @@ impl ElispHost {
                     free: t.free.clone(),
                     size: t.size,
                     weakness: t.weakness.clone(),
+                    user_test: t.user_test.clone(),
                 },
                 Obj::CharTable(t) => SerObj::CharTable {
                     subtype: t.subtype.clone(),
@@ -2700,6 +2716,7 @@ impl ElispHost {
                 free: t.free.clone(),
                 size: t.size,
                 weakness: t.weakness.clone(),
+                user_test: t.user_test.clone(),
             },
             Obj::CharTable(t) => SerObj::CharTable {
                 subtype: t.subtype.clone(),
@@ -2853,7 +2870,12 @@ impl ElispHost {
                     free,
                     size,
                     weakness,
-                } => Obj::HashTable(ElHashTable::from_slots(test, slots, free, size, weakness)),
+                    user_test,
+                } => {
+                    let mut t = ElHashTable::from_slots(test, slots, free, size, weakness);
+                    t.user_test = user_test;
+                    Obj::HashTable(t)
+                }
                 SerObj::CharTable {
                     subtype,
                     default,
@@ -5290,6 +5312,74 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                     call_function(&args[0], &[k, v])?;
                 }
                 return Ok(Value::Undef);
+            }
+            // A hash table whose test came from `define-hash-table-test` has
+            // elisp for its test and hash functions, so a lookup on one has to
+            // call elisp — which cannot happen inside the host borrow a subr
+            // body runs in. The built-in tests take the ordinary path in one
+            // borrow; only a user test re-enters.
+            "gethash" | "puthash" | "remhash" => {
+                let table_at = if name == "puthash" { 2 } else { 1 };
+                let Some(table) = args.get(table_at) else {
+                    return Err(format!(
+                        "wrong-number-of-arguments: {name} {}",
+                        args.len()
+                    ));
+                };
+                if let Some(t) = crate::builtins::ht_user_test(table) {
+                    return match name.as_str() {
+                        "gethash" => crate::builtins::gethash_user(args, &t),
+                        "puthash" => crate::builtins::puthash_user(args, &t),
+                        _ => crate::builtins::remhash_user(args, &t),
+                    };
+                }
+                return with_host(|h| match name.as_str() {
+                    "gethash" => crate::builtins::gethash(h, args),
+                    "puthash" => crate::builtins::puthash(h, args),
+                    _ => crate::builtins::remhash(h, args),
+                })
+                .map(|v| with_host(|h| h.promote_string(v)));
+            }
+            // `make-hash-table` resolves a `define-hash-table-test` name by
+            // reading the symbol's `hash-table-test` property, which is an
+            // elisp plist — so the lookup happens here, outside the borrow, and
+            // the resolved functions are handed to the table's constructor.
+            "make-hash-table" => {
+                let named = with_host(|h| {
+                    let mut i = 0;
+                    while i + 1 < args.len() {
+                        if h.sym_name(&args[i]).as_deref() == Some(":test") {
+                            if let Some(n) = h.sym_name(&args[i + 1]) {
+                                if !matches!(n.as_str(), "eq" | "eql" | "equal") {
+                                    return Some((args[i + 1].clone(), n));
+                                }
+                            }
+                        }
+                        i += 2;
+                    }
+                    None
+                });
+                let user = match named {
+                    None => None,
+                    Some((sym, _)) => {
+                        let getf = with_host(|h| h.intern("get"));
+                        let prop = with_host(|h| h.intern("hash-table-test"));
+                        let spec = call_function(&getf, &[sym.clone(), prop])?;
+                        match with_host(|h| h.list_vec(&spec)) {
+                            Some(fns) if fns.len() >= 2 => {
+                                Some((sym, fns[0].clone(), fns[1].clone()))
+                            }
+                            // `Fmake_hash_table` signals when the name was never
+                            // declared: (error "Invalid hash table test" NAME).
+                            _ => {
+                                return Err(with_host(|h| {
+                                    h.signal_error_with("Invalid hash table test", &sym)
+                                }))
+                            }
+                        }
+                    }
+                };
+                return with_host(|h| crate::builtins::make_hash_table_with(h, args, user));
             }
             "mapatoms" => {
                 if args.is_empty() {
