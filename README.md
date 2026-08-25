@@ -111,7 +111,7 @@ elisp --version
 | Records | `record make-record recordp` (a distinct type — slot 0 is the type symbol, `vectorp` is nil; backs `cl-defstruct`) |
 | Bool-vectors | `make-bool-vector bool-vector bool-vector-p bool-vector-count-population bool-vector-subsetp bool-vector-not` (`#&N"…"` syntax) |
 | Advice (nadvice) | `advice-add advice-remove add-function remove-function define-advice advice-member-p` (all `:around`/`:before`/`:after`/`:override`/`:filter-*`/`:*-while`/`:*-until` combinators) |
-| Hash tables | `make-hash-table gethash puthash remhash clrhash maphash hash-table-count hash-table-keys hash-table-values hash-table-p` |
+| Hash tables | `make-hash-table gethash puthash remhash clrhash maphash hash-table-count hash-table-size hash-table-test hash-table-weakness hash-table-rehash-size hash-table-rehash-threshold hash-table-keys hash-table-values hash-table-p copy-hash-table` (Emacs's slot + free-list model, so `maphash` order and slot reuse match) |
 | Predicates | `eq eql equal null not numberp integerp floatp stringp symbolp consp listp atom functionp` |
 | Symbols/cells | `set symbol-value symbol-function fset boundp fboundp symbol-name intern make-symbol` |
 | Strings | `concat string= string-equal string< upcase downcase number-to-string string-to-number string-split` |

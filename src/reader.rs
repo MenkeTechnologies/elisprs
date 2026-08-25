@@ -6,7 +6,7 @@
 //! (incl. `1+`, `<=`, `:keywords`), `'quote`, `#'function`, `?c` char literals,
 //! `;` comments, backquote/unquote (`` ` `` `,` `,@`), and dotted pairs (`a . b`).
 
-use crate::host::{el_truthy, ElispHost, Obj};
+use crate::host::{el_truthy, ElHashTable, ElispHost, Obj};
 use fusevm::Value;
 use num_bigint::BigInt;
 
@@ -568,13 +568,23 @@ impl Reader {
                 }
                 i += 2;
             }
-            let mut entries = Vec::new();
+            // Built without an index: the reader has no `hash_key`, so the
+            // table arrives the way a deserialized one does and the first
+            // lookup indexes it (see `ElHashTable::needs_index`).
+            let mut slots = Vec::new();
             let mut j = 0;
             while j + 1 < data.len() {
-                entries.push((data[j].clone(), data[j + 1].clone()));
+                slots.push(Some((data[j].clone(), data[j + 1].clone())));
                 j += 2;
             }
-            Ok(h.alloc(Obj::HashTable { test, entries }))
+            let size = slots.len();
+            Ok(h.alloc(Obj::HashTable(ElHashTable::from_slots(
+                test,
+                slots,
+                Vec::new(),
+                size,
+                Value::Undef,
+            ))))
         } else {
             // A record literal `#s(NAME slot…)`: slot 0 is the type symbol NAME,
             // exactly as written (`(aref rec 0)` returns it).

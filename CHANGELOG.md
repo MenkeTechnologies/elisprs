@@ -6,6 +6,93 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The hook API's missing four.** `remove-hook` (subr.el:2186, including the
+  depth-alist cleanup of bug#46414), `run-hook-with-args-until-success`,
+  `run-hook-with-args-until-failure` and `run-hook-wrapped` — all previously
+  `void-function`, with only `add-hook`/`run-hooks`/`run-hook-with-args`
+  present.
+- **`format-spec.el`, ported.** The old `format-spec` substituted `%CHAR` and
+  copied everything else through, so the whole
+  `%<flags><width><precision>CHAR` syntax fell out as literal text:
+  `(format-spec "%-5a|" '((?a . "x")))` answered `"5a|"` where Emacs answers
+  `"x    |"`. Flags `0 - < > ^ _`, width and precision in display columns,
+  IGNORE-MISSING's `nil`/`ignore`/`delete`/other, SPLIT, function-valued
+  substitutions and `format-spec-make` are all in, matching Emacs 30.2 on 32
+  probes.
+- **`insert-and-inherit`** (C `insert_and_inherit` →
+  `graft_intervals_into_buffer`): the inserted text takes the preceding
+  character's text properties, honouring `rear-nonsticky`, plus any the
+  following character marks `front-sticky`. This is the insert `format-spec`
+  uses to carry FORMAT's properties onto each substitution.
+- **`hash-table-size`, `hash-table-weakness`, `hash-table-rehash-size`,
+  `hash-table-rehash-threshold`** — the four hash-table accessors that were
+  void. `hash-table-size` reports the ALLOCATION size and follows Emacs 30.2's
+  growth series (measured: 0 → 6 → 24 → 96, and a `:size N` table jumps to
+  `max(4N, 24)` up to 64, doubling above).
+- **`copy-tree`'s VECTORS-AND-RECORDS argument** (subr.el:877), and with it the
+  iterative cdr walk that copies a dotted tail correctly.
+- **pcase's `map` and `cl-struct` patterns, `mapp` and `map-let`.** Both
+  patterns were absent from elisprs's pattern compiler, which signalled
+  `(error "pcase: unsupported pattern (map a)")` rather than matching, and that
+  took `map-let` (map.el:73 is a `pcase-let` over the `map` pattern) with it.
+  The `map` pattern accepts a bare symbol, a keyword, and the
+  `(KEY VAR [DEFAULT])` form whose KEY and DEFAULT are evaluated; `cl-struct`
+  reads slots through `cl-struct-slot-value` behind a `cl-typep` guard, so a
+  value of the wrong type fails the clause instead of signalling out of it.
+
+### Fixed (Emacs parity — object identity, hash-table slot order, closures)
+- **A string is an object, and `eq` is object identity.** `el_eq` answered `t`
+  only for the empty string, so `(let ((s "abc")) (eq s s))` was `nil` where
+  Emacs says `t`, and every identity-based primitive lied about strings:
+  `memq`, `memql`, `assq`, `delq`, `remq`, `eql`. Two references to one string
+  now share one `Arc` and compare `eq`; two equal literals still do not.
+- **`copy-sequence` returned its argument for a string or a vector.** Worse
+  than an identity gap: `(aset COPY 0 9)` wrote through to the original, so
+  every caller that copies before mutating shared one object.
+  `(let* ((v (vector 1 2)) (c (copy-sequence v))) (aset c 0 9) (list v c))`
+  answered `([9 2] [9 2])` instead of `([1 2] [9 2])`.
+- **A hash table's slot order is observable, and it was wrong.** Emacs stores
+  entries in a slot vector plus a free list: `remhash` frees a slot that the
+  next `puthash` reuses (LIFO), and `maphash`, the `#s(hash-table …)` printer
+  and `hash-table-keys` all walk slots in index order. elisprs stored a packed
+  association vector and appended instead, so a remove-then-add reordered the
+  whole walk. `hash-table-keys`/`hash-table-values` also come back in REVERSE
+  slot order, because subr-x's definitions `push` inside a `maphash` and never
+  reverse.
+- **`equal` on interpreted closures.** An interpreted closure IS its
+  `#[ARGLIST BODY ENV]` structure and `equal` descends into it, so
+  `(equal (lambda () 1) (lambda () 1))` is `t` in Emacs and was `nil` here.
+  That is also what makes an anonymous hook function removable — `remove-hook`
+  matches with `member`.
+
+### Performance
+- **Hash tables are hashed, not scanned.** Every `gethash`/`puthash`/`remhash`
+  walked a `Vec<(Value, Value)>` linearly *and cloned the whole vector first*,
+  so each operation cost O(n) comparisons and one O(n) allocation. A 20 000-key
+  build-then-read (`format`ed string keys) went **36.07 s → 0.69 s** of user
+  time (min of repeated runs, debug build). The new index maps a key hash to
+  candidate slots, with the hash computed once when the key goes in — which is
+  also why a key mutated after insertion is now lost, exactly as in Emacs.
+- **Compiled regexps are cached.** `string-match`/`re-search-forward`/
+  `looking-at` re-ran the elisp→`fancy_regex` translation *and*
+  `fancy_regex::Regex::new` on every call, so a match inside a loop paid a full
+  compile per iteration. 40 000 `(string-match "\\([a-z]+\\)-\\([0-9]+\\)"
+  "abc-123")` went **54.62 s → 0.85 s**. Emacs keeps a compiled-pattern cache
+  for the same reason (`compile_pattern`, search.c). The cache hands out a
+  shared `Rc<CompiledRe>` rather than a copy — a cloned regex carries an empty
+  match-cache and rebuilds its lazy DFA per call — keys on the pattern plus
+  `case-fold-search`, keeps the FAILURE so an invalid pattern still signals
+  every time, and skips patterns whose translation read the syntax table
+  (`\sC`, `\w`, `\cC`), which are only valid for the table they read.
+- **VMs are pooled per closure body.** Every elisp call did
+  `VM::new((*body).clone())` — a fresh VM plus a deep copy of the body `Chunk`
+  (`ops`, `constants`, `lines`, and one `String` per entry in `names`).
+  Profiling a 200 000-call loop put `_platform_memmove` at 141 of the
+  interpreter thread's 978 samples, second only to `VM::exec_op` at 177. A
+  pooled VM already holds its chunk, so the chunk is moved back in
+  (`std::mem::take` + `VM::reset`) and never copied; its JIT state survives with
+  it. A 20 000-call loop over a 120-form body went **2.95 s → 2.45 s** of user
+  time, and the copy is gone from the profile.
 - **`syntax.c`'s sexp/comment scanner.** `scan-lists`, `scan-sexps`,
   `parse-partial-sexp`, `syntax-ppss`, `forward-comment`,
   `backward-prefix-chars`, `matching-paren`, `syntax-after`, and the motion

@@ -74,7 +74,7 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// come back with `(fboundp 'when)` nil and `(symbol-function 'when)` nil where a
 /// cold run answered `t` and the `(macro . FUNCTION)` pair. `Entry` gained a field,
 /// which shifts the rkyv layout, so a v7 shard must be rejected outright.
-pub const SHARD_FORMAT_VERSION: u32 = 8;
+pub const SHARD_FORMAT_VERSION: u32 = 9;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next

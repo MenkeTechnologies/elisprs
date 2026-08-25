@@ -3947,3 +3947,162 @@ all of them listed below.
   in their error datum; a closure's printed form inside
   `wrong-number-of-arguments` carries its captured environment where Emacs's
   byte-code object carries `(t)`.
+
+---
+
+## Round 21 — object identity, the hash table's slot model, and the compiled-regexp cache
+
+Reference: **GNU Emacs 30.2** (`/opt/homebrew/bin/emacs`). Every form below was
+run under both engines through the same driver (`scripts/fuzz/drive.el` shape:
+one form per line, `=VALUE` or `!ERROR`), plus direct
+`emacs -Q --batch --eval '(prin1 FORM)'` for the individual measurements.
+
+### R21-A. `eq` had no object identity for strings — ✅ FIXED
+
+`el_eq` answered `t` for two strings only when both were empty, so a string was
+never `eq` to *itself*:
+
+```text
+                                        emacs 30.2      elisprs (before)
+(let ((s "abc")) (eq s s))              t               nil
+(let ((s "abc")) (eql s s))             t               nil
+(let ((s "abc")) (memq s (list s)))     ("abc")         nil
+(let ((s "abc")) (assq s (list (cons s 1))))  ("abc" . 1)   nil
+(let ((s "ab"))  (delq s (list s 1)))   (1)             ("ab" 1)
+```
+
+`Value::Str` is an `Arc<String>`, and every construction Emacs calls a fresh
+object allocates its own `Arc`, so pointer identity *is* the object identity
+`eq` compares. The empty string keeps its own clause: Emacs shares one
+`empty_unibyte_string` (alloc.c), so `(eq "" "")` stays `t`.
+
+### R21-B. `copy-sequence` returned its argument — ✅ FIXED
+
+For a string or a vector, `copy-sequence` answered `seq` itself. That is not
+only an identity gap; the "copy" aliased the original:
+
+```text
+(let* ((v (vector 1 2)) (c (copy-sequence v))) (aset c 0 9) (list v c))
+  emacs 30.2   ([1 2] [9 2])
+  elisprs      ([9 2] [9 2])
+```
+
+A string now copies through `substring` (which carries its text properties, as
+Emacs's `copy-sequence` does) and a vector through `vconcat`. `copy-tree` grew
+its VECTORS-AND-RECORDS argument at the same time (subr.el:877).
+
+### R21-C. A hash table's slot order is observable — ✅ FIXED
+
+Emacs stores entries in a slot vector plus a free list (`struct
+Lisp_Hash_Table`, fns.c). `remhash` frees a slot and the next `puthash` reuses
+the most recently freed one, and `maphash`, the `#s(hash-table …)` printer and
+`hash-table-keys` all walk slots in index order:
+
+```text
+(let ((h (make-hash-table)))
+  (dotimes (i 5) (puthash i i h))
+  (remhash 2 h) (puthash 9 9 h)
+  (let (acc) (maphash (lambda (k _v) (push k acc)) h) (nreverse acc)))
+
+  emacs 30.2   (0 1 9 3 4)      ; 9 took the slot 2 freed
+  elisprs      (0 1 3 4 9)      ; packed vector, so 9 was appended
+```
+
+`hash-table-keys`/`hash-table-values` also come back REVERSED, because
+subr-x's definitions `push` inside a `maphash` and never `nreverse`:
+`(b a)` and `(2 1)` for a table filled `a` then `b`.
+
+`hash-table-size`, `hash-table-weakness`, `hash-table-rehash-size` and
+`hash-table-rehash-threshold` were void. `hash-table-size` is the *allocation*
+size, whose growth series was measured rather than guessed: 0 → 6 → 24 → 96,
+and a `:size N` table jumps to `max(4N, 24)` up to 64 and doubles above it.
+
+### R21-D. `equal` on interpreted closures — ✅ FIXED
+
+An interpreted closure in Emacs *is* its `#[ARGLIST BODY ENV]` structure and
+`equal` descends into it. `(equal (lambda () 1) (lambda () 1))` is `t` there and
+was `nil` here, which is also why an anonymous hook function could not be
+removed — `remove-hook` matches with `member`.
+
+### R21-E. `format-spec` ignored its flag/width/precision syntax — ✅ FIXED
+
+The old implementation substituted `%CHAR` and copied the rest through, so the
+spec syntax fell out as literal text:
+
+```text
+(format-spec "%-5a|" '((?a . "x")))   emacs "x    |"    elisprs "5a|"
+(format-spec "%5a|"  '((?a . "x")))   emacs "    x|"    elisprs "a|"
+```
+
+Now a port of format-spec.el, including `insert-and-inherit` (which it needs to
+carry FORMAT's text properties onto each substitution) and `format-spec-make`.
+
+### R21-F. The hook API was missing four entry points — ✅ FIXED
+
+`remove-hook`, `run-hook-with-args-until-success`,
+`run-hook-with-args-until-failure` and `run-hook-wrapped` all answered
+`void-function`.
+
+### R21-G. pcase's `map` and `cl-struct` patterns were absent — ✅ FIXED
+
+elisprs's `pcase` is a hand-written pattern compiler, and neither pattern was in
+it: `(pcase '((a . 1)) ((map a) a))` answered
+`(error "pcase: unsupported pattern (map a)")` where Emacs answers `1`. That
+took `map-let` down with it — map.el:73 is a `pcase-let` over the `map` pattern
+— and `mapp` was undefined.
+
+Two details are worth naming because getting either wrong is a silent
+divergence rather than an error:
+
+- In `(map (KEY VAR [DEFAULT]))` the KEY and DEFAULT are **evaluated forms**,
+  not quoted names, so `(let ((k 'a)) (pcase '((a . 1)) ((map (k v 99)) v)))` is
+  `1` and the same form with `k` bound to `z` is `99`.
+- `pcase--clause` establishes a clause's binders *around* its tests, so a
+  `cl-struct` slot read runs before the type test could reject the value.
+  `cl-struct-slot-value` signals on the wrong type, so the reads are guarded by
+  the same `cl-typep` the test uses — `(pcase 5 ((cl-struct pt x) x) (_ 'no))`
+  has to answer `no`, not raise.
+
+### Still open
+
+- **Strings are immutable.** `aset` on a string signals
+  `(wrong-type-argument arrayp "ab")` where Emacs writes the character, and
+  `store-substring` is void. `Value::Str` is a shared `Arc<String>`; making it
+  writable needs an interior-mutable string object, because
+  `Arc::make_mut` would silently break the identity R21-A just established.
+- **`eq` on floats.** `(let ((f 1.5)) (eq f f))` is `t` in Emacs and `nil` here.
+  `Value::Float` is a machine `f64` with no identity, so the two answers Emacs
+  distinguishes — `t` for one object read twice, `nil` for two literals — cannot
+  both be produced. `eql` and `equal` on floats are correct.
+- **An interpreted closure captures its whole enclosing scope.** Emacs 30 prunes
+  a closure's environment to the variables it actually references:
+
+  ```text
+  (let ((n 1) (m 2)) (format "%S" (lambda () n)))
+    emacs 30.2   "#[nil (n) ((n . 1))]"
+    elisprs      "#[nil (n) ((m . 2) (n . 1))]"
+  ```
+
+  Visible through `prin1` and through `equal`. Closing it needs a free-variable
+  analysis at closure-creation time plus a capture list on the compiled
+  template; the whole `Lex` chain is captured today.
+- **`define-hash-table-test`** is void, and `make-hash-table :test MY=` falls
+  back to `eql`. A user test would have to call back into elisp from
+  `hash_eq`/`hash_key`, which run while the host is borrowed.
+- **`pcase-lambda`, the explicit `` (\` PAT) `` spelling and compound `cl-type`
+  specifiers** are missing: `(funcall (pcase-lambda (`(,a ,b)) (+ a b)) '(1 2))`
+  is `3` in Emacs and `(invalid-function (cons a (cons b nil)))` here, and
+  `(pcase 3 ((cl-type (integer 0 5)) 'in) (_ 'out))` is `in` there and
+  `(wrong-type-argument symbolp (integer 0 5))` here. (The `map` and `cl-struct`
+  patterns, `mapp` and `map-let` were closed in this round — see R21-G.)
+- **Generators.** `iter-defun`, `iter-lambda`, `iter-next`, `iter-do` and
+  `iter-end-of-sequence` are all void; the CPS transform generator.el performs
+  has no counterpart here.
+- **`rx` gaps.** `(rx (category latin))` errors where Emacs yields `"\\cl"`;
+  `(rx (in ?a ?b "0-9"))` yields `"[ab0-9]"` against Emacs's `"[0-9ab]"`;
+  `(rx (or))` yields `"\\(?:\\)"` against Emacs's ``"\\`a\\`"``; and
+  `minimal-match`/`maximal-match` are ignored (`(rx (minimal-match (one-or-more
+  "a")))` → `"a+"`, not `"a+?"`).
+- **`cl-defgeneric` answers its own name** where Emacs answers `nil`, and the
+  `(head SYMBOL)` specializer is unsupported.
+- **`string-pixel-width`** is void.

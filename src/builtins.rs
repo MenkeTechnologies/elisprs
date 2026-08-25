@@ -2,10 +2,15 @@
 //! ~irreducible core; the large derived surface (caar.., seq-*, cl-*, alist
 //! helpers) will be defined in an elisp prelude on top of these.
 
-use crate::host::{bigint_to_f64, num_cmp, CharTable, ElispHost, MatchData, Num, Obj, Resolved};
+use crate::host::{
+    bigint_to_f64, num_cmp, CharTable, ElHashTable, ElispHost, MatchData, Num, Obj, Resolved,
+};
 use fusevm::Value;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 type R = Result<Value, String>;
 
@@ -452,10 +457,22 @@ fn el_eq(h: &ElispHost, a: &Value, b: &Value) -> bool {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Obj(x), Value::Obj(y)) => x == y,
         (Value::Bool(true), Value::Bool(true)) => true,
-        // Emacs keeps ONE shared empty-string object (`empty_unibyte_string`
-        // in alloc.c): every 0-length string construction returns it, so
-        // (eq "" "") and (eq (make-string 0 10) "") are t.
-        (Value::Str(x), Value::Str(y)) => x.is_empty() && y.is_empty(),
+        // Strings are objects, and `eq` is object identity: two references to the
+        // SAME string are `eq` even though two equal literals are not.
+        // `Value::Str` is an `Arc<String>`, and every construction that Emacs
+        // calls a fresh object (`copy-sequence`, `substring`, `concat`,
+        // `make-string`, each literal read) allocates its own `Arc`, so pointer
+        // identity IS the object identity Emacs compares. Without this
+        // `(let ((s "abc")) (eq s s))` answered nil, and every identity-based
+        // list op over strings — `memq`, `assq`, `delq`, `memql` — answered as
+        // though the string were absent.
+        //
+        // The empty string keeps its own clause: Emacs shares ONE
+        // `empty_unibyte_string` object (alloc.c), so every 0-length string is
+        // `eq` to every other regardless of where it came from.
+        (Value::Str(x), Value::Str(y)) => {
+            std::sync::Arc::ptr_eq(x, y) || (x.is_empty() && y.is_empty())
+        }
         _ => {
             let _ = h;
             false
@@ -491,6 +508,28 @@ fn el_equal(h: &ElispHost, a: &Value, b: &Value) -> bool {
             (Some(Obj::BoolVector(ba)), Some(Obj::BoolVector(bb))) => ba == bb,
             // Two markers are `equal` when they share a buffer and position.
             (Some(Obj::Marker(_)), Some(Obj::Marker(_))) => h.markers_equal(a, b),
+            // An interpreted closure is its `#[ARGLIST BODY ENV]` structure, and
+            // `equal` descends into it: `(equal (lambda () 1) (lambda () 1))` is
+            // t, `(equal (lambda (x) x) (lambda (y) y))` is nil. `remove-hook`
+            // depends on it — it matches the function to drop with `member`, so
+            // an anonymous hook function could not be removed without this.
+            (Some(Obj::Closure { .. }), Some(Obj::Closure { .. })) => {
+                match (h.closure_parts(a), h.closure_parts(b)) {
+                    (Some((am, ad, aa, abody, aenv)), Some((bm, bd, ba, bbody, benv))) => {
+                        am == bm
+                            && ad == bd
+                            && el_equal(h, &aa, &ba)
+                            && abody.len() == bbody.len()
+                            && abody.iter().zip(&bbody).all(|(x, y)| el_equal(h, x, y))
+                            && aenv.len() == benv.len()
+                            && aenv
+                                .iter()
+                                .zip(&benv)
+                                .all(|((s1, v1), (s2, v2))| s1 == s2 && el_equal(h, v1, v2))
+                    }
+                    _ => false,
+                }
+            }
             _ => false,
         },
         _ => false,
@@ -851,7 +890,7 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
             }
             // A bool-vector/char-table/record has a length; a symbol, a subr, a
             // buffer … do not — Emacs signals rather than answering 0.
-            Some(Obj::CharTable(_)) | Some(Obj::HashTable { .. }) => Ok(Value::Int(0)),
+            Some(Obj::CharTable(_)) | Some(Obj::HashTable(_)) => Ok(Value::Int(0)),
             _ => Err(format!(
                 "wrong-type-argument: sequencep {}",
                 h.print(&a[0], true)
@@ -2525,100 +2564,280 @@ fn hash_eq(h: &ElispHost, test: u8, a: &Value, b: &Value) -> bool {
         _ => el_eq(h, a, b),
     }
 }
-fn make_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
-    let mut test = 1u8; // eql default
-    let mut i = 0;
-    while i + 1 < a.len() {
-        if h.sym_name(&a[i]).as_deref() == Some(":test") {
-            test = match h.sym_name(&a[i + 1]).as_deref() {
-                Some("eq") => 0,
-                Some("equal") => 2,
-                _ => 1,
-            };
-        }
-        i += 2;
-    }
-    Ok(h.alloc(Obj::HashTable {
-        test,
-        entries: Vec::new(),
-    }))
+
+/// How deep [`hash_key`] descends into an `equal`-test key.
+///
+/// The cap is what makes a circular key terminate. It only weakens the hash:
+/// two keys that agree down to this depth land in one bucket and are then told
+/// apart by `hash_eq`, so the answer stays exact.
+const HASH_DEPTH_LIMIT: u32 = 8;
+
+/// A hash of KEY consistent with [`hash_eq`] for TEST: keys the test calls equal
+/// always hash alike. The converse is not required — a collision costs one extra
+/// `hash_eq` call, never a wrong answer.
+fn hash_key(h: &ElispHost, test: u8, v: &Value) -> u64 {
+    use std::hash::Hasher;
+    let mut st = std::collections::hash_map::DefaultHasher::new();
+    hash_into(h, test, v, 0, &mut st);
+    st.finish()
 }
-fn ht_view(h: &ElispHost, v: &Value) -> Result<(u8, Vec<(Value, Value)>), String> {
+
+fn hash_into(h: &ElispHost, test: u8, v: &Value, depth: u32, st: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    if is_nil(v) {
+        st.write_u8(0);
+        return;
+    }
+    if depth > HASH_DEPTH_LIMIT {
+        st.write_u8(0xFF);
+        return;
+    }
+    match v {
+        Value::Int(n) => {
+            st.write_u8(1);
+            st.write_i64(*n);
+        }
+        // A float is `eql`/`equal` by bit pattern, so hash the bits. Under `eq`
+        // no two floats are equal at all, so any hash is consistent.
+        Value::Float(f) => {
+            st.write_u8(2);
+            st.write_u64(f.to_bits());
+        }
+        Value::Bool(b) => {
+            st.write_u8(3);
+            st.write_u8(u8::from(*b));
+        }
+        // A string hashes by CONTENT under every test: `equal` requires it, and
+        // under `eq`/`eql` the only pair that must agree is a string with
+        // itself, which content also gives.
+        Value::Str(txt) => {
+            st.write_u8(4);
+            txt.as_str().hash(st);
+        }
+        Value::Obj(id) => match h.arena.get(*id as usize) {
+            // A bignum is `eql` by VALUE, so its handle cannot be the hash.
+            Some(Obj::Bignum(b)) => {
+                st.write_u8(5);
+                b.to_string().hash(st);
+            }
+            // Only the `equal` test looks inside a container; under `eq`/`eql`
+            // two containers are equal only when they are the same object.
+            Some(Obj::Cons(a, d)) if test == 2 => {
+                st.write_u8(6);
+                hash_into(h, test, a, depth + 1, st);
+                hash_into(h, test, d, depth + 1, st);
+            }
+            Some(Obj::Vector(items)) | Some(Obj::Record(items)) if test == 2 => {
+                st.write_u8(7);
+                st.write_usize(items.len());
+                for it in items.iter() {
+                    hash_into(h, test, it, depth + 1, st);
+                }
+            }
+            Some(Obj::BoolVector(bits)) if test == 2 => {
+                st.write_u8(8);
+                bits.hash(st);
+            }
+            // Two markers are `equal` when they share a buffer and a position,
+            // which is not readable from here — put every marker in one bucket
+            // and let `hash_eq` decide.
+            Some(Obj::Marker(_)) if test == 2 => st.write_u8(9),
+            // Two closures are `equal` when their arglist, body and captures
+            // are, so the handle cannot be the hash under the `equal` test.
+            Some(Obj::Closure { .. }) if test == 2 => {
+                st.write_u8(12);
+                if let Some((is_macro, dynamic, arglist, body, captures)) = h.closure_parts(v) {
+                    st.write_u8(u8::from(is_macro));
+                    st.write_u8(u8::from(dynamic));
+                    hash_into(h, test, &arglist, depth + 1, st);
+                    st.write_usize(body.len());
+                    for form in &body {
+                        hash_into(h, test, form, depth + 1, st);
+                    }
+                    st.write_usize(captures.len());
+                    for (sym, val) in &captures {
+                        st.write_u32(*sym);
+                        hash_into(h, test, val, depth + 1, st);
+                    }
+                }
+            }
+            _ => {
+                st.write_u8(10);
+                st.write_u32(*id);
+            }
+        },
+        _ => st.write_u8(11),
+    }
+}
+
+fn ht_ref<'a>(h: &'a ElispHost, v: &Value) -> Result<&'a ElHashTable, String> {
     match h.obj(v) {
-        Some(Obj::HashTable { test, entries }) => Ok((*test, entries.clone())),
+        Some(Obj::HashTable(t)) => Ok(t),
         _ => Err(format!(
             "wrong-type-argument: hash-table-p {}",
             h.print(v, true)
         )),
     }
 }
-fn gethash(h: &mut ElispHost, a: &[Value]) -> R {
-    let (test, entries) = ht_view(h, &a[1])?;
-    for (k, v) in &entries {
-        if hash_eq(h, test, &a[0], k) {
-            return Ok(v.clone());
-        }
+
+fn ht_mut<'a>(h: &'a mut ElispHost, v: &Value) -> Option<&'a mut ElHashTable> {
+    match v {
+        Value::Obj(id) => match h.arena.get_mut(*id as usize) {
+            Some(Obj::HashTable(t)) => Some(t),
+            _ => None,
+        },
+        _ => None,
     }
-    Ok(a.get(2).cloned().unwrap_or(Value::Undef))
+}
+
+/// Fill a table's hash index if it arrived from a serialized image without one.
+/// See [`ElHashTable::needs_index`].
+fn ht_ensure_index(h: &mut ElispHost, v: &Value) -> Result<(), String> {
+    let t = ht_ref(h, v)?;
+    if !t.needs_index() {
+        return Ok(());
+    }
+    let test = t.test;
+    let keys: Vec<(u32, Value)> = t
+        .slots
+        .iter()
+        .enumerate()
+        .filter_map(|(i, slot)| slot.as_ref().map(|(k, _)| (i as u32, k.clone())))
+        .collect();
+    let hashes: Vec<(u32, u64)> = keys
+        .iter()
+        .map(|(i, k)| (*i, hash_key(h, test, k)))
+        .collect();
+    if let Some(t) = ht_mut(h, v) {
+        t.reindex(&hashes);
+    }
+    Ok(())
+}
+
+/// The slot holding KEY, and KEY's hash — the shared front half of `gethash`,
+/// `puthash` and `remhash`.
+fn ht_find(h: &mut ElispHost, table: &Value, key: &Value) -> Result<(u64, Option<u32>), String> {
+    ht_ensure_index(h, table)?;
+    let t = ht_ref(h, table)?;
+    let test = t.test;
+    let hk = hash_key(h, test, key);
+    let t = ht_ref(h, table)?;
+    let slot = t
+        .candidates(hk)
+        .iter()
+        .copied()
+        .find(|&i| t.key_at(i).is_some_and(|k| hash_eq(h, test, key, k)));
+    Ok((hk, slot))
+}
+
+fn make_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
+    let mut test = 1u8; // eql default
+    let mut size = 0usize;
+    let mut weakness = Value::Undef;
+    let mut i = 0;
+    while i + 1 < a.len() {
+        match h.sym_name(&a[i]).as_deref() {
+            Some(":test") => {
+                test = match h.sym_name(&a[i + 1]).as_deref() {
+                    Some("eq") => 0,
+                    Some("equal") => 2,
+                    _ => 1,
+                };
+            }
+            // `:size` is the initial allocation, reported back by
+            // `hash-table-size` until the table outgrows it.
+            Some(":size") => {
+                if let Value::Int(n) = a[i + 1] {
+                    size = n.max(0) as usize;
+                }
+            }
+            Some(":weakness") => weakness = a[i + 1].clone(),
+            _ => {}
+        }
+        i += 2;
+    }
+    Ok(h.alloc(Obj::HashTable(ElHashTable::new(test, size, weakness))))
+}
+fn gethash(h: &mut ElispHost, a: &[Value]) -> R {
+    let (_, slot) = ht_find(h, &a[1], &a[0])?;
+    match slot {
+        Some(i) => Ok(ht_ref(h, &a[1])?
+            .value_at(i)
+            .cloned()
+            .unwrap_or(Value::Undef)),
+        None => Ok(a.get(2).cloned().unwrap_or(Value::Undef)),
+    }
 }
 fn puthash(h: &mut ElispHost, a: &[Value]) -> R {
-    let (test, entries) = ht_view(h, &a[2])?;
-    let found = entries.iter().position(|(k, _)| hash_eq(h, test, &a[0], k));
-    if let Value::Obj(id) = &a[2] {
-        if let Some(Obj::HashTable { entries, .. }) = h.arena.get_mut(*id as usize) {
-            match found {
-                Some(i) => entries[i].1 = a[1].clone(),
-                None => entries.push((a[0].clone(), a[1].clone())),
-            }
+    let (hk, slot) = ht_find(h, &a[2], &a[0])?;
+    if let Some(t) = ht_mut(h, &a[2]) {
+        match slot {
+            Some(i) => t.set_value_at(i, a[1].clone()),
+            None => t.insert(hk, a[0].clone(), a[1].clone()),
         }
     }
     Ok(a[1].clone())
 }
 fn remhash(h: &mut ElispHost, a: &[Value]) -> R {
-    let (test, entries) = ht_view(h, &a[1])?;
-    let found = entries.iter().position(|(k, _)| hash_eq(h, test, &a[0], k));
-    if let (Some(i), Value::Obj(id)) = (found, &a[1]) {
-        if let Some(Obj::HashTable { entries, .. }) = h.arena.get_mut(*id as usize) {
-            entries.remove(i);
-        }
+    let (hk, slot) = ht_find(h, &a[1], &a[0])?;
+    if let (Some(i), Some(t)) = (slot, ht_mut(h, &a[1])) {
+        t.remove(hk, i);
     }
     Ok(Value::Undef) // remhash always returns nil
 }
 fn clrhash(h: &mut ElispHost, a: &[Value]) -> R {
-    if let Value::Obj(id) = &a[0] {
-        if let Some(Obj::HashTable { entries, .. }) = h.arena.get_mut(*id as usize) {
-            entries.clear();
-        }
+    if let Some(t) = ht_mut(h, &a[0]) {
+        t.clear();
     }
     Ok(a[0].clone())
 }
 fn hash_table_count(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::Int(ht_view(h, &a[0])?.1.len() as i64))
+    Ok(Value::Int(ht_ref(h, &a[0])?.count() as i64))
 }
 fn hash_table_p(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::HashTable { .. }))))
+    Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::HashTable(_)))))
 }
 /// `(hash-table-test TABLE)` — the symbol naming TABLE's comparison test.
 fn hash_table_test(h: &mut ElispHost, a: &[Value]) -> R {
-    let test = ht_view(h, &a[0])?.0;
-    let name = match test {
+    let name = match ht_ref(h, &a[0])?.test {
         0 => "eq",
         1 => "eql",
         _ => "equal",
     };
     Ok(h.intern(name))
 }
+/// `(hash-table-size TABLE)` — the current ALLOCATION size, not the entry count.
+fn hash_table_size(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(Value::Int(ht_ref(h, &a[0])?.size as i64))
+}
+/// `(hash-table-weakness TABLE)` — the `:weakness` argument as given.
+fn hash_table_weakness(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(ht_ref(h, &a[0])?.weakness.clone())
+}
+/// subr-x's `hash-table-keys`/`hash-table-values` are a `maphash` that PUSHES
+/// onto a list and never reverses it, so both come back in REVERSE slot order.
 fn hash_table_keys(h: &mut ElispHost, a: &[Value]) -> R {
-    let keys: Vec<Value> = ht_view(h, &a[0])?.1.into_iter().map(|(k, _)| k).collect();
+    let mut keys: Vec<Value> = ht_ref(h, &a[0])?.pairs().map(|(k, _)| k.clone()).collect();
+    keys.reverse();
     Ok(h.list_from(keys))
 }
 fn hash_table_values(h: &mut ElispHost, a: &[Value]) -> R {
-    let vals: Vec<Value> = ht_view(h, &a[0])?.1.into_iter().map(|(_, v)| v).collect();
+    let mut vals: Vec<Value> = ht_ref(h, &a[0])?.pairs().map(|(_, v)| v.clone()).collect();
+    vals.reverse();
     Ok(h.list_from(vals))
 }
 fn copy_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
-    let (test, entries) = ht_view(h, &a[0])?;
-    Ok(h.alloc(Obj::HashTable { test, entries }))
+    ht_ensure_index(h, &a[0])?;
+    let t = ht_ref(h, &a[0])?;
+    let (test, size, weakness) = (t.test, t.size, t.weakness.clone());
+    let pairs: Vec<(Value, Value)> = t.pairs().cloned().collect();
+    let mut copy = ElHashTable::new(test, size, weakness);
+    // Rebuilt in slot order, so the copy walks the way the original does.
+    let hashes: Vec<u64> = pairs.iter().map(|(k, _)| hash_key(h, test, k)).collect();
+    for ((k, v), hk) in pairs.into_iter().zip(hashes) {
+        copy.insert(hk, k, v);
+    }
+    Ok(h.alloc(Obj::HashTable(copy)))
 }
 
 // ── strings ──
@@ -3061,10 +3280,18 @@ pub(crate) fn char_of_byte(s: &str, byte_idx: usize) -> usize {
 /// `compile_cf` caller is already inside a subr holding `&mut ElispHost`, so a
 /// `with_host` here re-enters the same `RefCell` and aborts with
 /// "RefCell already borrowed" on the first `(string-match "\\s_" "-")`.
-struct HostSyntax<'a>(&'a ElispHost);
+struct HostSyntax<'a> {
+    host: &'a ElispHost,
+    /// Set when the translation actually asked for a syntax class — i.e. the
+    /// pattern used `\sC`, `\SC`, `\w`, `\W` or `\cC`. Such a translation is
+    /// only valid for the syntax table in force at the time, so it is the one
+    /// kind of pattern [`compile_cf`] must NOT cache.
+    used_syntax: std::cell::Cell<bool>,
+}
 impl crate::regexp::SyntaxLookup for HostSyntax<'_> {
     fn ranges(&self, class: char) -> Vec<(u32, u32)> {
-        self.0.syntax_class_ranges(class)
+        self.used_syntax.set(true);
+        self.host.syntax_class_ranges(class)
     }
 }
 
@@ -3090,27 +3317,92 @@ impl std::ops::Deref for CompiledRe {
     }
 }
 
+/// One `case-fold-search` setting's worth of compiled regexps. The value keeps
+/// the FAILURE as well as the success, so an invalid pattern keeps signalling.
+type ReCacheMap = HashMap<String, Result<Rc<CompiledRe>, String>>;
+
+thread_local! {
+    /// Compiled regexps, keyed by the elisp pattern — one map per
+    /// `case-fold-search` setting, so the lookup can borrow the pattern instead
+    /// of building a tuple key.
+    ///
+    /// Every `string-match`/`re-search-forward`/`looking-at` used to re-run the
+    /// elisp→`fancy_regex` translation AND `fancy_regex::Regex::new` from
+    /// scratch, so a match inside a loop paid a full regexp compile per
+    /// iteration: 40 000 `(string-match "\\([a-z]+\\)-\\([0-9]+\\)" "abc-123")`
+    /// took 56 s. Emacs keeps a compiled-pattern cache of its own for exactly
+    /// this reason (`compile_pattern`/`searchbufs`, search.c).
+    ///
+    /// The FAILURE is cached with the success: an invalid pattern has to keep
+    /// signalling `invalid-regexp` on every call, not silently start matching.
+    static RE_CACHE: RefCell<[ReCacheMap; 2]> = RefCell::new([HashMap::new(), HashMap::new()]);
+}
+
+/// Entries kept before the cache is dropped wholesale. Bounded because elisp
+/// builds patterns at runtime (`regexp-quote` of user input, `rx` expansions),
+/// so an unbounded cache would grow with the program's input, not its code.
+const RE_CACHE_MAX: usize = 1024;
+
 pub(crate) fn compile_cf(
     h: &ElispHost,
     pat: &str,
     case_insensitive: bool,
-) -> Result<CompiledRe, String> {
+) -> Result<Rc<CompiledRe>, String> {
+    let slot = usize::from(case_insensitive);
+    if let Some(hit) = RE_CACHE.with(|c| c.borrow()[slot].get(pat).cloned()) {
+        return hit;
+    }
+    let syntax = HostSyntax {
+        host: h,
+        used_syntax: std::cell::Cell::new(false),
+    };
+    let compiled = compile_uncached(pat, case_insensitive, &syntax);
+    // A pattern whose translation read the syntax table is valid only for the
+    // table it read; caching it would answer with a stale character set after
+    // `modify-syntax-entry` or a buffer switch.
+    if !syntax.used_syntax.get() {
+        RE_CACHE.with(|c| {
+            let mut maps = c.borrow_mut();
+            if maps[slot].len() >= RE_CACHE_MAX {
+                maps[slot].clear();
+            }
+            maps[slot].insert(pat.to_string(), compiled.clone());
+        });
+    }
+    compiled
+}
+
+fn compile_uncached(
+    pat: &str,
+    case_insensitive: bool,
+    syntax: &HostSyntax<'_>,
+) -> Result<Rc<CompiledRe>, String> {
     // `translate` reports Emacs's own diagnostics ("Unmatched [ or [^", …); they
     // ride under the `invalid-regexp` error symbol, as in Emacs.
-    let (translated, groups) = crate::regexp::translate_groups(pat, &HostSyntax(h))
-        .map_err(|e| format!("invalid-regexp: {e}"))?;
+    let (translated, groups) =
+        crate::regexp::translate_groups(pat, syntax).map_err(|e| format!("invalid-regexp: {e}"))?;
     // Elisp `^`/`$` always match line boundaries, so compile in multiline mode;
     // `\``/`\'` (translated to \A/\z) keep matching the absolute start/end.
     let flags = if case_insensitive { "(?mi)" } else { "(?m)" };
-    let pat = format!("{flags}{translated}");
-    let re = fancy_regex::Regex::new(&pat).map_err(|e| format!("invalid-regexp: {e}"))?;
+    let full = format!("{flags}{translated}");
+    let re = fancy_regex::Regex::new(&full).map_err(|e| format!("invalid-regexp: {e}"))?;
     // Identity numbering needs no remap, and skipping it keeps every ordinary
     // pattern on exactly the path it was on before explicit numbering existed.
     let identity = groups.iter().enumerate().all(|(i, &g)| g as usize == i + 1);
-    Ok(CompiledRe {
+    Ok(Rc::new(CompiledRe {
         re,
         emacs_groups: (!identity).then_some(groups),
-    })
+    }))
+}
+
+/// Drop every cached regexp. Called from `reset_host` so a fresh host never
+/// inherits patterns compiled against the previous one's syntax table.
+pub fn clear_regexp_cache() {
+    RE_CACHE.with(|c| {
+        let mut maps = c.borrow_mut();
+        maps[0].clear();
+        maps[1].clear();
+    });
 }
 /// Read the dynamic `case-fold-search` (default t) — string matching folds case
 /// unless it is bound to nil.
@@ -4207,7 +4499,7 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
                     "interpreted-function"
                 }
             }
-            Some(Obj::HashTable { .. }) => "hash-table",
+            Some(Obj::HashTable(_)) => "hash-table",
             Some(Obj::CharTable(_)) => "char-table",
             Some(Obj::Buffer(_)) => "buffer",
             Some(Obj::Marker(_)) => "marker",
@@ -7977,6 +8269,8 @@ pub fn install(h: &mut ElispHost) {
     s("clrhash", 1, Some(1), clrhash);
     s("hash-table-count", 1, Some(1), hash_table_count);
     s("hash-table-test", 1, Some(1), hash_table_test);
+    s("hash-table-size", 1, Some(1), hash_table_size);
+    s("hash-table-weakness", 1, Some(1), hash_table_weakness);
     s("hash-table-p", 1, Some(1), hash_table_p);
     s("hash-table-keys", 1, Some(1), hash_table_keys);
     s("hash-table-values", 1, Some(1), hash_table_values);

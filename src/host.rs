@@ -62,7 +62,14 @@ pub enum SerObj {
     BoolVector(Vec<bool>),
     HashTable {
         test: u8,
-        entries: Vec<(Value, Value)>,
+        /// Slots in allocation order, `None` for a freed one — the shape
+        /// [`Obj::HashTable`] stores, because slot order and the free list are
+        /// observable through `maphash` and the printer.
+        slots: Vec<Option<(Value, Value)>>,
+        /// Freed slot indices, newest last — the order `puthash` pops them in.
+        free: Vec<u32>,
+        size: usize,
+        weakness: Value,
     },
     CharTable {
         subtype: Value,
@@ -280,12 +287,8 @@ pub enum Obj {
         /// does not copy the source.
         src: Rc<ClosureSrc>,
     },
-    /// An elisp hash table. `test`: 0 = eq, 1 = eql, 2 = equal. Association-vector
-    /// storage (linear scan) — fine for the table sizes elisp config uses.
-    HashTable {
-        test: u8,
-        entries: Vec<(Value, Value)>,
-    },
+    /// An elisp hash table; see [`ElHashTable`] for the slot model.
+    HashTable(ElHashTable),
     /// An Emacs char-table (`make-char-table`). Maps char codes `0..=MAX_CHAR`
     /// to values, with a `subtype` symbol, a `default` slot, an optional `parent`
     /// char-table for lookup fallback, and `extra` slots. See [`CharTable`].
@@ -339,6 +342,194 @@ pub struct MarkerData {
     pub buffer: Option<usize>,
     pub pos: usize,
     pub insertion_type: bool,
+}
+
+/// An elisp hash table, in Emacs's slot model (`struct Lisp_Hash_Table`, fns.c).
+///
+/// Storage is a SLOT VECTOR in allocation order plus a free list, not a packed
+/// association vector, because Emacs's slot order is directly observable:
+/// `maphash`, the `#s(hash-table …)` printer and `hash-table-keys` all walk
+/// slots in index order, and `remhash` frees a slot that the NEXT `puthash`
+/// reuses (LIFO). A packed vector answered
+///
+/// ```text
+/// (let ((h (make-hash-table)))
+///   (dotimes (i 5) (puthash i i h))
+///   (remhash 2 h) (puthash 9 9 h)
+///   (let (acc) (maphash (lambda (k _v) (push k acc)) h) (nreverse acc)))
+///
+///   emacs 30.2   (0 1 9 3 4)      ; 9 took the slot 2 freed
+///   packed       (0 1 3 4 9)      ; 9 appended
+/// ```
+///
+/// `index` maps a key hash to the slots holding keys with that hash, which is
+/// what makes `gethash`/`puthash` O(1). Before it, every lookup was a linear
+/// scan over a freshly CLONED entry vector — O(n) comparisons and one O(n)
+/// allocation per operation, so a 20 000-key build-then-read took 30 s.
+///
+/// The hash is computed once, when the key goes in, exactly as Emacs does. A key
+/// mutated after insertion therefore becomes unfindable, which is Emacs's
+/// behaviour too (`(puthash k 'v h)` then `(setcar k 2)` then `(gethash k h)`
+/// answers nil in both).
+pub struct ElHashTable {
+    /// Comparison test: 0 = `eq`, 1 = `eql`, 2 = `equal`.
+    pub test: u8,
+    /// Slots in allocation order; `None` is a freed slot.
+    pub slots: Vec<Option<(Value, Value)>>,
+    /// Freed slot indices, popped LIFO — Emacs's `next_free` chain.
+    free: Vec<u32>,
+    /// Key hash → the slots whose key hashes to it.
+    index: HashMap<u64, Vec<u32>>,
+    /// Live entry count, kept incrementally so `hash-table-count` is O(1).
+    live: usize,
+    /// Whether `index` is populated. A table restored from a serialized image
+    /// arrives with its slots but WITHOUT hashes: rebuilding them needs the
+    /// host, to resolve the arena handles inside `equal`-test keys, and at
+    /// import time the arena is still being filled. The first lookup calls
+    /// [`ElHashTable::reindex`] instead.
+    indexed: bool,
+    /// Emacs's allocation size (`hash-table-size`), grown by the measured Emacs growth series.
+    pub size: usize,
+    /// The `:weakness` symbol as given. elisprs has no GC that can drop entries,
+    /// so this is reported back and nothing more.
+    pub weakness: Value,
+}
+
+impl ElHashTable {
+    pub fn new(test: u8, size: usize, weakness: Value) -> ElHashTable {
+        ElHashTable {
+            test,
+            slots: Vec::new(),
+            free: Vec::new(),
+            index: HashMap::new(),
+            live: 0,
+            indexed: true,
+            size,
+            weakness,
+        }
+    }
+
+    /// Rebuild a table from a serialized image. The index is left empty and
+    /// filled by the first lookup (see `needs_index`).
+    pub fn from_slots(
+        test: u8,
+        slots: Vec<Option<(Value, Value)>>,
+        free: Vec<u32>,
+        size: usize,
+        weakness: Value,
+    ) -> ElHashTable {
+        let live = slots.iter().flatten().count();
+        ElHashTable {
+            test,
+            slots,
+            free,
+            index: HashMap::new(),
+            live,
+            indexed: false,
+            size,
+            weakness,
+        }
+    }
+
+    pub fn needs_index(&self) -> bool {
+        !self.indexed
+    }
+
+    /// Install the hashes computed by the caller (which has the host the
+    /// `equal` test needs), one per live slot in slot order.
+    pub fn reindex(&mut self, hashes: &[(u32, u64)]) {
+        self.index.clear();
+        for &(slot, hk) in hashes {
+            self.index.entry(hk).or_default().push(slot);
+        }
+        self.indexed = true;
+    }
+
+    /// The allocation size a full table of `size` grows to. Measured on GNU
+    /// Emacs 30.2 by filling tables made with each `:size` and reading
+    /// `hash-table-size` back: 0→6, then ×4 with a floor of 24 up to 64, ×2
+    /// above it (3→24, 5→24, 6→24, 7→28, 10→40, 24→96, 64→256, 65→130).
+    fn grown(size: usize) -> usize {
+        match size {
+            0 => 6,
+            n if n <= 64 => (n * 4).max(24),
+            n => n * 2,
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.live
+    }
+
+    /// Live `(key, value)` pairs in slot order — what `maphash`, the printer and
+    /// `hash-table-keys` all walk.
+    pub fn pairs(&self) -> impl Iterator<Item = &(Value, Value)> {
+        self.slots.iter().flatten()
+    }
+
+    /// The slots whose key hashes to `hk`. The caller confirms each with the
+    /// table's test; a hash collision is a candidate, not a match.
+    pub fn candidates(&self, hk: u64) -> &[u32] {
+        self.index.get(&hk).map_or(&[][..], |v| v.as_slice())
+    }
+
+    pub fn key_at(&self, slot: u32) -> Option<&Value> {
+        self.slots[slot as usize].as_ref().map(|(k, _)| k)
+    }
+
+    pub fn value_at(&self, slot: u32) -> Option<&Value> {
+        self.slots[slot as usize].as_ref().map(|(_, v)| v)
+    }
+
+    pub fn set_value_at(&mut self, slot: u32, val: Value) {
+        if let Some(e) = self.slots[slot as usize].as_mut() {
+            e.1 = val;
+        }
+    }
+
+    /// Add a key that is not already present, reusing the most recently freed
+    /// slot if there is one.
+    pub fn insert(&mut self, hk: u64, key: Value, val: Value) {
+        if self.live >= self.size {
+            self.size = Self::grown(self.size);
+        }
+        let slot = match self.free.pop() {
+            Some(i) => {
+                self.slots[i as usize] = Some((key, val));
+                i
+            }
+            None => {
+                self.slots.push(Some((key, val)));
+                (self.slots.len() - 1) as u32
+            }
+        };
+        self.index.entry(hk).or_default().push(slot);
+        self.live += 1;
+    }
+
+    /// Free `slot`, whose key hashed to `hk`.
+    pub fn remove(&mut self, hk: u64, slot: u32) {
+        if self.slots[slot as usize].take().is_none() {
+            return;
+        }
+        if let Some(bucket) = self.index.get_mut(&hk) {
+            bucket.retain(|&i| i != slot);
+            if bucket.is_empty() {
+                self.index.remove(&hk);
+            }
+        }
+        self.free.push(slot);
+        self.live -= 1;
+    }
+
+    /// `clrhash`: Emacs drops the whole slot vector, so the next `puthash`
+    /// starts again at slot 0 rather than reusing a free list.
+    pub fn clear(&mut self) {
+        self.slots.clear();
+        self.free.clear();
+        self.index.clear();
+        self.live = 0;
+    }
 }
 
 /// An Emacs char-table's payload. Per-char values use efficient range storage:
@@ -635,6 +826,12 @@ pub struct ElispHost {
     /// Session-local (never serialized); a fresh `reset_host` clears it.
     pub(crate) form_lines: HashMap<u32, u32>,
 }
+
+/// What [`ElispHost::closure_parts`] reports: `(is_macro, dynamic, arglist,
+/// body, captures)`, where `captures` is the lexical chain innermost-first as
+/// `(symbol-handle, value)`. This is exactly the `#[ARGLIST BODY ENV]`
+/// structure Emacs's `equal` walks for an interpreted closure.
+pub type ClosureParts = (bool, bool, Value, Vec<Value>, Vec<(u32, Value)>);
 
 /// A closure's printable source: the arglist as written and the body forms.
 #[derive(Default)]
@@ -1883,6 +2080,40 @@ impl ElispHost {
         }
     }
 
+    /// The parts of a closure that Emacs's `equal` compares.
+    ///
+    /// An interpreted closure in Emacs IS its `#[ARGLIST BODY ENV]` structure,
+    /// and `equal` descends into it like any other vector-like — which is why
+    /// `(equal (lambda () 1) (lambda () 1))` answers t there. Returned as
+    /// `(is_macro, dynamic, arglist, body, captures)`; `captures` is the lexical
+    /// chain innermost-first as `(symbol-handle, value)`.
+    pub fn closure_parts(&self, v: &Value) -> Option<ClosureParts> {
+        match self.obj(v) {
+            Some(Obj::Closure {
+                is_macro,
+                dynamic,
+                src,
+                env,
+                ..
+            }) => {
+                let mut captures = Vec::new();
+                let mut cur = env.clone();
+                while let Some(scope) = cur {
+                    captures.push((scope.sym_handle(), scope.value()));
+                    cur = scope.parent_lex();
+                }
+                Some((
+                    *is_macro,
+                    *dynamic,
+                    src.arglist.clone(),
+                    src.body.clone(),
+                    captures,
+                ))
+            }
+            _ => None,
+        }
+    }
+
     /// Clone a closure's captured env (for slot access), or `None`.
     fn closure_env(&self, v: &Value) -> Option<Lex> {
         match self.obj(v) {
@@ -2009,9 +2240,12 @@ impl ElispHost {
                 Obj::Record(v) => SerObj::Record(v.clone()),
                 Obj::BoolVector(v) => SerObj::BoolVector(v.clone()),
                 Obj::Bignum(b) => SerObj::Bignum(b.clone()),
-                Obj::HashTable { test, entries } => SerObj::HashTable {
-                    test: *test,
-                    entries: entries.clone(),
+                Obj::HashTable(t) => SerObj::HashTable {
+                    test: t.test,
+                    slots: t.slots.clone(),
+                    free: t.free.clone(),
+                    size: t.size,
+                    weakness: t.weakness.clone(),
                 },
                 Obj::CharTable(t) => SerObj::CharTable {
                     subtype: t.subtype.clone(),
@@ -2185,9 +2419,12 @@ impl ElispHost {
             Obj::Vector(v) => SerObj::Vector(v.clone()),
             Obj::Record(v) => SerObj::Record(v.clone()),
             Obj::BoolVector(v) => SerObj::BoolVector(v.clone()),
-            Obj::HashTable { test, entries } => SerObj::HashTable {
-                test: *test,
-                entries: entries.clone(),
+            Obj::HashTable(t) => SerObj::HashTable {
+                test: t.test,
+                slots: t.slots.clone(),
+                free: t.free.clone(),
+                size: t.size,
+                weakness: t.weakness.clone(),
             },
             Obj::CharTable(t) => SerObj::CharTable {
                 subtype: t.subtype.clone(),
@@ -2334,7 +2571,13 @@ impl ElispHost {
                 SerObj::Vector(v) => Obj::Vector(v),
                 SerObj::Record(v) => Obj::Record(v),
                 SerObj::BoolVector(v) => Obj::BoolVector(v),
-                SerObj::HashTable { test, entries } => Obj::HashTable { test, entries },
+                SerObj::HashTable {
+                    test,
+                    slots,
+                    free,
+                    size,
+                    weakness,
+                } => Obj::HashTable(ElHashTable::from_slots(test, slots, free, size, weakness)),
                 SerObj::CharTable {
                     subtype,
                     default,
@@ -2594,9 +2837,9 @@ impl ElispHost {
                         kids.extend(src.body.iter().cloned());
                         Some(kids)
                     }
-                    Some(Obj::HashTable { entries, .. }) => {
-                        let mut kids = Vec::with_capacity(entries.len() * 2);
-                        for (k, val) in entries {
+                    Some(Obj::HashTable(t)) => {
+                        let mut kids = Vec::with_capacity(t.count() * 2);
+                        for (k, val) in t.pairs() {
                             kids.push(k.clone());
                             kids.push(val.clone());
                         }
@@ -2952,7 +3195,8 @@ impl ElispHost {
                         closure
                     }
                 }
-                Some(Obj::HashTable { test, entries }) => {
+                Some(Obj::HashTable(tbl)) => {
+                    let (test, entries) = (&tbl.test, tbl.pairs().collect::<Vec<_>>());
                     // Emacs-30 syntax: omit `test` when eql (the default), and
                     // `data` when empty — `#s(hash-table test equal data (k v …))`.
                     let mut s = String::from("#s(hash-table");
@@ -4506,6 +4750,11 @@ pub fn reset_host() {
     HOST.with(|h| *h.borrow_mut() = ElispHost::new());
     PRELUDE_LOADED.with(|c| c.set(false));
     PRELUDE_COMPILING.with(|c| c.set(false));
+    // The pooled VMs hold chunks whose constants are arena handles into the host
+    // just replaced; keeping them would resolve a stale handle in the new arena.
+    clear_vm_pool();
+    // Cached regexps were translated against the old host's syntax table.
+    crate::builtins::clear_regexp_cache();
 }
 pub fn prelude_loaded() -> bool {
     PRELUDE_LOADED.with(|c| c.get())
@@ -4741,7 +4990,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                     return Err(format!("wrong-number-of-arguments: maphash {}", args.len()));
                 }
                 let entries = with_host(|h| match h.obj(&args[1]) {
-                    Some(Obj::HashTable { entries, .. }) => Some(entries.clone()),
+                    Some(Obj::HashTable(t)) => Some(t.pairs().cloned().collect::<Vec<_>>()),
                     _ => None,
                 })
                 .ok_or("maphash: not a hash table")?;
@@ -5108,7 +5357,7 @@ fn run_closure(
         });
         return Err(e);
     }
-    let result = run_chunk((**body).clone());
+    let result = run_body(body);
     // Unwind to the entry depth (not just one scope): a `throw`/error out of an
     // inner `let` inside the body leaks scopes that this restores.
     with_host(|h| {
@@ -6070,10 +6319,12 @@ pub(crate) fn numeric_hook(op: NumOp, a: &Value, b: &Value) -> Result<Value, Str
     })
 }
 
-/// Run a compiled chunk on a fresh fusevm VM, returning the elisp result.
-pub fn run_chunk(chunk: Chunk) -> Result<Value, String> {
-    with_host(|h| h.error = None);
-    let mut vm = VM::new(chunk);
+/// Install the elisp execution contract on a VM: the extension dispatchers, the
+/// strict numeric hook, the fixnum range and the tracing JIT.
+///
+/// `VM::reset` preserves every one of these, so a pooled VM is configured once
+/// and reused.
+fn configure_vm(vm: &mut VM) {
     vm.set_extension_handler(Box::new(ext_dispatch));
     vm.set_extension_wide_handler(Box::new(ext_dispatch_wide));
     // elisp is not awk: arithmetic signals on a non-number and promotes past
@@ -6089,7 +6340,10 @@ pub fn run_chunk(chunk: Chunk) -> Result<Value, String> {
     if !debug_mode() {
         vm.enable_tracing_jit();
     }
-    let outcome = vm.run();
+}
+
+/// Read a finished VM's outcome as an elisp result.
+fn vm_outcome(vm: &VM, outcome: VMResult) -> Result<Value, String> {
     if let Some(e) = with_host(|h| h.take_error()) {
         return Err(e);
     }
@@ -6098,6 +6352,130 @@ pub fn run_chunk(chunk: Chunk) -> Result<Value, String> {
         VMResult::Halted => Ok(vm.stack.last().cloned().unwrap_or(Value::Undef)),
         VMResult::Error(e) => Err(e),
     }
+}
+
+/// Run a compiled chunk on a fresh fusevm VM, returning the elisp result.
+///
+/// Top-level entry point (one call per file / `eval` form). A CLOSURE body goes
+/// through [`run_body`] instead, which pools its VM.
+pub fn run_chunk(chunk: Chunk) -> Result<Value, String> {
+    with_host(|h| h.error = None);
+    let mut vm = VM::new(chunk);
+    configure_vm(&mut vm);
+    let outcome = vm.run();
+    vm_outcome(&vm, outcome)
+}
+
+/// A closure body's pooled VMs, plus the `Rc` that owns the chunk they hold.
+///
+/// Keeping the `Rc` alive is what makes the key sound: the key is the `Rc`'s
+/// address, and an address can only be handed to a second chunk after the first
+/// is freed.
+struct VmPoolEntry {
+    _chunk: Rc<Chunk>,
+    /// Boxed so the pooled VM never travels through a stack frame. A `VM` is a
+    /// large struct (stack, frames, globals, JIT state), and elisp call frames
+    /// nest one native frame per Lisp frame — holding an unboxed one on the
+    /// frame alongside the live one cost enough stack to overflow a 2 MiB test
+    /// thread (`cargo test --test eval` aborted with "has overflowed its
+    /// stack"). `clippy::vec_box` reads the `Box` as redundant indirection,
+    /// which it would be if the element never left the `Vec`; here it is what
+    /// keeps the element off the call frame.
+    #[allow(clippy::vec_box)]
+    vms: Vec<Box<VM>>,
+}
+
+thread_local! {
+    /// Pooled VMs keyed by closure body.
+    ///
+    /// `VM::new` allocates a JIT compiler, a 256-value stack, a frame vector and
+    /// a globals vector, and the caller used to hand it a fresh DEEP COPY of the
+    /// body `Chunk` — `ops`, `constants`, `lines`, and one `String` per entry in
+    /// `names` — on EVERY elisp call. Profiling a 200 000-call loop
+    /// (`sample`, macOS, debug build) put `_platform_memmove` at 141 of the
+    /// interpreter thread's 978 samples, second only to `VM::exec_op` at 177.
+    ///
+    /// Keying by chunk is what removes the copy: a pooled VM already holds the
+    /// chunk it ran last time, so [`run_body`] takes it back OUT of the VM
+    /// (`std::mem::take`) and hands the same value to `VM::reset`. Nothing is
+    /// cloned on a warm call, and the VM's JIT state — traces compiled for that
+    /// exact chunk — survives with it.
+    #[allow(clippy::type_complexity)]
+    static VM_POOL: RefCell<HashMap<usize, VmPoolEntry, BuildPtrHasher>> =
+        RefCell::new(HashMap::default());
+}
+
+/// A hasher for keys that are already well-distributed machine words (here, a
+/// chunk's address). `HashMap`'s default SipHash is built to resist adversarial
+/// keys, which a pointer this map never sees; on the call path it was pure
+/// overhead. This is Fibonacci hashing — one multiply, no state.
+#[derive(Default, Clone, Copy)]
+pub struct PtrHasher(u64);
+
+impl std::hash::Hasher for PtrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.write_u64(u64::from(*b));
+        }
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0 ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type BuildPtrHasher = std::hash::BuildHasherDefault<PtrHasher>;
+
+/// Most VMs kept per chunk. Recursion needs one live VM per frame; past this
+/// depth the extra VMs are dropped rather than held for the process's lifetime.
+const VM_POOL_PER_CHUNK: usize = 16;
+
+/// Run a closure body, reusing a pooled VM for that exact body when one is free.
+///
+/// Re-entrant: a recursive call finds the pool empty and builds its own VM, so
+/// the pool holds at most one VM per live frame of that body.
+pub fn run_body(body: &Rc<Chunk>) -> Result<Value, String> {
+    with_host(|h| h.error = None);
+    let key = Rc::as_ptr(body) as usize;
+    let pooled = VM_POOL.with(|p| p.borrow_mut().get_mut(&key).and_then(|e| e.vms.pop()));
+    let mut vm: Box<VM> = match pooled {
+        Some(mut vm) => {
+            // The VM already holds this chunk: move it out and straight back in,
+            // so `reset` clears the run state without copying the program.
+            let chunk = std::mem::take(&mut vm.chunk);
+            vm.reset(chunk);
+            vm
+        }
+        None => {
+            let mut vm = Box::new(VM::new((**body).clone()));
+            configure_vm(&mut vm);
+            vm
+        }
+    };
+    let outcome = vm.run();
+    let result = vm_outcome(&vm, outcome);
+    VM_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        let entry = pool.entry(key).or_insert_with(|| VmPoolEntry {
+            _chunk: Rc::clone(body),
+            vms: Vec::new(),
+        });
+        if entry.vms.len() < VM_POOL_PER_CHUNK {
+            entry.vms.push(vm);
+        }
+    });
+    result
+}
+
+/// Drop every pooled VM. Called from `reset_host`: the pooled VMs hold chunks
+/// whose constants are arena handles into the host being replaced.
+pub fn clear_vm_pool() {
+    VM_POOL.with(|p| p.borrow_mut().clear());
 }
 
 #[cfg(test)]

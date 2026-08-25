@@ -1584,10 +1584,45 @@ The argument may be a character or string.  The result has the same type."
         ((consp tree) (append (flatten-tree (car tree)) (flatten-tree (cdr tree))))
         (t (list tree))))
 (defun flatten-list (tree) (flatten-tree tree))
-(defun copy-tree (tree) (if (consp tree) (cons (copy-tree (car tree)) (copy-tree (cdr tree))) tree))
+(defun copy-tree (tree &optional vectors-and-records)
+  "Make a copy of TREE.
+If TREE is a cons cell, this recursively copies both its car and its cdr.
+With VECTORS-AND-RECORDS non-nil, traverse and copy vectors and records too."
+  ;; Ported from subr.el:877. The iterative cdr walk (rather than a plain
+  ;; `(cons (copy-tree (car …)) (copy-tree (cdr …)))' recursion) is what keeps a
+  ;; long list from recursing once per element, and it is the only shape that
+  ;; copies a DOTTED tail correctly under VECTORS-AND-RECORDS.
+  (if (consp tree)
+      (let (result)
+        (while (consp tree)
+          (let ((newcar (car tree)))
+            (if (or (consp (car tree))
+                    (and vectors-and-records
+                         (or (vectorp (car tree)) (recordp (car tree)))))
+                (setq newcar (copy-tree (car tree) vectors-and-records)))
+            (push newcar result))
+          (setq tree (cdr tree)))
+        (nconc (nreverse result)
+               (if (and vectors-and-records (or (vectorp tree) (recordp tree)))
+                   (copy-tree tree vectors-and-records)
+                 tree)))
+    (if (and vectors-and-records (or (vectorp tree) (recordp tree)))
+        (let ((i (length (setq tree (copy-sequence tree)))))
+          (while (>= (setq i (1- i)) 0)
+            (aset tree i (copy-tree (aref tree i) vectors-and-records)))
+          tree)
+      tree)))
 (defun copy-sequence (seq)
   (cond ((listp seq) (append seq nil))
-        ((or (stringp seq) (vectorp seq)) seq)
+        ;; A string and a vector copy into FRESH objects. Returning SEQ itself
+        ;; was a silent wrong answer twice over: `(eq seq (copy-sequence seq))'
+        ;; answered t where Emacs answers nil, and — worse — `aset' on the
+        ;; "copy" wrote through to the original, so `copy-tree'/`cl-copy-list'
+        ;; and every caller that copies before mutating shared one object.
+        ;; `substring' copies a string WITH its text properties (which is what
+        ;; Emacs's `copy-sequence' does); `vconcat' copies a vector's slots.
+        ((stringp seq) (substring seq 0))
+        ((vectorp seq) (vconcat seq))
         ;; A record is copied slot-for-slot into a fresh record (slot 0, the type,
         ;; is reproduced): `(copy-sequence rec)' preserves record-ness, so it is the
         ;; copier a cl-defstruct `copy-NAME' uses.
@@ -3296,20 +3331,6 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 ;; to the ordinary printer.
 (defun cl-prin1-to-string (object) (prin1-to-string object))
 (defun cl-prin1 (object &optional stream) (prin1 object stream))
-(defun format-spec (format specification &rest _)
-  ;; Replace each %X in FORMAT with the cdr of (X . VALUE) in SPECIFICATION; %% => %.
-  (let ((i 0) (n (length format)) (out nil))
-    (while (< i n)
-      (let ((c (aref format i)))
-        (if (and (eq c ?%) (< (1+ i) n))
-            (let ((nc (aref format (1+ i))))
-              (if (eq nc ?%) (setq out (cons "%" out))
-                (let ((cell (assq nc specification)))
-                  (setq out (cons (if cell (format "%s" (cdr cell)) "") out))))
-              (setq i (+ i 2)))
-          (setq out (cons (char-to-string c) out))
-          (setq i (1+ i)))))
-    (apply 'concat (nreverse out))))
 (defun subst-char-in-string (from to string &optional _inplace)
   (concat (mapcar (lambda (c) (if (eq c from) to c)) string)))
 (defun string-bytes (s)
@@ -3952,6 +3973,162 @@ remote, otherwise search locally."
      (unwind-protect
          (with-current-buffer --tb-- ,@body)
        (kill-buffer --tb--))))
+(defun insert-and-inherit (&rest args)
+  "Insert ARGS at point, inheriting text properties from the adjacent text.
+The inserted text takes the properties of the character BEFORE point, except
+those the preceding character marks `rear-nonsticky', plus the properties of the
+character AFTER point that it marks `front-sticky'.  At the beginning of the
+buffer there is no preceding character, so nothing is inherited."
+  ;; C `insert_and_inherit' -> `graft_intervals_into_buffer' (textprop.c). This
+  ;; is the insert `format-spec' uses to carry FORMAT's properties onto each
+  ;; substitution.
+  (let* ((start (point))
+         (before (and (> start (point-min)) (text-properties-at (1- start))))
+         (rear (plist-get before 'rear-nonsticky))
+         (inherited nil))
+    (apply #'insert args)
+    (let ((end (point)))
+      (while before
+        (let ((prop (car before)) (val (cadr before)))
+          (unless (or (eq prop 'rear-nonsticky)
+                      (eq rear t)
+                      (and (consp rear) (memq prop rear)))
+            (setq inherited (cons prop (cons val inherited)))))
+        (setq before (cddr before)))
+      ;; Anything the FOLLOWING character declares `front-sticky' is inherited
+      ;; too, and wins over the preceding character for the same property.
+      (let* ((after (and (< end (point-max)) (text-properties-at end)))
+             (front (plist-get after 'front-sticky))
+             (tail after))
+        (while tail
+          (let ((prop (car tail)) (val (cadr tail)))
+            (when (and (not (eq prop 'front-sticky))
+                       (or (eq front t) (and (consp front) (memq prop front))))
+              (setq inherited (cons prop (cons val inherited)))))
+          (setq tail (cddr tail))))
+      (when inherited
+        (add-text-properties start end inherited))))
+  nil)
+
+;;; ---- format-spec.el ----
+;; Faithful port of format-spec.el (Emacs 30.2). The previous implementation
+;; substituted %CHAR and nothing else: it dropped the flag/width/precision
+;; syntax silently, so `(format-spec "%-5a|" '((?a . "x")))' answered "5a|" —
+;; the width digits fell through as literal text.
+(defun format-spec (format specification &optional ignore-missing split)
+  "Return a string based on FORMAT and SPECIFICATION.
+Each %-spec may carry flags, a width and a precision:
+
+  %<flags><width><precision>character
+
+Flags: 0 pad with zeros, - pad on the right, < truncate on the left,
+> truncate on the right, ^ upcase, _ downcase.
+
+IGNORE-MISSING nil signals on a %-spec with no entry in SPECIFICATION;
+`ignore' leaves it verbatim, `delete' removes it.  With SPLIT, return the
+list of pieces instead of one string."
+  (with-temp-buffer
+    (let ((split-start (point-min))
+          (split-result nil))
+      (insert format)
+      (goto-char (point-min))
+      (while (search-forward "%" nil t)
+        (cond
+         ;; Quoted percent sign.
+         ((= (following-char) ?%)
+          (when (memq ignore-missing '(nil ignore delete))
+            (delete-char 1)))
+         ;; Valid format spec.
+         ((looking-at "\\([ 0<>^_-]+\\)?\\([0-9]+\\)?\\(\\.[0-9]+\\)?\\([[:alpha:]]\\)")
+          (let* ((beg (point))
+                 (end (match-end 0))
+                 (flags (match-string 1))
+                 (width (match-string 2))
+                 (trunc (match-string 3))
+                 (char (string-to-char (match-string 4)))
+                 (text (let ((res (cdr (assq char specification))))
+                         (if (functionp res) (funcall res) res))))
+            (when (and split (not (= (1- beg) split-start)))
+              (push (buffer-substring split-start (1- beg)) split-result))
+            (cond (text
+                   (setq text (format-spec--do-flags
+                               (format "%s" text)
+                               (format-spec--parse-flags flags)
+                               (and width (string-to-number width))
+                               (and trunc (car (read-from-string trunc 1)))))
+                   ;; Insert first, to preserve text properties.
+                   (insert-and-inherit text)
+                   ;; Delete the specifier body.
+                   (delete-region (point) (+ end (length text)))
+                   ;; Delete the percent sign.
+                   (delete-region (1- beg) beg))
+                  ((eq ignore-missing 'delete)
+                   (delete-region (1- beg) end))
+                  ((not ignore-missing)
+                   (error "Invalid format character: `%%%c'" char)))
+            (when split
+              (push (buffer-substring (1- beg) (point)) split-result)
+              (setq split-start (point)))))
+         ;; Signal an error on bogus format strings.
+         ((not ignore-missing)
+          (error "Invalid format string"))))
+      (if (not split)
+          (buffer-string)
+        (unless (= split-start (point-max))
+          (push (buffer-substring split-start (point-max)) split-result))
+        (nreverse split-result)))))
+
+(defun format-spec--do-flags (str flags width trunc)
+  "Return STR formatted according to FLAGS, WIDTH, and TRUNC."
+  (let (diff str-width)
+    ;; Truncate original string first, like `format' does.
+    (when trunc
+      (setq str-width (string-width str))
+      (when (> (setq diff (- str-width trunc)) 0)
+        (setq str (if (memq :chop-left flags)
+                      (truncate-string-to-width str str-width diff)
+                    (format (format "%%.%ds" trunc) str))
+              str-width trunc)))
+    ;; Pad or chop to width.
+    (when width
+      (setq str-width (or str-width (string-width str))
+            diff (- width str-width))
+      (cond ((zerop diff))
+            ((> diff 0)
+             (let ((pad (make-string diff (if (memq :pad-zero flags) ?0 ?\s))))
+               (setq str (if (memq :pad-right flags)
+                             (concat str pad)
+                           (concat pad str)))))
+            ((memq :chop-left flags)
+             (setq str (truncate-string-to-width str str-width (- diff))))
+            ((memq :chop-right flags)
+             (setq str (format (format "%%.%ds" width) str))))))
+  ;; Fiddle case.
+  (cond ((memq :upcase flags) (upcase str))
+        ((memq :downcase flags) (downcase str))
+        (str)))
+
+(defun format-spec--parse-flags (flags)
+  "Convert sequence of FLAGS to list of human-readable keywords."
+  (mapcan (lambda (char)
+            (cond ((eq char ?0) (list :pad-zero))
+                  ((eq char ?-) (list :pad-right))
+                  ((eq char ?<) (list :chop-left))
+                  ((eq char ?>) (list :chop-right))
+                  ((eq char ?^) (list :upcase))
+                  ((eq char ?_) (list :downcase))))
+          flags))
+
+(defun format-spec-make (&rest pairs)
+  "Return an alist suitable for use in `format-spec' based on PAIRS.
+PAIRS is a property list with characters as keys."
+  (let (alist)
+    (while pairs
+      (unless (cdr pairs)
+        (error "Invalid list of pairs"))
+      (push (cons (car pairs) (cadr pairs)) alist)
+      (setq pairs (cddr pairs)))
+    (nreverse alist)))
 ;; save-excursion: restore the current buffer AND point after BODY. Point is saved
 ;; as a marker-like position that tracks insertions/deletions during BODY.
 (defmacro save-excursion (&rest body)
@@ -5336,6 +5513,90 @@ HOOK should be a symbol; its value is a function or a list of functions."
   (dolist (hook hooks)
     (run-hook-with-args hook))
   nil)
+(defun run-hook-with-args-until-success (hook &rest args)
+  "Run HOOK's functions with ARGS, stopping at the first non-nil result.
+Return that result, or nil if every function returned nil."
+  ;; C `run_hook_with_args' with `until_success' (eval.c). A hook whose value is
+  ;; a single function is that one call; `t' inside a list is the buffer-local
+  ;; marker and is skipped, as in `run-hook-with-args'.
+  (when (boundp hook)
+    (let ((value (symbol-value hook)))
+      (if (functionp value)
+          (apply value args)
+        (let ((res nil))
+          (while (and value (null res))
+            (unless (eq (car value) t)
+              (setq res (apply (car value) args)))
+            (setq value (cdr value)))
+          res)))))
+(defun run-hook-with-args-until-failure (hook &rest args)
+  "Run HOOK's functions with ARGS, stopping at the first nil result.
+Return nil if one returned nil, t otherwise."
+  ;; C `run_hook_with_args' with `until_failure'. An unbound or empty hook has
+  ;; no function that can fail, so the answer is t.
+  (if (not (boundp hook))
+      t
+    (let ((value (symbol-value hook)))
+      (if (functionp value)
+          (apply value args)
+        (let ((ok t))
+          (while (and value ok)
+            (unless (eq (car value) t)
+              (setq ok (apply (car value) args)))
+            (setq value (cdr value)))
+          (and ok t))))))
+(defun run-hook-wrapped (hook wrap-function &rest args)
+  "Run HOOK's functions through WRAP-FUNCTION, stopping at the first non-nil.
+Each function F is invoked as (funcall WRAP-FUNCTION F ARGS...)."
+  ;; C `run_hook_wrapped' (eval.c): the wrapper decides how to call F, which is
+  ;; what lets a caller install a `condition-case' or a timing shim around every
+  ;; hook function without rewriting the hook.
+  (when (boundp hook)
+    (let ((value (symbol-value hook)))
+      (if (functionp value)
+          (apply wrap-function value args)
+        (let ((res nil))
+          (while (and value (null res))
+            (unless (eq (car value) t)
+              (setq res (apply wrap-function (car value) args)))
+            (setq value (cdr value)))
+          res)))))
+(defun remove-hook (hook function &optional local)
+  "Remove FUNCTION from HOOK's functions.
+Do nothing if HOOK does not currently contain FUNCTION."
+  ;; Ported from subr.el:2186. FUNCTION is matched with `equal' (via `member'),
+  ;; not `eq', so an anonymous function equal to the stored one removes it. The
+  ;; depth-alist entry goes with it — leaving it behind leaks the entry and
+  ;; re-orders the hook if the same function is added again (bug#46414).
+  (or (boundp hook) (set hook nil))
+  (or (default-boundp hook) (set-default hook nil))
+  (unless (and local (not (local-variable-p hook)))
+    (when (and (local-variable-p hook)
+               (not (and (consp (symbol-value hook))
+                         (memq t (symbol-value hook)))))
+      (setq local t))
+    (let ((hook-value (if local (symbol-value hook) (default-value hook)))
+          (old-fun nil))
+      (if (or (not (listp hook-value)) (eq (car hook-value) 'lambda))
+          (when (equal hook-value function)
+            (setq old-fun hook-value)
+            (setq hook-value nil))
+        (when (setq old-fun (car (member function hook-value)))
+          (setq hook-value (remq old-fun hook-value))))
+      (when old-fun
+        (let* ((depth-sym (get hook 'hook--depth-alist))
+               (depth-alist (if depth-sym (if local (symbol-value depth-sym)
+                                            (default-value depth-sym))))
+               (di (assq old-fun depth-alist)))
+          (when di
+            (setf (if local (symbol-value depth-sym)
+                    (default-value depth-sym))
+                  (remq di depth-alist)))))
+      (if (not local)
+          (set-default hook hook-value)
+        (if (equal hook-value '(t))
+            (kill-local-variable hook)
+          (set hook hook-value))))))
 
 ;; ---- pcase: structural `cond` (non-backquote subset) ----
 ;; Supported patterns (compiled to tests + bindings at macroexpansion time):
@@ -5570,6 +5831,47 @@ or the result is already atomic/grouped."
           (cons (cons (list 'vectorp val) (car r))
                 (cons (list lv (list 'if (list 'vectorp val) (list 'append val nil) nil))
                       (cdr r)))))
+       ;; (map KEY...): map.el's pattern. An element is a bare SYMBOL (bound to
+       ;; the value at 'SYMBOL), a KEYWORD :k (binding k to the value at :k), or
+       ;; a (KEY VAR [DEFAULT]) list whose KEY and DEFAULT are *evaluated*
+       ;; forms. `map-elt' answers DEFAULT for anything that is not a map, so
+       ;; the binders are safe to establish before the `mapp' test runs.
+       ((eq head 'map)
+        (let ((tests (list (list 'mapp val))) (binds nil))
+          (dolist (elt (cdr pat))
+            (setq binds
+                  (append binds
+                          (list (cond
+                                 ((consp elt)
+                                  (list (nth 1 elt)
+                                        (list 'map-elt val (nth 0 elt) (nth 2 elt))))
+                                 ((keywordp elt)
+                                  (list (intern (substring (symbol-name elt) 1))
+                                        (list 'map-elt val elt)))
+                                 (t (list elt (list 'map-elt val (list 'quote elt)))))))))
+          (cons tests binds)))
+       ;; (cl-struct TYPE SLOT...): cl-lib's pattern. A SLOT is a bare name
+       ;; (bound to itself) or (SLOT VAR). The slot reads are guarded by the
+       ;; type test, because `pcase--clause' establishes the binders around the
+       ;; tests and `cl-struct-slot-value' signals on the wrong type -- a
+       ;; non-matching value has to FAIL the clause, not error out of it.
+       ((eq head 'cl-struct)
+        (let* ((type (nth 1 pat))
+               (typed (list 'cl-typep val (list 'quote type)))
+               (tests (list typed))
+               (binds nil))
+          (dolist (slot (cddr pat))
+            (let ((name (if (consp slot) (car slot) slot))
+                  (var (if (consp slot) (nth 1 slot) slot)))
+              (setq binds
+                    (append binds
+                            (list (list var
+                                        (list 'if typed
+                                              (list 'cl-struct-slot-value
+                                                    (list 'quote type)
+                                                    (list 'quote name)
+                                                    val))))))))
+          (cons tests binds)))
        ;; (seq P0 P1 ...): match each subpattern against (nth i SV), where SV is
        ;; the elements as a list (or nil if VAL is not a sequence).
        ((eq head 'seq)
@@ -5969,6 +6271,12 @@ This is like the `&' operator of the C language."
 (defmacro cl-function (f) (list 'function f))
 
 (defun hash-table-empty-p (h) (= 0 (hash-table-count h)))
+;; Emacs 30 dropped the per-table rehash parameters from `struct
+;; Lisp_Hash_Table'; both accessors survive and answer the same constant for
+;; every table (measured on GNU Emacs 30.2: 1.5 and 0.8125, for a default table
+;; and for `:size 99' alike).
+(defun hash-table-rehash-size (_table) 1.5)
+(defun hash-table-rehash-threshold (_table) 0.8125)
 
 ;;; ---- map.el (subset) ----
 ;; A generic key/value interface over alists, hash-tables and arrays. A list
@@ -5978,6 +6286,9 @@ This is like the `&' operator of the C language."
 (defun map--plist-p (list)
   "Return non-nil if LIST is the start of a nonempty plist map."
   (and (consp list) (atom (car list))))
+(defun mapp (map)
+  "Return non-nil if MAP is a map (list, array or hash-table)."
+  (or (listp map) (arrayp map) (hash-table-p map)))
 (defun map-elt (map key &optional default testfn)
   (cond
    ((hash-table-p map) (gethash key map default))
@@ -6108,6 +6419,20 @@ This is like the `&' operator of the C language."
           (signal 'map-not-inplace (list map))))))
    ((arrayp map) (aset map key value) map)
    (t (error "map-put!: unsupported map type"))))
+(defun map--make-pcase-patterns (args)
+  "Return a `(map ...)' pcase pattern built from ARGS (map.el:639)."
+  (cons 'map
+        (mapcar (lambda (elt)
+                  (if (eq (car-safe elt) 'map) (map--make-pcase-patterns elt) elt))
+                args)))
+(defmacro map-let (keys map &rest body)
+  "Bind the variables in KEYS to the elements of MAP, then evaluate BODY.
+KEYS is a list of symbols, or of (KEY VARNAME [DEFAULT]) sublists in which KEY
+and DEFAULT are unquoted forms.  MAP can be an alist, plist, hash-table or
+array."
+  ;; map.el:73 -- `map-let' IS a `pcase-let' over the `map' pattern.
+  `(pcase-let ((,(map--make-pcase-patterns keys) ,map))
+     ,@body))
 (defun map-values-apply (function map) (map-apply (lambda (_k v) (funcall function v)) map))
 (defun map-keys-apply (function map) (map-apply (lambda (k _v) (funcall function k)) map))
 (defun map-merge (type &rest maps)
