@@ -3183,7 +3183,12 @@ function may, `gethash' on such a table included."
             nil
           (setq f fundef))))
     val))
-(defun function-put (f prop value) (put f prop value))
+(defun function-put (f prop value)
+  ;; A `compiler-macro' property changes how `macroexpand-all' treats every
+  ;; call to F, so the host keeps a set of the symbols that have one and only
+  ;; looks the property up for those (see `ElispHost::compiler_macros').
+  (when (eq prop 'compiler-macro) (--note-compiler-macro f))
+  (put f prop value))
 (defun define-symbol-prop (symbol prop value) (put symbol prop value))
 ;; `record'/`make-record' are `Obj::Record' primitives (see builtins.rs); a record
 ;; is a distinct type from a vector, with the type symbol in slot 0.
@@ -3266,12 +3271,32 @@ function may, `gethash' on such a table included."
 (--set-intrinsic-macro-cell
  'unless (cons 'macro (lambda (cond &rest body) (cons 'if (cons cond (cons nil body))))))
 (defun add-to-list (var elt &optional append compare-fn)
-  ;; Add ELT to VAR's list unless already present (COMPARE-FN, default `equal');
-  ;; prepend by default, or append to the end when APPEND is non-nil.
-  (let ((cur (symbol-value var)) (test (or compare-fn #'equal)) (found nil))
-    (dolist (x cur) (when (funcall test elt x) (setq found t)))
-    (if found cur
-      (set var (if append (append cur (list elt)) (cons elt cur))))))
+  "Add ELT to VAR's list value unless it is already there.
+VAR should not name a lexical variable -- the compiler macro below rewrites
+those call sites, and this function cannot: it reads and writes the SYMBOL's
+value cell.
+
+Faithful to subr.el, membership included: the default test is `member', an
+explicit `eq'/`eql' COMPARE-FN uses `memq'/`memql', and any other is walked by
+hand until it matches.  Which of the four runs is observable through a
+COMPARE-FN with side effects, and through how many times it is called."
+  ;; subr.el declares the compiler macro here.  This prelude is ONE file, and
+  ;; the `declare' bridge (`byte-run--set-compiler-macro') is not defined until
+  ;; much further down -- in Emacs byte-run.el is a separate file loaded first --
+  ;; so a `declare' here would be silently dropped.  It is registered by hand
+  ;; below instead; see `add-to-list--anon-cmacro'.
+  (if (cond
+       ((null compare-fn) (member elt (symbol-value var)))
+       ((eq compare-fn #'eq) (memq elt (symbol-value var)))
+       ((eq compare-fn #'eql) (memql elt (symbol-value var)))
+       (t (let ((lst (symbol-value var)))
+            (while (and lst (not (funcall compare-fn elt (car lst))))
+              (setq lst (cdr lst)))
+            lst)))
+      (symbol-value var)
+    (set var (if append
+                 (append (symbol-value var) (list elt))
+               (cons elt (symbol-value var))))))
 ;; equal-including-properties compares text as `equal' does, and additionally
 ;; requires matching text properties on strings.
 (defun equal-including-properties (a b)
@@ -3819,15 +3844,37 @@ of `load-path'."
 ;; (the two symbols are quoted, not evaluated), matching the real Emacs default.
 (defvar custom-theme-load-path (list 'custom-theme-directory t)
   "List of directories to search for custom theme files.")
+(defun expand-file-name--tilde (s)
+  "S with a leading `~' or `~/' replaced by $HOME. (No `~user' handling.)"
+  (cond ((string-prefix-p "~/" s) (concat (or (getenv "HOME") "~") (substring s 1)))
+        ((string= s "~") (or (getenv "HOME") "~"))
+        (t s)))
 (defun expand-file-name (name &optional dir)
   ;; Expand NAME against DIR (default `default-directory'), `~/' via $HOME, and
   ;; collapse `.', `..' and `//'. (No remote/`~user' handling.)
+  ;;
+  ;; The result is ABSOLUTE: DIR is itself expanded when it is relative, empty
+  ;; or `~'-prefixed, which is what makes `(expand-file-name "b" "a")' answer
+  ;; "<default-directory>/a/b" rather than "a/b".
   (setq dir (or dir default-directory))
-  (cond ((string-prefix-p "~/" name) (setq name (concat (or (getenv "HOME") "~") (substring name 1))))
-        ((string= name "~") (setq name (or (getenv "HOME") "~"))))
+  (setq name (expand-file-name--tilde name))
+  (setq dir (expand-file-name--tilde dir))
+  (unless (or (file-name-absolute-p dir)
+              ;; The fully degenerate call: with both NAME and DIR empty
+              ;; Emacs's C has nothing to make absolute and answers "".
+              (and (string= dir "") (string= name ""))
+              ;; A relative `default-directory' would recurse forever.
+              (string= dir default-directory))
+    (setq dir (expand-file-name dir default-directory)))
+  (if (and (string= name "") (string= dir "")) "" (expand-file-name--join name dir)))
+(defun expand-file-name--join (name dir)
   (let* ((combined (if (file-name-absolute-p name) name (concat (file-name-as-directory dir) name)))
          (abs (string-prefix-p "/" combined))
-         (trail (and (> (length combined) 1) (string-suffix-p "/" combined)))
+         ;; The trailing slash comes from NAME, not from the joined path: DIR is
+         ;; always given one by `file-name-as-directory', so reading it off
+         ;; COMBINED made `(expand-file-name "" "/a")' answer "/a/" where Emacs
+         ;; answers "/a". `(expand-file-name "b/" "/a")' is still "/a/b/".
+         (trail (and (> (length name) 0) (string-suffix-p "/" name)))
          (out nil))
     (dolist (c (split-string combined "/"))
       (cond ((or (string= c "") (string= c ".")) nil)
@@ -10135,6 +10182,33 @@ rather than files.  These modes usually use read-only buffers."
              (defun ,cfname (,@(car data) ,@args)
                (ignore ,@(delq '&rest (delq '&optional (copy-sequence args))))
                ,@(cdr data))))))))
+;; `add-to-list' is defined far above, before this bridge exists, so its
+;; compiler macro is registered by hand -- in exactly the shape
+;; `byte-run--set-compiler-macro' would have produced from a `declare'.
+;;
+;; The handler is subr.el's own. It DECLINES -- answering the form unchanged,
+;; so the ordinary function runs -- unless VAR is a literally-quoted symbol
+;; that is not special and APPEND is a constant, which is precisely the case
+;; the function cannot serve: it reads and writes a symbol's value cell, and a
+;; lexical variable has none. (subr.el also emits a byte-compiler warning here;
+;; elisprs has no `macroexp-compiling-p' path, and Emacs skips the warning on
+;; that branch too.)
+(defun add-to-list--anon-cmacro (exp var elt &optional append compare-fn)
+  (if (or (not (eq 'quote (car-safe var)))
+          (special-variable-p (car (cdr var)))
+          (not (macroexp-const-p append)))
+      exp
+    (let ((sym (car (cdr var)))
+          (appendp (eval append t)))
+      (list 'if (if compare-fn
+                    (list 'cl-member elt sym :test compare-fn)
+                  (list 'member elt sym))
+            sym
+            (if appendp
+                (list 'setq sym (list 'append sym (list 'list elt)))
+              (list 'setq sym (list 'cons elt sym)))))))
+(function-put 'add-to-list 'compiler-macro #'add-to-list--anon-cmacro)
+
 (defalias 'byte-run--set-doc-string
   (lambda (f _args pos)
     (list 'function-put (list 'quote f)

@@ -1332,6 +1332,15 @@ fn aref(h: &mut ElispHost, a: &[Value]) -> R {
         },
     }
 }
+/// `(--note-compiler-macro SYMBOL)` — record that SYMBOL now carries a
+/// `compiler-macro` property, so `macroexpand-all` knows to look it up. Called
+/// from the prelude's `function-put`; not an Emacs function.
+fn note_compiler_macro(h: &mut ElispHost, a: &[Value]) -> R {
+    if let Value::Obj(id) = &a[0] {
+        h.compiler_macros.insert(*id);
+    }
+    Ok(a[0].clone())
+}
 fn aset(h: &mut ElispHost, a: &[Value]) -> R {
     // A char-table indexes by character; `aset` sets that single char.
     if matches!(h.obj(&a[0]), Some(Obj::CharTable(_))) {
@@ -7009,10 +7018,27 @@ fn region_end(h: &mut ElispHost, _a: &[Value]) -> R {
 }
 
 // ── narrowing ──
+/// `(narrow-to-region START END)` — port of `Fnarrow_to_region` (editfns.c).
+///
+/// An inverted pair is accepted and swapped, but a pair outside the BUFFER —
+/// not outside the current restriction, which the call is about to replace — is
+/// `(args-out-of-range START END)`, naming the arguments in the order they were
+/// given rather than the swapped order. Clamping instead silently narrowed to
+/// something the caller did not ask for.
 fn narrow_to_region(h: &mut ElispHost, a: &[Value]) -> R {
-    let beg = as_int(h, &a[0])?.max(1) as usize;
-    let end = as_int(h, &a[1])?.max(1) as usize;
-    h.narrow(beg, end);
+    let beg = as_int(h, &a[0])?;
+    let end = as_int(h, &a[1])?;
+    let (lo, hi) = if beg <= end { (beg, end) } else { (end, beg) };
+    let z = h.cur_buf_ref().text.len() as i64 + 1;
+    if lo < 1 || hi > z {
+        let sym = h.intern("args-out-of-range");
+        let data = h.list_from(vec![Value::Int(beg), Value::Int(end)]);
+        let obj = h.cons(sym, data);
+        let msg = format!("args-out-of-range: {beg} {end}");
+        h.set_pending_error(&msg, obj);
+        return Err(msg);
+    }
+    h.narrow(lo as usize, hi as usize);
     Ok(Value::Undef)
 }
 fn widen_fn(h: &mut ElispHost, _a: &[Value]) -> R {
@@ -8385,6 +8411,7 @@ pub fn install(h: &mut ElispHost) {
     s("bool-vector-not", 1, Some(2), bool_vector_not);
     s("aref", 2, Some(2), aref);
     s("aset", 3, Some(3), aset);
+    s("--note-compiler-macro", 1, Some(1), note_compiler_macro);
     s("store-substring", 3, Some(3), store_substring);
     s("clear-string", 1, Some(1), clear_string);
     s("fillarray", 2, Some(2), fillarray);

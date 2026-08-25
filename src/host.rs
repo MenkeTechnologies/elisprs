@@ -859,6 +859,16 @@ pub struct ElispHost {
     /// for it once. Derived from the template's source, so it is never
     /// serialized: a cache hit recomputes it on the first instantiation.
     pub(crate) closure_free: HashMap<u32, Rc<std::collections::HashSet<u32>>>,
+    /// Symbols a `compiler-macro` property has been put on.
+    ///
+    /// [`macroexpand_all`] has to ask whether a call's head has one, and the
+    /// property lives in an elisp plist — so asking costs an elisp call, on
+    /// every call form in every file. This set is the cheap pre-filter: the one
+    /// place the property is written (`function-put`, prelude) records the
+    /// handle here, so the elisp lookup only happens for a head that really has
+    /// one. Derived state, never serialized; the prelude re-registers on a cold
+    /// run and a warm one inherits the compiled expansions already made.
+    pub(crate) compiler_macros: std::collections::HashSet<u32>,
     /// The one shared empty string object. Emacs allocates `empty_unibyte_string`
     /// once (alloc.c) and every zero-length string IS that object, so
     /// `(eq "" (make-string 0 ?a))` is `t`. Allocated in the built-in arena
@@ -1077,6 +1087,7 @@ impl ElispHost {
             load_buf: 0, // fixed below, once the slot exists
             string_props: HashMap::new(),
             closure_free: HashMap::new(),
+            compiler_macros: std::collections::HashSet::new(),
             empty_string: Value::Undef, // fixed below, once the arena exists
             oclosure_meta: HashMap::new(),
             intercepts: Vec::new(),
@@ -5412,7 +5423,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 if matches!(form, Value::Bool(true)) {
                     return Ok(form.clone());
                 }
-                let expanded = macroexpand_all(form)?;
+                let expanded = macroexpand_all_for_eval(form)?;
                 let chunk = with_host(|h| crate::compiler::compile_top(h, &expanded))?;
                 // FORM is evaluated in the lexical environment given by LEXICAL —
                 // NOT in the caller's. `(let ((x 5)) (eval 'x t))` signals
@@ -5900,7 +5911,23 @@ pub fn expand_intrinsic_macro(form: &Value) -> Option<Value> {
 /// be *both* a special variable and a macro (e.g. `delay-mode-hooks`) — expanding
 /// the binding head there loops forever.
 pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
-    macroexpand_all_impl(form, false)
+    macroexpand_all_impl(form, false, true)
+}
+
+/// [`macroexpand_all`] for the `eval` builtin, which does NOT apply compiler
+/// macros.
+///
+/// Emacs's `eval` walks the form itself; only `macroexpand-all` — and so
+/// `load`, through `internal-macroexpand-for-load` — runs
+/// `macroexp--compiler-macro`. The difference is observable, and it is the
+/// whole reason `add-to-list` works on a lexical variable in a loaded file and
+/// not through `eval`:
+///
+/// ```text
+/// (eval '(let ((l nil)) (add-to-list 'l 1) l) t)   ; (void-variable l)
+/// ```
+pub fn macroexpand_all_for_eval(form: &Value) -> Result<Value, String> {
+    macroexpand_all_impl(form, false, false)
 }
 
 /// `macroexpand-all` as the elisp builtin exposes it: identical to
@@ -5908,7 +5935,7 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
 /// (see [`expand_intrinsic_macro`]). Kept off the compile pipeline so the
 /// compiler's dedicated `when`/`unless` lowering (`compile_when`) still fires.
 pub fn macroexpand_all_builtin(form: &Value) -> Result<Value, String> {
-    macroexpand_all_impl(form, true)
+    macroexpand_all_impl(form, true, true)
 }
 
 /// `v`'s elements when it is a `(lambda ARGLIST . BODY)` form, else None.
@@ -5925,17 +5952,84 @@ fn lambda_parts(v: Option<&Value>) -> Option<Vec<Value>> {
 /// head. The ARGLIST is a parameter list, not code — a parameter named after a
 /// macro (e.g. `rx`) must NOT be macroexpanded — and the `function` wrapper is
 /// added by whichever caller wants it, so this never double-wraps.
-fn expand_lambda_bare(elems: &[Value], expand_intrinsics: bool) -> Result<Value, String> {
+fn expand_lambda_bare(
+    elems: &[Value],
+    expand_intrinsics: bool,
+    apply_cmacros: bool,
+) -> Result<Value, String> {
     let mut out = Vec::with_capacity(elems.len());
     out.push(elems[0].clone());
     out.push(elems[1].clone()); // ARGLIST, untouched
     for e in &elems[2..] {
-        out.push(macroexpand_all_impl(e, expand_intrinsics)?);
+        out.push(macroexpand_all_impl(e, expand_intrinsics, apply_cmacros)?);
     }
     Ok(with_host(|h| h.list_from(out)))
 }
 
-fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, String> {
+/// Apply the head symbol's COMPILER MACRO, if it has one.
+///
+/// A compiler macro is a rewrite a function may declare for its own call sites
+/// (`(declare (compiler-macro …))`, stored as the symbol's `compiler-macro`
+/// function property). Emacs applies them in `macroexp--expand-all`, which is
+/// why the same form answers differently through `load` and through plain
+/// `eval`:
+///
+/// ```text
+/// (eval '(let ((l nil)) (add-to-list 'l 1) l) t)   ; (void-variable l)
+/// (macroexpand-all '(let ((l nil)) (add-to-list 'l 1) l))
+///   ; => (let ((l nil)) (if (member 1 l) l (setq l (cons 1 l))) l)
+/// ```
+///
+/// The handler is called as `(HANDLER FORM . ARGS)` and may answer FORM itself
+/// to decline, which is how `add-to-list`'s handler passes a dynamic variable
+/// through to the ordinary function.
+fn apply_compiler_macro(form: &Value) -> Result<Option<Value>, String> {
+    let handler = with_host(|h| {
+        let elems = h.list_vec(form)?;
+        let head = elems.first()?;
+        // Only a symbol head can carry the property, and a macro has already
+        // been expanded by the time this runs. `compiler_macros` is the cheap
+        // pre-filter that keeps the elisp lookup off every call form.
+        let id = match head {
+            Value::Obj(id) if h.compiler_macros.contains(id) => *id,
+            _ => return None,
+        };
+        let _ = id;
+        // During the early prelude `function-get` is interned but not yet
+        // fbound; there are no compiler macros to find then either.
+        let getter = h.find_symbol("function-get")?;
+        h.resolve_function(&getter).ok()?;
+        Some((getter, head.clone(), elems[1..].to_vec()))
+    });
+    let Some((getter, head, args)) = handler else {
+        return Ok(None);
+    };
+    let prop = with_host(|h| h.intern("compiler-macro"));
+    let Ok(cm) = call_function(&getter, &[head, prop]) else {
+        return Ok(None);
+    };
+    if !el_truthy(&cm) {
+        return Ok(None);
+    }
+    let mut call = vec![form.clone()];
+    call.extend(args);
+    // `macroexp--compiler-macro` catches a handler's error and keeps the
+    // original form; a broken handler must not take the whole expansion down.
+    let Ok(out) = call_function(&cm, &call) else {
+        return Ok(None);
+    };
+    // A handler that answers its own argument declined.
+    if with_host(|h| h.values_eq(&out, form)) {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
+fn macroexpand_all_impl(
+    form: &Value,
+    expand_intrinsics: bool,
+    apply_cmacros: bool,
+) -> Result<Value, String> {
     let mut f = form.clone();
     loop {
         if let Some(e) = macroexpand_1(&f)? {
@@ -5944,6 +6038,12 @@ fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, 
         }
         if expand_intrinsics {
             if let Some(e) = expand_intrinsic_macro(&f) {
+                f = e;
+                continue;
+            }
+        }
+        if apply_cmacros {
+            if let Some(e) = apply_compiler_macro(&f)? {
                 f = e;
                 continue;
             }
@@ -5975,7 +6075,7 @@ fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, 
             // Expand the lambda BARE — `expand_lambda_bare` does not re-add the
             // wrapper, so `#'(lambda ...)` cannot come back as
             // `#'#'(lambda ...)`.
-            let lam = expand_lambda_bare(&inner, expand_intrinsics)?;
+            let lam = expand_lambda_bare(&inner, expand_intrinsics, apply_cmacros)?;
             Ok(with_host(|h| h.list_from(vec![elems[0].clone(), lam])))
         }
         // Binding forms: expand each binding's INIT (never the VAR, which may name
@@ -6000,7 +6100,11 @@ fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, 
                                 let mut np = Vec::with_capacity(parts.len());
                                 np.push(parts[0].clone()); // VAR, untouched
                                 for p in &parts[1..] {
-                                    np.push(macroexpand_all_impl(p, expand_intrinsics)?);
+                                    np.push(macroexpand_all_impl(
+                                        p,
+                                        expand_intrinsics,
+                                        apply_cmacros,
+                                    )?);
                                 }
                                 out.push(with_host(|h| h.list_from(np)));
                             }
@@ -6015,7 +6119,7 @@ fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, 
             out.push(elems[0].clone());
             out.push(new_bindings);
             for e in &elems[2..] {
-                out.push(macroexpand_all_impl(e, expand_intrinsics)?);
+                out.push(macroexpand_all_impl(e, expand_intrinsics, apply_cmacros)?);
             }
             let _ = kw;
             Ok(with_host(|h| h.list_from(out)))
@@ -6030,7 +6134,7 @@ fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, 
         // `cconv-make-interpreted-closure` stores the expanded body, so a
         // closure whose body contains a nested `lambda` PRINTS the `#'`.
         Some("lambda") if elems.len() >= 2 => {
-            let lam = expand_lambda_bare(&elems, expand_intrinsics)?;
+            let lam = expand_lambda_bare(&elems, expand_intrinsics, apply_cmacros)?;
             Ok(with_host(|h| {
                 let fsym = h.intern("function");
                 h.list_from(vec![fsym, lam])
@@ -6068,7 +6172,7 @@ fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, 
                 // Non-nil ⇒ BODY had a `declare'; expand the rewritten form (its
                 // inner defun has the `declare' stripped, so this does not recurse).
                 if el_truthy(&replaced) {
-                    return macroexpand_all_impl(&replaced, expand_intrinsics);
+                    return macroexpand_all_impl(&replaced, expand_intrinsics, apply_cmacros);
                 }
             }
             let mut out = Vec::with_capacity(elems.len());
@@ -6076,7 +6180,7 @@ fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, 
             out.push(elems[1].clone()); // NAME, untouched
             out.push(elems[2].clone()); // ARGLIST, untouched
             for e in &elems[3..] {
-                out.push(macroexpand_all_impl(e, expand_intrinsics)?);
+                out.push(macroexpand_all_impl(e, expand_intrinsics, apply_cmacros)?);
             }
             Ok(with_host(|h| h.list_from(out)))
         }
@@ -6089,8 +6193,8 @@ fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, 
                 // would be `invalid-function` — `#'(lambda …)` is a form that
                 // evaluates to a closure, not a closure.
                 let expanded = match (i == 0).then(|| lambda_parts(Some(e))).flatten() {
-                    Some(parts) => expand_lambda_bare(&parts, expand_intrinsics)?,
-                    None => macroexpand_all_impl(e, expand_intrinsics)?,
+                    Some(parts) => expand_lambda_bare(&parts, expand_intrinsics, apply_cmacros)?,
+                    None => macroexpand_all_impl(e, expand_intrinsics, apply_cmacros)?,
                 };
                 // A `defmacro' among sibling forms has to take effect BEFORE its
                 // siblings are expanded, or a macro defined and used in the same
