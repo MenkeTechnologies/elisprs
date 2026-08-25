@@ -5016,3 +5016,172 @@ with a real payoff and it is not in this round.
   representation of nil, the most pervasive value in the language, for no
   observable gain while R25-B and R25-D stand. Measured and declined; it becomes
   worth doing only after the slot work above.
+
+## Round 26 — the surfaces round 24's sweep had not reached
+
+Reference: **GNU Emacs 31.1**; see round 22's header. Round 24 swept file names,
+buffers, errors, obarrays, `map`/`seq` and regexps. This round took the areas it
+had left: buffer-local variables, `cl-loop`'s fuller clause set, `seq`/`map`
+across all three sequence types, `save-match-data`, `format-time-string`'s
+breadth, `syntax-ppss`, abbrev tables and overlays.
+
+```text
+buffer-local variable semantics            20 forms   1 divergence (a void fn)
+cl-loop clauses + seq/map on 3 seq types   49 forms   1
+save-match-data + format-time-string       31 forms   3
+syntax-ppss / parse-partial-sexp            6 forms   0
+overlays + abbrev tables                   20 forms  14
+```
+
+A third probe-method lesson, after round 24's two: `(cl-loop with a = 1 with b =
+2 collect (+ a b) into r finally return r)` hung the driver, and it is not a
+bug — a `cl-loop` with no termination clause is an infinite loop in Emacs too.
+The probe was wrong, not the engine. It cost a timeout to find out, which is
+cheaper than the alternative of reporting it.
+
+### R26-A. `cl-loop`'s hash-table iteration ran backwards — ✅ FIXED
+
+```text
+(cl-loop for k being the hash-keys of H collect k)
+  emacs 31.1   (a b c)
+  elisprs      (c b a)
+```
+
+The clause built its tail from `hash-table-keys`, which reports
+REVERSE-insertion order. That is Emacs's own behaviour for that function and
+elisprs already matched it — verified directly rather than assumed, because the
+first reading of the sweep had it backwards:
+
+```text
+(:keys (c b a) :values (3 2 1) :maphash (a b c))
+```
+
+So the bug was routing an iteration that must follow the table's order through a
+function that deliberately does not. It walks `maphash` order now. The first
+attempt at this "fixed" `hash-table-keys` instead, which would have broken a
+function that was right; the entry is here partly to record that the two orders
+genuinely differ and neither is a mistake.
+
+Walking PAIRS rather than keys also fixed the other direction of `using`:
+
+```text
+(cl-loop for v being the hash-values of H using (hash-keys k) collect (cons k v))
+  emacs 31.1   ((a . 1) (b . 2))
+  elisprs      ((nil . 2) (nil . 1))
+```
+
+Only the key-iteration companion was wired, because it could reach the value
+with `gethash`; there is no `gethash` from a value back to a key.
+
+### R26-B. `format-time-string`'s week directives and case flags — ✅ FIXED
+
+`%G`, `%g`, `%V`, `%U`, `%W` and `%C` passed through as literal text, and `^`/`#`
+were parsed and discarded.
+
+`%G`/`%g`/`%V` are the ISO 8601 week-based year and week, which are NOT the
+calendar year and week: a week runs Monday to Sunday and belongs to the year
+containing its Thursday, so 2024-01-01 (a Monday) is week 01 of 2024 while
+2023-01-01 (a Sunday) is week 52 of 2022, and a year has 53 ISO weeks when it
+starts on a Thursday or is a leap year starting on a Wednesday. `%U`/`%W` are
+the simpler thing they are often confused with — weeks from the first Sunday and
+the first Monday, days before it being week 00. On 2024-01-01 all three
+disagree: `%U %W %V` is `00 01 01`.
+
+`^` upcases; `#` "changes case", which Emacs resolves as *upcase unless the text
+is already caseless-or-upper* — `%#a` is `THU` and `%#p` is `am`, not the
+swap-case that glibc's `#` does. A field width also right-aligns a STRING
+directive (`%^10a` is `"       THU"`), which only the numeric ones honoured.
+
+Checked on 462 timestamps: every 1–4 January and 29–31 December from 1970
+through 2035, which is exactly where the week-based year and the calendar year
+disagree. 0 divergences.
+
+### R26-C. Overlays — ✅ ADDED
+
+The whole family was void. An overlay is not a text property with a different
+spelling: it is an OBJECT over a buffer range, so it survives the text under it
+changing, both ends move with edits, and deleting it DETACHES it rather than
+clearing anything — the object stays `overlayp`, its ends and buffer read nil,
+and `move-overlay` puts it back.
+
+`OverlayData` mirrors `MarkerData`: the range and the two advance flags live
+behind an `Rc` shared between the `Obj::Overlay` and the owning buffer's list,
+so the existing `adjust_for_insert`/`adjust_for_delete` move every overlay in
+the pass they already make over every marker. The advance flags are exactly a
+marker's insertion type applied per end, which is why the four insertion cases
+fall out of `adj_ins` unchanged:
+
+```text
+overlay (2 4), insert "XY" at 2, default   -> (2 6)   text lands INSIDE
+                          FRONT-ADVANCE    -> (4 6)   text lands outside
+overlay (2 4), insert "XY" at 4, default   -> (2 4)   text lands outside
+                          REAR-ADVANCE     -> (2 6)   text lands INSIDE
+```
+
+Measured, not assumed: `overlays-at` covers `start <= POS < end`, so an overlay
+ending at POS does not cover it; an EMPTY overlay is still reported by
+`overlays-in`, including when BEG equals END; `overlay-properties` is
+newest-first but re-putting a property keeps its position; `make-overlay` swaps
+an inverted pair; and `next-overlay-change` answers `point-max` when there is no
+next change.
+
+`copy-overlay`, `overlay-recenter` and `remove-overlays` are the subr.el layer.
+`remove-overlays` is why `copy-overlay` is needed at all: an overlay that only
+partly overlaps the range is MOVED out of it, and one that SPANS the range is
+split in two, rather than deleted.
+
+One placement note for future prelude work, since it cost a debugging cycle:
+these definitions sit after `save-excursion`'s, because the prelude is loaded in
+order and `remove-overlays` uses that macro — a macro used above its own
+definition compiles as a CALL and fails at load with "special form … not yet
+lowered".
+
+### Swept clean
+
+- **Buffer-local variables**, 19 of 20: `make-local-variable`, `setq-local`,
+  `defvar-local`, `make-variable-buffer-local`, `kill-local-variable`,
+  `setq-default`, `default-value`, `buffer-local-value`, `local-variable-p`,
+  `local-variable-if-set-p`, and `let` over a buffer-local binding the local
+  slot rather than the global default.
+- **`syntax-ppss` and `parse-partial-sexp`**, 6 of 6, including the depth,
+  string-terminator and open-paren-list fields.
+- **`save-match-data`**, including that it restores on a non-local exit.
+- **`cl-loop`**, 26 clause forms; **`seq`/`map`**, 23 forms across list, vector
+  and string.
+
+### Still open
+
+- **Abbrev tables**, partial. `define-abbrev-table` answers its own name where
+  Emacs answers nil; `abbrev-table-p` and `abbrev-expansion` are void; and
+  `make-abbrev-table` answers a vector where Emacs answers an obarray
+  (`#<obarray n=1>`) — an abbrev table IS an obarray there, so closing this
+  means building it on `obarray-make` rather than adding the two functions.
+- **`buffer-local-variables`** is void. Its value is the buffer's whole
+  local-variable alist, whose LENGTH in Emacs is dominated by the built-in
+  buffer-locals (20 in a fresh temp buffer) — a number elisprs cannot match
+  without modelling those, so the honest form of this gap is "the function is
+  absent", not "the function is wrong".
+- Everything named in rounds 23-25 that is still open there — generators, `eq`
+  on floats, the unibyte/multibyte distinction, the missing collector, `~USER`
+  expansion, and variable watchers.
+
+### Variable watchers, re-measured
+
+Round 24 recorded these as needing five call sites. That was right but understated
+the difficulty, and this round measured what the `let` path actually demands:
+
+```text
+(setq w 5)          -> watcher runs BEFORE the store: (symbol-value 'w) is still 0
+(let ((w 9)) nil)   -> TWO notifications, (w 9 let nil) then (w 0 unlet nil)
+(makunbound 'w)     -> operation `makunbound', and `boundp' is still t inside
+a watcher that signals -> the assignment is ABANDONED; w keeps its old value
+```
+
+So the notification is synchronous, happens before the change, and is a barrier
+that can cancel it. A queue drained after the fact — the obvious way to get
+around the host borrow — is therefore wrong in all three respects. The
+notification has to happen with the borrow released at each of `set_value`,
+`specbind`, `unbind_to` and `makunbound`; `specbind`/`unbind_to` are single
+choke points, but `unbind_to` also runs during ERROR UNWINDING, where calling
+elisp that may itself signal is the hazardous part. That is the work, and it is
+still not done.
