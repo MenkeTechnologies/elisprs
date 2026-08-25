@@ -4868,3 +4868,20 @@ from — the second line is that bound: at start 2 an unbounded `a+` would reach
   `~USER` prefix needs a passwd lookup and is left as-is. Named here because
   the rest of `expand-file-name` is now exact, so this is the only remaining
   hole in it.
+- **Variable watchers.** `add-variable-watcher`, `remove-variable-watcher` and
+  `get-variable-watchers` are void. Found in this round's sweep and NOT
+  implemented, deliberately: Emacs notifies from `set_internal`, which covers
+  five operations — `set`, `let`, `unlet`, `makunbound`, `defvaralias` — and a
+  version that hooks only the `SETVAR` op would answer correctly for `setq` and
+  silently miss every `let`-binding of a watched variable, which is worse than
+  the function being absent. The re-entrancy is the same shape R23-E solved
+  (the watcher is elisp, and `set_value` runs inside the host borrow), and so
+  is the fix: a cheap host-side "this symbol has watchers" set, with the
+  notification run outside the borrow. What is missing is the five call sites,
+  not the mechanism.
+- **A byte-compiled object cannot print as one.** `(advice-member-p 'm 'f)`
+  answers the advice OBJECT, and Emacs prints it as `#[128 "\304\300\"\207" …]`
+  where elisprs prints an interpreted closure. The BEHAVIOUR agrees — the
+  member test, the removal, and what the advised function returns all match —
+  and elisprs has no byte-code objects to print, so this is a representation
+  difference rather than a gap to close.

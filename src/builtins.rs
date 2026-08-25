@@ -7749,14 +7749,87 @@ fn set_buf_match(h: &mut ElispHost, spans0: &[Option<(usize, usize)>], text: Str
         from_buffer: true,
     });
 }
+/// The four search commands, driven COUNT times.
+///
+/// COUNT is not a decoration: `(search-forward "a" nil t 2)` finds the SECOND
+/// occurrence, COUNT 0 searches not at all and answers point, and a NEGATIVE
+/// COUNT searches the other way — `search-forward` with -1 is a backward
+/// search. Ignoring it made every one of those answer the first match instead.
+///
+/// Failure is per Emacs's `search_command`: with NOERROR nil it signals; with
+/// NOERROR `t` it answers nil and leaves point WHERE IT WAS, which matters
+/// because a partial run has already moved it; with any other non-nil NOERROR
+/// it answers nil and moves point to the limit.
+fn search_with_count(
+    h: &mut ElispHost,
+    a: &[Value],
+    forward: bool,
+    fwd: fn(&mut ElispHost, &[Value]) -> Result<Option<i64>, String>,
+    bwd: fn(&mut ElispHost, &[Value]) -> Result<Option<i64>, String>,
+) -> R {
+    let noerror = a.get(2).cloned().unwrap_or(Value::Undef);
+    let count = match a.get(3) {
+        Some(v) if !is_nil(v) => as_int(h, v)?,
+        _ => 1,
+    };
+    let entry = h.cur_buf().point;
+    if count == 0 {
+        return Ok(Value::Int(entry as i64));
+    }
+    let (step, reps) = if count > 0 {
+        (fwd, count)
+    } else {
+        (bwd, -count)
+    };
+    let mut last = None;
+    for _ in 0..reps {
+        match step(h, a)? {
+            Some(p) => last = Some(p),
+            None => {
+                if is_nil(&noerror) {
+                    h.cur_buf().point = entry;
+                    return Err(format!("search-failed: {}", as_string(h, &a[0])?));
+                }
+                if matches!(noerror, Value::Bool(true)) {
+                    h.cur_buf().point = entry;
+                } else {
+                    // Any other non-nil NOERROR moves point to the limit — which
+                    // end that is depends on the direction actually searched,
+                    // and a negative COUNT reverses the command's own.
+                    let going_forward = forward == (count > 0);
+                    let len = h.cur_buf().text.len();
+                    let limit = match a.get(1) {
+                        Some(v) if !is_nil(v) => (as_int(h, v)?.max(1) as usize).min(len + 1),
+                        _ if going_forward => len + 1,
+                        _ => 1,
+                    };
+                    h.cur_buf().point = limit;
+                }
+                return Ok(Value::Undef);
+            }
+        }
+    }
+    Ok(Value::Int(last.unwrap_or(entry as i64)))
+}
 fn search_forward(h: &mut ElispHost, a: &[Value]) -> R {
+    search_with_count(h, a, true, search_forward_once, search_backward_once)
+}
+fn search_backward(h: &mut ElispHost, a: &[Value]) -> R {
+    search_with_count(h, a, false, search_backward_once, search_forward_once)
+}
+fn re_search_forward(h: &mut ElispHost, a: &[Value]) -> R {
+    search_with_count(h, a, true, re_search_forward_once, re_search_backward_once)
+}
+fn re_search_backward(h: &mut ElispHost, a: &[Value]) -> R {
+    search_with_count(h, a, false, re_search_backward_once, re_search_forward_once)
+}
+fn search_forward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
     let needle: Vec<char> = as_string(h, &a[0])?.chars().collect();
     let len = h.cur_buf().text.len();
     let bound = match a.get(1) {
         Some(v) if !is_nil(v) => (as_int(h, v)?.max(0) as usize).min(len + 1),
         _ => len + 1,
     };
-    let noerror = a.get(2).is_some_and(|v| !is_nil(v));
     let start = h.cur_buf().point - 1;
     let nlen = needle.len();
     let found = {
@@ -7783,20 +7856,18 @@ fn search_forward(h: &mut ElispHost, a: &[Value]) -> R {
             let text: String = h.cur_buf().text.iter().collect();
             h.cur_buf().point = end + 1;
             set_buf_match(h, &[Some((i, end))], text);
-            Ok(Value::Int((end + 1) as i64))
+            Ok(Some((end + 1) as i64))
         }
-        None if noerror => Ok(Value::Undef),
-        None => Err(format!("search-failed: {}", as_string(h, &a[0])?)),
+        None => Ok(None),
     }
 }
-fn re_search_forward(h: &mut ElispHost, a: &[Value]) -> R {
+fn re_search_forward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
     let pat = as_string(h, &a[0])?;
     let re = compile_cf(h, &pat, case_fold_search(h))?;
     let bound = match a.get(1) {
         Some(v) if !is_nil(v) => Some(as_int(h, v)?.max(0) as usize),
         _ => None,
     };
-    let noerror = a.get(2).is_some_and(|v| !is_nil(v));
     let text: String = h.cur_buf().text.iter().collect();
     let start_char = h.cur_buf().point - 1;
     let m = run_match(&re, &text, start_char).filter(|spans| {
@@ -7804,15 +7875,15 @@ fn re_search_forward(h: &mut ElispHost, a: &[Value]) -> R {
             .map(|(_, e)| bound.is_none_or(|b| e < b))
             .unwrap_or(false)
     });
+    let _ = &pat;
     match m {
         Some(spans0) => {
             let endc = spans0[0].unwrap().1;
             h.cur_buf().point = endc + 1;
             set_buf_match(h, &spans0, text);
-            Ok(Value::Int((endc + 1) as i64))
+            Ok(Some((endc + 1) as i64))
         }
-        None if noerror => Ok(Value::Undef),
-        None => Err(format!("search-failed: {pat}")),
+        None => Ok(None),
     }
 }
 fn looking_at(h: &mut ElispHost, a: &[Value]) -> R {
@@ -8181,13 +8252,12 @@ fn current_column(h: &mut ElispHost, _a: &[Value]) -> R {
     }
     Ok(Value::Int(col as i64))
 }
-fn search_backward(h: &mut ElispHost, a: &[Value]) -> R {
+fn search_backward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
     let needle: Vec<char> = as_string(h, &a[0])?.chars().collect();
     let bound = match a.get(1) {
         Some(v) if !is_nil(v) => (as_int(h, v)?.max(1) as usize) - 1,
         _ => 0,
     };
-    let noerror = a.get(2).is_some_and(|v| !is_nil(v));
     let point = h.cur_buf().point;
     let nlen = needle.len();
     let found = {
@@ -8215,10 +8285,9 @@ fn search_backward(h: &mut ElispHost, a: &[Value]) -> R {
             let text: String = h.cur_buf().text.iter().collect();
             h.cur_buf().point = i + 1;
             set_buf_match(h, &[Some((i, i + nlen))], text);
-            Ok(Value::Int((i + 1) as i64))
+            Ok(Some((i + 1) as i64))
         }
-        None if noerror => Ok(Value::Undef),
-        None => Err(format!("search-failed: {}", as_string(h, &a[0])?)),
+        None => Ok(None),
     }
 }
 /// `(re-search-backward REGEXP &optional BOUND NOERROR COUNT)`.
@@ -8240,7 +8309,7 @@ fn search_backward(h: &mut ElispHost, a: &[Value]) -> R {
 /// 4, past where the search began. Collecting non-overlapping forward matches
 /// instead answered 1 for the first and nil for the second, and ignored BOUND
 /// entirely.
-fn re_search_backward(h: &mut ElispHost, a: &[Value]) -> R {
+fn re_search_backward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
     let pat = as_string(h, &a[0])?;
     let re = compile_cf(h, &pat, case_fold_search(h))?;
     // BOUND: the match may not START before it (`search_backward` reads it the
@@ -8249,7 +8318,6 @@ fn re_search_backward(h: &mut ElispHost, a: &[Value]) -> R {
         Some(v) if !is_nil(v) => (as_int(h, v)?.max(1) as usize) - 1,
         _ => 0,
     };
-    let noerror = a.get(2).is_some_and(|v| !is_nil(v));
     let full: String = h.cur_buf().text.iter().collect();
     let point_char = h.cur_buf().point - 1;
     // Truncating at point is what bounds the match END; char offsets in the
@@ -8269,15 +8337,15 @@ fn re_search_backward(h: &mut ElispHost, a: &[Value]) -> R {
             }
         }
     }
+    let _ = &pat;
     match found {
         Some(spans0) => {
             let bc = spans0[0].unwrap().0;
             h.cur_buf().point = bc + 1;
             set_buf_match(h, &spans0, full);
-            Ok(Value::Int((bc + 1) as i64))
+            Ok(Some((bc + 1) as i64))
         }
-        None if noerror => Ok(Value::Undef),
-        None => Err(format!("search-failed: {pat}")),
+        None => Ok(None),
     }
 }
 fn parse_char_set(spec: &str) -> (bool, Vec<(char, char)>) {
