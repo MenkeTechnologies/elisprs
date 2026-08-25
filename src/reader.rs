@@ -148,7 +148,16 @@ impl Reader {
                     Ok(marker(h, "unquote", f))
                 }
             }
-            '"' => self.read_string(),
+            // A string LITERAL is an object, allocated once by the reader: Emacs
+            // has no pure space since 30, so `(progn (defun f () "ab")
+            // (aset (f) 0 ?z) (f))` answers "zb" — the literal a function
+            // returns is one mutable cell, not a fresh copy per evaluation.
+            // `read_string` builds the text as a transient; promoting it here
+            // means every string that reaches the compiler is already a cell.
+            '"' => {
+                let s = self.read_string()?;
+                Ok(h.promote_string(s))
+            }
             '?' => self.read_char_literal(),
             '\'' => {
                 self.pos += 1;
@@ -614,7 +623,10 @@ impl Reader {
         let items = h
             .list_vec(&lst)
             .ok_or_else(|| "invalid-read-syntax: #".to_string())?;
-        let Some(Value::Str(s)) = items.first().cloned() else {
+        let Some(head) = items.first().cloned() else {
+            return Err("invalid-read-syntax: #".to_string());
+        };
+        let Some(s) = h.str_arc(&head) else {
             return Err("invalid-read-syntax: #".to_string());
         };
         let len = s.chars().count() as i64;
@@ -636,7 +648,7 @@ impl Reader {
                 h.string_set_props(&s, lo as usize, hi as usize, &plist);
             }
         }
-        Ok(Value::Str(s))
+        Ok(head)
     }
 
     /// Read a `#&N"PACKED"` bool-vector literal: N is the bit count, PACKED a
@@ -663,7 +675,7 @@ impl Reader {
         // octal for bytes >= 128); each resulting code point is one packed byte.
         let packed: Vec<u32> = match self.read_string()? {
             Value::Str(s) => s.chars().map(|c| c as u32).collect(),
-            _ => unreachable!("read_string returns a string"),
+            _ => unreachable!("read_string returns a transient string"),
         };
         let mut bits = Vec::with_capacity(len);
         for i in 0..len {

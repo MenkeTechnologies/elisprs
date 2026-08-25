@@ -123,6 +123,13 @@ pub enum SerObj {
         src_body: Vec<Value>,
     },
     Bignum(BigInt),
+    /// A string object ([`Obj::Str`]). Appended at the END of the enum on
+    /// purpose: bincode encodes a variant by its ordinal, so inserting one
+    /// mid-enum renumbers every later variant and misdecodes an older image.
+    /// (`cache::SHARD_FORMAT_VERSION` is bumped alongside it anyway, since a
+    /// pre-`Str` image's string literals are transients the new build would not
+    /// accept as objects.)
+    Str(String),
 }
 
 /// Extension-op IDs emitted by the compiler and dispatched here.
@@ -171,7 +178,22 @@ pub struct Params {
 /// binding shared by a closure and its enclosing body updates for both.
 pub struct Scope {
     sym: u32,
-    val: RefCell<Value>,
+    /// The binding's value CELL, shared rather than owned.
+    ///
+    /// A closure captures a *pruned* copy of the chain (see
+    /// [`ElispHost::instantiate_closure`]), which means the same binding is
+    /// reachable through two different `Scope` nodes. Emacs's interpreted
+    /// environment is an alist and its pruning is `(mapcar (lambda (fv) (assq fv
+    /// env)) …)`, which re-uses the very cons cells — so a `setq` through the
+    /// closure is visible in the enclosing body and vice versa:
+    ///
+    /// ```text
+    /// (let ((n 1)) (funcall (lambda () (setq n 2))) n)   ; => 2
+    /// ```
+    ///
+    /// An owned `RefCell<Value>` per node would give the closure a private copy
+    /// and answer 1.
+    val: Rc<RefCell<Value>>,
     parent: Lex,
 }
 pub type Lex = Option<Rc<Scope>>;
@@ -181,9 +203,15 @@ impl Scope {
     pub(crate) fn new(sym: u32, val: Value, parent: Lex) -> Self {
         Scope {
             sym,
-            val: RefCell::new(val),
+            val: Rc::new(RefCell::new(val)),
             parent,
         }
+    }
+
+    /// A node re-using an existing binding's value cell — the pruned-capture
+    /// counterpart of Emacs's `(assq fv env)`, which hands back the same cons.
+    pub(crate) fn sharing(sym: u32, val: Rc<RefCell<Value>>, parent: Lex) -> Self {
+        Scope { sym, val, parent }
     }
 
     /// The bound symbol's arena handle.
@@ -193,6 +221,10 @@ impl Scope {
     /// The binding's current value.
     pub(crate) fn value(&self) -> Value {
         self.val.borrow().clone()
+    }
+    /// The binding's value cell, for a capture that must share it.
+    pub(crate) fn value_cell(&self) -> Rc<RefCell<Value>> {
+        Rc::clone(&self.val)
     }
     /// The enclosing scope.
     pub(crate) fn parent_lex(&self) -> Lex {
@@ -260,6 +292,33 @@ pub enum Obj {
     /// bool-vector is an array and a sequence (so `aref`/`aset`/`length`/`elt`/
     /// `append`/`mapcar` apply) but NOT a vector (`vectorp` is nil).
     BoolVector(Vec<bool>),
+    /// An elisp STRING object.
+    ///
+    /// An Emacs string is a mutable object with identity: `aset`,
+    /// `store-substring` and `clear-string` write through *every* reference to
+    /// it, and `eq` compares the object rather than the text. `Value::Str`
+    /// cannot model that. It is an `Arc<String>` *value*, and the only way to
+    /// write through a shared `Arc` is `Arc::make_mut`, which copies whenever
+    /// the buffer is shared — so the write would land on a private copy and be
+    /// invisible to every alias, which is the opposite of what Emacs does:
+    ///
+    /// ```text
+    /// (let* ((a (copy-sequence "ab")) (b a)) (aset a 0 ?z) b)   ; => "zb"
+    /// ```
+    ///
+    /// A string therefore lives in the arena like every other elisp object, and
+    /// the arena handle IS its identity — the same thing that makes `eq` work
+    /// for conses. Emacs 30 removed pure space, so this holds for a *literal*
+    /// too: `(progn (defun f () "ab") (aset (f) 0 ?z) (f))` answers `"zb"`,
+    /// which is why the reader allocates one cell per string literal and the
+    /// compiler loads that handle as the constant.
+    ///
+    /// The payload stays an `Arc<String>` so [`ElispHost::str_view`] can hand a
+    /// builtin a plain `Value::Str` of the current text for the price of a
+    /// refcount bump rather than a copy. A write installs a fresh `Arc` and
+    /// carries the string's text-property entry over to it
+    /// ([`ElispHost::set_string_text`]).
+    Str(Arc<String>),
     Subr {
         name: String,
         min: usize,
@@ -780,6 +839,18 @@ pub struct ElispHost {
     /// `Arc` clones (`eq` strings) exactly like Emacs, but are lost across `concat`/
     /// `substring` (which mint fresh allocations) unless re-registered explicitly.
     pub(crate) string_props: HashMap<usize, (Weak<String>, Vec<Value>)>,
+    /// Free-variable sets per closure TEMPLATE handle — the analysis
+    /// [`Self::trim_lex`] runs, memoized so a `lambda` evaluated in a loop pays
+    /// for it once. Derived from the template's source, so it is never
+    /// serialized: a cache hit recomputes it on the first instantiation.
+    pub(crate) closure_free: HashMap<u32, Rc<std::collections::HashSet<u32>>>,
+    /// The one shared empty string object. Emacs allocates `empty_unibyte_string`
+    /// once (alloc.c) and every zero-length string IS that object, so
+    /// `(eq "" (make-string 0 ?a))` is `t`. Allocated in the built-in arena
+    /// prefix, so the handle is identical on the cache-hit and cache-miss paths
+    /// and is never serialized as user heap. Nothing can mutate it: `aset` on a
+    /// zero-length string is `args-out-of-range` and `clear-string` is a no-op.
+    pub(crate) empty_string: Value,
     /// OClosure metadata, keyed by the closure object's arena handle. An OClosure
     /// (`oclosure.el`) is an ordinary [`Obj::Closure`] that also carries a *type*
     /// symbol and an ordered list of *slot* symbol handles. The slot *values* are
@@ -990,6 +1061,8 @@ impl ElispHost {
             need_newline: false,
             load_buf: 0, // fixed below, once the slot exists
             string_props: HashMap::new(),
+            closure_free: HashMap::new(),
+            empty_string: Value::Undef, // fixed below, once the arena exists
             oclosure_meta: HashMap::new(),
             intercepts: Vec::new(),
             subr_aliased: std::collections::HashSet::new(),
@@ -1002,6 +1075,10 @@ impl ElispHost {
         // The default buffer's own object handle (allocated after the arena
         // exists, before `builtin_count` is fixed so it stays in the stable
         // built-in prefix and is never serialized as user heap).
+        // The one shared empty string object (see `ElispHost::empty_string`),
+        // allocated in the built-in prefix so its handle is stable across a
+        // cache hit and it is never serialized as user heap.
+        h.empty_string = h.alloc(Obj::Str(Arc::new(String::new())));
         let scratch = h.alloc(Obj::Buffer(0));
         h.buffers[0].self_obj = scratch;
         // The other two buffers a bare `emacs -Q --batch` starts with, in the
@@ -1048,6 +1125,135 @@ impl ElispHost {
         let id = self.arena.len() as u32;
         self.arena.push(obj);
         Value::Obj(id)
+    }
+
+    // ── string objects ──
+    //
+    // An elisp string is an arena cell ([`Obj::Str`]); a bare `Value::Str` is a
+    // TRANSIENT — the form a builtin builds its result in before it is promoted
+    // at the call boundary, and the form `str_view` hands back for reading. The
+    // accessors below take either, so a builtin that only reads text never has
+    // to know which one it was given.
+
+    /// The current text of `v`, if `v` is a string (cell or transient).
+    pub fn str_text<'a>(&'a self, v: &'a Value) -> Option<&'a str> {
+        match v {
+            Value::Str(s) => Some(s.as_str()),
+            Value::Obj(id) => match self.arena.get(*id as usize) {
+                Some(Obj::Str(s)) => Some(s.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The current text of `v` as a shared `Arc` — a refcount bump, not a copy.
+    /// This is also the key `string_props` is stored under, so a caller that
+    /// needs a string's properties must go through here rather than re-wrapping
+    /// the text in a fresh `Arc`.
+    pub fn str_arc(&self, v: &Value) -> Option<Arc<String>> {
+        match v {
+            Value::Str(s) => Some(Arc::clone(s)),
+            Value::Obj(id) => match self.arena.get(*id as usize) {
+                Some(Obj::Str(s)) => Some(Arc::clone(s)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `v` viewed as a plain `Value::Str` when it is a string cell, so a
+    /// `match` written against `Value::Str(..)` sees the cell's current text.
+    /// Anything else (including a transient) comes back unchanged.
+    ///
+    /// The view is a refcount bump and is valid only until the string is
+    /// written: it carries the text, not the identity. A builtin that STORES
+    /// its argument (`cons`, `list`, `puthash`, `aset` into a vector) must store
+    /// the original value, never the view, or the stored string would no longer
+    /// be `eq` to the one the caller passed.
+    pub fn str_view(&self, v: &Value) -> Value {
+        match v {
+            Value::Obj(id) => match self.arena.get(*id as usize) {
+                Some(Obj::Str(s)) => Value::Str(Arc::clone(s)),
+                _ => v.clone(),
+            },
+            _ => v.clone(),
+        }
+    }
+
+    /// Whether `v` is a string — `stringp`.
+    pub fn is_string(&self, v: &Value) -> bool {
+        self.str_text(v).is_some()
+    }
+
+    /// Allocate a fresh elisp string object holding `s`.
+    ///
+    /// The empty string is the one shared object Emacs shares
+    /// (`ElispHost::empty_string`); everything else gets its own cell, because
+    /// two separately-built strings are never `eq` in Emacs.
+    pub fn new_string(&mut self, s: impl Into<String>) -> Value {
+        self.new_string_arc(Arc::new(s.into()))
+    }
+
+    /// [`Self::new_string`] for text that is already behind an `Arc` — keeps the
+    /// allocation (and therefore any `string_props` entry keyed on it) intact.
+    pub fn new_string_arc(&mut self, s: Arc<String>) -> Value {
+        if s.is_empty() {
+            return self.empty_string.clone();
+        }
+        self.alloc(Obj::Str(s))
+    }
+
+    /// [`Self::new_string`] that also hands back the `Arc` the fresh cell holds.
+    ///
+    /// `string_props` is keyed by that `Arc`, so a caller that carries text
+    /// properties onto the string it just built needs it. Looking it up again
+    /// through [`Self::str_arc`] would work but costs a second arena probe and
+    /// invites the caller to key on a *re-wrapped* `Arc`, which would silently
+    /// address a different (empty) property entry.
+    pub fn new_string_keyed(&mut self, s: String) -> (Value, Arc<String>) {
+        let v = self.new_string(s);
+        // Read the `Arc` back OUT of the cell rather than handing back the one
+        // that went in: an empty string is the one shared `empty_string` object,
+        // whose `Arc` is not the caller's.
+        let arc = self.str_arc(&v).expect("new_string yields a string cell");
+        (v, arc)
+    }
+
+    /// Promote a transient `Value::Str` into a string object. Values that are
+    /// already objects (and non-strings) pass through untouched, so this is
+    /// idempotent and safe to apply at every boundary a value crosses.
+    pub fn promote_string(&mut self, v: Value) -> Value {
+        match v {
+            Value::Str(s) => self.new_string_arc(s),
+            other => other,
+        }
+    }
+
+    /// Replace a string object's text in place. Every reference to the object
+    /// sees the new text — that is the whole point of the cell.
+    ///
+    /// The text-property entry travels with it: `string_props` is keyed by the
+    /// `Arc` allocation, and a write installs a fresh one, so without the
+    /// re-key `(aset (propertize "abc" 'p 1) 0 ?z)` would drop the property that
+    /// Emacs keeps (`#("zbc" 0 3 (p 1))`).
+    ///
+    /// Answers `false` when `v` is not a string cell (a transient cannot be
+    /// written through — there is nothing shared to write to).
+    pub fn set_string_text(&mut self, v: &Value, text: String) -> bool {
+        let Value::Obj(id) = v else { return false };
+        let Some(Obj::Str(old)) = self.arena.get(*id as usize) else {
+            return false;
+        };
+        let old_key = Arc::as_ptr(old) as usize;
+        let fresh = Arc::new(text);
+        let new_key = Arc::as_ptr(&fresh) as usize;
+        if let Some((_, props)) = self.string_props.remove(&old_key) {
+            self.string_props
+                .insert(new_key, (Arc::downgrade(&fresh), props));
+        }
+        self.arena[*id as usize] = Obj::Str(fresh);
+        true
     }
 
     /// The only way to make an elisp integer: a value inside fixnum range is a
@@ -1374,6 +1580,7 @@ impl ElispHost {
         match v {
             Value::Str(s) => Some(s.chars().map(|c| Value::Int(c as i64)).collect()),
             Value::Obj(id) => match self.arena.get(*id as usize) {
+                Some(Obj::Str(s)) => Some(s.chars().map(|c| Value::Int(c as i64)).collect()),
                 Some(Obj::Vector(items)) => Some(items.clone()),
                 // A bool-vector's elements are `t`/`nil`.
                 Some(Obj::BoolVector(bits)) => Some(
@@ -1956,7 +2163,7 @@ impl ElispHost {
             // closures that captured the earlier head never see it.
             self.lex = Some(Rc::new(Scope {
                 sym: id,
-                val: RefCell::new(val),
+                val: Rc::new(RefCell::new(val)),
                 parent: self.lex.take(),
             }));
         }
@@ -2036,7 +2243,15 @@ impl ElispHost {
             let (params, body, is_macro, src) =
                 (params.clone(), body.clone(), *is_macro, src.clone());
             let dynamic = self.dynamic_binding;
-            let env = if dynamic { None } else { self.lex.clone() };
+            let template_id = match template {
+                Value::Obj(id) => *id,
+                _ => u32::MAX,
+            };
+            let env = if dynamic {
+                None
+            } else {
+                self.trim_lex(template_id, &src)
+            };
             return self.alloc(Obj::Closure {
                 params,
                 body,
@@ -2056,6 +2271,64 @@ impl ElispHost {
     // type + slot-name list (side table) and reads/writes slot values in the
     // closure's captured lexical env by symbol. The observable oclosure API
     // (define / lambda / accessors / `oclosure-type`) matches Emacs exactly.
+
+    /// The lexical environment a closure created from `template` captures:
+    /// the bindings in force, pruned to the ones its body actually references.
+    ///
+    /// Emacs does this in `cconv-make-interpreted-closure` (cconv.el), whose own
+    /// doc says why: "reduce ENV to the part actually used by the function, so we
+    /// are closer to the ideal of 'safe for space'. In practice it has two
+    /// benefits: it makes closures a bit more predictable and human-readable, and
+    /// more importantly it avoids accidentally including values that we cannot
+    /// print `read'ably". It is observable — `(let ((n 1) (m 2)) (lambda () n))`
+    /// prints `#[nil (n) ((n . 1))]`, not `((m . 2) (n . 1))` — and it changes
+    /// `equal` on closures, which compares the captured environment.
+    ///
+    /// Three details are load-bearing:
+    ///
+    /// - The surviving bindings keep the ENVIRONMENT's order, not the order the
+    ///   body mentions them in: `(let ((a 1) (b 2) (c 3)) (lambda () (list a c)))`
+    ///   and `… (list c a)` both close over `((c . 3) (a . 1))`.
+    /// - Only the INNERMOST binding of a shadowed name survives, because Emacs's
+    ///   `assq` stops at the first match.
+    /// - The kept nodes SHARE their value cells with the enclosing chain (see
+    ///   [`Scope::val`]), so `setq` still crosses the closure boundary in both
+    ///   directions.
+    ///
+    /// The free-variable set is computed once per closure TEMPLATE and cached:
+    /// a `lambda` inside a loop instantiates a fresh closure per iteration off
+    /// one template, and re-walking its source every time would put an O(body)
+    /// cost on every evaluation of the `lambda` form.
+    fn trim_lex(&mut self, template_id: u32, src: &Rc<ClosureSrc>) -> Lex {
+        self.lex.as_ref()?;
+        let free = match self.closure_free.get(&template_id) {
+            Some(f) => Rc::clone(f),
+            None => {
+                let f = Rc::new(crate::freevars::free_vars(self, &src.arglist, &src.body));
+                if template_id != u32::MAX {
+                    self.closure_free.insert(template_id, Rc::clone(&f));
+                }
+                f
+            }
+        };
+        let mut kept: Vec<(u32, Rc<RefCell<Value>>)> = Vec::new();
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut cur = self.lex.clone();
+        while let Some(scope) = cur {
+            let sym = scope.sym_handle();
+            if free.contains(&sym) && seen.insert(sym) {
+                kept.push((sym, scope.value_cell()));
+            }
+            cur = scope.parent_lex();
+        }
+        // `kept` is innermost-first; re-link from the outermost in so the head
+        // stays the innermost binding.
+        let mut env: Lex = None;
+        for (sym, cell) in kept.into_iter().rev() {
+            env = Some(Rc::new(Scope::sharing(sym, cell, env)));
+        }
+        env
+    }
 
     /// True if `v` is a closure (`closurep`).
     pub fn is_closure(&self, v: &Value) -> bool {
@@ -2199,7 +2472,7 @@ impl ElispHost {
         for (k, &sym) in slots.iter().enumerate().rev() {
             env = Some(Rc::new(Scope {
                 sym,
-                val: RefCell::new(vals[k].clone()),
+                val: Rc::new(RefCell::new(vals[k].clone())),
                 parent: env.take(),
             }));
         }
@@ -2239,6 +2512,7 @@ impl ElispHost {
                 Obj::Vector(v) => SerObj::Vector(v.clone()),
                 Obj::Record(v) => SerObj::Record(v.clone()),
                 Obj::BoolVector(v) => SerObj::BoolVector(v.clone()),
+                Obj::Str(s) => SerObj::Str(s.to_string()),
                 Obj::Bignum(b) => SerObj::Bignum(b.clone()),
                 Obj::HashTable(t) => SerObj::HashTable {
                     test: t.test,
@@ -2419,6 +2693,7 @@ impl ElispHost {
             Obj::Vector(v) => SerObj::Vector(v.clone()),
             Obj::Record(v) => SerObj::Record(v.clone()),
             Obj::BoolVector(v) => SerObj::BoolVector(v.clone()),
+            Obj::Str(s) => SerObj::Str(s.to_string()),
             Obj::HashTable(t) => SerObj::HashTable {
                 test: t.test,
                 slots: t.slots.clone(),
@@ -2571,6 +2846,7 @@ impl ElispHost {
                 SerObj::Vector(v) => Obj::Vector(v),
                 SerObj::Record(v) => Obj::Record(v),
                 SerObj::BoolVector(v) => Obj::BoolVector(v),
+                SerObj::Str(s) => Obj::Str(Arc::new(s)),
                 SerObj::HashTable {
                     test,
                     slots,
@@ -3012,6 +3288,17 @@ impl ElispHost {
     /// `#N=` prefix and then print its body without re-entering the label check
     /// (which would see the label already assigned and emit `#N#` forever).
     fn print_body(&self, v: &Value, readable: bool, depth: usize) -> String {
+        // A string OBJECT renders through the `Value::Str` arm below on a view of
+        // its current text. The view shares the cell's `Arc`, which is what the
+        // `#("abc" 0 3 (p 1))` propertized form looks its intervals up under.
+        let view;
+        let v = match self.obj(v) {
+            Some(Obj::Str(s)) => {
+                view = Value::Str(Arc::clone(s));
+                &view
+            }
+            _ => v,
+        };
         match v {
             Value::Undef => "nil".to_string(),
             Value::Bool(true) => "t".to_string(),
@@ -3065,6 +3352,11 @@ impl ElispHost {
                 }
             }
             Value::Obj(id) => match self.arena.get(*id as usize) {
+                // Unreachable: `print_body` replaced a string object with a view
+                // of its text before this match. Here for exhaustiveness.
+                Some(Obj::Str(s)) => {
+                    self.print_body(&Value::Str(Arc::clone(s)), readable, depth)
+                }
                 Some(Obj::Symbol(s)) => {
                     if readable {
                         print_symbol_readable(&s.name)
@@ -3394,10 +3686,9 @@ impl ElispHost {
                 self.buffers.get(idx).filter(|b| b.name.is_some())?;
                 Some(idx)
             }
-            _ => match v {
-                Value::Str(s) => self.find_buffer_by_name(s),
-                _ => None,
-            },
+            _ => self
+                .str_text(v)
+                .and_then(|name| self.find_buffer_by_name(name)),
         }
     }
     /// The slot a buffer *object* names, live or killed. `resolve_buffer` filters
@@ -3427,9 +3718,9 @@ impl ElispHost {
         if let Some(idx) = self.buffer_slot(v) {
             return Ok(Some(idx));
         }
-        match v {
-            Value::Str(s) => Ok(self.find_buffer_by_name(s)),
-            _ => Err(format!(
+        match self.str_text(v) {
+            Some(name) => Ok(self.find_buffer_by_name(name)),
+            None => Err(format!(
                 "wrong-type-argument: stringp {}",
                 self.print(v, true)
             )),
@@ -3445,9 +3736,9 @@ impl ElispHost {
     ///
     /// The name goes in unquoted (`SDATA`, not `prin1`).
     pub fn nsberror(&self, v: &Value) -> String {
-        match v {
-            Value::Str(s) => format!("error: No buffer named {s}"),
-            _ => "error: Invalid buffer argument".to_string(),
+        match self.str_text(v) {
+            Some(name) => format!("error: No buffer named {name}"),
+            None => "error: Invalid buffer argument".to_string(),
         }
     }
     /// Index of the live buffer named `name`, if any.
@@ -3665,7 +3956,7 @@ impl ElispHost {
                 let ignore = self.buffers[self.current].name.clone();
                 newname = self.generate_new_buffer_name(&newname, ignore.as_deref());
             } else if other == self.current {
-                return Ok(Value::str(newname));
+                return Ok(self.new_string(newname));
             } else {
                 // The C is `error ("Buffer name `%s' is in use", …)`, and `error`
                 // runs its template through `format-message`, so Emacs 30.2 (default
@@ -3676,7 +3967,7 @@ impl ElispHost {
             }
         }
         self.buffers[self.current].name = Some(newname.clone());
-        Ok(Value::str(newname))
+        Ok(self.new_string(newname))
     }
     /// Open the buffer `load` reads a file through, and make it the *only* live
     /// ` *load*`-family buffer for this load.
@@ -4180,8 +4471,8 @@ impl ElispHost {
     /// strings also compare by content (adjacent cells that were given an
     /// `equal`-string property merge, matching Emacs's shared-string intervals).
     fn merge_val_eq(&self, a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Str(x), Value::Str(y)) => x == y,
+        match (self.str_text(a), self.str_text(b)) {
+            (Some(x), Some(y)) => x == y,
             _ => self.values_eq(a, b),
         }
     }
@@ -4493,7 +4784,7 @@ impl ElispHost {
     pub fn signal_error_with(&mut self, message: &str, datum: &Value) -> String {
         let msg = format!("error: {message} {}", self.print(datum, true));
         let sym = self.intern("error");
-        let m = Value::str(message.to_string());
+        let m = self.new_string(message);
         let data = self.list_from(vec![m, datum.clone()]);
         let obj = self.cons(sym, data);
         self.set_pending_error(&msg, obj);
@@ -4539,9 +4830,10 @@ impl ElispHost {
             // `(end-of-file "/path/to/file.el")` and only a bare
             // `emacs --batch --eval` reports `(end-of-file)`.
             if sym_candidate == "end-of-file" {
-                if let Some(file @ Value::Str(_)) = self
+                if let Some(file) = self
                     .find_symbol("load-true-file-name")
                     .and_then(|s| self.get_value(&s).ok())
+                    .filter(|v| self.is_string(v))
                 {
                     return self.list_from(vec![s, file]);
                 }
@@ -4582,7 +4874,7 @@ impl ElispHost {
             }
         }
         let s = self.intern(&sym);
-        let m = Value::str(msg);
+        let m = self.new_string(msg);
         self.list_from(vec![s, m])
     }
 
@@ -5113,10 +5405,11 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             // bareword). Shells out to rustc, so it must run outside any host
             // borrow — hence here with the other intrinsics. Returns nil.
             "__rust-compile" => {
-                let b64 = match args.first() {
-                    Some(Value::Str(s)) => s.to_string(),
-                    _ => String::new(),
-                };
+                let b64 = with_host(|h| {
+                    args.first()
+                        .and_then(|v| h.str_text(v).map(str::to_string))
+                        .unwrap_or_default()
+                });
                 return fusevm::ffi::compile_and_register(&b64).map(|_| Value::Undef);
             }
             _ => {}
@@ -5153,12 +5446,8 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             // (no function cell) reaches here, and the cheap membership check
             // keeps this off the hot path. elisp Values ARE fusevm Values, so the
             // args (ints/floats/strings) marshal straight through `try_call`.
-            if let Some(name) = with_host(|h| h.sym_name(f)) {
-                if fusevm::ffi::is_registered(&name) {
-                    if let Some(r) = fusevm::ffi::try_call(&name, args) {
-                        return r;
-                    }
-                }
+            if let Some(r) = try_rust_ffi(f, args) {
+                return r;
             }
             return Err(e);
         }
@@ -5172,7 +5461,11 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 // count it was given.
                 return Err(with_host(|h| h.signal_wrong_nargs(&callee, args.len())));
             }
-            with_host(|h| f(h, args))
+            // Promote a string a subr built as a bare `Value::Str` transient
+            // into a string CELL before it can be stored anywhere: an elisp
+            // value that reaches a variable, a cons, or a hash table has to be
+            // the mutable object, or `aset` on it would signal `arrayp`.
+            with_host(|h| f(h, args).map(|v| h.promote_string(v)))
         }
         Resolved::Closure {
             params,
@@ -5204,6 +5497,28 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
     }
 }
 
+/// The inline-Rust FFI fallback, kept OUT of [`call_function`]'s frame.
+///
+/// `call_function` is on the elisp recursion path — every nested elisp call
+/// stacks one of its frames — and it is a large function already. Its locals are
+/// stack slots whether or not the branch holding them runs, so an argument
+/// vector declared inline here would widen every frame of a deep recursion for a
+/// path that fires only on a `void-function` miss. `#[inline(never)]` keeps it a
+/// call away.
+#[inline(never)]
+fn try_rust_ffi(f: &Value, args: &[Value]) -> Option<Result<Value, String>> {
+    let name = with_host(|h| h.sym_name(f))?;
+    if !fusevm::ffi::is_registered(&name) {
+        return None;
+    }
+    // A string argument travels as an arena HANDLE, which means nothing to a
+    // `pub extern "C" fn(*const c_char)`. Hand the marshaller a view of the text
+    // instead; the callee copies it either way, so flattening loses no identity.
+    let flat: Vec<Value> = with_host(|h| args.iter().map(|v| h.str_view(v)).collect());
+    let r = fusevm::ffi::try_call(&name, &flat)?;
+    Some(r.map(|v| with_host(|h| h.promote_string(v))))
+}
+
 /// Stable merge sort driven by an elisp less-than predicate. `pred` is called as
 /// `(pred a b)`; a non-nil result means `a` precedes `b`. Equal elements keep
 /// their input order (the merge takes from the left run on ties).
@@ -5221,7 +5536,12 @@ fn value_lt(a: &Value, b: &Value) -> Result<bool, String> {
     if let (Some(x), Some(y)) = (num_f(a), num_f(b)) {
         return Ok(x < y);
     }
-    if let (Value::Str(x), Value::Str(y)) = (a, b) {
+    if let (Some(x), Some(y)) = with_host(|h| {
+        (
+            h.str_text(a).map(str::to_string),
+            h.str_text(b).map(str::to_string),
+        )
+    }) {
         return Ok(x < y);
     }
     match (with_host(|h| h.sym_name(a)), with_host(|h| h.sym_name(b))) {
@@ -5481,6 +5801,30 @@ pub fn macroexpand_all_builtin(form: &Value) -> Result<Value, String> {
     macroexpand_all_impl(form, true)
 }
 
+/// `v`'s elements when it is a `(lambda ARGLIST . BODY)` form, else None.
+fn lambda_parts(v: Option<&Value>) -> Option<Vec<Value>> {
+    let v = v?;
+    with_host(|h| {
+        let parts = h.list_vec(v)?;
+        (parts.len() >= 2 && h.sym_name(parts.first()?).as_deref() == Some("lambda"))
+            .then_some(parts)
+    })
+}
+
+/// Expand a `(lambda ARGLIST . BODY)` form's BODY, keeping the bare `lambda`
+/// head. The ARGLIST is a parameter list, not code — a parameter named after a
+/// macro (e.g. `rx`) must NOT be macroexpanded — and the `function` wrapper is
+/// added by whichever caller wants it, so this never double-wraps.
+fn expand_lambda_bare(elems: &[Value], expand_intrinsics: bool) -> Result<Value, String> {
+    let mut out = Vec::with_capacity(elems.len());
+    out.push(elems[0].clone());
+    out.push(elems[1].clone()); // ARGLIST, untouched
+    for e in &elems[2..] {
+        out.push(macroexpand_all_impl(e, expand_intrinsics)?);
+    }
+    Ok(with_host(|h| h.list_from(out)))
+}
+
 fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, String> {
     let mut f = form.clone();
     loop {
@@ -5510,7 +5854,20 @@ fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, 
     let head = with_host(|h| h.sym_name(&elems[0]));
     match head.as_deref() {
         // Quoted data is never expanded.
-        Some("quote") | Some("function") => Ok(f),
+        Some("quote") => Ok(f),
+        // `#'(lambda ...)` is not quoted data: the body is code and Emacs's
+        // `macroexp--expand-all` expands it (`(macroexpand-all '#'(lambda ()
+        // (when 1 2)))` is `#'(lambda nil (if 1 (progn 2)))`). `#'SYMBOL` is.
+        Some("function") => {
+            let Some(inner) = lambda_parts(elems.get(1)) else {
+                return Ok(f);
+            };
+            // Expand the lambda BARE — `expand_lambda_bare` does not re-add the
+            // wrapper, so `#'(lambda ...)` cannot come back as
+            // `#'#'(lambda ...)`.
+            let lam = expand_lambda_bare(&inner, expand_intrinsics)?;
+            Ok(with_host(|h| h.list_from(vec![elems[0].clone(), lam])))
+        }
         // Binding forms: expand each binding's INIT (never the VAR, which may name
         // a macro) and the body forms; keep the head and the binding names as-is.
         Some(kw @ ("let" | "let*")) => {
@@ -5556,14 +5913,18 @@ fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, 
         // `(lambda ARGLIST . BODY)`: the ARGLIST is a parameter list, not code —
         // a parameter named after a macro (e.g. `rx`) must NOT be macroexpanded.
         // Keep head + ARGLIST verbatim; expand only the body forms.
+        //
+        // `lambda` is a MACRO in Emacs (subr.el: `(list 'function (cons 'lambda
+        // cdr))`), so expansion also wraps it: `(macroexpand-all '(list (lambda
+        // () n)))` is `(list #'(lambda nil n))`. That wrapper is observable —
+        // `cconv-make-interpreted-closure` stores the expanded body, so a
+        // closure whose body contains a nested `lambda` PRINTS the `#'`.
         Some("lambda") if elems.len() >= 2 => {
-            let mut out = Vec::with_capacity(elems.len());
-            out.push(elems[0].clone());
-            out.push(elems[1].clone()); // ARGLIST, untouched
-            for e in &elems[2..] {
-                out.push(macroexpand_all_impl(e, expand_intrinsics)?);
-            }
-            Ok(with_host(|h| h.list_from(out)))
+            let lam = expand_lambda_bare(&elems, expand_intrinsics)?;
+            Ok(with_host(|h| {
+                let fsym = h.intern("function");
+                h.list_from(vec![fsym, lam])
+            }))
         }
         // `(defun|defmacro NAME ARGLIST . BODY)`: same protection for the ARGLIST
         // (and NAME); only the body forms are expression positions.
@@ -5611,8 +5972,16 @@ fn macroexpand_all_impl(form: &Value, expand_intrinsics: bool) -> Result<Value, 
         }
         _ => {
             let mut out = Vec::with_capacity(elems.len());
-            for e in &elems {
-                let expanded = macroexpand_all_impl(e, expand_intrinsics)?;
+            for (i, e) in elems.iter().enumerate() {
+                // A lambda in HEAD position keeps its bare `lambda` head:
+                // `(macroexpand-all '((lambda (x) x) 5))` is
+                // `((lambda (x) x) 5)` in Emacs, and `(#'(lambda (x) x) 5)`
+                // would be `invalid-function` — `#'(lambda …)` is a form that
+                // evaluates to a closure, not a closure.
+                let expanded = match (i == 0).then(|| lambda_parts(Some(e))).flatten() {
+                    Some(parts) => expand_lambda_bare(&parts, expand_intrinsics)?,
+                    None => macroexpand_all_impl(e, expand_intrinsics)?,
+                };
                 // A `defmacro' among sibling forms has to take effect BEFORE its
                 // siblings are expanded, or a macro defined and used in the same
                 // enclosing form is unusable: expansion of `(progn (defmacro m …)
@@ -5685,9 +6054,9 @@ pub(crate) fn load_abspath(candidate: &str) -> std::path::PathBuf {
 /// `load-in-progress` are dynamically bound and restored afterward — even if a
 /// form errors (the specstack is unwound to the pre-load depth).
 fn intrinsic_load(args: &[Value]) -> Result<Value, String> {
-    let file = match args.first() {
-        Some(Value::Str(s)) => s.to_string(),
-        Some(other) => {
+    let file = match args.first().map(|v| (v, with_host(|h| h.str_text(v).map(str::to_string)))) {
+        Some((_, Some(s))) => s,
+        Some((other, None)) => {
             return Err(format!(
                 "wrong-type-argument: stringp {}",
                 other.as_str_cow()
@@ -5726,10 +6095,7 @@ fn intrinsic_load(args: &[Value]) -> Result<Value, String> {
         let dirs: Vec<String> = lp
             .unwrap_or_default()
             .iter()
-            .filter_map(|v| match v {
-                Value::Str(s) => Some(s.to_string()),
-                _ => None,
-            })
+            .filter_map(|v| with_host(|h| h.str_text(v).map(str::to_string)))
             .collect();
         if dirs.is_empty() {
             vec![format!("./{file}")]
@@ -5786,7 +6152,10 @@ fn intrinsic_load(args: &[Value]) -> Result<Value, String> {
         std::fs::read_to_string(&path)
             .map_err(|e| format!("file-error: Cannot open load file: {}: {e}", path.display()))?
     };
-    let abs = Value::str(path.to_string_lossy().into_owned());
+    let abs = with_host(|h| {
+        let text = path.to_string_lossy().into_owned();
+        h.new_string(text)
+    });
 
     // Dynamically bind the load vars, remembering the pre-load specstack depth
     // so we can unwind them even if a form errors.

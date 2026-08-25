@@ -12,6 +12,7 @@ pub mod builtins;
 pub mod cache;
 pub mod compiler;
 pub mod dap;
+pub mod freevars;
 pub mod host;
 pub mod intercepts;
 pub mod lsp;
@@ -174,7 +175,7 @@ pub fn format_error(e: &str) -> String {
     let obj = host::with_host(|h| h.make_error_object(e));
     let func = host::with_host(|h| h.intern("error-message-string"));
     match host::call_function(&func, &[obj]) {
-        Ok(Value::Str(s)) => s.to_string(),
+        Ok(v) => host::with_host(|h| h.str_text(&v).map(str::to_string)).unwrap_or_else(|| e.to_string()),
         _ => e.to_string(),
     }
 }
@@ -192,7 +193,10 @@ fn with_load_file_name<T>(
     path: &str,
     run: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let abs = Value::str(host::load_abspath(path).to_string_lossy().into_owned());
+    let abs = host::with_host(|h| {
+        let text = host::load_abspath(path).to_string_lossy().into_owned();
+        h.new_string(text)
+    });
     let depth = host::with_host(|h| {
         let d = h.specdepth();
         let lfn = h.intern("load-file-name");
@@ -286,12 +290,13 @@ fn install_entry_point_state(path: &str, src: &str, entry: EntryPoint) {
     let args: Vec<String> = std::env::args().collect();
     // Everything after the script argument. `main` picks the first non-flag
     // argument as the file, so find that same one rather than assuming a slot.
-    let left: Vec<Value> = match args.iter().position(|a| a == path) {
-        Some(i) => args[i + 1..].iter().cloned().map(Value::str).collect(),
+    let tail: Vec<String> = match args.iter().position(|a| a == path) {
+        Some(i) => args[i + 1..].to_vec(),
         None => Vec::new(),
     };
     host::with_host(|h| {
-        let all: Vec<Value> = args.iter().cloned().map(Value::str).collect();
+        let left: Vec<Value> = tail.into_iter().map(|s| h.new_string(s)).collect();
+        let all: Vec<Value> = args.iter().cloned().map(|s| h.new_string(s)).collect();
         let all = h.list_from(all);
         let left = h.list_from(left);
         let cla = h.intern("command-line-args");

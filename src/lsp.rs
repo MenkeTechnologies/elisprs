@@ -438,6 +438,24 @@ pub const SUBRS: &[Entry] = &[
         doc: "Set the IDX'th element of ARRAY to VALUE.",
     },
     Entry {
+        name: "store-substring",
+        kind: Kind::Function,
+        sig: "(store-substring STRING IDX OBJ)",
+        doc: "Write OBJ (a character or string) into STRING at IDX; return STRING.",
+    },
+    Entry {
+        name: "clear-string",
+        kind: Kind::Function,
+        sig: "(clear-string STRING)",
+        doc: "Overwrite every character of STRING with NUL, in place; return nil.",
+    },
+    Entry {
+        name: "fillarray",
+        kind: Kind::Function,
+        sig: "(fillarray ARRAY ITEM)",
+        doc: "Set every element of ARRAY (a vector or string) to ITEM; return ARRAY.",
+    },
+    Entry {
         name: "symbol-name",
         kind: Kind::Function,
         sig: "(symbol-name SYMBOL)",

@@ -169,7 +169,13 @@ fn compile_form(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
         Value::Float(f) => {
             b.emit(Op::LoadFloat(*f), 0);
         }
-        Value::Str(_) => load_const(b, form.clone()),
+        // A transient `Value::Str` only reaches here from a caller that built a
+        // form in Rust; the reader promotes every source literal to a string
+        // CELL, which arrives as `Value::Obj` and is loaded as a constant below.
+        Value::Str(_) => {
+            let cell = h.promote_string(form.clone());
+            load_const(b, cell);
+        }
         Value::Undef | Value::Bool(false) => {
             b.emit(Op::LoadUndef, 0);
         }

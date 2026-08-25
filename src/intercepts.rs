@@ -238,9 +238,11 @@ impl ElispHost {
     /// (`intercept-args` is the real argument *list*, not a joined string).
     pub(crate) fn set_intercept_context(&mut self, name: &str, args: &[Value], full: &str) {
         let arglist = self.list_from(args.to_vec());
-        self.bind_intercept_var("intercept-name", Value::str(name));
+        let name = self.new_string(name);
+        let full = self.new_string(full);
+        self.bind_intercept_var("intercept-name", name);
         self.bind_intercept_var("intercept-args", arglist);
-        self.bind_intercept_var("intercept-cmd", Value::str(full.to_string()));
+        self.bind_intercept_var("intercept-cmd", full);
     }
 
     /// Bind the timing context variables read by `after` advice (`intercept-ms`
@@ -420,10 +422,7 @@ pub fn intrinsic_intercept_proceed() -> Result<Value, String> {
 fn intercept_subr(h: &mut ElispHost, args: &[Value]) -> Result<Value, String> {
     let kind_name = h
         .sym_name(&args[0])
-        .or_else(|| match &args[0] {
-            Value::Str(s) => Some(s.to_string()),
-            _ => None,
-        })
+        .or_else(|| h.str_text(&args[0]).map(str::to_string))
         .ok_or("intercept: KIND must be a symbol or string")?;
     let kind = match kind_name.as_str() {
         "before" => AdviceKind::Before,
@@ -435,9 +434,9 @@ fn intercept_subr(h: &mut ElispHost, args: &[Value]) -> Result<Value, String> {
             ))
         }
     };
-    let pattern = match &args[1] {
-        Value::Str(s) => s.to_string(),
-        _ => return Err("intercept: PATTERN must be a string".to_string()),
+    let pattern = match h.str_text(&args[1]).map(str::to_string) {
+        Some(s) => s,
+        None => return Err("intercept: PATTERN must be a string".to_string()),
     };
     let code = args[2].clone();
     let id = h.intercepts.iter().map(|i| i.id).max().unwrap_or(0) + 1;
@@ -457,12 +456,8 @@ fn intercept_list_subr(h: &mut ElispHost, _args: &[Value]) -> Result<Value, Stri
     let mut out = Vec::with_capacity(items.len());
     for i in &items {
         let kind = h.intern(i.kind.as_str());
-        let entry = h.list_from(vec![
-            Value::Int(i.id as i64),
-            kind,
-            Value::str(i.pattern.clone()),
-            i.code.clone(),
-        ]);
+        let pattern = h.new_string(i.pattern.clone());
+        let entry = h.list_from(vec![Value::Int(i.id as i64), kind, pattern, i.code.clone()]);
         out.push(entry);
     }
     Ok(h.list_from(out))

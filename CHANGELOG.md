@@ -6,6 +6,22 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Strings are mutable objects.** `aset` on a string signalled
+  `(wrong-type-argument arrayp "ab")`; `store-substring` and `clear-string` were
+  void; `fillarray` refused anything but a vector. A string is now an arena
+  object (`Obj::Str`) whose handle is the identity `eq` compares, so a write is
+  visible through every reference to it — an alias, a list element, the literal
+  a function returns — while `(let ((s "abc")) (eq s s))` stays `t` and two
+  equal literals stay distinct. `store-substring` and `clear-string` are
+  ported (`Fstore_substring`, `Fclear_string`), `fillarray` takes a string, and
+  `aset` reproduces Emacs's check order (index before character) and its
+  per-character `store-substring` bounds check, which leaves the prefix written
+  and names the partially-written string in the error. Text properties travel
+  with the write, so `(aset (propertize "abc" 'p 1) 0 ?z)` is still
+  `#("zbc" 0 3 (p 1))`. Every string constant in a compiled chunk is now an
+  object handle rather than an inline value, so the cache shard format is v10
+  and a v9 shard is rejected.
+- **`store-substring`, `clear-string`**, and `fillarray` on a string.
 - **The hook API's missing four.** `remove-hook` (subr.el:2186, including the
   depth-alist cleanup of bug#46414), `run-hook-with-args-until-success`,
   `run-hook-with-args-until-failure` and `run-hook-wrapped` — all previously
@@ -39,6 +55,23 @@ All notable changes to elisprs are documented here. The format follows
   `(KEY VAR [DEFAULT])` form whose KEY and DEFAULT are evaluated; `cl-struct`
   reads slots through `cl-struct-slot-value` behind a `cl-typep` guard, so a
   value of the wrong type fails the clause instead of signalling out of it.
+
+### Fixed
+- **An interpreted closure captured its whole enclosing scope.**
+  `(let ((n 1) (m 2)) (format "%S" (lambda () n)))` printed
+  `"#[nil (n) ((m . 2) (n . 1))]"` where Emacs prints `"#[nil (n) ((n . 1))]"`,
+  and a closure referencing nothing printed the enclosing bindings instead of
+  Emacs's `(t)`. `src/freevars.rs` ports `cconv-fv` / `cconv-analyze-form`
+  (cconv.el) and `ElispHost::trim_lex` applies it: the surviving bindings keep
+  the environment's order, only the innermost binding of a shadowed name
+  survives, and the kept nodes SHARE the enclosing chain's value cells so `setq`
+  still crosses the closure boundary. Visible through `prin1` and through
+  `equal`, which compares the captured environment.
+- **`macroexpand-all` did not expand `lambda`.** `lambda` is a macro in Emacs
+  (`subr.el`: `(list 'function (cons 'lambda cdr))`), so
+  `(macroexpand-all '(list (lambda () n)))` is `(list #'(lambda nil n))`; it
+  answered `(list (lambda nil n))`. The same arm stopped treating
+  `#'(lambda ...)` as quoted data — its body is code and Emacs expands it.
 
 ### Fixed (Emacs parity — object identity, hash-table slot order, closures)
 - **A string is an object, and `eq` is object identity.** `el_eq` answered `t`

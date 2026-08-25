@@ -106,7 +106,7 @@ elisp --version
 | Arithmetic | `+ - * / % mod 1+ 1- abs max min = /= < > <= >=` |
 | Lists | `car cdr cons list append nth nthcdr reverse length member memq assoc assq member-ignore-case` |
 | c*r combinators | `caar cadr cdar cddr caadr cadar cdaar cdadr cddar` (+ `cl-caar cl-cadr cl-cdar cl-cddr`) |
-| Mutation | `setcar setcdr aset` |
+| Mutation | `setcar setcdr aset fillarray store-substring clear-string` (a string is a mutable object: `aset`/`store-substring`/`clear-string` write through every reference to it) |
 | Vectors | `vector make-vector aref vectorp` |
 | Records | `record make-record recordp` (a distinct type — slot 0 is the type symbol, `vectorp` is nil; backs `cl-defstruct`) |
 | Bool-vectors | `make-bool-vector bool-vector bool-vector-p bool-vector-count-population bool-vector-subsetp bool-vector-not` (`#&N"…"` syntax) |

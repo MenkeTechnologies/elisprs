@@ -4106,3 +4106,253 @@ divergence rather than an error:
 - **`cl-defgeneric` answers its own name** where Emacs answers `nil`, and the
   `(head SYMBOL)` specializer is unsupported.
 - **`string-pixel-width`** is void.
+
+## Round 22 — a string is a mutable object, and a closure keeps only what it uses
+
+Reference: **GNU Emacs 31.1** (`/opt/homebrew/bin/emacs`). Earlier rounds quote
+30.2; that binary is no longer installed on this machine, so every measurement
+below states what was actually run. Where a form is also recorded in an earlier
+round the two readings agree — R21's `(let ((n 1) (m 2)) (format "%S" (lambda
+() n)))` reading `"#[nil (n) ((n . 1))]"` reproduces byte for byte on 31.1 —
+so the rules exercised here did not move between the two releases. Two forms
+that DO differ between the releases are named in "Still open" rather than
+asserted anywhere.
+
+Forms were run through a two-process driver (one `emacs -Q --batch -l` and one
+`elisp` over the same generated file, `(princ (format "%S" FORM))` per line,
+with a `lexical-binding: t` cookie), so a whole probe set is one process per
+engine and the corpus state cannot leak between forms in one engine but not the
+other.
+
+### R22-A. Strings were immutable — ✅ FIXED
+
+`aset` on a string signalled `arrayp`; `store-substring` and `clear-string`
+were void; `fillarray` refused anything but a vector.
+
+```text
+                                                          emacs 31.1  elisprs (before)
+(let ((s (copy-sequence "ab"))) (aset s 0 ?z) s)          "zb"        (wrong-type-argument arrayp "ab")
+(let* ((a (copy-sequence "ab")) (b a)) (aset a 0 ?z) b)   "zb"        (wrong-type-argument arrayp "ab")
+(progn (defun f () "ab") (aset (f) 0 ?z) (f))             "zb"        (wrong-type-argument arrayp "ab")
+(aset "ab" 0 ?z)                                          122         (wrong-type-argument arrayp "ab")
+(let ((s (copy-sequence "abcdef"))) (store-substring s 1 "XY") s)
+                                                          "aXYdef"    (void-function store-substring)
+(let ((s (copy-sequence "abc"))) (clear-string s) (append s nil))
+                                                          (0 0 0)     (void-function clear-string)
+(let ((s (copy-sequence "ab"))) (fillarray s ?z) s)       "zz"        (wrong-type-argument arrayp "ab")
+```
+
+R21 named the trap and it is real: `Value::Str` is an `Arc<String>` *value*, and
+the only way to write through a shared `Arc` is `Arc::make_mut`, which copies
+whenever the buffer is shared. The write would land on a private copy — the
+alias line above would answer `"ab"` — and the copy would break the pointer
+identity R21-A had just established for `eq`.
+
+What actually holds both properties is the same thing that already holds them
+for a cons: **a string is an arena object.** `Obj::Str(Arc<String>)` is the
+cell, the arena handle is the identity `eq` compares, and a write installs a
+fresh `Arc` in the cell so every reference sees the new text. `Value::Str`
+survives only as a *transient* — the form a builtin builds a result in before
+`ElispHost::promote_string` promotes it at the subr-return boundary
+(`host.rs`), and the form `ElispHost::str_view` hands back for reading.
+
+Four details that had to be got right, each of which is a silent wrong answer
+rather than an error if missed:
+
+- **The empty string is one shared object.** `(eq "" (make-string 0 ?a))` is
+  `t`, so `new_string_arc` answers the single `ElispHost::empty_string` cell for
+  any zero-length text. It is allocated in the built-in arena prefix, so its
+  handle is the same on the cache-hit and cache-miss paths.
+- **Text properties travel with the write.** `string_props` is keyed by the text
+  allocation and a write installs a fresh one, so `set_string_text` re-keys the
+  entry: `(let ((s (propertize "abc" 'p 1))) (aset s 0 ?z) s)` is
+  `#("zbc" 0 3 (p 1))`, not `"zbc"`.
+- **A hash table does NOT rehash.** Emacs hashes at `puthash` time, so mutating
+  a key strands the entry:
+  `(let ((h (make-hash-table :test 'equal)) (s (copy-sequence "abc")))
+  (puthash s 1 h) (aset s 0 ?z) (gethash "zbc" h))` is `nil` in both.
+- **`Faset` checks the index BEFORE the character.** `(aset s 5 'x)` is
+  `(args-out-of-range "ab" 5)`, not `(wrong-type-argument characterp x)`.
+  `Fstore_substring` goes further and checks *per character*, so a too-long OBJ
+  writes what fits and the error names the partially-written string:
+  `(let ((s (copy-sequence "abc"))) (store-substring s 1 "XYZW"))` is
+  `(args-out-of-range "aXY" 3)`.
+
+A string literal is a cell the *reader* allocates (`reader.rs`), which is why
+`(progn (defun f () "ab") (aset (f) 0 ?z) (f))` answers `"zb"`: Emacs 30 removed
+pure space, so the string a function returns is one object, not a fresh copy per
+call. That moved every string constant in a compiled chunk from an inline
+`Value::Str` to a `Value::Obj` handle, so `cache::SHARD_FORMAT_VERSION` went to
+10 — a v9 shard replays literals that are not string objects at all, which would
+print correctly and then signal `arrayp` on the first write.
+
+`tests/parity_mutable_strings.rs` (7 tests, 40 forms).
+
+### R22-B. An interpreted closure captured its whole enclosing scope — ✅ FIXED
+
+```text
+                                                          emacs 31.1              elisprs (before)
+(let ((n 1) (m 2)) (format "%S" (lambda () n)))           "#[nil (n) ((n . 1))]"  "#[nil (n) ((m . 2) (n . 1))]"
+(let ((n 1)) (format "%S" (lambda () 5)))                 "#[nil (5) (t)]"        "#[nil (5) ((n . 1))]"
+(let ((n 1)) (format "%S" (lambda (n) n)))                "#[(n) (n) (t)]"        "#[(n) (n) ((n . 1))]"
+(let ((n 1)) (format "%S" (lambda () (let ((n 2)) n))))   "#[nil ((let ((n 2)) n)) (t)]"
+                                                                                  "#[nil ((let ((n 2)) n)) ((n . 1))]"
+(let ((n 1)) (format "%S" (lambda () 'n)))                "#[nil ('n) (t)]"       "#[nil ('n) ((n . 1))]"
+```
+
+Emacs prunes in `cconv-make-interpreted-closure` (`lisp/emacs-lisp/cconv.el`),
+whose own comment gives the reason: "reduce ENV to the part actually used by the
+function, so we are closer to the ideal of 'safe for space'. In practice it has
+two benefits: it makes closures a bit more predictable and human-readable, and
+more importantly it avoids accidentally including values that we cannot print
+`read'ably." The analysis is `cconv-fv` / `cconv-analyze-form`; the port is
+`src/freevars.rs`, applied by `ElispHost::trim_lex` from
+`instantiate_closure` (`host.rs`).
+
+Three rules are load-bearing, and each was measured rather than assumed:
+
+- **Environment order, not mention order.**
+  `(let ((a 1) (b 2) (c 3)) (lambda () (list c a)))` and the same body written
+  `(list a c)` both close over `((c . 3) (a . 1))` — Emacs reads the survivors
+  out of the environment with `assq`, so the environment's order wins.
+- **Only the innermost binding of a shadowed name survives**, for the same
+  reason: `assq` stops at the first match.
+- **The kept bindings SHARE their value cells with the enclosing chain.** Emacs
+  prunes with `(mapcar (lambda (fv) (assq fv env)) …)`, which hands back the very
+  cons cells, so `setq` still crosses the closure boundary:
+  `(let ((n 1) (m 2)) (let ((f (lambda () (setq n (1+ n))))) (funcall f) n))` is
+  `2`. `Scope`'s value is therefore an `Rc<RefCell<Value>>` rather than an owned
+  `RefCell<Value>`; an owned cell per node would have given the closure a private
+  copy and answered `1`.
+
+What counts as a reference is syntactic, exactly as in cconv: `setq`'s target
+does, a nested `lambda`'s free variables do, a reference inside a branch that
+can never run does (`oclosure--lambda` depends on that — it emits a dead
+`(if t nil SLOT…)` so an unread slot stays in the captured environment for the
+accessors), and `'n`, `#'n` and a call head `(n)` do not.
+
+The free-variable set is computed once per closure TEMPLATE and memoized on the
+host (`ElispHost::closure_free`): a `lambda` inside a loop instantiates a fresh
+closure per iteration off one template, and re-walking its source every time
+would put an O(body) cost on every evaluation of the `lambda` form. It is derived
+from the template's source, so it is never serialized — a cache hit recomputes it
+on the first instantiation.
+
+`tests/parity_closure_capture_pruning.rs` (7 tests, 24 forms).
+
+### R22-C. `macroexpand-all` did not expand `lambda` — ✅ FIXED
+
+`lambda` is a macro in Emacs (`subr.el`: `(list 'function (cons 'lambda cdr))`),
+so expansion wraps it — and `cconv-make-interpreted-closure` stores the
+*expanded* body, which makes the wrapper visible in a printed closure:
+
+```text
+                                                    emacs 31.1                elisprs (before)
+(macroexpand-all '(list (lambda () n)))             (list #'(lambda nil n))   (list (lambda nil n))
+(macroexpand-all '(lambda () n))                    #'(lambda nil n)          (lambda nil n)
+(let ((n 1) (m 2)) (format "%S" (lambda () (lambda () m))))
+                                                    "#[nil (#'(lambda nil m)) ((m . 2))]"
+                                                                              "#[nil ((lambda nil m)) ((m . 2) (n . 1))]"
+```
+
+The same arm also stopped `#'(lambda …)` from being treated as quoted data: its
+body is code, and Emacs's `macroexp--expand-all` expands it. Quoted data is
+still never touched — `(macroexpand-all ''(lambda () n))` is `'(lambda nil n)`
+in both.
+
+### R22-D. `call_function`'s frame carried the FFI fallback — ✅ FIXED
+
+Not a parity bug; a stack-depth one, found because
+`tests/eval.rs::emacs_parity_local_functions_and_let_alist` began overflowing a
+test thread's 2 MiB stack. `call_function` is on the elisp recursion path — every
+nested elisp call stacks one of its frames — and it is already a large function.
+A local declared in one of its cold branches is a stack slot in *every* frame
+whether the branch runs or not, so the inline-Rust FFI fallback's argument vector
+widened the whole recursion. It is now `#[inline(never)] fn try_rust_ffi`, a call
+away from the frame. Measured: the test overflows at `RUST_MIN_STACK=2097152`
+before the split and passes after it.
+
+### R22-E. `--tiers`: elisprs reaches no native code, and loop shape is not why
+
+```text
+$ elisp --tiers loop.el            # (while (< i 200000) (setq s (+ s i)) (setq i (1+ i)))
+ops                     32
+block-JIT eligible      false
+block-JIT compiled      false
+largest eligible region 0..4 (4 ops)
+loop @5                trace-eligible=false traced=false blacklisted=false
+block-ineligible ops
+  Extended              8
+  ExtendedWide          2
+  LoadUndef             1
+reaches native code     false
+```
+
+The loop shape is NOT the gate here. groovyrs's fix was for a loop that did not
+end in a backward branch to its own anchor; elisprs's `while` already lowers to
+one — the disassembly ends the body with `Jump(5)` onto the header at 5, which
+is exactly what fusevm's `is_trace_eligible` accepts (`Op::Jump(t) |
+Op::JumpIfTrue(t) | Op::JumpIfFalse(t) if *t == anchor_ip`, `jit.rs`). Rotating
+the lowering would change nothing.
+
+The gate is the op *kind*. `is_trace_op_allowed_at` (`jit.rs`) falls through to
+`is_block_eligible_op_at` for anything it does not name, and `Op::Extended` is
+not eligible for either tier. Every elisp variable read and write is an
+`Op::Extended` host callback — `Extended(2, 0)` is `GETVAR`, `Extended(3, 0)` is
+`SETVAR`, `Extended(0, 0)` is `TRUTHY` — because an elisp variable lives in the
+`ElispHost` (a symbol value cell, or a `Scope` node in the lexical chain), not in
+a fusevm slot or global. `dolist` and `dotimes` expand to `let` + `while`, so
+they lower to the same ops and report the same gating reason.
+
+Reaching native code would mean lowering lexical variables to fusevm SLOTS
+(`Op::GetSlot`/`Op::SetSlot`, which both tiers accept) instead of host GETVAR /
+SETVAR — a lexical-slot allocator in the compiler, not a loop rotation. That is
+a real change with a real payoff and it is not in this round.
+
+### Still open
+
+- **`eq` on floats.** `(let ((f 1.5)) (eq f f))` is `t` in Emacs and `nil` here;
+  so is `(let ((l (list 1.5))) (eq (car l) (car l)))`. Two separately-read equal
+  floats are `nil` in both, and `eql`/`equal` on floats are already right — so
+  the only gap is one object read twice. Boxing floats the way strings were just
+  boxed would close it, and the cost is not the same trade: a string is read
+  through `str_text` at a bounded number of sites, whereas a float is the payload
+  of every arithmetic op in the VM, `Op::Add`/`Op::Mul`/`Op::NumLt` included.
+  Making `Value::Float` an arena handle would put an arena probe on the numeric
+  hot path and would end the fusevm-native lowering of `+`/`-`/`*`/comparisons
+  (`compiler.rs` emits `Op::Add`, `Op::Mul`, `Op::NumLt` &c. directly), which is
+  the only part of elisp that reaches fusevm's own opcodes at all — see R22-E for
+  how little else does. Measured shape of the trade rather than an assertion that
+  it is not worth it: the fix is one representation change, the cost is every
+  float arithmetic op in the language, and the observable difference is a single
+  `eq` answer that `eql` already gives correctly.
+- **No unibyte/multibyte string distinction.** `multibyte-string-p` is
+  approximated in the prelude as "has a non-ASCII character", and a string holds
+  Rust `String` text with no unibyte flag, so the character-width edges of `aset`
+  diverge: `(let ((s (copy-sequence "ab"))) (aset s 0 233) s)` is `"\351b"` in
+  Emacs (a raw byte in a unibyte string) and `"\u{e9}b"` here. The two forms whose
+  answers also differ between Emacs 30 and 31 are in this family and are asserted
+  nowhere: `(aset UNIBYTE 0 955)` and `(aset MULTIBYTE 0 955)`. Closing it means a
+  unibyte/multibyte flag on `Obj::Str` and a byte-vs-character text model, not a
+  patch to `aset`.
+- **`define-hash-table-test`** is still void, and `make-hash-table :test MY=`
+  falls back to `eql`. The obstacle named in R21 is the right one and it is
+  re-entrancy, not the API: `hash_eq`/`hash_key` run while the host is borrowed
+  (`with_host`), and a user test has to call back into elisp, which needs the
+  borrow released. The shape that would work is the one the `eval`/`load`/`sort`
+  intrinsics already use — resolve the test function OUT of the borrow, then run
+  the comparison outside it — which means hash lookup can no longer hold a
+  `&mut ElispHost` across the probe. That is a change to the hash table's calling
+  convention, not a missing builtin.
+- **Generators.** `iter-defun`, `iter-lambda`, `iter-next`, `iter-do` and
+  `iter-end-of-sequence` are all void; the CPS transform `generator.el` performs
+  has no counterpart here.
+- **`rx` gaps.** `(rx (category latin))` errors where Emacs yields `"\\cl"`;
+  `(rx (in ?a ?b "0-9"))` yields `"[ab0-9]"` against Emacs's `"[0-9ab]"`;
+  `(rx (or))` yields `"\\(?:\\)"` against Emacs's ``"\\`a\\`"``; and
+  `minimal-match`/`maximal-match` are ignored.
+- **`pcase-lambda`, the explicit `` (\` PAT) `` spelling and compound `cl-type`
+  specifiers** are missing.
+- **`cl-defgeneric` answers its own name** where Emacs answers `nil`, and the
+  `(head SYMBOL)` specializer is unsupported.
+- **`string-pixel-width`** is void.

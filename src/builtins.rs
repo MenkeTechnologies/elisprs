@@ -71,9 +71,9 @@ fn as_int(h: &ElispHost, v: &Value) -> Result<i64, String> {
 /// The string value of `v`, or Emacs's `(wrong-type-argument stringp X)` — with
 /// X printed as `prin1` would, never as the raw heap handle the value carries.
 fn as_string(h: &ElispHost, v: &Value) -> Result<String, String> {
-    match v {
-        Value::Str(s) => Ok(s.to_string()),
-        _ => Err(format!("wrong-type-argument: stringp {}", h.print(v, true))),
+    match h.str_text(v) {
+        Some(s) => Ok(s.to_string()),
+        None => Err(format!("wrong-type-argument: stringp {}", h.print(v, true))),
     }
 }
 /// Strict integer accessor signalling `integerp` (for `ash`/`lsh`/`lognot`/`logcount`).
@@ -495,8 +495,13 @@ fn el_equal(h: &ElispHost, a: &Value, b: &Value) -> bool {
     if el_eql(h, a, b) {
         return true;
     }
+    // Two strings are `equal` when their CURRENT text matches — read through
+    // `str_text` so a string that `aset`/`store-substring` has rewritten
+    // compares as what it now holds, not as what it was allocated with.
+    if let (Some(x), Some(y)) = (h.str_text(a), h.str_text(b)) {
+        return x == y;
+    }
     match (a, b) {
-        (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Obj(_), Value::Obj(_)) => match (h.obj(a), h.obj(b)) {
             (Some(Obj::Cons(a1, a2)), Some(Obj::Cons(b1, b2))) => {
                 el_equal(h, a1, b1) && el_equal(h, a2, b2)
@@ -608,10 +613,10 @@ fn append_fn(h: &mut ElispHost, a: &[Value]) -> R {
         if is_nil(v) {
             continue;
         }
-        match h.obj(v) {
-            Some(Obj::Vector(items)) => out.extend(items.clone()),
-            _ => match v {
-                Value::Str(s) => out.extend(s.chars().map(|c| Value::Int(c as i64))),
+        match h.str_text(v) {
+            Some(s) => out.extend(s.chars().map(|c| Value::Int(c as i64)).collect::<Vec<_>>()),
+            None => match h.obj(v) {
+                Some(Obj::Vector(items)) => out.extend(items.clone()),
                 _ => out.extend(h.seq_vec_checked(v)?),
             },
         }
@@ -624,8 +629,9 @@ fn append_fn(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn reverse_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // `reverse` works on any sequence: list, string, or vector.
-    if let Value::Str(s) = &a[0] {
-        return Ok(Value::str(s.chars().rev().collect::<String>()));
+    if let Some(s) = h.str_text(&a[0]) {
+        let rev = s.chars().rev().collect::<String>();
+        return Ok(h.new_string(rev));
     }
     // Reject an improper list (and a non-sequence) with Emacs's error before
     // falling through to the list path, which would otherwise silently ignore
@@ -698,19 +704,19 @@ fn case_fold(h: &mut ElispHost, a: &[Value], upper: bool) -> R {
         Value::Int(c) if *c < 0 => Err(h.signal_wrong_type("char-or-string-p", &a[0])),
         Value::Int(c) if *c > 0x3F_FFFF => Ok(Value::Int(*c)),
         Value::Int(c) => Ok(Value::Int(simple_case(*c, upper))),
-        Value::Str(s) => {
+        _ if h.is_string(&a[0]) => {
             // Case folding is character-for-character here, so the text
             // properties land on the same characters they were on.
-            let folded = Value::str(if upper {
-                s.to_uppercase()
+            let src = h.str_arc(&a[0]).expect("checked stringp");
+            let text = if upper {
+                src.to_uppercase()
             } else {
-                s.to_lowercase()
-            });
-            if let Value::Str(out) = &folded {
-                if out.chars().count() == s.chars().count() {
-                    let src = std::sync::Arc::clone(s);
-                    h.string_carry_all(out, &src);
-                }
+                src.to_lowercase()
+            };
+            let same_len = text.chars().count() == src.chars().count();
+            let (folded, out) = h.new_string_keyed(text);
+            if same_len {
+                h.string_carry_all(&out, &src);
             }
             Ok(folded)
         }
@@ -736,9 +742,9 @@ fn case_fold(h: &mut ElispHost, a: &[Value], upper: bool) -> R {
 fn char_titlecase(h: &mut ElispHost, a: &[Value]) -> R {
     match &a[0] {
         Value::Int(c) if (0..=0x3F_FFFF).contains(c) => match char::from_u32(*c as u32) {
-            Some(ch) => Ok(Value::str(titlecase_str(ch))),
+            Some(ch) => Ok(h.new_string(titlecase_str(ch))),
             // A code point with no scalar value (a surrogate) has no case.
-            None => Ok(Value::str(String::new())),
+            None => Ok(h.new_string(String::new())),
         },
         v => Err(format!(
             "wrong-type-argument: characterp {}",
@@ -840,8 +846,10 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
     if is_nil(&a[0]) {
         return Ok(Value::Int(0));
     }
+    if let Some(s) = h.str_text(&a[0]) {
+        return Ok(Value::Int(s.chars().count() as i64));
+    }
     match &a[0] {
-        Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
         // A symbol, a number, t … are not sequences: Emacs signals rather than
         // answering 0. (`safe-length` is the one that answers 0.)
         Value::Bool(_) | Value::Int(_) | Value::Float(_) => Err(format!(
@@ -1126,8 +1134,8 @@ fn symbolp(h: &mut ElispHost, a: &[Value]) -> R {
             || matches!(h.obj(&a[0]), Some(Obj::Symbol(_))),
     ))
 }
-fn stringp(_h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(matches!(a[0], Value::Str(_))))
+fn stringp(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(h.is_string(&a[0])))
 }
 /// `natnump` is a C subr in Emacs (data.c), so `#'natnump` must be — and print
 /// as — `#<subr natnump>` (a prelude lambda would print its closure source in
@@ -1312,12 +1320,12 @@ fn aref(h: &mut ElispHost, a: &[Value]) -> R {
         Some(Obj::BoolVector(bits)) => get(bits.len())
             .map(|i| nil_or(bits[i]))
             .ok_or_else(|| oor(h)),
-        _ => match &a[0] {
-            Value::Str(s) => get(s.chars().count())
+        _ => match h.str_text(&a[0]) {
+            Some(s) => get(s.chars().count())
                 .and_then(|i| s.chars().nth(i))
                 .map(|c| Value::Int(c as i64))
                 .ok_or_else(|| oor(h)),
-            _ => Err(format!(
+            None => Err(format!(
                 "wrong-type-argument: arrayp {}",
                 h.print(&a[0], true)
             )),
@@ -1362,6 +1370,28 @@ fn aset(h: &mut ElispHost, a: &[Value]) -> R {
             _ => {}
         }
     }
+    // A STRING is mutable, and the write lands on the string OBJECT, so every
+    // reference to it — an alias, a list element, a function's literal — sees
+    // the new character. Emacs 30 removed pure space, so even a literal is
+    // writable: `(progn (defun f () "ab") (aset (f) 0 ?z) (f))` is `"zb"`.
+    //
+    // `Faset` (data.c) checks the INDEX before the character: `(aset "ab" 5 'x)`
+    // is `(args-out-of-range "ab" 5)`, not `(wrong-type-argument characterp x)`.
+    if h.is_string(&a[0]) {
+        let mut chars: Vec<char> = h
+            .str_text(&a[0])
+            .expect("checked stringp")
+            .chars()
+            .collect();
+        if i >= chars.len() {
+            return Err(format!("args-out-of-range: {} {idx}", h.print(&a[0], true)));
+        }
+        let c = as_char(h, &a[2])?;
+        chars[i] = char::from_u32(c).unwrap_or('\u{fffd}');
+        let text: String = chars.into_iter().collect();
+        h.set_string_text(&a[0], text);
+        return Ok(a[2].clone());
+    }
     // Emacs names the offending object: `(aset 5 0 1)` is
     // `(wrong-type-argument arrayp 5)`, never a bare `(wrong-type-argument arrayp)`.
     Err(format!(
@@ -1369,9 +1399,18 @@ fn aset(h: &mut ElispHost, a: &[Value]) -> R {
         h.print(&a[0], true)
     ))
 }
-/// `(fillarray ARRAY ITEM)` — set every element of vector ARRAY to ITEM, in
-/// place. (Strings are immutable here, so only vectors are supported.)
+/// `(fillarray ARRAY ITEM)` — set every element of ARRAY to ITEM, in place.
+/// ARRAY may be a vector or a string; for a string ITEM must be a character
+/// (`(fillarray (copy-sequence "ab") ?z)` leaves `"zz"`).
 fn fillarray(h: &mut ElispHost, a: &[Value]) -> R {
+    if h.is_string(&a[0]) {
+        let n = h.str_text(&a[0]).expect("checked stringp").chars().count();
+        let c = as_char(h, &a[1])?;
+        let ch = char::from_u32(c).unwrap_or('\u{fffd}');
+        let text: String = std::iter::repeat_n(ch, n).collect();
+        h.set_string_text(&a[0], text);
+        return Ok(a[0].clone());
+    }
     if let Value::Obj(id) = &a[0] {
         if let Some(Obj::Vector(items)) = h.arena.get_mut(*id as usize) {
             for x in items.iter_mut() {
@@ -1384,6 +1423,65 @@ fn fillarray(h: &mut ElispHost, a: &[Value]) -> R {
         "wrong-type-argument: arrayp {}",
         h.print(&a[0], true)
     ))
+}
+
+/// `(store-substring STRING IDX OBJ)` — port of `Fstore_substring` (editfns.c).
+/// OBJ is a character or a string; its characters overwrite STRING starting at
+/// IDX, and STRING itself is returned.
+///
+/// The bounds check is *per character*, not up front, so a too-long OBJ writes
+/// what fits and only then signals — and the error names the PARTIALLY WRITTEN
+/// string, because the datum is the string object:
+///
+/// ```text
+/// (let ((s (copy-sequence "abc"))) (store-substring s 1 "XYZW"))
+///   => (args-out-of-range "aXY" 3)
+/// ```
+fn store_substring(h: &mut ElispHost, a: &[Value]) -> R {
+    if !h.is_string(&a[0]) {
+        return Err(h.signal_wrong_type("stringp", &a[0]));
+    }
+    let mut chars: Vec<char> = h
+        .str_text(&a[0])
+        .expect("checked stringp")
+        .chars()
+        .collect();
+    let idx = as_int(h, &a[1])?;
+    let incoming: Vec<char> = match h.str_text(&a[2]) {
+        Some(s) => s.chars().collect(),
+        None => vec![char::from_u32(as_char(h, &a[2])?).unwrap_or('\u{fffd}')],
+    };
+    for (k, c) in incoming.into_iter().enumerate() {
+        let pos = idx + k as i64;
+        if pos < 0 || pos as usize >= chars.len() {
+            // Flush what was written before naming the range, so the datum
+            // shows the partial result exactly as Emacs's does.
+            let text: String = chars.into_iter().collect();
+            h.set_string_text(&a[0], text);
+            return Err(format!(
+                "args-out-of-range: {} {pos}",
+                h.print(&a[0], true)
+            ));
+        }
+        chars[pos as usize] = c;
+    }
+    let text: String = chars.into_iter().collect();
+    h.set_string_text(&a[0], text);
+    Ok(a[0].clone())
+}
+
+/// `(clear-string STRING)` — port of `Fclear_string` (fns.c): overwrite every
+/// character of STRING with NUL, in place, and answer nil. The length is
+/// unchanged (`(length (clear-string (copy-sequence "abc")))` reads 3 on the
+/// string), which is what makes it useful for wiping a password buffer.
+fn clear_string(h: &mut ElispHost, a: &[Value]) -> R {
+    if !h.is_string(&a[0]) {
+        return Err(h.signal_wrong_type("stringp", &a[0]));
+    }
+    let n = h.str_text(&a[0]).expect("checked stringp").chars().count();
+    let text: String = std::iter::repeat_n('\0', n).collect();
+    h.set_string_text(&a[0], text);
+    Ok(Value::Undef)
 }
 
 // ── char-tables ──
@@ -1532,7 +1630,7 @@ fn wrong_char_table(h: &ElispHost, v: &Value) -> String {
 // ── symbols / cells ──
 fn symbol_name(h: &mut ElispHost, a: &[Value]) -> R {
     match h.sym_name(&a[0]) {
-        Some(s) => Ok(Value::str(s)),
+        Some(s) => Ok(h.new_string(s)),
         None => Err(format!(
             "wrong-type-argument: symbolp {}",
             h.print(&a[0], true)
@@ -1560,9 +1658,14 @@ fn obarray_arg(h: &ElispHost, v: Option<&Value>) -> Result<Option<u32>, String> 
     }
 }
 fn intern_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let name = match &a[0] {
-        Value::Str(s) => s.to_string(),
-        v => return Err(format!("wrong-type-argument: stringp {}", h.print(v, true))),
+    let name = match h.str_text(&a[0]) {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(format!(
+                "wrong-type-argument: stringp {}",
+                h.print(&a[0], true)
+            ))
+        }
     };
     match obarray_arg(h, a.get(1))? {
         // `nil` and `t` are already in the global obarray in Emacs, so interning
@@ -1606,9 +1709,9 @@ fn obarrayp_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(unintern NAME &optional OBARRAY)` — remove NAME (a symbol or string) from
 /// OBARRAY, returning t if a symbol was removed, nil otherwise.
 fn unintern_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let name = match &a[0] {
-        Value::Str(s) => s.to_string(),
-        _ => h
+    let name = match h.str_text(&a[0]) {
+        Some(s) => s.to_string(),
+        None => h
             .sym_name(&a[0])
             .ok_or_else(|| format!("wrong-type-argument: stringp {}", h.print(&a[0], true)))?,
     };
@@ -1619,9 +1722,12 @@ fn unintern_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(removed))
 }
 fn make_symbol_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    match &a[0] {
-        Value::Str(s) => Ok(h.make_symbol(&s.to_string())),
-        v => Err(format!("wrong-type-argument: stringp {}", h.print(v, true))),
+    match h.str_text(&a[0]).map(str::to_string) {
+        Some(s) => Ok(h.make_symbol(&s)),
+        None => Err(format!(
+            "wrong-type-argument: stringp {}",
+            h.print(&a[0], true)
+        )),
     }
 }
 fn set_fn(h: &mut ElispHost, a: &[Value]) -> R {
@@ -1744,13 +1850,14 @@ fn push_output_capture(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(Value::Undef)
 }
 fn pop_output_capture(h: &mut ElispHost, _a: &[Value]) -> R {
-    Ok(Value::str(h.output_capture.pop().unwrap_or_default()))
+    let captured = h.output_capture.pop().unwrap_or_default();
+    Ok(h.new_string(captured))
 }
 fn prin1_to_string(h: &mut ElispHost, a: &[Value]) -> R {
     // `(prin1-to-string OBJECT &optional NOESCAPE)` — a non-nil NOESCAPE prints
     // the way `princ` does (no quotes, no escapes).
     let readable = a.get(1).is_none_or(is_nil);
-    Ok(Value::str(h.print_checked(&a[0], readable)?))
+    Ok(h.new_string(h.print_checked(&a[0], readable)?))
 }
 
 // ── nonlocal exits ──
@@ -1797,14 +1904,14 @@ fn curve_quotes(fmt: &str) -> String {
 
 /// `el_format` with the format template curve-quoted (`format-message`).
 fn el_format_message(h: &mut ElispHost, a: &[Value]) -> Result<String, String> {
-    match a.first() {
-        Some(Value::Str(s)) => {
+    match a.first().and_then(|v| h.str_text(v)).map(curve_quotes) {
+        Some(curved) => {
             let mut args = a.to_vec();
-            args[0] = Value::str(curve_quotes(s));
+            args[0] = h.new_string(curved);
             el_format(h, &args)
         }
         // A non-string template is el_format's error to report, unchanged.
-        _ => el_format(h, a),
+        None => el_format(h, a),
     }
 }
 
@@ -1812,7 +1919,7 @@ fn error_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // Error object: (error "MESSAGE"). Keep it for condition-case.
     let msg = el_format_message(h, a)?;
     let esym = h.intern("error");
-    let mstr = Value::str(msg.clone());
+    let mstr = h.new_string(msg.clone());
     let data = h.list_from(vec![mstr]);
     let obj = h.cons(esym, data);
     let full = format!("error: {msg}");
@@ -1823,7 +1930,7 @@ fn user_error_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // Like `error`, but signals the `user-error` condition.
     let msg = el_format_message(h, a)?;
     let esym = h.intern("user-error");
-    let mstr = Value::str(msg.clone());
+    let mstr = h.new_string(msg.clone());
     let data = h.list_from(vec![mstr]);
     let obj = h.cons(esym, data);
     let full = format!("user-error: {msg}");
@@ -1875,14 +1982,14 @@ fn concat_fn(h: &mut ElispHost, a: &[Value]) -> R {
         if is_nil(v) {
             continue;
         }
-        match v {
-            Value::Str(s) => {
+        match h.str_arc(v) {
+            Some(s) => {
                 let n = s.chars().count();
-                pieces.push((Some(std::sync::Arc::clone(s)), 0, n));
+                out.push_str(&s);
+                pieces.push((Some(s), 0, n));
                 carried += n;
-                out.push_str(s);
             }
-            _ => match h.obj(v) {
+            None => match h.obj(v) {
                 Some(Obj::Vector(items)) => {
                     for it in items.clone() {
                         push_char(h, &mut out, &it)?;
@@ -1913,10 +2020,8 @@ fn concat_fn(h: &mut ElispHost, a: &[Value]) -> R {
             carried = so_far;
         }
     }
-    let out = Value::str(out);
-    if let Value::Str(s) = &out {
-        h.string_carry_props(s, &pieces);
-    }
+    let (out, key) = h.new_string_keyed(out);
+    h.string_carry_props(&key, &pieces);
     Ok(out)
 }
 /// A parsed `%`-directive: `%[-][0][width][.prec]CONV`.
@@ -2183,9 +2288,14 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
 /// properties of the format string's own literal text, and those of a `%s`
 /// argument, each onto the characters they produced. Padding carries none.
 fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>), String> {
-    let fmt = match &a[0] {
-        Value::Str(s) => s.to_string(),
-        v => return Err(format!("wrong-type-argument: stringp {}", h.print(v, true))),
+    let fmt = match h.str_text(&a[0]) {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(format!(
+                "wrong-type-argument: stringp {}",
+                h.print(&a[0], true)
+            ))
+        }
     };
     // Runs of the result, in order. Everything but a `%s` argument's own
     // characters carries no properties: the format string's literal text and
@@ -2317,8 +2427,8 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>
         // A `%s` of a string argument reproduces that string's characters, so
         // its properties belong on them. Truncation by a precision drops the
         // tail but keeps the head's, which the offsets below already express.
-        let carries: Option<std::sync::Arc<String>> = match (conv, a.get(idx)) {
-            ('s', Some(Value::Str(s))) => Some(std::sync::Arc::clone(s)),
+        let carries: Option<std::sync::Arc<String>> = match conv {
+            's' => a.get(idx).and_then(|v| h.str_arc(v)),
             _ => None,
         };
         let body = match conv {
@@ -2479,11 +2589,8 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>
 }
 fn format_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let (s, pieces) = el_format_pieces(h, a)?;
-    let out = Value::str(s);
-    if let Value::Str(s) = &out {
-        let s = std::sync::Arc::clone(s);
-        h.string_carry_props(&s, &pieces);
-    }
+    let (out, key) = h.new_string_keyed(s);
+    h.string_carry_props(&key, &pieces);
     Ok(out)
 }
 /// `(message FORMAT-STRING &rest ARGS)`. Port of `Fmessage` (`src/xdisp.c`) plus
@@ -2513,8 +2620,8 @@ fn format_fn(h: &mut ElispHost, a: &[Value]) -> R {
 fn message_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let blank = match a.first() {
         Some(v) if is_nil(v) => true,
-        Some(Value::Str(s)) => s.is_empty(),
-        _ => false,
+        Some(v) => h.str_text(v).is_some_and(str::is_empty),
+        None => false,
     };
     let text = if blank {
         None
@@ -2528,7 +2635,7 @@ fn message_fn(h: &mut ElispHost, a: &[Value]) -> R {
     match text {
         Some(s) => {
             eprintln!("{s}");
-            Ok(Value::str(s))
+            Ok(h.new_string(s))
         }
         None => {
             eprintln!();
@@ -2548,7 +2655,7 @@ fn prin1_fn(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn number_to_string(h: &mut ElispHost, a: &[Value]) -> R {
     as_number_p(h, &a[0], false)?;
-    Ok(Value::str(h.print(&a[0], false)))
+    Ok(h.new_string(h.print(&a[0], false)))
 }
 
 // ── hash tables ──
@@ -2613,6 +2720,12 @@ fn hash_into(h: &ElispHost, test: u8, v: &Value, depth: u32, st: &mut impl std::
         Value::Str(txt) => {
             st.write_u8(4);
             txt.as_str().hash(st);
+        }
+        // A string CELL hashes as its text, not as its handle: `equal` compares
+        // the text, so two distinct cells holding "ab" must share a bucket.
+        Value::Obj(_) if h.is_string(v) => {
+            st.write_u8(4);
+            h.str_text(v).unwrap_or_default().hash(st);
         }
         Value::Obj(id) => match h.arena.get(*id as usize) {
             // A bignum is `eql` by VALUE, so its handle cannot be the hash.
@@ -2845,7 +2958,7 @@ fn copy_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
 /// A C subr in Emacs (editfns.c) that demands `stringp` (never a vector, unlike
 /// `substring`); index handling is then identical to `substring`.
 fn substring_no_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    if !matches!(&a[0], Value::Str(_)) {
+    if !h.is_string(&a[0]) {
         return Err(format!(
             "wrong-type-argument: stringp {}",
             h.print(&a[0], true)
@@ -2854,8 +2967,7 @@ fn substring_no_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // `substring` carries the slice's text properties; this subr is exactly
     // that slice without them.
     let out = substring(h, a)?;
-    if let Value::Str(s) = &out {
-        let s = std::sync::Arc::clone(s);
+    if let Some(s) = h.str_arc(&out) {
         h.string_clear_props(&s);
     }
     Ok(out)
@@ -2867,9 +2979,9 @@ fn substring(h: &mut ElispHost, a: &[Value]) -> R {
         Str(Vec<char>),
         Vec(Vec<Value>),
     }
-    let seq = match &a[0] {
-        Value::Str(s) => Seq::Str(s.chars().collect()),
-        _ => match h.obj(&a[0]) {
+    let seq = match h.str_text(&a[0]) {
+        Some(s) => Seq::Str(s.chars().collect()),
+        None => match h.obj(&a[0]) {
             Some(Obj::Vector(items)) => Seq::Vec(items.clone()),
             _ => {
                 return Err(format!(
@@ -2928,12 +3040,12 @@ fn substring(h: &mut ElispHost, a: &[Value]) -> R {
     }
     match seq {
         Seq::Str(c) => {
-            let out = Value::str(c[start as usize..end as usize].iter().collect::<String>());
+            let text = c[start as usize..end as usize].iter().collect::<String>();
+            let src = h.str_arc(&a[0]);
+            let (out, dst) = h.new_string_keyed(text);
             // The slice's characters keep the properties they had in the
             // original, re-based to the new string's start.
-            if let (Value::Str(src), Value::Str(dst)) = (&a[0], &out) {
-                let src = std::sync::Arc::clone(src);
-                let dst = std::sync::Arc::clone(dst);
+            if let Some(src) = src {
                 h.string_carry_props(&dst, &[(Some(src), start as usize, (end - start) as usize)]);
             }
             Ok(out)
@@ -3139,7 +3251,7 @@ fn string_empty_p(h: &mut ElispHost, a: &[Value]) -> R {
     // ((string-empty-p nil) => nil, no error) and anything else draws
     // `string=`'s `stringp` signal.
     match &a[0] {
-        Value::Str(s) => Ok(nil_or(s.is_empty())),
+        v if h.is_string(v) => Ok(nil_or(h.str_text(v).is_some_and(str::is_empty))),
         v if is_nil(v) => Ok(Value::Undef), // symbol name "nil" is non-empty
         v => match h.sym_name(v) {
             Some(name) => Ok(nil_or(name.is_empty())),
@@ -3170,7 +3282,7 @@ fn string_join(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn char_to_string(h: &mut ElispHost, a: &[Value]) -> R {
     let n = as_char(h, &a[0])?;
-    Ok(Value::str(
+    Ok(h.new_string(
         char::from_u32(n).map(|c| c.to_string()).unwrap_or_default(),
     ))
 }
@@ -3198,7 +3310,7 @@ fn make_string(h: &mut ElispHost, a: &[Value]) -> R {
     for _ in 0..n {
         s.push(c);
     }
-    Ok(Value::str(s))
+    Ok(h.new_string(s))
 }
 /// `(string &rest CHARACTERS)` — a string of CHARACTERS.
 ///
@@ -3213,21 +3325,18 @@ fn string_fn(h: &mut ElispHost, a: &[Value]) -> R {
             s.push(c);
         }
     }
-    Ok(Value::str(s))
+    Ok(h.new_string(s))
 }
 fn string_to_list(h: &mut ElispHost, a: &[Value]) -> R {
     // Emacs defines this as `(append STRING nil)`, so it accepts any sequence and
     // signals `sequencep` — not `stringp` — on anything else.
-    match &a[0] {
-        Value::Str(st) => {
-            let items: Vec<Value> = st.chars().map(|c| Value::Int(c as i64)).collect();
-            Ok(h.list_from(items))
-        }
-        v => match h.seq_vec(v) {
+    match h.str_text(&a[0]).map(|st| st.chars().map(|c| Value::Int(c as i64)).collect()) {
+        Some(items) => Ok(h.list_from(items)),
+        None => match h.seq_vec(&a[0]) {
             Some(items) => Ok(h.list_from(items)),
             None => Err(format!(
                 "wrong-type-argument: sequencep {}",
-                h.print(v, true)
+                h.print(&a[0], true)
             )),
         },
     }
@@ -3528,25 +3637,30 @@ fn match_string(h: &mut ElispHost, a: &[Value]) -> R {
     let span = md.spans.get(n).copied().flatten();
     // Buffer matches store 1-based buffer positions; read the current buffer
     // text by char (unless an explicit STRING argument is given).
-    if md.from_buffer && !matches!(a.get(1), Some(Value::Str(_))) {
+    let explicit = a.get(1).and_then(|v| h.str_text(v)).map(str::to_string);
+    if md.from_buffer && explicit.is_none() {
         return Ok(match span {
             Some((b, e)) => {
                 let t = &h.cur_buf().text;
                 let (lo, hi) = ((b - 1).min(t.len()), (e - 1).min(t.len()));
-                Value::str(t[lo..hi].iter().collect::<String>())
+                let text = t[lo..hi].iter().collect::<String>();
+                h.new_string(text)
             }
             None => Value::Undef,
         });
     }
-    let subject = match a.get(1) {
-        Some(Value::Str(s)) => s.to_string(),
-        _ => md.subject.clone(),
+    let Some(md) = h.match_data.as_ref() else {
+        return Ok(Value::Undef);
+    };
+    let subject = match explicit {
+        Some(s) => s,
+        None => md.subject.clone(),
     };
     match span {
         Some((b, e)) => {
             let bb = byte_of_char(&subject, b);
             let eb = byte_of_char(&subject, e);
-            Ok(Value::str(subject.get(bb..eb).unwrap_or("").to_string()))
+            Ok(h.new_string(subject.get(bb..eb).unwrap_or("").to_string()))
         }
         None => Ok(Value::Undef),
     }
@@ -3625,7 +3739,7 @@ fn regexp_quote(h: &mut ElispHost, a: &[Value]) -> R {
         }
         out.push(c);
     }
-    Ok(Value::str(out))
+    Ok(h.new_string(out))
 }
 
 /// Adapt REP's case to MATCHED's (Emacs FIXEDCASE-nil behavior): an all-uppercase
@@ -4397,6 +4511,9 @@ fn sxhash_equal(h: &ElispHost, v: &Value, depth: u32) -> u64 {
         Value::Bool(false) | Value::Undef => 0,
         Value::Bool(true) => 1,
         Value::Obj(_) => match h.obj(v) {
+            // A string cell hashes as its text, like a transient: `equal`
+            // compares text, so `sxhash-equal` has to agree.
+            Some(Obj::Str(s)) => hash_bytes(s),
             Some(Obj::Symbol(s)) => hash_mix(0x5111, hash_bytes(&s.name)),
             Some(Obj::Cons(car, cdr)) => {
                 if depth >= 5 {
@@ -4474,6 +4591,7 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
         Value::Int(_) => "integer",
         Value::Float(_) => "float",
         Value::Str(_) => "string",
+        _ if h.is_string(&a[0]) => "string",
         Value::Bool(_) | Value::Undef => "symbol",
         Value::Obj(_) => match h.obj(&a[0]) {
             Some(Obj::Cons(..)) => "cons",
@@ -4486,6 +4604,9 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
             // only keeps the match exhaustive over `Obj`.
             Some(Obj::Record(_)) => "record",
             Some(Obj::BoolVector(_)) => "bool-vector",
+            // Unreachable: the `Value::Str` arm above matches first, because
+            // `type_of` views its argument through `str_view`. Here for exhaustiveness.
+            Some(Obj::Str(_)) => "string",
             Some(Obj::Subr { .. }) => "subr",
             // Emacs 30 renamed the interpreted-closure type: `(type-of (lambda ()))`
             // is `interpreted-function` (it was `function` only up to Emacs 29).
@@ -4616,8 +4737,7 @@ fn char_or_string_p(_h: &mut ElispHost, a: &[Value]) -> R {
     // A "character" is an integer in [0, #x3FFFFF]; strings always qualify.
     let ok = match &a[0] {
         Value::Int(n) => (0..=0x3F_FFFF).contains(n),
-        Value::Str(_) => true,
-        _ => false,
+        v => _h.is_string(v),
     };
     Ok(nil_or(ok))
 }
@@ -4671,7 +4791,7 @@ fn set_intrinsic_macro_cell(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(intern-soft NAME)` — the interned symbol named NAME, or nil if none exists.
 fn intern_soft(h: &mut ElispHost, a: &[Value]) -> R {
     let name = match &a[0] {
-        Value::Str(s) => s.to_string(),
+        v if h.is_string(v) => h.str_text(v).unwrap_or_default().to_string(),
         // `t` and `nil` ARE interned symbols in Emacs; elisprs represents them as
         // `Value::Bool`/`Value::Undef` rather than heap symbols, so `sym_name`
         // misses them and `(intern-soft t)` answered nil where Emacs answers `t`.
@@ -4808,8 +4928,8 @@ fn vconcat_fn(h: &mut ElispHost, a: &[Value]) -> R {
         }
         match h.obj(v) {
             Some(Obj::Vector(items)) => out.extend(items.clone()),
-            _ => match v {
-                Value::Str(s) => out.extend(s.chars().map(|c| Value::Int(c as i64))),
+            _ => match h.str_text(v).map(|s| s.chars().map(|c| Value::Int(c as i64)).collect::<Vec<_>>()) {
+                Some(chars) => out.extend(chars),
                 // Fvconcat's list walk names a dotted TAIL with listp
                 // ((vconcat '(t . 9)) => listp 9) and a non-sequence with
                 // sequencep — exactly seq_vec_checked's contract.
@@ -5287,10 +5407,12 @@ fn hash_input(h: &mut ElispHost, a: &[Value], obj_idx: usize) -> Result<Vec<u8>,
     Ok(bytes[start as usize..end as usize].to_vec())
 }
 fn sha1_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::str(to_hex(&sha1_bytes(&hash_input(h, a, 0)?))))
+    let digest = to_hex(&sha1_bytes(&hash_input(h, a, 0)?));
+    Ok(h.new_string(digest))
 }
 fn md5_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(Value::str(to_hex(&md5_bytes(&hash_input(h, a, 0)?))))
+    let digest = to_hex(&md5_bytes(&hash_input(h, a, 0)?));
+    Ok(h.new_string(digest))
 }
 /// `(secure-hash ALGORITHM OBJECT &optional START END BINARY)`.
 fn secure_hash(h: &mut ElispHost, a: &[Value]) -> R {
@@ -5313,11 +5435,11 @@ fn secure_hash(h: &mut ElispHost, a: &[Value]) -> R {
     };
     // BINARY (4th optional, index 4): return the raw bytes as a string.
     if a.get(4).is_some_and(|v| !is_nil(v)) {
-        Ok(Value::str(
+        Ok(h.new_string(
             digest.iter().map(|&b| b as char).collect::<String>(),
         ))
     } else {
-        Ok(Value::str(to_hex(&digest)))
+        Ok(h.new_string(to_hex(&digest)))
     }
 }
 /// `(secure-hash-algorithms)` — the list of algorithms `secure-hash' accepts.
@@ -5466,38 +5588,42 @@ fn b64_input_bytes(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 /// Render decoded bytes as a string with each byte a char 0–255 (unibyte-ish).
-fn bytes_to_str(bytes: &[u8]) -> Value {
-    Value::str(bytes.iter().map(|&b| b as char).collect::<String>())
+fn bytes_to_str(h: &mut ElispHost, bytes: &[u8]) -> Value {
+    let text = bytes.iter().map(|&b| b as char).collect::<String>();
+    h.new_string(text)
 }
 fn base64_encode_string(h: &mut ElispHost, a: &[Value]) -> R {
     let raw = b64_encode(&b64_input_bytes(&as_string(h, &a[0])?)?, B64_STD, true);
     let no_break = a.get(1).is_some_and(|v| !is_nil(v));
-    Ok(Value::str(if no_break { raw } else { b64_wrap(&raw) }))
+    Ok(h.new_string(if no_break { raw } else { b64_wrap(&raw) }))
 }
 /// `(base64-decode-string STRING &optional BASE64URL IGNORE-INVALID)`.
 fn base64_decode_string(h: &mut ElispHost, a: &[Value]) -> R {
     let url = a.get(1).is_some_and(|v| !is_nil(v));
-    Ok(bytes_to_str(&b64_decode(&as_string(h, &a[0])?, url)?))
+    let bytes = b64_decode(&as_string(h, &a[0])?, url)?;
+    Ok(bytes_to_str(h, &bytes))
 }
 fn base64url_encode_string(h: &mut ElispHost, a: &[Value]) -> R {
     let no_pad = a.get(1).is_some_and(|v| !is_nil(v));
-    Ok(Value::str(b64_encode(
+    Ok(h.new_string(b64_encode(
         &b64_input_bytes(&as_string(h, &a[0])?)?,
         B64_URL,
         !no_pad,
     )))
 }
 fn base64url_decode_string(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(bytes_to_str(&b64_decode(&as_string(h, &a[0])?, true)?))
+    let bytes = b64_decode(&as_string(h, &a[0])?, true)?;
+    Ok(bytes_to_str(h, &bytes))
 }
 /// `(url-hexify-string STRING)` — percent-encode all but `[A-Za-z0-9-._~]`.
 fn url_hexify_string(h: &mut ElispHost, a: &[Value]) -> R {
     // Emacs's `url-hexify-string` is a `mapconcat` over its argument, so it takes
     // any *sequence* — `[1 2]` hexifies to "%01%02" and nil to "" — and a
     // non-sequence reports `sequencep`, not `stringp`.
-    let src = match &a[0] {
-        Value::Str(s) => s.to_string(),
-        v => {
+    let src = match h.str_text(&a[0]).map(str::to_string) {
+        Some(s) => s,
+        None => {
+            let v = &a[0];
             let items = h
                 .seq_vec(v)
                 .ok_or_else(|| h.signal_wrong_type("sequencep", v))?;
@@ -5519,7 +5645,7 @@ fn url_hexify_string(h: &mut ElispHost, a: &[Value]) -> R {
             out.push_str(&format!("%{b:02X}"));
         }
     }
-    Ok(Value::str(out))
+    Ok(h.new_string(out))
 }
 /// `(url-unhex-string STRING)` — decode `%XX` escapes.
 fn url_unhex_string(h: &mut ElispHost, a: &[Value]) -> R {
@@ -5549,7 +5675,7 @@ fn url_unhex_string(h: &mut ElispHost, a: &[Value]) -> R {
         out.push(chars[i]);
         i += 1;
     }
-    Ok(Value::str(out))
+    Ok(h.new_string(out))
 }
 /// `(string-to-vector STRING)` — a vector of STRING's character codes.
 fn string_to_vector(h: &mut ElispHost, a: &[Value]) -> R {
@@ -5688,9 +5814,9 @@ fn text_char_description(h: &mut ElispHost, a: &[Value]) -> R {
         } else {
             (c as u8 as char).to_string()
         };
-        Ok(Value::str(s))
+        Ok(h.new_string(s))
     } else {
-        Ok(Value::str(
+        Ok(h.new_string(
             char::from_u32(c as u32)
                 .map(|c| c.to_string())
                 .unwrap_or_default(),
@@ -5834,7 +5960,7 @@ fn car_less_than_car(h: &mut ElispHost, a: &[Value]) -> R {
 /// `wrong-type-argument` when SUBR is not a subr (e.g. a plain symbol).
 fn subr_name(h: &mut ElispHost, a: &[Value]) -> R {
     match h.obj(&a[0]) {
-        Some(Obj::Subr { name, .. }) => Ok(Value::str(name.clone())),
+        Some(Obj::Subr { name, .. }) => Ok(h.new_string(name.clone())),
         _ => Err(format!(
             "wrong-type-argument: subrp {}",
             h.print(&a[0], true)
@@ -6008,7 +6134,7 @@ fn member_ignore_case(h: &mut ElispHost, a: &[Value]) -> R {
             _ if is_nil(&cur) => return Ok(Value::Undef),
             _ => return Err(h.signal_wrong_type("listp", &cur)),
         };
-        if let Value::Str(_) = &car {
+        if h.is_string(&car) {
             let cmp = compare_strings(
                 h,
                 &[
@@ -6135,6 +6261,7 @@ fn check_time_zone(h: &mut ElispHost, zone: Option<&Value>) -> Result<bool, Stri
     let mut wall = false;
     let ok = match z {
         Value::Undef | Value::Bool(_) | Value::Int(_) | Value::Str(_) => true,
+        v if h.is_string(v) => true,
         v => match h.obj(v) {
             Some(Obj::Symbol(s)) => {
                 wall = s.name == "wall";
@@ -6144,9 +6271,7 @@ fn check_time_zone(h: &mut ElispHost, zone: Option<&Value>) -> Result<bool, Stri
             Some(Obj::Cons(_, _)) => {
                 let items = h.seq_vec(v);
                 items.is_some_and(|it| {
-                    it.len() == 2
-                        && matches!(it[0], Value::Int(_))
-                        && matches!(it[1], Value::Str(_))
+                    it.len() == 2 && matches!(it[0], Value::Int(_)) && h.is_string(&it[1])
                 })
             }
             _ => false,
@@ -6370,14 +6495,14 @@ fn format_time_string(h: &mut ElispHost, a: &[Value]) -> R {
     let secs = time_arg_secs(h, a.get(1))?;
     let local = check_time_zone(h, a.get(2))?;
     let tm = time_decompose(secs, a.get(2), local);
-    Ok(Value::str(fmt_time_string(&fmt, &tm, secs)))
+    Ok(h.new_string(fmt_time_string(&fmt, &tm, secs)))
 }
 
 fn current_time_string(h: &mut ElispHost, a: &[Value]) -> R {
     let secs = time_arg_secs(h, a.first())?;
     let local = check_time_zone(h, a.get(1))?;
     let tm = time_decompose(secs, a.get(1), local);
-    Ok(Value::str(fmt_time_string(
+    Ok(h.new_string(fmt_time_string(
         "%a %b %e %H:%M:%S %Y",
         &tm,
         secs,
@@ -6460,7 +6585,7 @@ fn setenv_fn(h: &mut ElispHost, a: &[Value]) -> R {
         Some(v) if !is_nil(v) => {
             let val = as_string(h, v)?;
             std::env::set_var(&name, &val);
-            Ok(Value::str(val))
+            Ok(h.new_string(val))
         }
         _ => {
             std::env::remove_var(&name);
@@ -6506,8 +6631,8 @@ fn func_arity(h: &mut ElispHost, a: &[Value]) -> R {
     };
     Ok(h.cons(Value::Int(min), maxv))
 }
-fn current_directory(_h: &mut ElispHost, _a: &[Value]) -> R {
-    Ok(Value::str(
+fn current_directory(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(h.new_string(
         std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "/".to_string()),
@@ -6535,17 +6660,17 @@ fn system_type(h: &mut ElispHost, _a: &[Value]) -> R {
 // as a string. Emacs caches Vsystem_name from gethostname(2) at init; we query
 // it directly. gethostname failure is effectively unreachable; the "unknown"
 // fallback mirrors Emacs's own default when the host name is unavailable.
-fn system_name(_h: &mut ElispHost, _a: &[Value]) -> R {
+fn system_name(h: &mut ElispHost, _a: &[Value]) -> R {
     let mut buf = [0u8; 256];
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
     if rc != 0 {
-        return Ok(Value::str("unknown"));
+        return Ok(h.new_string("unknown"));
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     if end == 0 {
-        return Ok(Value::str("unknown"));
+        return Ok(h.new_string("unknown"));
     }
-    Ok(Value::str(
+    Ok(h.new_string(
         String::from_utf8_lossy(&buf[..end]).into_owned(),
     ))
 }
@@ -6559,12 +6684,12 @@ fn system_name(_h: &mut ElispHost, _a: &[Value]) -> R {
 ///   2. otherwise on macOS the per-user Darwin temp dir from
 ///      `confstr(_CS_DARWIN_USER_TEMP_DIR)` (e.g. `/var/folders/.../T/`).
 ///   3. otherwise `"/tmp/"`.
-fn temp_directory(_h: &mut ElispHost, _a: &[Value]) -> R {
+fn temp_directory(h: &mut ElispHost, _a: &[Value]) -> R {
     // `std::env::var` returns Ok("") when TMPDIR is set but empty, and
     // Err(NotPresent) only when it is absent — matching Emacs's `egetenv`
     // "non-NULL means present" test.
     if let Ok(v) = std::env::var("TMPDIR") {
-        return Ok(Value::str(v));
+        return Ok(h.new_string(v));
     }
     #[cfg(target_os = "macos")]
     {
@@ -6580,11 +6705,11 @@ fn temp_directory(_h: &mut ElispHost, _a: &[Value]) -> R {
         // the name is unknown, > buf.len() means it was truncated.
         if n > 1 && n <= buf.len() {
             if let Ok(s) = std::str::from_utf8(&buf[..n - 1]) {
-                return Ok(Value::str(s.to_string()));
+                return Ok(h.new_string(s.to_string()));
             }
         }
     }
-    Ok(Value::str("/tmp/".to_string()))
+    Ok(h.new_string("/tmp/".to_string()))
 }
 
 // ── filesystem (read-only queries) ──
@@ -6632,7 +6757,7 @@ fn file_writable_p(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn file_symlink_p(h: &mut ElispHost, a: &[Value]) -> R {
     match std::fs::read_link(fs_expand(&as_string(h, &a[0])?)) {
-        Ok(t) => Ok(Value::str(t.to_string_lossy().into_owned())),
+        Ok(t) => Ok(h.new_string(t.to_string_lossy().into_owned())),
         Err(_) => Ok(Value::Undef),
     }
 }
@@ -6645,8 +6770,8 @@ fn file_executable_p(h: &mut ElispHost, a: &[Value]) -> R {
 /// Internal: absolute path of the running `elisp` binary, backing
 /// `invocation-name'/`invocation-directory'/`exec-directory'. Falls back to the
 /// bare name `"elisp"` if the OS cannot report the executable path.
-fn invocation_file(_h: &mut ElispHost, _a: &[Value]) -> R {
-    Ok(Value::str(
+fn invocation_file(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(h.new_string(
         std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "elisp".to_string()),
@@ -6721,7 +6846,7 @@ fn generate_new_buffer_name(h: &mut ElispHost, a: &[Value]) -> R {
         Some(v) if !is_nil(v) => Some(as_string(h, v)?),
         _ => None,
     };
-    Ok(Value::str(
+    Ok(h.new_string(
         h.generate_new_buffer_name(&base, ignore.as_deref()),
     ))
 }
@@ -6734,7 +6859,7 @@ fn buffer_name(h: &mut ElispHost, a: &[Value]) -> R {
         _ => h.current,
     };
     Ok(match &h.buffers[idx].name {
-        Some(n) => Value::str(n.clone()),
+        Some(n) => h.new_string(n.clone()),
         None => Value::Undef,
     })
 }
@@ -6880,8 +7005,10 @@ fn current_local_map_fn(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(h.current_local_map())
 }
 fn insert_chars(h: &ElispHost, v: &Value) -> Result<Vec<char>, String> {
+    if let Some(s) = h.str_text(v) {
+        return Ok(s.chars().collect());
+    }
     match v {
-        Value::Str(s) => Ok(s.chars().collect()),
         Value::Int(n) => Ok(vec![char::from_u32(*n as u32).unwrap_or('\u{fffd}')]),
         _ => Err(format!(
             "wrong-type-argument: char-or-string-p {}",
@@ -6896,8 +7023,8 @@ fn insert_fn(h: &mut ElispHost, a: &[Value]) -> R {
         let n = chars.len();
         h.cur_insert(chars, true);
         // A propertized string carries its text properties into the buffer.
-        if let Value::Str(arc) = v {
-            if let Some(plists) = h.string_props_vec(arc) {
+        if let Some(arc) = h.str_arc(v) {
+            if let Some(plists) = h.string_props_vec(&arc) {
                 for (i, pl) in plists.into_iter().enumerate().take(n) {
                     if !is_nil(&pl) {
                         h.buffer_set_plist_at(start - 1 + i, pl);
@@ -6923,7 +7050,7 @@ fn buffer_string(h: &mut ElispHost, _a: &[Value]) -> R {
         (b.begv, b.zv)
     };
     let text: String = h.cur_buf_ref().text[(begv - 1)..(zv - 1)].iter().collect();
-    let out = Value::str(text);
+    let (out, arc) = h.new_string_keyed(text);
     let plists: Vec<Value> = (begv - 1..zv - 1)
         .map(|i| {
             h.cur_buf_ref()
@@ -6934,9 +7061,7 @@ fn buffer_string(h: &mut ElispHost, _a: &[Value]) -> R {
         })
         .collect();
     if plists.iter().any(|p| !is_nil(p)) {
-        if let Value::Str(arc) = &out {
-            h.string_set_props_vec(arc, plists);
-        }
+        h.string_set_props_vec(&arc, plists);
     }
     Ok(out)
 }
@@ -7016,7 +7141,7 @@ fn buffer_substring_core(h: &mut ElispHost, a: &[Value], with_props: bool) -> R 
     let text: String = buf.text[(lo - 1) as usize..(hi - 1) as usize]
         .iter()
         .collect();
-    let out = Value::str(text);
+    let (out, arc) = h.new_string_keyed(text);
     if with_props {
         // Copy the covered per-char plists (offset to the substring's indices).
         let plists: Vec<Value> = ((lo - 1) as usize..(hi - 1) as usize)
@@ -7029,9 +7154,7 @@ fn buffer_substring_core(h: &mut ElispHost, a: &[Value], with_props: bool) -> R 
             })
             .collect();
         if plists.iter().any(|p| !is_nil(p)) {
-            if let Value::Str(arc) = &out {
-                h.string_set_props_vec(arc, plists);
-            }
+            h.string_set_props_vec(&arc, plists);
         }
     }
     Ok(out)
@@ -7131,7 +7254,7 @@ enum PropObj {
 }
 fn prop_object(h: &ElispHost, obj: Option<&Value>) -> Result<PropObj, String> {
     match obj {
-        Some(Value::Str(s)) => Ok(PropObj::Str(s.clone())),
+        Some(v) if h.is_string(v) => Ok(PropObj::Str(h.str_arc(v).expect("checked stringp"))),
         None | Some(Value::Undef) | Some(Value::Bool(false)) => Ok(PropObj::Buf(h.current)),
         Some(v) => match h.resolve_buffer(v) {
             Some(bi) => Ok(PropObj::Buf(bi)),
@@ -7285,12 +7408,11 @@ fn remove_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// an Emacs one. Returns DST unchanged when the lengths differ or SRC has no
 /// properties.
 fn carry_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let (Value::Str(src), Value::Str(dst)) = (&a[0], &a[1]) else {
+    let (Some(src), Some(dst)) = (h.str_arc(&a[0]), h.str_arc(&a[1])) else {
         return Ok(a[1].clone());
     };
     if src.chars().count() == dst.chars().count() {
-        let src = std::sync::Arc::clone(src);
-        h.string_carry_all(dst, &src);
+        h.string_carry_all(&dst, &src);
     }
     Ok(a[1].clone())
 }
@@ -7299,7 +7421,7 @@ fn carry_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
 fn propertize_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let base = as_string(h, &a[0])?;
     let len = base.chars().count();
-    let out = Value::str(base);
+    let (out, arc) = h.new_string_keyed(base);
     // Build the plist from the trailing PROP VALUE pairs (in given order).
     let mut flat: Vec<Value> = Vec::new();
     let mut i = 1;
@@ -7310,9 +7432,7 @@ fn propertize_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
     if !flat.is_empty() {
         let plist = h.list_from(flat);
-        if let Value::Str(arc) = &out {
-            h.string_set_props(arc, 0, len, &plist);
-        }
+        h.string_set_props(&arc, 0, len, &plist);
     }
     Ok(out)
 }
@@ -7331,7 +7451,8 @@ fn insert_file_contents(h: &mut ElispHost, a: &[Value]) -> R {
     let chars: Vec<char> = content.chars().collect();
     let n = chars.len() as i64;
     h.cur_insert(chars, false); // leaves point at the beginning of the inserted text
-    Ok(h.list_from(vec![Value::str(raw), Value::Int(n)]))
+    let raw = h.new_string(raw);
+    Ok(h.list_from(vec![raw, Value::Int(n)]))
 }
 
 // ── buffer motion ──
@@ -7633,7 +7754,7 @@ fn expand_repl(newtext: &str, gt: &dyn Fn(usize) -> String) -> Result<String, St
 /// uses cannot express it — the object is attached directly.
 fn no_such_subexp(h: &mut ElispHost, subexp: usize) -> String {
     let sym = h.intern("error");
-    let text = Value::str("replace-match subexpression does not exist");
+    let text = h.new_string("replace-match subexpression does not exist");
     let data = h.list_from(vec![text, Value::Int(subexp as i64)]);
     let obj = h.cons(sym, data);
     let msg = format!("error: replace-match subexpression does not exist: {subexp}");
@@ -7663,7 +7784,7 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
         md.spans.clone()
     };
     // STRING mode: spans are 0-based char indices into STRING; return a new string.
-    if let Some(Value::Str(s)) = a.get(3) {
+    if let Some(s) = a.get(3).and_then(|v| h.str_text(v)).map(str::to_string) {
         let subject: Vec<char> = s.chars().collect();
         let Some((b, e)) = spans.get(subexp).copied().flatten() else {
             return Err(no_such_subexp(h, subexp));
@@ -7698,7 +7819,7 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
         let mut out: String = subject[..b].iter().collect();
         out.push_str(&rep);
         out.extend(&subject[e..]);
-        return Ok(Value::str(out));
+        return Ok(h.new_string(out));
     }
     let text: Vec<char> = h.cur_buf().text.clone();
     let (begv, zv) = (h.cur_buf().begv, h.cur_buf().zv);
@@ -7744,9 +7865,9 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
 fn write_region(h: &mut ElispHost, a: &[Value]) -> R {
     let append = a.get(3).is_some_and(|v| !is_nil(v));
     // START may be a string (write it directly) or a buffer position.
-    let content: String = match &a[0] {
-        Value::Str(s) => s.to_string(),
-        _ => {
+    let content: String = match h.str_text(&a[0]).map(str::to_string) {
+        Some(s) => s,
+        None => {
             let len = h.cur_buf_ref().text.len() as i64;
             let s = as_int(h, &a[0])?.clamp(1, len + 1);
             let e = match a.get(1) {
@@ -7812,8 +7933,8 @@ fn shell_command_to_string(h: &mut ElispHost, a: &[Value]) -> R {
         .arg(&cmd)
         .output()
     {
-        Ok(o) => Ok(Value::str(String::from_utf8_lossy(&o.stdout).into_owned())),
-        Err(_) => Ok(Value::str(String::new())),
+        Ok(o) => Ok(h.new_string(String::from_utf8_lossy(&o.stdout).into_owned())),
+        Err(_) => Ok(h.new_string(String::new())),
     }
 }
 fn call_process(h: &mut ElispHost, a: &[Value]) -> R {
@@ -8168,6 +8289,8 @@ pub fn install(h: &mut ElispHost) {
     s("bool-vector-not", 1, Some(2), bool_vector_not);
     s("aref", 2, Some(2), aref);
     s("aset", 3, Some(3), aset);
+    s("store-substring", 3, Some(3), store_substring);
+    s("clear-string", 1, Some(1), clear_string);
     s("fillarray", 2, Some(2), fillarray);
     s("make-char-table--new", 3, Some(3), make_char_table_new);
     s("char-table-p", 1, Some(1), char_table_p);

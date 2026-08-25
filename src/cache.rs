@@ -74,7 +74,15 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// come back with `(fboundp 'when)` nil and `(symbol-function 'when)` nil where a
 /// cold run answered `t` and the `(macro . FUNCTION)` pair. `Entry` gained a field,
 /// which shifts the rkyv layout, so a v7 shard must be rejected outright.
-pub const SHARD_FORMAT_VERSION: u32 = 9;
+/// v10 makes an elisp string an arena OBJECT (`Obj::Str`) instead of a bare
+/// `Value::Str`, so `aset`/`store-substring` can write through every reference
+/// to it. `SerObj` gained a `Str` variant, and — more to the point — every
+/// string literal in a cached chunk is now a `Value::Obj` handle rather than an
+/// inline `Value::Str`. A v9 shard therefore replays literals that are not
+/// string objects at all: they would print correctly and then signal
+/// `arrayp` on the first write, which is the pre-fix behaviour served from a
+/// warm cache.
+pub const SHARD_FORMAT_VERSION: u32 = 10;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next
