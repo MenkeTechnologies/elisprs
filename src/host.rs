@@ -5020,16 +5020,23 @@ fn print_symbol_readable(name: &str) -> String {
     if name.is_empty() {
         return "##".to_string();
     }
-    // A name that would read as a number, or that starts with `?`/`.`, needs a
-    // leading escape so it reads back as a symbol rather than a number/char/dot.
+    // A name that would read as a number, or that starts with `?`, needs a
+    // leading escape so it reads back as a symbol rather than a number or a
+    // character literal.
+    //
+    // A leading `.` needs one only when the WHOLE name is dots: `.` is the
+    // dotted-pair separator and `..` is reserved, but `.a` reads back as
+    // itself — which matters because `let-alist` binds exactly those names, and
+    // `(let-alist ALIST '.a)` printed the escaped form.
     let numeric = crate::reader::token_is_number(name);
+    let all_dots = name.chars().all(|c| c == '.');
     let mut out = String::new();
     for (i, c) in name.chars().enumerate() {
         let needs_escape = matches!(
             c,
             '"' | '\\' | '\'' | ';' | '#' | '(' | ')' | ',' | '`' | '[' | ']'
         ) || (c as u32) <= 0x20
-            || (i == 0 && (numeric || c == '?' || c == '.'));
+            || (i == 0 && (numeric || c == '?' || (c == '.' && all_dots)));
         if needs_escape {
             out.push('\\');
         }

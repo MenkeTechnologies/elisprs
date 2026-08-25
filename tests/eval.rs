@@ -511,7 +511,20 @@ fn emacs_parity_symbol_read_print_escapes() {
     assert_eq!(eval("(prin1-to-string (intern \"a b\"))"), "\"a\\\\ b\"");
     assert_eq!(eval("(prin1-to-string (intern \"a#b\"))"), "\"a\\\\#b\"");
     assert_eq!(eval("(prin1-to-string (intern \"123\"))"), "\"\\\\123\"");
-    assert_eq!(eval("(prin1-to-string (intern \".foo\"))"), "\"\\\\.foo\"");
+    // A leading dot needs an escape only when the name would otherwise read as
+    // something else: `.` is the dotted-pair separator and `.5` is a number,
+    // but `.foo` reads back as itself. This assertion used to demand
+    // `"\\.foo"`, which is not what `emacs -Q --batch` prints — verified three
+    // ways on GNU Emacs 31.1 (`--eval`, a loaded file, and a read round-trip).
+    // `let-alist` binds exactly these names, so it was visible there.
+    assert_eq!(eval("(prin1-to-string (intern \".foo\"))"), "\".foo\"");
+    assert_eq!(eval("(prin1-to-string (intern \".\"))"), "\"\\\\.\"");
+    assert_eq!(eval("(prin1-to-string (intern \"..\"))"), "\"\\\\..\"");
+    assert_eq!(eval("(prin1-to-string (intern \".5\"))"), "\"\\\\.5\"");
+    assert_eq!(
+        eval("(eq (read (prin1-to-string (intern \".foo\"))) (intern \".foo\"))"),
+        "t"
+    );
     // …but ordinary symbols and mid-symbol dots/`+` are untouched.
     assert_eq!(eval("(prin1-to-string (intern \"a.b\"))"), "\"a.b\"");
     assert_eq!(eval("(prin1-to-string (intern \"1+\"))"), "\"1+\"");

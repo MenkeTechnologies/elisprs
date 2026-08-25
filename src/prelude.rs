@@ -2377,7 +2377,11 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
                    (let ((lastb (car (last bindings))))
                      (if (consp lastb) (car lastb) lastb)))
                  nil))
-;; let-alist: bind every `.KEY' symbol in BODY to (cdr (assq 'KEY ALIST)).
+;; let-alist (lisp/emacs-lisp/let-alist.el): bind every `.KEY' symbol in BODY to
+;; the corresponding value in ALIST.  A DOTTED CHAIN descends: `.a.b.c' reads
+;; (cdr (assq 'c (cdr (assq 'b (cdr (assq 'a ALIST)))))), so an intermediate
+;; that is not a list signals `listp' rather than answering nil.  A name with a
+;; SECOND leading dot escapes the mechanism: `..a' is the ordinary symbol `.a'.
 (defun let-alist--dots (form acc)
   (cond
    ((and (symbolp form) form)
@@ -2388,15 +2392,30 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
     (if (eq (car form) 'quote) acc
       (let-alist--dots (cdr form) (let-alist--dots (car form) acc))))
    (t acc)))
+(defun let-alist--remove-dot (symbol)
+  "SYMBOL without its leading dot."
+  (let ((name (symbol-name symbol)))
+    (if (string-prefix-p "." name) (intern (substring name 1)) symbol)))
+(defun let-alist--list-to-sexp (list var)
+  "Turn the key LIST into nested `(cdr (assq KEY ...))' reads of VAR."
+  (list 'cdr (list 'assq (list 'quote (car list))
+                   (if (cdr list) (let-alist--list-to-sexp (cdr list) var) var))))
+(defun let-alist--access-sexp (symbol variable)
+  "The form that reads SYMBOL's value out of VARIABLE."
+  (let* ((clean (let-alist--remove-dot symbol))
+         (name (symbol-name clean)))
+    ;; Still dotted after removing one: `..a' means the plain symbol `.a'.
+    (if (string-prefix-p "." name)
+        clean
+      (let-alist--list-to-sexp
+       (mapcar #'intern (nreverse (split-string name "[.]"))) variable))))
 (defmacro let-alist (alist &rest body)
-  (let ((dots (let-alist--dots body nil)))
-    `(let ((--let-alist-- ,alist))
-       (let ,(mapcar (lambda (d)
-                       (list d (list 'cdr (list 'assq
-                                                (list 'quote (intern (substring (symbol-name d) 1)))
-                                                '--let-alist--))))
-                     dots)
-         ,@body))))
+  (let ((var (make-symbol "alist")))
+    (list 'let (list (list var alist))
+          (cons 'let
+                (cons (mapcar (lambda (d) (list d (let-alist--access-sexp d var)))
+                              (let-alist--dots body nil))
+                      body)))))
 ;; cl-flet / cl-labels: lexical local functions. Rewrite calls to a NAME and
 ;; #'NAME in BODY into `funcall'/refs of a let-bound lambda. cl-labels also walks
 ;; the function bodies (so they can recurse / call each other) and binds via
