@@ -4885,3 +4885,134 @@ from — the second line is that bound: at start 2 an unbounded `a+` would reach
   member test, the removal, and what the advised function returns all match —
   and elisprs has no byte-code objects to print, so this is a representation
   difference rather than a gap to close.
+
+## Round 25 — the tier gate, measured by lifting it
+
+Round 23 (R23-G) reported that elisprs reaches no native code because
+`is_block_eligible_op_at` answers `global_extension_for(id).is_some()` for an
+extended op and elisprs registers no `JitExtension` at all. That reading was
+right, and it made elisprs look like the one frontend whose tier gate is a
+*registration* rather than a representation problem. This round registered one
+to find out. It is not: the registration is only the first of five layers, and
+the ones underneath it are representation after all.
+
+Everything below was measured by building the experiment, not by reading
+`jit.rs`. The experimental `JitExtension` is NOT landed — see the end.
+
+### R25-A. Registering an extension does lift the `Op::Extended` gate — measured
+
+A `JitExtension` whose `can_jit` claims elisprs's thirteen extended-op ids
+(`host::ops`), registered with `register_global_extension` at host init:
+
+```text
+                             before                    after
+block-ineligible ops         Extended       8          ExtendedWide   2
+                             ExtendedWide   2          LoadUndef      1
+                             LoadUndef      1
+```
+
+`Extended` leaves the list. `can_jit` alone does it — the static check never
+calls `emit_extended`. So the first layer really is a registration.
+
+### R25-B. `Op::ExtendedWide` cannot be lifted at all — measured
+
+It stayed ineligible with the extension registered, and the source says why:
+the eligibility check tests `if let Op::Extended(id, _) = op`, which does not
+match `ExtendedWide`, so it falls through to the allow-list, which does not
+contain it; and the Cranelift block codegen has **no `Op::ExtendedWide` arm at
+all**. No frontend can register its way past that.
+
+elisprs emits `ExtendedWide` for `LETBIND`/`UNBIND` — i.e. for every `let`, and
+so for every function body. A loop written with `let`-bound locals can never be
+block-compiled. The `defvar`-only loop below exists solely to get past it.
+
+### R25-C. A third gate, and this one WAS ours — ✅ FIXED
+
+With `Extended` lifted and `let` avoided, one op remained ineligible
+(`LoadUndef`, sitting after the loop, outside the body) — and yet the body was
+still `trace-eligible=false`. The reason is fusevm's boolean rule: a `Value::Bool`
+has no kind in the tier's lattice, so it may only be produced when the very next
+op consumes it (`bool_is_consumed_in_place` — `JumpIfTrue`, `JumpIfFalse` or
+`Pop`). elisprs emitted
+
+```text
+0023  NumLt
+0024  Extended(0, 0)      ; TRUTHY
+0025  JumpIfFalse(42)
+```
+
+so `NumLt` was refused as a bool producer, and with it the whole body.
+
+The `TRUTHY` was redundant on its own terms: it maps an elisp value to
+`Bool(non-nil)`, and `NumLt` has already pushed a `Value::Bool`, for which that
+is the identity. Eliding it after a native comparison flips the body:
+
+```text
+loop @20   trace-eligible=false traced=false     (before)
+loop @20   trace-eligible=true  traced=false     (after)
+```
+
+That is the first `trace-eligible=true` elisprs has produced. The elision is
+landed on its own merits — it also removes a host round-trip per condition
+evaluation, worth ~2% on a conditional-heavy loop (7.33 s → 7.17 s best-of-three
+over 400 000 iterations with two conditionals each; the arms overlap, so treat
+it as small-but-real rather than as a headline).
+
+### R25-D. `traced` stayed false, and the value model is why
+
+`trace-eligible=true` is a static verdict. No trace was installed, and it would
+not have compiled if one had been: the experimental `emit_extended` declines,
+and nothing sound could replace it. The JIT's abstract value model is
+
+```rust
+enum JitTy { Int, Float }        // the abstract stack's element kind
+enum JitResult { Int(i64), Float(f64) }
+```
+
+There is no lane for `Value::Obj`, `Value::Str`, `Value::Bool` or
+`Value::Undef`. Two consequences, both source-verified at their sites:
+
+- **`Op::LoadConst` of a non-scalar aborts codegen.** Both the constant-folding
+  path (`simulate_one_op`) and the block codegen match `FuseValue::Int`/`Float`
+  and `_ => return None` on anything else. Every elisprs variable reference is
+  `LoadConst(SYMBOL-HANDLE); Extended(GETVAR)`, and that constant is a
+  `Value::Obj`. So compilation aborts one op *before* the extension is ever
+  consulted.
+- **An extension cannot introduce a boxed value into the scalar lane.** The one
+  escape hatch, `ExtJitCtx::call_host`, passes and returns `i64`. A `GETVAR`
+  lowered that way would have to push an encoded elisp value as `JitTy::Int` —
+  and the very next `Op::Add` emits a raw `iadd` with no tag check, so `(+ s i)`
+  would add the encodings. Silently wrong, which is worse than not compiling.
+
+So `emit_extended` has no sound implementation for `GETVAR`, `SETVAR`, `CALL`
+or `TRUTHY`: each moves arbitrary elisp values, and the tier has nowhere to put
+one.
+
+### R25-E. What the extension is NOT landed
+
+Registering it would make `is_block_eligible` answer true for chunks that then
+fail codegen at the first `LoadConst` of a symbol — fusevm would attempt a
+compile on every hot chunk and throw it away. That is a pessimization with no
+benefit, so the experiment was reverted after measuring. Only R25-C is landed.
+
+### What would actually unlock the tier
+
+Not a registration. Lexical variables would have to live in fusevm SLOTS
+(`Op::GetSlot`/`Op::SetSlot` — accepted by both tiers) rather than in `Scope`
+nodes on the host, so that a numeric loop body lowers to `GetSlot; LoadInt;
+NumLt; JumpIfFalse; …; SetSlot` with no extended op and no `Obj` constant. That
+is a compiler change with an escape analysis attached: a variable captured by a
+closure, referenced dynamically, or `special` cannot be a slot. It is real work
+with a real payoff and it is not in this round.
+
+### Not done, with the measurement rather than an intention
+
+- **`LoadUndef` in an if-without-else body.** Genuinely block-ineligible, and
+  `Op::LoadFalse` is eligible and is also nil here (`is_nil` accepts both
+  `Value::Undef` and `Value::Bool(false)`). But swapping the two changes what
+  `(if c t)` returns when the test fails, and `Value::Undef` is matched
+  *specifically* — without `Bool(false)` beside it — at 39 sites across
+  `builtins.rs` and `host.rs`, out of 221 mentions. That is a change to the
+  representation of nil, the most pervasive value in the language, for no
+  observable gain while R25-B and R25-D stand. Measured and declined; it becomes
+  worth doing only after the slot work above.
