@@ -5626,6 +5626,192 @@ Do nothing if HOOK does not currently contain FUNCTION."
 ;; ---- rx: compile an `rx' S-expression form to a regexp string (a useful
 ;; subset of rx.el — string/char literals, the named character classes and
 ;; anchors, group/or/seq, the quantifiers, char sets `(any …)' and `(not …)').
+;; Faithful ports of the `rx.el' tables and of the character-alternative
+;; machinery that decides what an `(any ...)' form prints as.  Concatenating the
+;; arguments in the order given -- what `rx--charset' used to do -- is only
+;; accidentally right: Emacs sorts the characters, merges adjacent ones into
+;; ranges, moves `]' to the front and `^'/`-' to the back, and drops the
+;; brackets entirely for a single character.  `(rx (in ?a ?b "0-9"))' is
+;; "[0-9ab]", not "[ab0-9]", and `(rx (any ?a))' is "a", not "[a]".
+(defconst rx--char-classes
+  '((digit . digit) (numeric . digit) (num . digit)
+    (control . cntrl) (cntrl . cntrl)
+    (hex-digit . xdigit) (hex . xdigit) (xdigit . xdigit)
+    (blank . blank)
+    (graphic . graph) (graph . graph)
+    (printing . print) (print . print)
+    (alphanumeric . alnum) (alnum . alnum)
+    (letter . alpha) (alphabetic . alpha) (alpha . alpha)
+    (ascii . ascii) (nonascii . nonascii)
+    (lower . lower) (lower-case . lower)
+    (punctuation . punct) (punct . punct)
+    (space . space) (whitespace . space) (white . space)
+    (upper . upper) (upper-case . upper)
+    (word . word) (wordchar . word)
+    (unibyte . unibyte) (multibyte . multibyte))
+  "Alist mapping rx symbols to character classes.")
+
+(defconst rx--categories
+  '((space-for-indent . ?\s) (base . ?.) (consonant . ?0) (base-vowel . ?1)
+    (upper-diacritical-mark . ?2) (lower-diacritical-mark . ?3)
+    (tone-mark . ?4) (symbol . ?5) (digit . ?6)
+    (vowel-modifying-diacritical-mark . ?7) (vowel-sign . ?8)
+    (semivowel-lower . ?9) (not-at-end-of-line . ?<)
+    (not-at-beginning-of-line . ?>) (alpha-numeric-two-byte . ?A)
+    (chinese-two-byte . ?C) (greek-two-byte . ?G)
+    (japanese-hiragana-two-byte . ?H) (indian-two-byte . ?I)
+    (japanese-katakana-two-byte . ?K) (strong-left-to-right . ?L)
+    (korean-hangul-two-byte . ?N) (strong-right-to-left . ?R)
+    (cyrillic-two-byte . ?Y) (combining-diacritic . ?^)
+    (ascii . ?a) (arabic . ?b) (chinese . ?c) (ethiopic . ?e) (greek . ?g)
+    (korean . ?h) (indian . ?i) (japanese . ?j) (japanese-katakana . ?k)
+    (latin . ?l) (lao . ?o) (tibetan . ?q) (japanese-roman . ?r)
+    (thai . ?t) (vietnamese . ?v) (hebrew . ?w) (cyrillic . ?y)
+    (can-break . ?|))
+  "Alist mapping rx category names to their `\\c' category characters.")
+
+(defun rx--category-code (arg)
+  "The `\\c' category character ARG names, or ARG itself if it is a character."
+  (cond ((symbolp arg)
+         (let ((cat (assq arg rx--categories)))
+           (unless cat (error "Unknown rx category `%s'" arg))
+           (cdr cat)))
+        ((integerp arg) arg)
+        (t (error "Invalid rx `category' argument `%s'" arg))))
+
+(defun rx--string-to-intervals (str)
+  "Decode STR as intervals: A-Z becomes (?A . ?Z) and a lone X becomes (?X . ?X)."
+  ;; rx.el decodes a UNIBYTE string's bytes through `unibyte-char-to-multibyte'
+  ;; first.  elisprs has no unibyte/multibyte distinction (see BUGS.md), so
+  ;; every character is taken as itself.
+  (let ((len (length str)) (i 0) (intervals nil))
+    (while (< i len)
+      (if (and (< i (- len 2)) (= (aref str (1+ i)) ?-))
+          (let ((start (aref str i)) (end (aref str (+ i 2))))
+            (cond ((and (<= start #x7f) (>= end #x3fff80))
+                   ;; A range from ASCII into the raw bytes is split so it does
+                   ;; not absorb the Unicode characters caught in between.
+                   (setq intervals (cons (cons start #x7f) intervals))
+                   (setq intervals (cons (cons #x3fff80 end) intervals)))
+                  ((<= start end)
+                   (setq intervals (cons (cons start end) intervals)))
+                  (t (error "Invalid rx `any' range: %s" (substring str i (+ i 3)))))
+            (setq i (+ i 3)))
+        (setq intervals (cons (cons (aref str i) (aref str i)) intervals))
+        (setq i (1+ i))))
+    intervals))
+
+(defun rx--condense-intervals (intervals)
+  "Merge adjacent and overlapping INTERVALS by mutation, preserving order.
+INTERVALS is a list of (START . END) with START <= END, sorted by START."
+  (let ((tail intervals) (d nil))
+    (while (setq d (cdr tail))
+      (if (>= (cdr (car tail)) (1- (car (car d))))
+          (progn
+            (setcdr (car tail) (max (cdr (car tail)) (cdr (car d))))
+            (setcdr tail (cdr d)))
+        (setq tail d)))
+    intervals))
+
+(defun rx--parse-any (body)
+  "Parse the arguments of an `(any ...)' construct.
+Return (INTERVALS . CLASSES): a sorted list of disjoint non-adjacent
+intervals, and the named character classes in the order they occur."
+  (let ((classes nil) (strings nil) (conses nil))
+    (dolist (arg body)
+      (cond ((stringp arg) (setq strings (cons arg strings)))
+            ((and (consp arg) (integerp (car arg)) (integerp (cdr arg))
+                  (<= (car arg) (cdr arg)))
+             ;; Copy the cons: `rx--generate-alt' mutates the intervals.
+             (setq conses (cons (cons (car arg) (cdr arg)) conses)))
+            ((integerp arg) (setq conses (cons (cons arg arg) conses)))
+            ((and (symbolp arg)
+                  (let ((class (cdr (assq arg rx--char-classes))))
+                    (and class (or (memq class classes)
+                                   (progn (setq classes (cons class classes)) t))))))
+            (t (error "Invalid rx `any' argument: %s" arg))))
+    (cons (rx--condense-intervals
+           (sort (append conses (mapcan (function rx--string-to-intervals) strings))
+                 (lambda (a b) (< (car a) (car b)))))
+          (nreverse classes))))
+
+(defun rx--generate-alt (negated intervals classes)
+  "Generate a character alternative from sorted INTERVALS and CLASSES.
+NEGATED non-nil negates it."
+  ;; rx.el also re-expresses an interval set that covers the raw-byte boundary
+  ;; #x3fff7f in complemented form.  elisprs has no raw-byte model, so no input
+  ;; the reader can build reaches that case and the complement is not ported.
+  (cond
+   ;; Single character.
+   ((and intervals (eq (car (car intervals)) (cdr (car intervals)))
+         (null (cdr intervals)) (null classes))
+    (let ((ch (car (car intervals))))
+      (if negated
+          (if (eq ch ?\n)
+              (rx--symbol 'nonl)
+            (concat "[^" (char-to-string ch) "]"))
+        (regexp-quote (char-to-string ch)))))
+   ;; Empty set, or (negated) any character.
+   ((and (null intervals) (null classes))
+    (if negated (rx--symbol 'anychar) (rx--symbol 'unmatchable)))
+   (t
+    (let ((dash nil) (caret nil) (rbrac-l nil) (rbrac-r nil) (dash-r nil) (dash-l nil))
+      ;; Move `]' and the range `]-x' to the front.
+      (setq rbrac-l (assq ?\] intervals))
+      (when rbrac-l
+        (setq intervals (cons rbrac-l (remq rbrac-l intervals))))
+      ;; Split `x-]' and move the lone `]' to the front.
+      (setq rbrac-r (rassq ?\] intervals))
+      (when (and rbrac-r (not (eq (car rbrac-r) ?\])))
+        (setcdr rbrac-r ?\\)
+        (setq intervals (cons (cons ?\] ?\]) intervals)))
+      ;; Split `,--', which would otherwise end up as `,-'.
+      (setq dash-r (rassq ?- intervals))
+      (when (eq (car dash-r) ?,)
+        (setcdr dash-r ?,)
+        (setq dash "-"))
+      ;; Remove `-' (lone, or at the start of an interval).
+      (setq dash-l (assq ?- intervals))
+      (when dash-l
+        (if (eq (cdr dash-l) ?-)
+            (setq intervals (remq dash-l intervals))
+          (setcar dash-l ?.))
+        (setq dash "-"))
+      ;; A leading `^' (or the range `^-x') in a non-negated set.
+      (when (and (eq (car (car intervals)) ?^) (not negated))
+        (if (eq (cdr (car intervals)) ?^)
+            (if (or (cdr intervals) classes)
+                (progn (setq intervals (cdr intervals)) (setq caret "^"))
+              (setq intervals (cons (cons ?- ?-) intervals))
+              (setq dash nil))
+          (setq intervals (cons (cons ?_ (cdr (car intervals)))
+                                (cons (cons ?^ ?^) (cdr intervals))))))
+      (concat
+       "[" (if negated "^" "")
+       (mapconcat
+        (lambda (iv)
+          (cond ((eq (car iv) (cdr iv)) (char-to-string (car iv)))
+                ((eq (1+ (car iv)) (cdr iv)) (string (car iv) (cdr iv)))
+                ((and (<= (car iv) #x3fff7f) (<= #x3fff7f (cdr iv)))
+                 (string (car iv) ?- #x3fff7f #x3fff80 ?- (cdr iv)))
+                (t (string (car iv) ?- (cdr iv)))))
+        intervals "")
+       (mapconcat (lambda (cls) (concat "[:" (symbol-name cls) ":]")) classes "")
+       (or caret "")
+       (or dash "")
+       "]")))))
+
+(defun rx--translate-any (negated body)
+  "Translate an `(any ...)' construct, negated when NEGATED."
+  (let ((parsed (rx--parse-any body)))
+    (rx--generate-alt negated (car parsed) (cdr parsed))))
+
+(defvar rx--greedy t
+  "Whether the quantifiers translated right now are greedy.
+`minimal-match'/`maximal-match' rebind it around their body; only the
+`zero-or-more'/`one-or-more'/`zero-or-one' spellings consult it, because the
+`*'/`+'/`?' and `*?'/`+?'/`??' spellings state their own greediness.")
+
 (defun rx--symbol (s)
   (cond
    ((memq s '(bol line-start)) "^")
@@ -5670,6 +5856,9 @@ Do nothing if HOOK does not currently contain FUNCTION."
           (t nil))))
 (defun rx--quant-body (args)
   (let ((s (rx--seq args))) (if (rx--atom-p s) s (concat "\\(?:" s "\\)"))))
+(defun rx--rep (op greedy args)
+  "ARGS quantified by OP (\"*\", \"+\" or \"?\"), non-greedy unless GREEDY."
+  (concat (rx--quant-body args) op (if greedy "" "?")))
 (defun rx--class-in (s)
   (substring (rx--symbol s) 1 (1- (length (rx--symbol s)))))
 (defun rx--charset (args)
@@ -5681,16 +5870,27 @@ Do nothing if HOOK does not currently contain FUNCTION."
 (defun rx--not (arg)
   (cond
    ((and (consp arg) (memq (car arg) '(any in char)))
-    (concat "[^" (rx--charset (cdr arg)) "]"))
+    (rx--translate-any t (cdr arg)))
+   ;; `(not (not X))' is X: rx.el flips the sense and recurses.
+   ((and (consp arg) (eq (car arg) 'not)) (rx--form (car (cdr arg))))
+   ((and (consp arg) (eq (car arg) 'syntax))
+    (if (eq (car (cdr arg)) 'word)
+        "\\W"
+      (concat "\\S" (rx--syntax-code (car (cdr arg))))))
+   ((and (consp arg) (eq (car arg) 'category))
+    (concat "\\C" (char-to-string (rx--category-code (car (cdr arg))))))
    ((eq arg 'word-boundary) "\\B")
    ;; `(not CHAR)' is the complement of a single character: (rx-to-string
    ;; '(not ?a)) => "[^a]". It is not an error.
-   ((integerp arg) (concat "[^" (char-to-string arg) "]"))
+   ((integerp arg) (rx--generate-alt t (list (cons arg arg)) nil))
    ((symbolp arg)
-    (let ((s (rx--symbol arg)))
-      (if (and (> (length s) 1) (eq (aref s 0) ?\[))
-          (concat "[^" (substring s 1 (1- (length s))) "]")
-        (concat "[^" s "]"))))
+    (let ((class (cdr (assq arg rx--char-classes))))
+      (if class
+          (rx--generate-alt t nil (list class))
+        (let ((s (rx--symbol arg)))
+          (if (and (> (length s) 1) (eq (aref s 0) ?\[))
+              (concat "[^" (substring s 1 (1- (length s))) "]")
+            (concat "[^" s "]"))))))
    (t (error "Illegal argument to rx `not': %S" arg))))
 (defun rx--form (form)
   (cond
@@ -5726,20 +5926,32 @@ Do nothing if HOOK does not currently contain FUNCTION."
     (cond
      ((memq head '(seq sequence : and)) (rx--seq args))
      ((memq head '(or |))
-      ;; Emacs folds all-single-character alternatives into a char class.
-      (if (and args (rx--all-1char-p args))
-          (concat "[" (mapconcat 'rx--1char args "") "]")
-        (concat "\\(?:" (mapconcat 'rx--form args "\\|") "\\)")))
+      ;; rx.el `rx--translate-or': no branches at all is a never-matching
+      ;; regexp, and a single branch is that branch (no shy group).
+      (cond
+       ((null args) (rx--symbol 'unmatchable))
+       ((null (cdr args)) (rx--form (car args)))
+       ;; Emacs folds all-single-character alternatives into a char class.
+       ((rx--all-1char-p args) (concat "[" (mapconcat 'rx--1char args "") "]"))
+       (t (concat "\\(?:" (mapconcat 'rx--form args "\\|") "\\)"))))
      ((memq head '(group submatch)) (concat "\\(" (rx--seq args) "\\)"))
      ((memq head '(group-n submatch-n))
       (concat "\\(?" (number-to-string (car args)) ":" (rx--seq (cdr args)) "\\)"))
-     ((memq head '(zero-or-more * 0+)) (concat (rx--quant-body args) "*"))
-     ((memq head '(one-or-more + 1+)) (concat (rx--quant-body args) "+"))
-     ((memq head '(zero-or-one opt optional)) (concat (rx--quant-body args) "?"))
+     ;; Only the long spellings consult `rx--greedy'; the operator spellings
+     ;; state their own greediness (rx.el's dispatch table), which is why
+     ;; `(rx (minimal-match (opt "a")))' is "a??" and
+     ;; `(rx (minimal-match (\? "a")))' is "a?".
+     ((memq head '(zero-or-more 0+)) (rx--rep "*" rx--greedy args))
+     ((memq head '(one-or-more 1+)) (rx--rep "+" rx--greedy args))
+     ((memq head '(zero-or-one opt optional)) (rx--rep "?" rx--greedy args))
+     ((eq head '*) (rx--rep "*" t args))
+     ((eq head '+) (rx--rep "+" t args))
+     ((eq head '*?) (rx--rep "*" nil args))
+     ((eq head '+?) (rx--rep "+" nil args))
      ;; `?` reads as the space char (32) and `??` as the `?` char (63); Emacs's
      ;; rx treats them as the greedy/non-greedy optional operators.
-     ((eql head 32) (concat (rx--quant-body args) "?"))
-     ((eql head 63) (concat (rx--quant-body args) "??"))
+     ((eql head 32) (rx--rep "?" t args))
+     ((eql head 63) (rx--rep "?" nil args))
      ((eq head 'syntax)
       ;; Emacs emits the `\w` shorthand for word syntax, `\sC` for the rest.
       (if (eq (car args) 'word) "\\w" (concat "\\s" (rx--syntax-code (car args)))))
@@ -5750,14 +5962,22 @@ Do nothing if HOOK does not currently contain FUNCTION."
           (concat (rx--quant-body (nthcdr 2 args)) "\\{" (number-to-string (car args)) ","
                   (number-to-string (nth 1 args)) "\\}")
         (concat (rx--quant-body (cdr args)) "\\{" (number-to-string (car args)) "\\}")))
-     ((memq head '(any in char)) (concat "[" (rx--charset args) "]"))
+     ((memq head '(any in char)) (rx--translate-any nil args))
+     ((eq head 'category)
+      (concat "\\c" (char-to-string (rx--category-code (car args)))))
+     ((eq head 'not-category)
+      (concat "\\C" (char-to-string (rx--category-code (car args)))))
+     ((eq head 'not-syntax)
+      (if (eq (car args) 'word) "\\W" (concat "\\S" (rx--syntax-code (car args)))))
      ((eq head 'not) (rx--not (car args)))
      ((memq head '(regexp regex)) (car args))
      ((eq head 'literal) (regexp-quote (car args)))
      ((eq head 'backref) (concat "\\" (number-to-string (car args))))
-     ;; minimal-match/maximal-match: render the inner form (greediness control
-     ;; isn't modeled separately here).
-     ((memq head '(minimal-match maximal-match)) (rx--form (car args)))
+     ;; `minimal-match'/`maximal-match' set the greediness of every quantifier
+     ;; in their body (rx.el `rx--control-greedy'), so
+     ;; `(rx (minimal-match (one-or-more "a") (zero-or-more "b")))' is "a+?b*?".
+     ((eq head 'minimal-match) (let ((rx--greedy nil)) (rx--seq args)))
+     ((eq head 'maximal-match) (let ((rx--greedy t)) (rx--seq args)))
      (t (if (symbolp head) (error "Unknown rx form `%s'" head) (error "Bad rx operator `%S'" head))))))
 (defmacro rx (&rest forms) (rx--seq forms))
 (defun rx-to-string (form &optional no-group)

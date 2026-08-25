@@ -5662,6 +5662,31 @@ fn run_closure(
     dynamic: bool,
     args: &[Value],
 ) -> Result<Value, String> {
+    // One nested elisp call is several Rust frames deep — `run_closure`, the
+    // nested `VM::run`, its dispatch loop, `ext_dispatch`, `call_function` —
+    // and elisp recursion is bounded by `max-lisp-eval-depth` (default 1600),
+    // not by the OS stack. On a thread with the platform default stack that
+    // limit is unreachable: the process aborts on a hardware stack overflow
+    // first, which is not a signal any `condition-case` can catch. The reader
+    // already grows the stack on demand for exactly this reason
+    // (`reader.rs`'s `read_form`); doing it here makes
+    // `excessive-lisp-nesting` the thing that fires, on any thread, rather
+    // than the stack guard page.
+    //
+    // `maybe_grow` is a stack-pointer comparison when there is headroom, so
+    // the ordinary call pays a compare and a branch.
+    stacker::maybe_grow(256 * 1024, 8 * 1024 * 1024, || {
+        run_closure_inner(params, body, env, dynamic, args)
+    })
+}
+
+fn run_closure_inner(
+    params: &Rc<Params>,
+    body: &Rc<Chunk>,
+    env: Lex,
+    dynamic: bool,
+    args: &[Value],
+) -> Result<Value, String> {
     with_host(|h| h.enter_eval_frame())?;
     let entry = with_host(|h| h.scope_depth());
     let prev_mode = with_host(|h| std::mem::replace(&mut h.dynamic_binding, dynamic));
