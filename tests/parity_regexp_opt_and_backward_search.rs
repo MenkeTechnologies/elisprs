@@ -270,3 +270,128 @@ fn looking_back_matches_the_text_before_point() {
         "1"
     );
 }
+
+/// COUNT is not a decoration: it selects the Nth match, 0 searches not at all,
+/// and a NEGATIVE count searches the other way. All four commands ignored it.
+#[test]
+fn the_search_commands_take_a_count() {
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"abcabc\") (goto-char 1) \
+              (list (search-forward \"abc\" nil t 2) (point)))"
+        ),
+        "(7 7)"
+    );
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aaa\") (goto-char 1) \
+              (list (search-forward \"a\" nil t 3) (point)))"
+        ),
+        "(4 4)"
+    );
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aaa\") (goto-char 4) \
+              (list (search-backward \"a\" nil t 2) (point)))"
+        ),
+        "(2 2)"
+    );
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aXbXcX\") (goto-char 1) \
+              (list (re-search-forward \"X\" nil t 3) (point) (match-beginning 0)))"
+        ),
+        "(7 7 6)"
+    );
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aaa\") (goto-char 4) \
+              (list (re-search-backward \"a\" nil t 2) (point)))"
+        ),
+        "(2 2)"
+    );
+    // The match data is the Nth match's, not the first's.
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aXbXcX\") (goto-char 1) \
+              (list (re-search-forward \"X\" nil t 2) (match-beginning 0) (match-end 0)))"
+        ),
+        "(5 4 5)"
+    );
+    // Zero searches not at all; negative searches the other way.
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aaa\") (goto-char 1) \
+              (list (search-forward \"a\" nil t 0) (point)))"
+        ),
+        "(1 1)"
+    );
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aaa\") (goto-char 2) \
+              (list (search-forward \"a\" nil t -1) (point)))"
+        ),
+        "(1 1)"
+    );
+}
+
+/// Failure has THREE cases, and COUNT is what makes the difference between the
+/// first two visible: a partial run has already moved point.
+#[test]
+fn a_failed_search_restores_or_moves_point_by_noerror() {
+    // NOERROR nil: signal.
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aaa\") (goto-char 1) \
+              (condition-case e (search-forward \"a\" nil nil 5) (error (car e))))"
+        ),
+        "search-failed"
+    );
+    // NOERROR t: nil, and point is back where it started — three of the five
+    // repetitions succeeded first.
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aaa\") (goto-char 1) \
+              (list (search-forward \"a\" nil t 5) (point)))"
+        ),
+        "(nil 1)"
+    );
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aaa\") (goto-char 1) \
+              (list (re-search-forward \"a\" nil t 5) (point)))"
+        ),
+        "(nil 1)"
+    );
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aaa\") (goto-char 2) \
+              (list (search-forward \"a\" nil t -5) (point)))"
+        ),
+        "(nil 2)"
+    );
+    // Any other non-nil NOERROR: nil, and point moves to the limit — which end
+    // depends on the direction actually searched.
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aaa\") (goto-char 1) \
+              (list (search-forward \"a\" nil 'move 5) (point)))"
+        ),
+        "(nil 4)"
+    );
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aaa\") (goto-char 4) \
+              (list (search-backward \"a\" nil 'move 5) (point)))"
+        ),
+        "(nil 1)"
+    );
+    // …and an explicit BOUND is that limit.
+    assert_eq!(
+        eval(
+            "(with-temp-buffer (insert \"aaa\") (goto-char 1) \
+              (list (search-forward \"a\" 2 'move 5) (point)))"
+        ),
+        "(nil 2)"
+    );
+}
