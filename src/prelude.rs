@@ -10021,35 +10021,97 @@ backward but still to a less deep spot."
 ;; ported, so `major-mode' stays `fundamental-mode'; only the table is modeled.
 (set-syntax-table emacs-lisp-mode-syntax-table)
 
-;; Abbrev table placeholder (boundary: the abbrev/obarray subsystem is not
-;; modeled).  An abbrev table is a plain vector here rather than a real obarray.
-;; `abbrev-table-get'/`abbrev-table-put' are ported for their observable
-;; behavior (get returns what put stored; unset props are nil) using a property
-;; side-table keyed by table identity, since the real accessors store props in
-;; the table's own "" symbol, which needs the obarray subsystem elisprs lacks.
+;; ---- abbrev tables (abbrev.el) ----
+;; An abbrev table IS an obarray: each abbrev is a symbol interned in it whose
+;; VALUE is the expansion, and the table's own properties live on the symbol
+;; named "" interned in the same table.  This used to be a documented
+;; placeholder built on a plain vector with a side-table for the properties,
+;; because elisprs had no obarrays; it does now, so this is the real thing and
+;; `(abbrev-table-p (make-abbrev-table))' and `(obarrayp ...)' both answer t
+;; while a bare `(obarray-make)' answers nil to the first.
+(defun obarray-get (ob name) (intern-soft name ob))
+(defun obarray-put (ob name) (intern name ob))
+(defun obarray-map (fn ob) (mapatoms fn ob))
+(defun abbrev-table-get (table prop)
+  "Get the property PROP of abbrev table TABLE."
+  (let ((sym (obarray-get table ""))) (if sym (get sym prop))))
+(defun abbrev-table-put (table prop val)
+  "Set the property PROP of abbrev table TABLE to VAL."
+  (let ((sym (obarray-put table "")))
+    (set sym nil)          ; so it is never mistaken for an abbrev
+    (put sym prop val)))
 (defun make-abbrev-table (&optional props)
   "Create a new, empty abbrev table object.
 PROPS is a list of properties."
-  (let ((table (make-vector 59 0)))
+  (let ((table (obarray-make)))
+    ;; The `modiff' counter doubles as the tag that says this obarray is an
+    ;; abbrev table -- which is how `abbrev-table-p' tells the two apart.
+    (abbrev-table-put table :abbrev-table-modiff 0)
     (while (consp props)
-      (abbrev-table-put table (car props) (cadr props))
-      (setq props (cddr props)))
+      (abbrev-table-put table (pop props) (pop props)))
     table))
-(defvar --abbrev-table-props-- (make-hash-table :test 'eq)
-  "Maps an abbrev table object to its property plist (see `abbrev-table-get').")
-(defun abbrev-table-get (table prop)
-  "Get the PROP property of abbrev table TABLE."
-  (plist-get (gethash table --abbrev-table-props--) prop))
-(defun abbrev-table-put (table prop val)
-  "Set the PROP property of abbrev table TABLE to VAL."
-  (puthash table
-           (plist-put (gethash table --abbrev-table-props--) prop val)
-           --abbrev-table-props--)
-  val)
-(defun define-abbrev-table (tablename &rest _)
-  (unless (and (boundp tablename) (vectorp (symbol-value tablename)))
+(defun abbrev-table-p (object)
+  "Return non-nil if OBJECT is an abbrev table."
+  (and (obarrayp object)
+       (numberp (ignore-error wrong-type-argument
+                  (abbrev-table-get object :abbrev-table-modiff)))))
+(defun abbrev-table-empty-p (object &optional ignore-system)
+  "Return nil if there are any abbrev symbols in OBJECT.
+The table's own \"\" property symbol does not count."
+  (unless (abbrev-table-p object) (error "Non abbrev table object"))
+  (not (catch 'some
+         (obarray-map (lambda (abbrev)
+                        (unless (or (zerop (length (symbol-name abbrev)))
+                                    (and ignore-system (abbrev-get abbrev :system)))
+                          (throw 'some t)))
+                      object))))
+(defalias 'abbrev-get #'get)
+(defalias 'abbrev-put #'put)
+(defvar abbrev-minor-mode-table-alist nil
+  "Alist of abbrev tables to use for minor modes.")
+(defvar abbrev-table-name-list '(global-abbrev-table)
+  "List of symbols whose values are abbrev tables.")
+(defun define-abbrev (table name expansion &optional hook &rest props)
+  "Define an abbrev NAME in TABLE expanding to EXPANSION.
+Answers the abbrev's symbol, whose VALUE is the expansion -- which is what
+`abbrev-expansion' reads back."
+  ;; The obsolete positional calling convention: (… HOOK COUNT SYSTEM).
+  (when (and (consp props) (or (null (car props)) (numberp (car props))))
+    (setq props (append (list :count (car props))
+                        (if (nth 1 props) (list :system (nth 1 props))))))
+  (unless (plist-get props :count) (setq props (plist-put props :count 0)))
+  (setq props (plist-put props :abbrev-table-modiff
+                         (abbrev-table-get table :abbrev-table-modiff)))
+  (let ((sym (obarray-put table name)))
+    (set sym expansion)
+    (fset sym hook)
+    (setplist sym props)
+    (abbrev-table-put table :abbrev-table-modiff
+                      (1+ (abbrev-table-get table :abbrev-table-modiff)))
+    sym))
+(defun abbrev-symbol (abbrev &optional table)
+  "The symbol representing ABBREV in TABLE (default the global table)."
+  (let ((sym (obarray-get (or table global-abbrev-table) abbrev)))
+    (and sym (symbol-value sym) sym)))
+(defun abbrev-expansion (abbrev &optional table)
+  "Return the string ABBREV expands into, or nil."
+  (let ((sym (abbrev-symbol abbrev table)))
+    (and sym (symbol-value sym))))
+(defvar global-abbrev-table (make-abbrev-table)
+  "The abbrev table whose abbrevs affect all buffers.")
+(defun define-abbrev-table (tablename &optional definitions _docstring &rest props)
+  "Define TABLENAME as an abbrev table name, with DEFINITIONS in it.
+Answers nil, as Emacs does -- the table is reached through the variable."
+  (unless (and (boundp tablename) (abbrev-table-p (symbol-value tablename)))
     (set tablename (make-abbrev-table)))
-  tablename)
+  (let ((table (symbol-value tablename)))
+    (while (consp props)
+      (abbrev-table-put table (pop props) (pop props)))
+    (dolist (d definitions)
+      (apply #'define-abbrev table d)))
+  (unless (memq tablename abbrev-table-name-list)
+    (setq abbrev-table-name-list (cons tablename abbrev-table-name-list)))
+  nil)
 
 ;; merge-ordered-lists (subr.el): merge LISTS into one, removing duplicates and
 ;; obeying each list's relative order (C3-style). Used by derived-mode-all-parents.

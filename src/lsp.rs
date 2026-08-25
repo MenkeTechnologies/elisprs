@@ -456,6 +456,48 @@ pub const SUBRS: &[Entry] = &[
         doc: "Set every element of ARRAY (a vector or string) to ITEM; return ARRAY.",
     },
     Entry {
+        name: "make-overlay",
+        kind: Kind::Function,
+        sig: "(make-overlay BEG END &optional BUFFER FRONT-ADVANCE REAR-ADVANCE)",
+        doc: "Make an overlay over BEG..END; both ends move with edits.",
+    },
+    Entry {
+        name: "overlay-put",
+        kind: Kind::Function,
+        sig: "(overlay-put OVERLAY PROP VALUE)",
+        doc: "Set OVERLAY's PROP to VALUE.",
+    },
+    Entry {
+        name: "overlay-get",
+        kind: Kind::Function,
+        sig: "(overlay-get OVERLAY PROP)",
+        doc: "OVERLAY's PROP, or nil.",
+    },
+    Entry {
+        name: "overlays-in",
+        kind: Kind::Function,
+        sig: "(overlays-in BEG END)",
+        doc: "Overlays overlapping BEG..END, empty ones included.",
+    },
+    Entry {
+        name: "overlays-at",
+        kind: Kind::Function,
+        sig: "(overlays-at POS)",
+        doc: "Overlays covering POS (start <= POS < end).",
+    },
+    Entry {
+        name: "delete-overlay",
+        kind: Kind::Function,
+        sig: "(delete-overlay OVERLAY)",
+        doc: "Detach OVERLAY from its buffer; `move-overlay' re-attaches it.",
+    },
+    Entry {
+        name: "remove-overlays",
+        kind: Kind::Function,
+        sig: "(remove-overlays &optional BEG END NAME VAL)",
+        doc: "Remove matching overlays in BEG..END, moving or splitting partial ones.",
+    },
+    Entry {
         name: "string-pixel-width",
         kind: Kind::Function,
         sig: "(string-pixel-width STRING &optional BUFFER)",
