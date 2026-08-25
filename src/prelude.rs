@@ -6043,7 +6043,13 @@ or the result is already atomic/grouped."
        ;; (rx …): match VAL (a string) against the compiled regexp.
        ((eq head 'rx)
         (cons (list (list 'and (list 'stringp val) (list 'string-match (rx--seq (cdr pat)) val))) nil))
-       ((eq head 'cl-type) (cons (list (list (cl-typecase--pred (car (cdr pat))) val)) nil))
+       ;; `(cl-type TYPE)': route through `cl-typep', not through a
+       ;; symbol-to-predicate name mangle, so a COMPOUND specifier works --
+       ;; `(pcase 3 ((cl-type (integer 0 5)) 'in) (_ 'out))' is `in', where
+       ;; naming a predicate after `(integer 0 5)' was `wrong-type-argument
+       ;; symbolp'.
+       ((eq head 'cl-type)
+        (cons (list (list 'cl-typep val (list 'quote (car (cdr pat))))) nil))
        ;; (app FN PAT): match PAT against (FN VAL).
        ((eq head 'app)
         (let* ((tv (make-symbol "app"))
@@ -6177,6 +6183,27 @@ or the result is already atomic/grouped."
 (defmacro pcase-let* (bindings &rest body)
   ;; Sequential pcase-let; our `let*' expansion already binds in order.
   (cons 'pcase-let (cons bindings body)))
+(defmacro pcase-lambda (lambda-list &rest body)
+  "A `lambda' whose parameters may be pcase PATTERNS instead of names.
+Each pattern parameter becomes a fresh name that a `pcase-let*' destructures
+around BODY, so `(funcall (pcase-lambda (`(,a ,b)) (+ a b)) (list 1 2))' is 3."
+  ;; Emacs tests each parameter for a `\=`' head, because there a backquote
+  ;; pattern survives macroexpansion as a `(\=` PAT)' form.  This reader
+  ;; expands backquote EAGERLY, so `\=`(,a ,b)' arrives already as the
+  ;; `(cons a (cons b nil))' pattern -- which is exactly the structural pattern
+  ;; `pcase--compile' takes.  The test is therefore "is it a cons": a symbol
+  ;; (including `&optional'/`&rest') is an ordinary parameter, anything else is
+  ;; a pattern.
+  (let ((bindings nil) (parameters nil) (i 0))
+    (dolist (pat lambda-list)
+      (if (consp pat)
+          (let ((arg (intern (concat "--pl-arg-" (number-to-string i) "--"))))
+            (setq bindings (cons (list pat arg) bindings))
+            (setq parameters (cons arg parameters)))
+        (setq parameters (cons pat parameters)))
+      (setq i (1+ i)))
+    (list 'lambda (nreverse parameters)
+          (cons 'pcase-let* (cons (nreverse bindings) body)))))
 (defmacro pcase-setq (&rest args)
   ;; Pairs of PATTERN VALUE: destructure each VALUE and `setq' the pattern's
   ;; variables (the existing bindings, not new ones).
