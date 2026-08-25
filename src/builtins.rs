@@ -6470,11 +6470,16 @@ fn fmt_time_string(fmt: &str, tm: &libc::tm, secs: f64) -> String {
             out.push('%');
             break;
         }
-        // Optional flags (-_0^#) then optional field width.
+        // Optional flags (-_0^#) then optional field width. `-_0` control
+        // padding and are read by `numpad`; `^`/`#` case-fold the directive's
+        // own output and are applied after it is produced.
         let mut flag: Option<char> = None;
+        let mut case_flag: Option<char> = None;
         while i < chars.len() && matches!(chars[i], '-' | '_' | '0' | '^' | '#') {
             if matches!(chars[i], '-' | '_' | '0') {
                 flag = Some(chars[i]);
+            } else {
+                case_flag = Some(chars[i]);
             }
             i += 1;
         }
@@ -6513,6 +6518,9 @@ fn fmt_time_string(fmt: &str, tm: &libc::tm, secs: f64) -> String {
             }
         };
         let year = tm.tm_year as i64 + 1900;
+        // Everything this directive emits, so the case flags and the field
+        // width can be applied to it afterwards.
+        let seg_start = out.len();
         match d {
             'Y' => out.push_str(&numpad(year, 1, '0')),
             'y' => out.push_str(&numpad(year.rem_euclid(100), 2, '0')),
@@ -6578,13 +6586,102 @@ fn fmt_time_string(fmt: &str, tm: &libc::tm, secs: f64) -> String {
             'n' => out.push('\n'),
             't' => out.push('\t'),
             '%' => out.push('%'),
+            // Century, and the ISO 8601 week-based year and week number. These
+            // are not the calendar year and week: `%G`/`%V` follow the week
+            // that contains the year's first Thursday, so 2024-01-01 (a Monday)
+            // is week 01 of 2024 while 2023-01-01 (a Sunday) is week 52 of 2022.
+            'C' => out.push_str(&numpad(year.div_euclid(100), 2, '0')),
+            'G' => out.push_str(&numpad(iso_week_year(tm).0, 1, '0')),
+            'g' => out.push_str(&numpad(iso_week_year(tm).0.rem_euclid(100), 2, '0')),
+            'V' => out.push_str(&numpad(iso_week_year(tm).1, 2, '0')),
+            // Week of the year counting from the first Sunday (`%U`) or the
+            // first Monday (`%W`); days before it are week 00.
+            'U' => out.push_str(&numpad(
+                (tm.tm_yday as i64 + 7 - tm.tm_wday as i64) / 7,
+                2,
+                '0',
+            )),
+            'W' => out.push_str(&numpad(
+                (tm.tm_yday as i64 + 7 - (tm.tm_wday as i64 + 6) % 7) / 7,
+                2,
+                '0',
+            )),
             other => {
                 out.push('%');
                 out.push(other);
             }
         }
+        // `^` upcases; `#` changes case — upcase unless the text is already
+        // caseless-or-upper, in which case downcase. `(format-time-string "%#a")`
+        // is "THU" and `"%#p"` is "am".
+        if let Some(c) = case_flag {
+            let seg = out.split_off(seg_start);
+            let upcase = c == '^' || seg.chars().any(|ch| ch.is_lowercase());
+            out.push_str(&if upcase {
+                seg.to_uppercase()
+            } else {
+                seg.to_lowercase()
+            });
+        }
+        // A field width on a STRING directive right-aligns it; the numeric ones
+        // already consumed `user_w` through `numpad`.
+        if let Some(w) = user_w {
+            if matches!(d, 'p' | 'P' | 'a' | 'A' | 'b' | 'h' | 'B' | 'Z') {
+                let seg = out.split_off(seg_start);
+                let n = seg.chars().count();
+                if n < w {
+                    out.push_str(&" ".repeat(w - n));
+                }
+                out.push_str(&seg);
+            }
+        }
     }
     out
+}
+
+/// The ISO 8601 week-based year and week number for `tm`.
+///
+/// A week runs Monday to Sunday and belongs to the year containing its
+/// Thursday, so the first days of January can fall in the previous year's week
+/// 52 or 53, and the last days of December in the next year's week 01.
+fn iso_week_year(tm: &libc::tm) -> (i64, i64) {
+    let year = tm.tm_year as i64 + 1900;
+    // Monday = 1 … Sunday = 7.
+    let wday = if tm.tm_wday == 0 {
+        7
+    } else {
+        tm.tm_wday as i64
+    };
+    let yday = tm.tm_yday as i64 + 1; // 1-based day of year
+    let week = (yday - wday + 10) / 7;
+    if week < 1 {
+        (year - 1, iso_weeks_in_year(year - 1))
+    } else if week > iso_weeks_in_year(year) {
+        (year + 1, 1)
+    } else {
+        (year, week)
+    }
+}
+
+/// 52 or 53 — a year has 53 ISO weeks when it starts on a Thursday, or is a
+/// leap year starting on a Wednesday.
+fn iso_weeks_in_year(year: i64) -> i64 {
+    let leap = |y: i64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    // Day of week of 1 January, Monday = 1 … Sunday = 7 (Zeller-style).
+    let jan1 = |y: i64| {
+        let d = (y + (y - 1).div_euclid(4) - (y - 1).div_euclid(100) + (y - 1).div_euclid(400))
+            .rem_euclid(7);
+        if d == 0 {
+            7
+        } else {
+            d
+        }
+    };
+    if jan1(year) == 4 || (leap(year) && jan1(year) == 3) {
+        53
+    } else {
+        52
+    }
 }
 
 fn float_time(h: &mut ElispHost, a: &[Value]) -> R {
