@@ -4269,6 +4269,45 @@ PAIRS is a property list with characters as keys."
        (--se-pop--))))
 ;; save-restriction: restore the buffer's narrowing after BODY (the saved bounds
 ;; track edits made in BODY, like Emacs markers).
+;; ---- overlays: the subr.el layer over the primitives ----
+;; `overlay-recenter' was an optimisation hint for Emacs's old overlay
+;; representation; it has been a no-op there since the interval tree landed, and
+;; elisprs scans a per-buffer list, so it is one here too.
+(defun overlay-recenter (_pos) nil)
+(defun copy-overlay (o)
+  "Return a copy of overlay O, with the same range, buffer and properties."
+  (let ((o1 (if (overlay-buffer o)
+                (make-overlay (overlay-start o) (overlay-end o) (overlay-buffer o) nil nil)
+              ;; A detached overlay copies to a detached overlay.
+              (let ((tmp (make-overlay (point-min) (point-min))))
+                (delete-overlay tmp)
+                tmp)))
+        (props (overlay-properties o)))
+    (while props
+      (overlay-put o1 (pop props) (pop props)))
+    o1))
+(defun remove-overlays (&optional beg end name val)
+  "Remove overlays between BEG and END whose property NAME is `eq' to VAL.
+An overlay that only partly overlaps the range is MOVED out of it rather than
+removed, and one that spans the range is split in two -- which is why this needs
+`copy-overlay' and cannot just delete what `overlays-in' reports."
+  (unless beg (setq beg (point-min)))
+  (unless end (setq end (point-max)))
+  (overlay-recenter end)
+  (if (< end beg) (setq beg (prog1 end (setq end beg))))
+  (save-excursion
+    (dolist (o (overlays-in beg end))
+      (when (eq (overlay-get o name) val)
+        (if (< (overlay-start o) beg)
+            (if (> (overlay-end o) end)
+                (progn
+                  (move-overlay (copy-overlay o) (overlay-start o) beg)
+                  (move-overlay o end (overlay-end o)))
+              (move-overlay o (overlay-start o) beg))
+          (if (> (overlay-end o) end)
+              (move-overlay o end (overlay-end o))
+            (delete-overlay o)))))))
+
 (defmacro save-restriction (&rest body)
   `(progn (--save-restriction--)
      (unwind-protect (progn ,@body) (--restore-restriction--))))

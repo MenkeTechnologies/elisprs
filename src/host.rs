@@ -368,6 +368,7 @@ pub enum Obj {
     /// so a single edit updates every reference; see [`MarkerData`]. Runtime-only,
     /// never serialized.
     Marker(Rc<RefCell<MarkerData>>),
+    Overlay(Rc<RefCell<OverlayData>>),
     /// A first-class obarray (`obarray-make`): a private namespace of interned
     /// symbols. Each name maps to a distinct symbol arena id created via
     /// [`ElispHost::make_symbol`], so a private obarray's symbols never collide
@@ -407,6 +408,29 @@ pub struct MarkerData {
     pub buffer: Option<usize>,
     pub pos: usize,
     pub insertion_type: bool,
+}
+
+/// An overlay: a range of buffer positions carrying a property list.
+///
+/// Like a marker, the data is shared (`Rc`) between the [`Obj::Overlay`] and
+/// the owning buffer's `overlays` list, so an edit adjusts both ends through
+/// one borrow. The two advance flags are what `make-overlay`'s FRONT-ADVANCE
+/// and REAR-ADVANCE control, and they are exactly a marker's insertion type
+/// applied to each end: text inserted AT the start goes inside the overlay
+/// unless FRONT-ADVANCE, and text inserted at the end goes outside it unless
+/// REAR-ADVANCE.
+///
+/// `buffer` is `None` for a deleted overlay, which is why `overlay-start` and
+/// `overlay-buffer` both answer nil after `delete-overlay` while the object
+/// itself stays an overlay.
+pub struct OverlayData {
+    pub buffer: Option<usize>,
+    pub start: usize,
+    pub end: usize,
+    pub front_advance: bool,
+    pub rear_advance: bool,
+    /// Property list, newest first — the order `overlay-properties` reports.
+    pub props: Vec<(Value, Value)>,
 }
 
 /// An elisp hash table, in Emacs's slot model (`struct Lisp_Hash_Table`, fns.c).
@@ -979,6 +1003,9 @@ pub struct EditBuffer {
     /// (`Rc`) with the corresponding `Obj::Marker`; a marker is removed here when
     /// it is re-pointed (`set-marker`) elsewhere or detached.
     pub markers: Vec<Rc<RefCell<MarkerData>>>,
+    /// Overlays in this buffer, in creation order — which is the order
+    /// `overlays-in` reports them in.
+    pub overlays: Vec<Rc<RefCell<OverlayData>>>,
     /// Point: 1-based, always kept within `[begv, zv]`.
     pub point: usize,
     /// Narrowing lower bound (`point-min`); 1 when un-narrowed. Marker-like with
@@ -1068,6 +1095,7 @@ impl ElispHost {
             print_being: RefCell::new(Vec::new()),
             print_circle_on: Cell::new(false),
             buffers: vec![EditBuffer {
+                overlays: Vec::new(),
                 name: Some("*scratch*".to_string()),
                 self_obj: Value::Undef,
                 text: Vec::new(),
@@ -2558,15 +2586,17 @@ impl ElispHost {
                 // Buffer/marker/obarray objects are runtime-only (created after
                 // prelude load) and never appear in a compiled/AOT heap image;
                 // emit a harmless placeholder so the match stays exhaustive.
-                Obj::Buffer(_) | Obj::Marker(_) | Obj::Obarray(_) => SerObj::Symbol {
-                    name: "--unexpected-runtime-obj--".to_string(),
-                    value: None,
-                    function: None,
-                    special: false,
-                    buffer_local_auto: false,
-                    alias_of: None,
-                    interned: false,
-                },
+                Obj::Buffer(_) | Obj::Marker(_) | Obj::Overlay(_) | Obj::Obarray(_) => {
+                    SerObj::Symbol {
+                        name: "--unexpected-runtime-obj--".to_string(),
+                        value: None,
+                        function: None,
+                        special: false,
+                        buffer_local_auto: false,
+                        alias_of: None,
+                        interned: false,
+                    }
+                }
                 Obj::Closure {
                     params,
                     body,
@@ -2756,17 +2786,19 @@ impl ElispHost {
             },
             // Runtime-only objects (and subrs, which `install` recreates): a
             // placeholder keeps the arena indices aligned.
-            Obj::Subr { .. } | Obj::Buffer(_) | Obj::Marker(_) | Obj::Obarray(_) => {
-                SerObj::Symbol {
-                    name: "--unexpected-runtime-obj--".to_string(),
-                    value: None,
-                    function: None,
-                    special: false,
-                    buffer_local_auto: false,
-                    alias_of: None,
-                    interned: false,
-                }
-            }
+            Obj::Subr { .. }
+            | Obj::Buffer(_)
+            | Obj::Marker(_)
+            | Obj::Overlay(_)
+            | Obj::Obarray(_) => SerObj::Symbol {
+                name: "--unexpected-runtime-obj--".to_string(),
+                value: None,
+                function: None,
+                special: false,
+                buffer_local_auto: false,
+                alias_of: None,
+                interned: false,
+            },
         }
     }
 
@@ -3478,6 +3510,18 @@ impl ElispHost {
                         None => "#<marker in no buffer>".to_string(),
                     }
                 }
+                Some(Obj::Overlay(o)) => {
+                    let od = o.borrow();
+                    match od
+                        .buffer
+                        .and_then(|bi| self.buffers.get(bi).and_then(|b| b.name.as_ref()))
+                    {
+                        Some(name) => {
+                            format!("#<overlay from {} to {} in {}>", od.start, od.end, name)
+                        }
+                        None => "#<overlay in no buffer>".to_string(),
+                    }
+                }
                 Some(Obj::Obarray(d)) => {
                     let n = if d.global {
                         self.obarray.len()
@@ -3783,6 +3827,7 @@ impl ElispHost {
     fn new_buffer(&mut self, name: String) -> Value {
         let idx = self.buffers.len();
         self.buffers.push(EditBuffer {
+            overlays: Vec::new(),
             name: Some(name),
             self_obj: Value::Undef,
             text: Vec::new(),
@@ -4077,6 +4122,15 @@ impl ElispHost {
             let ins_type = md.insertion_type;
             adj_ins(&mut md.pos, pos, len, ins_type);
         }
+        // An overlay's two ends advance independently: FRONT-ADVANCE decides
+        // whether text inserted at the start lands outside it, REAR-ADVANCE
+        // whether text inserted at the end lands inside it.
+        for ov in b.overlays.iter() {
+            let mut od = ov.borrow_mut();
+            let (fa, ra) = (od.front_advance, od.rear_advance);
+            adj_ins(&mut od.start, pos, len, fa);
+            adj_ins(&mut od.end, pos, len, ra);
+        }
     }
     /// Apply a deletion of `[from, to)` in the current buffer to every marker-like
     /// position, including point.
@@ -4097,6 +4151,11 @@ impl ElispHost {
         }
         for mk in b.markers.iter() {
             adj_del(&mut mk.borrow_mut().pos, from, to);
+        }
+        for ov in b.overlays.iter() {
+            let mut od = ov.borrow_mut();
+            adj_del(&mut od.start, from, to);
+            adj_del(&mut od.end, from, to);
         }
     }
     /// Insert `chars` at point in the current buffer. `leave_after` puts point

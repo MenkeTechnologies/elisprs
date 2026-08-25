@@ -41,6 +41,18 @@ All notable changes to elisprs are documented here. The format follows
   so `(string-pixel-width "ab\tc")` is 9 where `(string-width "ab\tc")` is 11.
 - **`rx`: `(category …)`, `*?`/`+?`**, and the `not` spellings
   `(not (syntax X))`, `(not (not X))` and `(not CLASS)`.
+- **Overlays.** The whole family was absent: `make-overlay`, `overlayp`,
+  `overlay-start`/`-end`/`-buffer`, `overlay-get`/`-put`/`-properties`,
+  `delete-overlay`, `move-overlay`, `copy-overlay`, `overlays-at`,
+  `overlays-in`, `next-overlay-change`, `previous-overlay-change` and
+  `remove-overlays`. An overlay is an object rather than a text property: it
+  survives the text under it changing, both ends move with edits like markers,
+  and deleting one detaches it (`overlay-start` reads nil, `move-overlay` puts
+  it back). `FRONT-ADVANCE`/`REAR-ADVANCE` decide which side of an insertion at
+  an endpoint the new text lands on, and `remove-overlays` moves or SPLITS an
+  overlay that only partly overlaps the range rather than deleting it.
+- **`format-time-string`: `%G`, `%g`, `%V`, `%U`, `%W`, `%C`** and the `^`/`#`
+  case flags; a field width now also right-aligns a string directive.
 - **`looking-back`**, **`text-property-any`**, **`text-property-not-all`** and
   **`listify-key-sequence`** — all previously void.
 - **`regexp-opt-charset`**, and `regexp-opt`/`regexp-opt-group` ported from

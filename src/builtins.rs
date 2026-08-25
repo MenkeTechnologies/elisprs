@@ -4707,6 +4707,7 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
         Value::Bool(_) | Value::Undef => "symbol",
         Value::Obj(_) => match h.obj(&a[0]) {
             Some(Obj::Cons(..)) => "cons",
+            Some(Obj::Overlay(_)) => "overlay",
             // Emacs answers `integer` for a bignum too — fixnum and bignum are one
             // type, split only by `fixnump`/`bignump`.
             Some(Obj::Bignum(_)) => "integer",
@@ -8151,6 +8152,230 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Undef)
 }
 
+// ── overlays ──
+//
+// An overlay is a buffer range carrying a property list. It differs from a text
+// property in that it is an OBJECT: it survives the text under it changing, both
+// of its ends move with edits like markers, and deleting it detaches it rather
+// than clearing anything. `host::OverlayData` holds the range and the two
+// advance flags; the owning buffer holds the same `Rc`, which is what lets
+// `adjust_for_insert`/`adjust_for_delete` move every overlay in one pass.
+
+/// The shared data behind an overlay object, or None if `v` is not one.
+fn ov_rc(h: &ElispHost, v: &Value) -> Option<Rc<RefCell<crate::host::OverlayData>>> {
+    match h.obj(v) {
+        Some(Obj::Overlay(o)) => Some(o.clone()),
+        _ => None,
+    }
+}
+fn ov_of(h: &mut ElispHost, v: &Value) -> Result<Rc<RefCell<crate::host::OverlayData>>, String> {
+    ov_rc(h, v).ok_or_else(|| h.signal_wrong_type("overlayp", v))
+}
+fn overlayp(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(nil_or(ov_rc(h, &a[0]).is_some()))
+}
+/// `(make-overlay BEG END &optional BUFFER FRONT-ADVANCE REAR-ADVANCE)`.
+///
+/// An inverted pair is accepted and swapped, and both ends are clamped into the
+/// buffer, so `(make-overlay 4 2)` is the same overlay as `(make-overlay 2 4)`.
+fn make_overlay(h: &mut ElispHost, a: &[Value]) -> R {
+    let bi = match a.get(2) {
+        Some(v) if !is_nil(v) => h
+            .resolve_buffer(v)
+            .ok_or_else(|| h.signal_wrong_type("buffer-or-string-p", v))?,
+        _ => h.current,
+    };
+    let z = h.buffers[bi].text.len() as i64 + 1;
+    let clamp = |n: i64| n.clamp(1, z) as usize;
+    let b0 = clamp(as_int(h, &a[0])?);
+    let e0 = clamp(as_int(h, &a[1])?);
+    let (start, end) = if b0 <= e0 { (b0, e0) } else { (e0, b0) };
+    let od = Rc::new(RefCell::new(crate::host::OverlayData {
+        buffer: Some(bi),
+        start,
+        end,
+        front_advance: a.get(3).is_some_and(|v| !is_nil(v)),
+        rear_advance: a.get(4).is_some_and(|v| !is_nil(v)),
+        props: Vec::new(),
+    }));
+    h.buffers[bi].overlays.push(od.clone());
+    Ok(h.alloc(Obj::Overlay(od)))
+}
+fn overlay_start(h: &mut ElispHost, a: &[Value]) -> R {
+    let od = ov_of(h, &a[0])?;
+    let od = od.borrow();
+    Ok(match od.buffer {
+        Some(_) => Value::Int(od.start as i64),
+        None => Value::Undef,
+    })
+}
+fn overlay_end(h: &mut ElispHost, a: &[Value]) -> R {
+    let od = ov_of(h, &a[0])?;
+    let od = od.borrow();
+    Ok(match od.buffer {
+        Some(_) => Value::Int(od.end as i64),
+        None => Value::Undef,
+    })
+}
+fn overlay_buffer(h: &mut ElispHost, a: &[Value]) -> R {
+    let od = ov_of(h, &a[0])?;
+    let bi = od.borrow().buffer;
+    Ok(match bi {
+        Some(i) => h.buffer_object(i),
+        None => Value::Undef,
+    })
+}
+fn overlay_get(h: &mut ElispHost, a: &[Value]) -> R {
+    let od = ov_of(h, &a[0])?;
+    let od = od.borrow();
+    Ok(od
+        .props
+        .iter()
+        .find(|(k, _)| el_eq(h, k, &a[1]))
+        .map(|(_, v)| v.clone())
+        .unwrap_or(Value::Undef))
+}
+/// `(overlay-put OV PROP VALUE)`. A property set twice keeps its original
+/// position in the list, which is why `overlay-properties` is newest-first only
+/// for properties that are new.
+fn overlay_put(h: &mut ElispHost, a: &[Value]) -> R {
+    let od = ov_of(h, &a[0])?;
+    let existing = od
+        .borrow()
+        .props
+        .iter()
+        .position(|(k, _)| el_eq(h, k, &a[1]));
+    let mut od = od.borrow_mut();
+    match existing {
+        Some(i) => od.props[i].1 = a[2].clone(),
+        None => od.props.insert(0, (a[1].clone(), a[2].clone())),
+    }
+    Ok(a[2].clone())
+}
+fn overlay_properties(h: &mut ElispHost, a: &[Value]) -> R {
+    let od = ov_of(h, &a[0])?;
+    let flat: Vec<Value> = od
+        .borrow()
+        .props
+        .iter()
+        .flat_map(|(k, v)| [k.clone(), v.clone()])
+        .collect();
+    Ok(h.list_from(flat))
+}
+/// `(delete-overlay OV)` — detach it. The object stays an overlay; its ends and
+/// buffer read as nil, and `move-overlay` can put it back.
+fn delete_overlay(h: &mut ElispHost, a: &[Value]) -> R {
+    let od = ov_of(h, &a[0])?;
+    let was = od.borrow().buffer;
+    if let Some(bi) = was {
+        h.buffers[bi].overlays.retain(|o| !Rc::ptr_eq(o, &od));
+    }
+    od.borrow_mut().buffer = None;
+    Ok(Value::Undef)
+}
+/// `(move-overlay OV BEG END &optional BUFFER)` — also re-attaches a deleted
+/// overlay, to BUFFER or to the current buffer.
+fn move_overlay(h: &mut ElispHost, a: &[Value]) -> R {
+    let od = ov_of(h, &a[0])?;
+    let old = od.borrow().buffer;
+    let bi = match a.get(3) {
+        Some(v) if !is_nil(v) => h
+            .resolve_buffer(v)
+            .ok_or_else(|| h.signal_wrong_type("buffer-or-string-p", v))?,
+        _ => old.unwrap_or(h.current),
+    };
+    let z = h.buffers[bi].text.len() as i64 + 1;
+    let clamp = |n: i64| n.clamp(1, z) as usize;
+    let b0 = clamp(as_int(h, &a[1])?);
+    let e0 = clamp(as_int(h, &a[2])?);
+    if old != Some(bi) {
+        if let Some(o) = old {
+            h.buffers[o].overlays.retain(|x| !Rc::ptr_eq(x, &od));
+        }
+        h.buffers[bi].overlays.push(od.clone());
+    }
+    {
+        let mut m = od.borrow_mut();
+        m.buffer = Some(bi);
+        m.start = b0.min(e0);
+        m.end = b0.max(e0);
+    }
+    Ok(a[0].clone())
+}
+/// Overlays of the current buffer whose range satisfies `keep`, in creation
+/// order — which is the order `overlays-in` reports.
+fn overlays_where(
+    h: &mut ElispHost,
+    keep: impl Fn(usize, usize) -> bool,
+) -> Vec<Rc<RefCell<crate::host::OverlayData>>> {
+    h.buffers[h.current]
+        .overlays
+        .iter()
+        .filter(|o| {
+            let od = o.borrow();
+            keep(od.start, od.end)
+        })
+        .cloned()
+        .collect()
+}
+fn overlays_to_list(h: &mut ElispHost, ovs: Vec<Rc<RefCell<crate::host::OverlayData>>>) -> R {
+    let items: Vec<Value> = ovs.into_iter().map(|o| h.alloc(Obj::Overlay(o))).collect();
+    Ok(h.list_from(items))
+}
+/// `(overlays-at POS)` — those that COVER POS, i.e. `start <= POS < end`. An
+/// overlay ending at POS does not cover it, so `(overlays-at 3)` is nil for an
+/// overlay from 1 to 3.
+fn overlays_at(h: &mut ElispHost, a: &[Value]) -> R {
+    let pos = as_int(h, &a[0])? as usize;
+    let ovs = overlays_where(h, |s, e| s <= pos && pos < e);
+    overlays_to_list(h, ovs)
+}
+/// `(overlays-in BEG END)` — those overlapping the range. An EMPTY overlay is
+/// included when it sits inside it, including when BEG equals END.
+fn overlays_in(h: &mut ElispHost, a: &[Value]) -> R {
+    let beg = as_int(h, &a[0])? as usize;
+    let end = as_int(h, &a[1])? as usize;
+    let ovs = overlays_where(h, |s, e| {
+        if s == e {
+            beg <= s && s <= end
+        } else {
+            s < end && e > beg
+        }
+    });
+    overlays_to_list(h, ovs)
+}
+/// `(next-overlay-change POS)` — the next position after POS where an overlay
+/// begins or ends, or `point-max` when there is none.
+fn next_overlay_change(h: &mut ElispHost, a: &[Value]) -> R {
+    let pos = as_int(h, &a[0])? as usize;
+    let zv = h.cur_buf_ref().zv;
+    let mut best = zv;
+    for o in h.buffers[h.current].overlays.iter() {
+        let od = o.borrow();
+        for p in [od.start, od.end] {
+            if p > pos && p < best {
+                best = p;
+            }
+        }
+    }
+    Ok(Value::Int(best as i64))
+}
+/// `(previous-overlay-change POS)` — the previous such position, or `point-min`.
+fn previous_overlay_change(h: &mut ElispHost, a: &[Value]) -> R {
+    let pos = as_int(h, &a[0])? as usize;
+    let begv = h.cur_buf_ref().begv;
+    let mut best = begv;
+    for o in h.buffers[h.current].overlays.iter() {
+        let od = o.borrow();
+        for p in [od.start, od.end] {
+            if p < pos && p > best {
+                best = p;
+            }
+        }
+    }
+    Ok(Value::Int(best as i64))
+}
+
 // ── filesystem writes / mutations ──
 fn write_region(h: &mut ElispHost, a: &[Value]) -> R {
     let append = a.get(3).is_some_and(|v| !is_nil(v));
@@ -8607,6 +8832,26 @@ pub fn install(h: &mut ElispHost) {
     s("bool-vector-not", 1, Some(2), bool_vector_not);
     s("aref", 2, Some(2), aref);
     s("aset", 3, Some(3), aset);
+    // overlays
+    s("make-overlay", 2, Some(5), make_overlay);
+    s("overlayp", 1, Some(1), overlayp);
+    s("overlay-start", 1, Some(1), overlay_start);
+    s("overlay-end", 1, Some(1), overlay_end);
+    s("overlay-buffer", 1, Some(1), overlay_buffer);
+    s("overlay-get", 2, Some(2), overlay_get);
+    s("overlay-put", 3, Some(3), overlay_put);
+    s("overlay-properties", 1, Some(1), overlay_properties);
+    s("delete-overlay", 1, Some(1), delete_overlay);
+    s("move-overlay", 3, Some(4), move_overlay);
+    s("overlays-at", 1, Some(2), overlays_at);
+    s("overlays-in", 2, Some(2), overlays_in);
+    s("next-overlay-change", 1, Some(1), next_overlay_change);
+    s(
+        "previous-overlay-change",
+        1,
+        Some(1),
+        previous_overlay_change,
+    );
     s("--note-compiler-macro", 1, Some(1), note_compiler_macro);
     s("store-substring", 3, Some(3), store_substring);
     s("clear-string", 1, Some(1), clear_string);
