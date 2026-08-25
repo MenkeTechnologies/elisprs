@@ -4647,22 +4647,159 @@ If all LST elements are zeros or LST is nil, return zero."
             (setq i (+ i 2)))
         (setq i (1+ i))))
     count))
-(defun regexp-opt (strings &optional paren)
-  (let ((open (cond ((stringp paren) paren)
-                    ((eq paren 'words) "\\<\\(")
-                    ((eq paren 'symbols) "\\_<\\(")
-                    (paren "\\(")
-                    (t "\\(?:")))
-        (close (cond ((eq paren 'words) "\\)\\>")
-                     ((eq paren 'symbols) "\\)\\_>")
-                     (t "\\)"))))
+;; regexp-opt.el, ported. The old implementation joined the strings with `\\|',
+;; which is a correct regexp but not the one Emacs builds: `regexp-opt' factors
+;; common prefixes and suffixes and folds one-character alternatives into a
+;; character set, so `(regexp-opt '("cat" "cot" "cut"))' is "\\(?:c\\(?:[aou]t\\)\\)"
+;; and `(regexp-opt '("a" "b" "c"))' is "[abc]". That output is observable
+;; wherever a caller inspects or composes the result -- `rx''s all-strings `or'
+;; branch is one -- so it is the shape, not just the language, that has to match.
+(defun regexp-opt--common-prefix (strings)
+  "The longest common prefix of STRINGS.
+`regexp-opt-group' asks `try-completion' for this, having bound
+`completion-ignore-case' and `completion-regexp-list' to nil so that it means
+exactly the common prefix and nothing else."
+  (let ((pre (car strings)) (rest (cdr strings)))
+    (while (and rest (> (length pre) 0))
+      (let ((s (car rest)) (i 0))
+        (while (and (< i (length pre)) (< i (length s))
+                    (eq (aref pre i) (aref s i)))
+          (setq i (1+ i)))
+        (setq pre (substring pre 0 i)))
+      (setq rest (cdr rest)))
+    (or pre "")))
+(defun regexp-opt-charset (chars)
+  "Return a regexp matching a character in CHARS (a list of characters).
+The empty list yields a regexp that never matches."
+  ;; The C walks a char-table; walking the sorted, de-duplicated list is the
+  ;; same traversal. A run becomes a RANGE only when it is longer than three
+  ;; characters (`(> end (+ start 2))'), which is why (?a ?b ?c) is "[abc]" and
+  ;; (?a ?b ?c ?d) is "[a-d]".
+  (let ((bracket "") (dash "") (caret "") (plain nil) (charset "")
+        (start -1) (end -2))
+    (dolist (char chars)
+      (cond ((eq char ?\]) (setq bracket "]"))
+            ((eq char ?^) (setq caret "^"))
+            ((eq char ?-) (setq dash "-"))
+            (t (setq plain (cons char plain)))))
+    (setq plain (sort (delete-dups (nreverse plain)) #'<))
+    (dolist (c plain)
+      (if (= (1- c) end)
+          (setq end c)
+        (if (> end (+ start 2))
+            (setq charset (concat charset (string start) "-" (string end)))
+          (while (>= end start)
+            (setq charset (concat charset (string start)))
+            (setq start (1+ start))))
+        (setq start c end c)))
+    (when (>= end start)
+      (if (> end (+ start 2))
+          (setq charset (concat charset (string start) "-" (string end)))
+        (while (>= end start)
+          (setq charset (concat charset (string start)))
+          (setq start (1+ start)))))
+    ;; `]' must come first, `^' must not, and `-' must be first or last.
+    (let ((all (concat bracket charset caret dash)))
+      (cond ((= (length all) 0) "\\`a\\`")
+            ((= (length all) 1) (regexp-quote all))
+            ((string= all "^-") "[-^]")
+            (t (concat "[" all "]"))))))
+(defun regexp-opt-group (strings &optional paren lax)
+  "Return a regexp matching a string in the SORTED list STRINGS.
+PAREN non-nil wraps the result; LAX non-nil omits the wrapping where it is not
+needed. Merges keywords to avoid backtracking, as regexp-opt.el does."
+  (let* ((open-group (cond ((stringp paren) paren) (paren "\\(?:") (t "")))
+         (close-group (if paren "\\)" ""))
+         (open-charset (if lax "" open-group))
+         (close-charset (if lax "" close-group)))
     (cond
-     ((null strings) "\\(?:\\`a\\`\\)")
-     ;; A single one-character string needs no group.
-     ((and (null paren) (null (cdr strings)) (= (length (car strings)) 1))
-      (regexp-quote (car strings)))
-     (t (let ((sorted (sort (copy-sequence strings) #'string<)))
-          (concat open (mapconcat #'regexp-quote sorted "\\|") close))))))
+     ((= (length strings) 0) "")
+     ((= (length strings) 1)
+      (if (= (length (car strings)) 1)
+          (concat open-charset (regexp-quote (car strings)) close-charset)
+        (concat open-group (regexp-quote (car strings)) close-group)))
+     ;; An empty string: drop it and make the rest optional.
+     ((= (length (car strings)) 0)
+      (concat open-charset (regexp-opt-group (cdr strings) t t) "?" close-charset))
+     ;; Several one-character strings: a character set beats alternation.
+     ((and (= (length (car strings)) 1)
+           (let ((found nil))
+             (dolist (s (cdr strings)) (when (= (length s) 1) (setq found t)))
+             found))
+      (let ((letters nil) (rest nil))
+        (dolist (s strings)
+          (if (= (length s) 1)
+              (setq letters (cons (aref s 0) letters))
+            (setq rest (cons s rest))))
+        (if rest
+            ;; Longest first, so the alternation matches the longer string.
+            (concat open-group (regexp-opt-group (nreverse rest))
+                    "\\|" (regexp-opt-charset letters) close-group)
+          (concat open-charset (regexp-opt-charset letters) close-charset))))
+     (t
+      (let ((prefix (regexp-opt--common-prefix strings)))
+        (if (> (length prefix) 0)
+            (let* ((n (length prefix))
+                   (suffixes (mapcar (lambda (s) (substring s n)) strings)))
+              (concat open-group (regexp-quote prefix)
+                      (regexp-opt-group suffixes t t) close-group))
+          (let* ((sgnirts (mapcar (lambda (s) (reverse s)) strings))
+                 (xiffus (regexp-opt--common-prefix sgnirts)))
+            (if (> (length xiffus) 0)
+                (let* ((n (- (length xiffus)))
+                       ;; Sorting matters for cases such as ("ad" "d").
+                       (prefixes (sort (mapcar (lambda (s) (substring s 0 n)) strings)
+                                       #'string<)))
+                  (concat open-group (regexp-opt-group prefixes t t)
+                          (regexp-quote (reverse xiffus)) close-group))
+              ;; No shared affix: split on the first character and recurse.
+              (let* ((char (substring (car strings) 0 1))
+                     (half1 nil) (half2 nil))
+                (dolist (s strings)
+                  (if (and (null half2) (string-prefix-p char s))
+                      (setq half1 (cons s half1))
+                    (setq half2 (cons s half2))))
+                (concat open-group (regexp-opt-group (nreverse half1))
+                        "\\|" (regexp-opt-group (nreverse half2))
+                        close-group))))))))))
+(defun regexp-opt (strings &optional paren)
+  "Return a regexp matching any string in STRINGS, each taken literally.
+PAREN controls the surrounding group: a string is used as the opening bracket,
+`words'/`symbols' add the word/symbol boundaries, any other non-nil value uses
+`\\(', and nil uses a shy group only where one is needed."
+  (let* ((open (cond ((stringp paren) paren) (paren "\\(")))
+         (re (if strings
+                 (regexp-opt-group (delete-dups (sort (copy-sequence strings) #'string<))
+                                   (or open t) (not open))
+               (concat (or open "\\(?:") "\\`a\\`" "\\)"))))
+    (cond ((eq paren 'words) (concat "\\<" re "\\>"))
+          ((eq paren 'symbols) (concat "\\_<" re "\\_>"))
+          (t re))))
+
+;; `looking-back' (subr.el): `looking-at' for the text BEFORE point.  The trick
+;; is the `\\=' anchor -- searching backwards for "\\(?:REGEXP\\)\\=" finds a match
+;; that ENDS at point.  GREEDY then walks the start backwards one character at a
+;; time for as long as the match still reaches the end, which is allowed to pass
+;; LIMIT.
+(defun looking-back (regexp &optional limit greedy)
+  "Return non-nil if the text before point matches REGEXP."
+  (let ((start (point))
+        (pos (save-excursion
+               (and (re-search-backward (concat "\\(?:" regexp "\\)\\=") limit t)
+                    (point)))))
+    (if (and greedy pos)
+        (save-restriction
+          (narrow-to-region (point-min) start)
+          (while (and (> pos (point-min))
+                      (save-excursion
+                        (goto-char pos)
+                        (backward-char 1)
+                        (looking-at (concat "\\(?:" regexp "\\)\\'"))))
+            (setq pos (1- pos)))
+          (save-excursion
+            (goto-char pos)
+            (looking-at (concat "\\(?:" regexp "\\)\\'"))))
+      (not (null pos)))))
 
 (defmacro while-let (binding &rest body)
   (let ((var (car (car binding))) (val (car (cdr (car binding)))))
@@ -6067,8 +6204,66 @@ per-buffer display model.  `string-pixel-width' and `char-width' read it.")
    ((symbolp form) (rx--symbol form))
    ((consp form) (rx--list form))
    (t (error "Bad rx expression: %S" form))))
-(defun rx--seq (forms) (mapconcat 'rx--form forms ""))
+(defun rx--seq (forms)
+  ;; A lone element is its own translation -- no grouping -- so a top-level
+  ;; `or' prints bare. With siblings, an element that is a bare alternation is
+  ;; wrapped, because alternation binds loosest.
+  (if (and forms (null (cdr forms)))
+      (rx--form (car forms))
+    (mapconcat (lambda (f)
+                 (let ((s (rx--form f)))
+                   (if (rx--alt-form-p f) (concat "\\(?:" s "\\)") s)))
+               forms "")))
 (defun rx--1char (a) (cond ((integerp a) (char-to-string a)) ((stringp a) a) (t "")))
+(defun rx--or-branch-string (a)
+  "An `or' branch as the literal string it stands for."
+  (if (integerp a) (char-to-string a) a))
+(defun rx--all-strings-p (args)
+  "Whether every `or' branch is a literal string or character."
+  (let ((ok t))
+    (dolist (a args) (unless (or (stringp a) (integerp a)) (setq ok nil)))
+    ok))
+(defun rx--or-flatten (args)
+  "ARGS with nested `or' branches spliced in, as `rx--optimize-or-args' does."
+  (let ((out nil))
+    (dolist (a args)
+      (if (and (consp a) (memq (car a) '(or |)))
+          (dolist (b (rx--or-flatten (cdr a))) (setq out (cons b out)))
+        (setq out (cons a out))))
+    (nreverse out)))
+(defun rx--charset-args (a)
+  "The `any' arguments branch A contributes, or nil if it contributes none.
+A character, a one-character string, an `(any ...)' form and a named character
+class all denote character sets, so an `or' of them is ONE set."
+  (cond ((integerp a) (list a))
+        ((and (stringp a) (= (length a) 1)) (list a))
+        ((and (consp a) (memq (car a) '(any in char))) (cdr a))
+        ((and (symbolp a) a (cdr (assq a rx--char-classes))) (list a))
+        (t nil)))
+(defun rx--all-charsets-p (args)
+  "Whether every branch in ARGS denotes a character set."
+  (let ((ok t))
+    (dolist (a args) (unless (rx--charset-args a) (setq ok nil)))
+    ok))
+(defun rx--alt-form-p (form)
+  "Whether FORM translates to a BARE top-level alternation.
+`rx--seq' has to parenthesize such an element when it has siblings, because
+alternation binds loosest; alone it is left bare, which is why
+`(rx (or \"a\" (: \"b\" \"c\")))' is \"a\\|bc\" and not a shy group."
+  (and (consp form)
+       (cond
+        ((memq (car form) '(or |))
+         ;; An `or' that folds to a character set or to `regexp-opt' output is
+         ;; already atomic; only the alternation fallback is bare.
+         (let ((args (rx--or-flatten (cdr form))))
+           (not (or (null args) (null (cdr args))
+                    (rx--all-strings-p args)
+                    (rx--all-charsets-p args)))))
+        ;; A single-element sequence is its element.
+        ((and (memq (car form) '(seq sequence : and))
+              (cdr form) (null (cdr (cdr form))))
+         (rx--alt-form-p (car (cdr form))))
+        (t nil))))
 (defun rx--all-1char-p (args)
   (let ((ok t))
     (while args
@@ -6095,13 +6290,30 @@ per-buffer display model.  `string-pixel-width' and `char-width' read it.")
      ((memq head '(seq sequence : and)) (rx--seq args))
      ((memq head '(or |))
       ;; rx.el `rx--translate-or': no branches at all is a never-matching
-      ;; regexp, and a single branch is that branch (no shy group).
+      ;; regexp, and a single branch is that branch (no shy group). Nested
+      ;; `or's flatten first, so `(or (or "a" "b") "c")' is one three-way
+      ;; alternation and folds to "[abc]".
+      (setq args (rx--or-flatten args))
       (cond
        ((null args) (rx--symbol 'unmatchable))
        ((null (cdr args)) (rx--form (car args)))
-       ;; Emacs folds all-single-character alternatives into a char class.
-       ((rx--all-1char-p args) (concat "[" (mapconcat 'rx--1char args "") "]"))
-       (t (concat "\\(?:" (mapconcat 'rx--form args "\\|") "\\)"))))
+       ;; rx.el `rx--translate-or': when every branch is a literal string (or a
+       ;; character, which `rx--normalize-char-pattern' makes one), the whole
+       ;; alternation goes through `regexp-opt' -- which is NOT the same
+       ;; rendering as `(any ...)': it sorts but does not condense a run into a
+       ;; range, so `(rx (or "a" "b" "c"))' is "[abc]" where `(rx (in "abc"))'
+       ;; is "[a-c]".
+       ;; All literal strings/characters: `regexp-opt' (NOT the `any'
+       ;; rendering -- it sorts but does not condense a run into a range, so
+       ;; `(or "a" "b" "c")' is "[abc]" where `(in "abc")' is "[a-c]").
+       ((rx--all-strings-p args)
+        (regexp-opt (mapcar #'rx--or-branch-string args) nil))
+       ;; Every branch denotes a character set: they merge into ONE set.
+       ((rx--all-charsets-p args)
+        (rx--translate-any nil (apply #'append (mapcar #'rx--charset-args args))))
+       ;; Otherwise a bare alternation; `rx--seq' parenthesizes it if it has
+       ;; siblings, and `rx--quant-body' if a quantifier follows.
+       (t (mapconcat 'rx--form args "\\|"))))
      ((memq head '(group submatch)) (concat "\\(" (rx--seq args) "\\)"))
      ((memq head '(group-n submatch-n))
       (concat "\\(?" (number-to-string (car args)) ":" (rx--seq (cdr args)) "\\)"))

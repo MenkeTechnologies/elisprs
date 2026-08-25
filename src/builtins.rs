@@ -8221,28 +8221,59 @@ fn search_backward(h: &mut ElispHost, a: &[Value]) -> R {
         None => Err(format!("search-failed: {}", as_string(h, &a[0])?)),
     }
 }
+/// `(re-search-backward REGEXP &optional BOUND NOERROR COUNT)`.
+///
+/// A backward search is not "the last forward match before point". Emacs tries
+/// START positions from point downwards and takes the FIRST that matches, and
+/// it stops the match at the position the search started from — so for `a+` in
+/// `"aaa"` with point at 4 the answer is a one-character match at 3, not the
+/// three-character match at 1 that a forward scan finds first:
+///
+/// ```text
+/// (with-temp-buffer (insert "aaa") (goto-char 4)
+///   (list (re-search-backward "a+" nil t) (match-beginning 0) (match-end 0)))
+///   => (3 3 4)
+/// (with-temp-buffer (insert "aaa") (goto-char 3) …)   => (2 2 3)
+/// ```
+///
+/// The second line is the end bound: at start 2 an unbounded `a+` would reach
+/// 4, past where the search began. Collecting non-overlapping forward matches
+/// instead answered 1 for the first and nil for the second, and ignored BOUND
+/// entirely.
 fn re_search_backward(h: &mut ElispHost, a: &[Value]) -> R {
     let pat = as_string(h, &a[0])?;
     let re = compile_cf(h, &pat, case_fold_search(h))?;
+    // BOUND: the match may not START before it (`search_backward` reads it the
+    // same way for a literal search).
+    let bound = match a.get(1) {
+        Some(v) if !is_nil(v) => (as_int(h, v)?.max(1) as usize) - 1,
+        _ => 0,
+    };
     let noerror = a.get(2).is_some_and(|v| !is_nil(v));
-    let text: String = h.cur_buf().text.iter().collect();
+    let full: String = h.cur_buf().text.iter().collect();
     let point_char = h.cur_buf().point - 1;
-    // Last non-overlapping match that ends at or before point.
-    let mut best: Option<Vec<Option<(usize, usize)>>> = None;
-    let mut from = 0;
-    while let Some(spans) = run_match(&re, &text, from) {
-        let (b, e) = spans[0].unwrap();
-        if e > point_char {
-            break;
+    // Truncating at point is what bounds the match END; char offsets in the
+    // prefix are the same as in the whole text, so the spans need no rebasing.
+    let cut = byte_of_char(&full, point_char);
+    let text = full[..cut].to_string();
+    let mut found: Option<Vec<Option<(usize, usize)>>> = None;
+    let mut s = point_char + 1;
+    while s > bound {
+        s -= 1;
+        if let Some(spans) = run_match(&re, &text, s) {
+            // `run_match` finds the LEFTMOST match at or after `s`; only one
+            // that begins exactly at `s` is a match starting there.
+            if spans[0].map(|(b, _)| b) == Some(s) {
+                found = Some(spans);
+                break;
+            }
         }
-        best = Some(spans.clone());
-        from = if e > b { e } else { e + 1 };
     }
-    match best {
+    match found {
         Some(spans0) => {
             let bc = spans0[0].unwrap().0;
             h.cur_buf().point = bc + 1;
-            set_buf_match(h, &spans0, text);
+            set_buf_match(h, &spans0, full);
             Ok(Value::Int((bc + 1) as i64))
         }
         None if noerror => Ok(Value::Undef),
