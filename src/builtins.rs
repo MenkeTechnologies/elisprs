@@ -6423,6 +6423,13 @@ fn time_decompose(secs: f64, zone: Option<&Value>, local: bool) -> libc::tm {
         _ => {
             let t = secs.floor() as libc::time_t;
             unsafe { libc::gmtime_r(&t, &mut tm) };
+            // `gmtime_r` names the zone whatever the platform calls it: glibc
+            // says "GMT", the BSD/macOS libc says "UTC". Emacs reaches UTC by
+            // setting `TZ=UTC0`, so `%Z` there is "UTC" on every platform
+            // (measured: `emacs --batch --eval '(format-time-string "%Z" 0 t)'`).
+            // Stamp the name Emacs prints rather than inheriting libc's, which
+            // made `%#Z` render "gmt" on Linux and "utc" on macOS.
+            tm.tm_zone = c"UTC".as_ptr() as *mut libc::c_char;
         }
     }
     tm
