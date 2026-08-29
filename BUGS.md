@@ -5185,3 +5185,91 @@ notification has to happen with the borrow released at each of `set_value`,
 choke points, but `unbind_to` also runs during ERROR UNWINDING, where calling
 elisp that may itself signal is the hazardous part. That is the work, and it is
 still not done.
+
+## Oracle drift — what GNU Emacs 31.1 changed under `split-string` and `end-of-file`
+
+Every expectation in this tree is measured against **GNU Emacs 30.2** (see the
+top of this file), and `scripts/fuzz_parity.sh` refuses any other oracle unless
+`EMACS_VERSION_EXPECT` says otherwise. Run against a **31.1** oracle, a 3 000-form
+corpus reports 5 divergences — and all five are upstream changes between 30 and
+31, not elisprs bugs. They are recorded here so the next run against a 31.x
+oracle costs a lookup instead of a re-triage.
+
+### `split-string` type errors: `stringp` (30) → `sequencep` (31)
+
+Emacs 30's `split-string` (`lisp/subr.el`) goes straight to `string-match`, so a
+non-string STRING is caught by the regexp engine:
+
+```elisp
+(let* ((keep-nulls (not (if separators omit-nulls t)))
+       (rexp (or separators split-string-default-separators))
+       (start 0) …)
+```
+
+Emacs 31 rewrote it and takes the length first, so `length` reports the type
+instead — and TRIM is now built with `concat`, which accepts any sequence:
+
+```elisp
+(let* ((keep-empty (and separators (not omit-empty)))
+       (len (length string))
+       (trim-left-re (and trim (concat "\\`\\(?:" trim "\\)")))
+       …)
+```
+
+Measured, `emacs -Q --batch`:
+
+```text
+form                              30.2 (elisprs)              31.1
+(split-string 5 "_")              (wrong-type-argument        (wrong-type-argument
+                                   stringp 5)                  sequencep 5)
+(split-string 'sym "s" nil)       … stringp sym               … sequencep sym
+(split-string "ab" "b" t 'car)    … stringp car               … sequencep car
+(split-string "ab" "b" t '(1))    … stringp (1)               ("a")   ; concat
+```
+
+A STRING that IS a sequence but not a string still answers `stringp` on both, so
+`(split-string '(1 2) "x")` and `(split-string [97 98] "b")` are unchanged. The
+31 order is length-of-STRING before concat-of-TRIM, so `(split-string 5 "_" nil 'car)`
+names `5` there.
+
+### `end-of-file` data: unconditional load path (30) → per-source (31)
+
+Emacs 30 attaches the file being loaded to EVERY `end-of-file`, whatever the read
+came from (`src/lread.c`):
+
+```c
+static AVOID
+end_of_file_error (void)
+{
+  if (STRINGP (Vload_true_file_name))
+    xsignal1 (Qend_of_file, Vload_true_file_name);
+
+  xsignal0 (Qend_of_file);
+}
+```
+
+Emacs 31 takes the source instead, so only a read **from a file** carries the
+path and only a read **from a buffer** carries the buffer; a string reports bare
+`(end-of-file)`:
+
+```c
+static AVOID
+end_of_file_error (source_t *source)
+{
+  if (from_file_p (source))
+    xsignal1 (Qend_of_file, Vload_true_file_name);
+  else if (from_buffer_p (source))
+    xsignal1 (Qend_of_file, source->object);
+  else
+    xsignal0 (Qend_of_file);
+}
+```
+
+So `(read-from-string "")` inside a loaded file answers `(end-of-file "/path/to/file.el")`
+on 30 — which is what `make_error_object` reproduces — and `(end-of-file)` on 31.
+A bare `--eval` has no `load-true-file-name` and answers `(end-of-file)` on both,
+which is why the divergence only appears through the fuzz driver's loaded file.
+
+Retargeting elisprs to 31.x is a decision about which Emacs it tracks, not a bug
+fix: making either of these match 31 breaks the 30.2 expectations this file and
+the whole corpus are measured against.
