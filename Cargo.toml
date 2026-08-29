@@ -57,7 +57,7 @@ crate-type = ["rlib", "staticlib"]
 # .el file is desugared (src/rust_ffi.rs) to a `(__rust-compile ...)` call that
 # compiles the block to a cached cdylib and registers its exports, which then
 # become callable from elisp by bareword (`(add 21 21)`).
-fusevm = { version = "0.23.0", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
+fusevm = { version = "0.25.0", features = ["jit", "jit-disk-cache", "aot", "ffi"] }
 
 # `elisp --lsp` speaks LSP over stdio (src/lsp.rs); `elisp --dap` speaks the
 # Debug Adapter Protocol over stdio (src/dap.rs). libc gives the DAP server a
