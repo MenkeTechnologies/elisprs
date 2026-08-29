@@ -191,3 +191,64 @@ fn nconc_and_mapcan_are_fnconc() {
     );
     assert_eq!(eval("(mapcan (lambda (x) (list x)) [1 2])"), "(1 2)");
 }
+
+/// `cl-member` with NO keywords is `memql` (`cl-seq.el`), not a lisp walk — and
+/// `memql` is C, so `CHECK_LIST_END` names the WHOLE list. The lisp walk stopped
+/// on the non-nil tail and named that instead, and `cl-set-difference` — which
+/// routes a numeric element's comparison through `cl-member` — inherited it.
+/// The keyword path IS a lisp walk in Emacs too, so it still names the tail; the
+/// two are supposed to disagree.
+///
+/// Measured on GNU Emacs 31.1; `cl-member` is byte-identical on the emacs-30
+/// branch, so these hold for the 30.2 oracle the rest of this file uses.
+#[test]
+fn cl_member_without_keywords_is_memql() {
+    assert_eq!(
+        err("(cl-member 1 '(2 . 3))"),
+        "(wrong-type-argument listp (2 . 3))"
+    );
+    assert_eq!(
+        err("(cl-member 3 '(1 2 . 3))"),
+        "(wrong-type-argument listp (1 2 . 3))"
+    );
+    assert_eq!(
+        err("(cl-member 1 \"abc\")"),
+        "(wrong-type-argument listp \"abc\")"
+    );
+    // The keyword path keeps naming the tail, exactly as Emacs's does.
+    assert_eq!(
+        err("(cl-member 1 '(2 . 3) :test #'eql)"),
+        "(wrong-type-argument listp 3)"
+    );
+    // `cl-set-difference` compares a numeric element with `cl-member`, so the
+    // original fuzz form reported `4194303` where Emacs reports the pair.
+    assert_eq!(
+        err("(cl-set-difference '(3.14 nil) (cons (ftruncate 9.3e+18) (max-char)))"),
+        "(wrong-type-argument listp (9.3e+18 . 4194303))"
+    );
+    assert_eq!(
+        err("(cl-set-difference '(1 2) '(3 . 4))"),
+        "(wrong-type-argument listp (3 . 4))"
+    );
+    // A non-numeric element goes to `memq` instead, which already named the
+    // whole list — this is the control.
+    assert_eq!(
+        err("(cl-adjoin 'a '(b . c))"),
+        "(wrong-type-argument listp (b . c))"
+    );
+    // `cl-intersection`/`cl-union` take `(length LIST2)` for their length swap
+    // before any comparison, so a dotted LIST2 is caught there and still names
+    // the tail. Not a bug: Emacs answers the same.
+    assert_eq!(
+        err("(cl-intersection '(1) '(2 . 3))"),
+        "(wrong-type-argument listp 3)"
+    );
+    // Proper lists are unaffected, under `eql` semantics on both paths.
+    assert_eq!(eval("(cl-member 'b '(a b c))"), "(b c)");
+    assert_eq!(eval("(cl-member 1.5 (list (+ 1.0 0.5)))"), "(1.5)");
+    assert_eq!(
+        eval("(cl-member \"a\" (list (copy-sequence \"a\")))"),
+        "nil"
+    );
+    assert_eq!(eval("(cl-set-difference '(1 2 3) '(2))"), "(1 3)");
+}

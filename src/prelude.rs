@@ -2660,13 +2660,22 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
   (cond ((stringp seq) (apply (function string) lst))
         ((vectorp seq) (vconcat lst))
         (t lst)))
+;; cl-seq.el: with NO keywords at all, `cl-member' IS `memql' — the lisp walk
+;; below only runs for the keyword path. That is not a shortcut, it is the
+;; contract, because `memql' walks the list in C and `CHECK_LIST_END' names the
+;; WHOLE list in its error data: `(cl-member 1 (quote (2 . 3)))' is
+;; `(wrong-type-argument listp (2 . 3))', where the walk stopped on the non-nil
+;; tail and reported `3'. `cl-set-difference' and `cl--adjoin' route a numeric
+;; element's comparison through here, so they reported the tail too.
 (defun cl-member (item lst &rest keys)
-  (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
-        (key (cl--getkey keys :key 'identity)) (r nil))
-    (while (and lst (not r))
-      (if (cl--seq-match test test-not item (funcall key (car lst)))
-          (setq r lst) (setq lst (cdr lst))))
-    r))
+  (if keys
+      (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
+            (key (cl--getkey keys :key 'identity)) (r nil))
+        (while (and lst (not r))
+          (if (cl--seq-match test test-not item (funcall key (car lst)))
+              (setq r lst) (setq lst (cdr lst))))
+        r)
+    (memql item lst)))
 (defun cl-assoc (item alist &rest keys)
   (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
         (key (cl--getkey keys :key 'identity)) (r nil))
