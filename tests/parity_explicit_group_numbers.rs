@@ -137,3 +137,43 @@ fn plain_and_shy_groups_are_unchanged() {
         "(0 1 0 1)"
     );
 }
+
+/// An explicit number only ever RAISES Emacs's group counter. `regex-emacs.c`
+/// keeps `bufp->re_nsub` as the running maximum (`if (regnum > bufp->re_nsub)
+/// bufp->re_nsub = regnum`) and a plain `\(` takes `++bufp->re_nsub`, so a
+/// number BELOW the count reached so far leaves the counter alone. The
+/// translator instead set its counter to `N + 1` unconditionally, which made the
+/// next plain group reuse a number already taken and dropped a register from
+/// `match-data`. Emacs 31.1 for `\(a\)\(b\)\(?1:c\)\(d\)` on "abcd":
+/// `(0 4 2 3 1 2 3 4)` — elisprs answered `(0 4 2 3 3 4)`. (31.1 rather than the
+/// 30.2 this file otherwise names, because 30.2 was not installed; the
+/// `regex-emacs.c` lines are identical on the emacs-30 branch.)
+#[test]
+fn an_explicit_number_below_the_count_does_not_rewind_it() {
+    assert_eq!(
+        eval(r#"(progn (string-match "\\(a\\)\\(b\\)\\(?1:c\\)\\(d\\)" "abcd") (match-data))"#),
+        "(0 4 2 3 1 2 3 4)"
+    );
+}
+
+/// A back reference names an EMACS group number, and fancy-regex numbers its
+/// captures positionally — so `\(?3:a\)\3` has one emitted group, numbered 3
+/// there and 1 here, and passing `\3` through made the crate refuse the pattern
+/// outright. A number explicit numbering skipped over is a register no group
+/// ever writes, and Emacs's `duplicate` on an unset register always fails.
+#[test]
+fn back_references_are_remapped_to_the_emitted_group() {
+    assert_eq!(eval(r#"(string-match "\\(?3:a\\)\\3" "aa")"#), "0");
+    assert_eq!(
+        eval(r#"(progn (string-match "\\(?3:a\\)\\3" "aa") (match-data))"#),
+        "(0 2 nil nil nil nil 0 1)"
+    );
+    assert_eq!(eval(r#"(string-match "\\(?3:a\\)\\3\\3" "aaa")"#), "0");
+    assert_eq!(
+        eval(r#"(progn (string-match "\\(?2:a\\)\\2" "aa") (match-data))"#),
+        "(0 2 nil nil 0 1)"
+    );
+    // Group 1 exists as a number but nothing assigns it, so `\1` never matches.
+    assert_eq!(eval(r#"(string-match "\\(?2:a\\)\\1" "aa")"#), "nil");
+    assert_eq!(eval(r#"(string-match "\\(?2:a\\)\\1" "a")"#), "nil");
+}

@@ -1213,3 +1213,111 @@ fn short_circuiting_cl_searches_tolerate_an_improper_tail() {
     assert_eq!(eval("(cl-position ?b \"abc\")"), "1");
     assert_eq!(eval("(cl-find 3 '(1 2 3 4 3) :from-end t)"), "3");
 }
+
+/// `\N` is validated when the pattern is COMPILED, not left to the engine.
+/// `regex-emacs.c` rejects it two ways: the group has not been opened yet
+/// (`reg > bufp->re_nsub`), and the group is open but its `\)` has not been read
+/// (`group_in_compile_stack`) — both `REG_ESUBREG`, "Invalid back reference".
+/// elisprs passed `\N` straight to fancy-regex, so the first shape surfaced the
+/// crate's own wording (`"Error compiling regex: Invalid back reference to
+/// group 1"`) and the second was not diagnosed at all: `\(\1\)` compiled and
+/// answered nil.
+///
+/// Measured on GNU Emacs 31.1 — 30.2 was not installed when this was written —
+/// and the `regex-emacs.c` lines it reproduces are identical on the emacs-30
+/// branch, so these hold for the 30.2 oracle the rest of this file uses.
+#[test]
+fn backreference_validity_is_a_compile_error() {
+    let err = |re: &str| {
+        eval(&format!(
+            "(condition-case e (string-match {re} \"\") (error e))"
+        ))
+    };
+    let esubreg = r#"(invalid-regexp "Invalid back reference")"#;
+    // No group at all.
+    assert_eq!(err(r#""\\1""#), esubreg);
+    assert_eq!(err(r#""x\\2""#), esubreg);
+    assert_eq!(err(r#""\\9""#), esubreg);
+    // The original fuzz form: `(prin1-to-string (intern "1.2"))` is `\1.2`.
+    assert_eq!(err(r#"(prin1-to-string (intern "1.2"))"#), esubreg);
+    // Fewer groups than the number names.
+    assert_eq!(err(r#""\\(a\\)\\2""#), esubreg);
+    assert_eq!(err(r#""\\(a\\)\\(b\\)\\3""#), esubreg);
+    // A shy group takes no number, so `\1` still has nothing to name.
+    assert_eq!(err(r#""\\(?:a\\)\\1""#), esubreg);
+    // Group open, `\)` not yet read — a self-reference is rejected even though
+    // the number exists.
+    assert_eq!(err(r#""\\(a\\1\\)""#), esubreg);
+    assert_eq!(err(r#""\\(\\1\\)""#), esubreg);
+    assert_eq!(err(r#""\\(?1:\\1\\)""#), esubreg);
+    // What Emacs accepts must still compile and match.
+    assert_eq!(eval(r#"(string-match "\\(a\\)\\1" "aa")"#), "0");
+    assert_eq!(eval(r#"(string-match "\\(a\\)\\|\\1" "a")"#), "0");
+}
+
+/// A character alternative's diagnostics, all from `regex-emacs.c`.
+///
+/// * A range's two characters are fetched as soon as a member is followed by
+///   `-`, so a pattern that ends on that `-` fails inside `PATFETCH` with
+///   `REG_EEND` — but only there: the trailing `-` of `[a-b-` is read as an
+///   ordinary member on its own turn of the loop, and that is `REG_EBRACK`.
+/// * `re_wctype` knows a fixed list of class names and rejects anything else
+///   with `REG_ECTYPE`; it does not fall back to treating them as members.
+/// * `re_wctype_parse` needs a real `:]` terminator within the remaining count,
+///   so `[[:a]b]` is NOT a class — the `[`, `:` and `a` are members and `b]`
+///   follows the alternative.
+///
+/// elisprs reported unmatched-bracket for the first, silently accepted the
+/// second, and scanned to the first `]` for the third, swallowing the rest.
+///
+/// Measured on GNU Emacs 31.1, against `regex-emacs.c` lines that are identical
+/// on the emacs-30 branch.
+#[test]
+fn character_alternative_diagnostics_match_emacs() {
+    let err = |re: &str| {
+        eval(&format!(
+            "(condition-case e (string-match {re} \"x\") (error e))"
+        ))
+    };
+    let eend = r#"(invalid-regexp "Premature end of regular expression")"#;
+    let ebrack = r#"(invalid-regexp "Unmatched [ or [^")"#;
+    let ectype = r#"(invalid-regexp "Invalid character class name")"#;
+
+    assert_eq!(err(r#""[a-""#), eend);
+    assert_eq!(err(r#""[]-""#), eend);
+    assert_eq!(err(r#""[a\\-""#), eend);
+    // The `-` is the member being read, not a range's dash.
+    assert_eq!(err(r#""[-""#), ebrack);
+    assert_eq!(err(r#""[^-""#), ebrack);
+    assert_eq!(err(r#""[a-b-""#), ebrack);
+    // A class `continue`s the member loop, so no range fetch starts.
+    assert_eq!(err(r#""[[:alpha:]-""#), ebrack);
+
+    assert_eq!(err(r#""[[:foo:]]""#), ectype);
+    assert_eq!(err(r#""[x[:foo:]]""#), ectype);
+    // The name check is exact — no case folding, no trimming.
+    assert_eq!(err(r#""[[:Alpha:]]""#), ectype);
+    assert_eq!(err(r#""[[:alpha :]]""#), ectype);
+    assert_eq!(err(r#""[[::]]""#), ectype);
+    // The NAME is rejected before the unterminated alternative is noticed.
+    assert_eq!(err(r#""[[:foo:]""#), ectype);
+
+    // Not a class: no `:]` within the count, so these compile as members.
+    assert_eq!(eval(r#"(string-match "[[:]" "x")"#), "nil");
+    assert_eq!(eval(r#"(string-match "[[:]" ":")"#), "0");
+    assert_eq!(eval(r#"(string-match "[[:a]b]" "[b]")"#), "0");
+    assert_eq!(eval(r#"(string-match "[[:a]b]" "b")"#), "nil");
+
+    // A `]` that is not the terminator is a member, and can open a range.
+    assert_eq!(eval(r#"(string-match "[]-a]" "^")"#), "0");
+    assert_eq!(eval(r#"(string-match "[]-a]" "]")"#), "0");
+    assert_eq!(eval(r#"(string-match "[]-a]" "b")"#), "nil");
+    assert_eq!(eval(r#"(string-match "[]ab]" "]")"#), "0");
+    assert_eq!(eval(r#"(string-match "[^]ab]" "]")"#), "nil");
+    // The shapes that already worked must keep working.
+    assert_eq!(eval(r#"(string-match "[a-]" "-")"#), "0");
+    assert_eq!(eval(r#"(string-match "[0-9-]" "-")"#), "0");
+    assert_eq!(eval(r#"(string-match "[{[]" "[")"#), "0");
+    assert_eq!(eval(r#"(string-match "[[:alpha:]]" "Ü")"#), "0");
+    assert_eq!(eval(r#"(string-match "[z-a]" "b")"#), "nil");
+}

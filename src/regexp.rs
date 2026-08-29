@@ -8,12 +8,19 @@
 //! can be reused wholesale instead of writing a matcher by hand.
 //!
 //! Coverage is the common, portable subset of elisp regexp syntax: grouping
-//! (incl. shy `\(?:`), alternation, bounded repeats, anchors (`\``, `\'`, `\<`,
-//! `\>`, `\_<`, `\_>`), word/symbol/whitespace escapes (`\w \W \b \B \s- \sw`),
-//! and character alternatives `[...]` (passed through, since both dialects share
-//! `[a-z]`, `[^...]`, and POSIX `[:class:\]`). Backreferences in the *pattern*
-//! (`\1`..`\9`) pass through to fancy-regex's backtracking engine, which spells
-//! them the same way.
+//! (incl. shy `\(?:` and explicitly-numbered `\(?N:`), alternation, bounded
+//! repeats, anchors (`\``, `\'`, `\<`, `\>`, `\_<`, `\_>`), word/symbol/whitespace
+//! escapes (`\w \W \b \B \s- \sw`), character alternatives `[...]`, and
+//! backreferences `\1`..`\9`.
+//!
+//! The last two are NOT pass-throughs, though they look like ones. A `\`, a `[`
+//! and a non-terminating `]` are ordinary members in an elisp alternative and
+//! metacharacters to the crate; a `[:NAME:]` class is recognized on Emacs's
+//! terms (`re_wctype_parse`) rather than by scanning to the next `]`; and a
+//! backreference names an EMACS group number, which under explicit numbering is
+//! not the position fancy-regex would give it. Emacs also validates `\N` while
+//! reading the pattern, so an out-of-range or self-referential one has to be
+//! diagnosed here and not left to the engine.
 
 /// Translate an Emacs regexp string into the `regex` crate's syntax.
 ///
@@ -86,10 +93,7 @@ pub fn translate_groups(pat: &str, syn: &dyn SyntaxLookup) -> Result<(String, Ve
     let mut it = pat.chars().peekable();
     // Depth of open `\(` groups, so a stray `\)` is diagnosed like Emacs's.
     let mut depth: i32 = 0;
-    // Emacs group number the next `\(` will take, and the number each emitted
-    // capture group carries, in emission order.
-    let mut next_group: u32 = 1;
-    let mut groups: Vec<u32> = Vec::new();
+    let mut groups = Groups::default();
     // Whether a repetition operator here has something to repeat. False at the
     // start of the pattern and just after `\(` or `\|`, where Emacs reads
     // `*`/`+`/`?` as ordinary characters.
@@ -102,7 +106,6 @@ pub fn translate_groups(pat: &str, syn: &dyn SyntaxLookup) -> Result<(String, Ve
                 &mut depth,
                 &mut can_repeat,
                 syn,
-                &mut next_group,
                 &mut groups,
             )?,
             // Literal in elisp, special in the crate → escape.
@@ -139,7 +142,26 @@ pub fn translate_groups(pat: &str, syn: &dyn SyntaxLookup) -> Result<(String, Ve
     if depth > 0 {
         return Err(UNMATCHED_OPEN.into());
     }
-    Ok((out, groups))
+    Ok((out, groups.emitted))
+}
+
+/// The capture-group state `regex-emacs.c` keeps while reading a pattern.
+#[derive(Default)]
+struct Groups {
+    /// Emacs's `bufp->re_nsub`: how many groups the reader has opened so far,
+    /// which is also the number the next plain `\(` takes. An explicit `\(?N:`
+    /// only ever RAISES it (`if (regnum > bufp->re_nsub) bufp->re_nsub =
+    /// regnum`), so a later plain `\(` continues from the maximum and not from
+    /// N + 1 — `\(a\)\(b\)\(?1:c\)\(d\)` numbers `d` 3, not 2.
+    nsub: u32,
+    /// The Emacs number each EMITTED capture group carries, in emission order.
+    /// This is what [`translate_groups`] returns, and what maps a `\N` onto the
+    /// position fancy-regex gave the group.
+    emitted: Vec<u32>,
+    /// Emacs's compile stack: the groups whose `\)` has not been read yet. A
+    /// back reference to one of them is an error even though the number exists,
+    /// and a shy group is entered as 0 because no `\N` can ever name it.
+    open: Vec<u32>,
 }
 
 /// The largest scalar value a Rust `char` can hold. Emacs's character space runs
@@ -197,6 +219,43 @@ const TRAILING_BACKSLASH: &str = "Trailing backslash";
 /// Emacs's catch-all for a malformed construct it has no specific message for —
 /// what `\(?0:…\)` and `\(?a:…\)` report.
 const INVALID_REGEXP: &str = "Invalid regular expression";
+/// `REG_ESUBREG` — `\N` naming a group that has not been opened, or one whose
+/// `\)` has not been reached yet.
+const INVALID_BACKREF: &str = "Invalid back reference";
+/// `REG_EEND` — what `PATFETCH` reports when the pattern runs out mid-construct.
+/// Reachable only from a character alternative's range: `[a-` ends inside the
+/// two-character fetch `regex-emacs.c` starts as soon as it sees the `-`.
+const PREMATURE_END: &str = "Premature end of regular expression";
+/// `REG_ECTYPE` — `[[:NAME:]]` for a NAME `re_wctype` does not know.
+const INVALID_CLASS_NAME: &str = "Invalid character class name";
+/// A `fancy_regex` construct that matches nothing, for the elisp constructs
+/// Emacs compiles but that can never succeed: a reversed range, and a back
+/// reference to a register no group ever writes.
+const NEVER_MATCHES: &str = "[^\\s\\S]";
+
+/// The character-class names `re_wctype` (`regex-emacs.c`) accepts. Anything
+/// else between `[:` and `:]` is `Invalid character class name` — Emacs does not
+/// fall back to treating it as ordinary members, and the comparison is exact, so
+/// `[[:Alpha:]]` and `[[:alpha :]]` are both rejected.
+const CLASS_NAMES: [&str; 17] = [
+    "alnum",
+    "alpha",
+    "ascii",
+    "blank",
+    "cntrl",
+    "digit",
+    "graph",
+    "lower",
+    "multibyte",
+    "nonascii",
+    "print",
+    "punct",
+    "space",
+    "unibyte",
+    "upper",
+    "word",
+    "xdigit",
+];
 
 fn translate_escape(
     it: &mut std::iter::Peekable<std::str::Chars>,
@@ -204,8 +263,7 @@ fn translate_escape(
     depth: &mut i32,
     can_repeat: &mut bool,
     syn: &dyn SyntaxLookup,
-    next_group: &mut u32,
-    groups: &mut Vec<u32>,
+    groups: &mut Groups,
 ) -> Result<(), String> {
     let Some(e) = it.next() else {
         return Err(TRAILING_BACKSLASH.into());
@@ -246,8 +304,11 @@ fn translate_escape(
                         return Err(INVALID_REGEXP.into());
                     }
                     it.next(); // consume ':'
-                    *next_group = n + 1;
-                    groups.push(n);
+                    if n > groups.nsub {
+                        groups.nsub = n;
+                    }
+                    groups.emitted.push(n);
+                    groups.open.push(n);
                     out.push('(');
                 } else {
                     // Shy group `\(?:`. Emacs's reader accepts exactly two things
@@ -260,11 +321,13 @@ fn translate_escape(
                     }
                     it.next();
                     out.push_str("(?:");
+                    groups.open.push(0);
                 }
             } else {
                 out.push('(');
-                groups.push(*next_group);
-                *next_group += 1;
+                groups.nsub += 1;
+                groups.emitted.push(groups.nsub);
+                groups.open.push(groups.nsub);
             }
             *depth += 1;
         }
@@ -273,6 +336,7 @@ fn translate_escape(
                 return Err(UNMATCHED_CLOSE.into());
             }
             *depth -= 1;
+            groups.open.pop();
             out.push(')');
         }
         '|' => out.push('|'),
@@ -387,11 +451,33 @@ fn translate_escape(
                 Some(_) | None => out.push_str(if neg { WS_SYNTAX_NEG } else { WS_SYNTAX }),
             }
         }
-        // Backreferences `\1`..`\9` — fancy-regex's backtracking engine handles
-        // these; both dialects spell them the same way.
+        // Backreferences `\1`..`\9`. Emacs validates them at COMPILE time
+        // (`regex-emacs.c`): `\N` is `Invalid back reference` when N names a
+        // group the reader has not opened yet (`reg > bufp->re_nsub`) and also
+        // when that group is still open (`group_in_compile_stack`), so
+        // `\(a\1\)` is rejected while `\(a\)\1` is not. Without this the crate
+        // decided instead, and its own wording leaked into the elisp error data.
         '1'..='9' => {
-            out.push('\\');
-            out.push(e);
+            let reg = e as u32 - '0' as u32;
+            if reg > groups.nsub || groups.open.contains(&reg) {
+                return Err(INVALID_BACKREF.into());
+            }
+            // fancy-regex numbers captures positionally, so an Emacs group
+            // number has to be mapped to the emitted group's position — under
+            // explicit numbering the two differ (`\(?3:a\)\3` has one emitted
+            // group, numbered 1 there and 3 here). Where a number was reused,
+            // the last group to carry it is the one Emacs's register holds.
+            match groups.emitted.iter().rposition(|&g| g == reg) {
+                Some(i) => {
+                    out.push('\\');
+                    out.push_str(&(i + 1).to_string());
+                }
+                // A register explicit numbering skipped over — `\(?2:a\)\1` —
+                // is never assigned, and Emacs's `duplicate` on an unset
+                // register always fails. There is no such group to reference
+                // here, so emit something that cannot match instead.
+                None => out.push_str(NEVER_MATCHES),
+            }
         }
         // Anything else: keep the escape (covers `\.`, `\*`, `\\`, `\+`, …).
         other => {
@@ -497,52 +583,56 @@ fn copy_class(
         out.push('^');
         it.next();
     }
-    // A `]` in the first position is a literal member, not the terminator.
+    // A `]` in the first position is a literal member, not the terminator —
+    // and, being a member, it can open a range: `[]-a]` is `]` through `a`.
     if it.peek() == Some(&']') {
-        out.push(']');
+        push_member(']', out, &mut buf);
         it.next();
+        copy_range(it, out, &mut buf)?;
     }
     while let Some(c) = it.next() {
         match c {
             // In an elisp char class a backslash is an ordinary character (no
             // escapes), so escape it for the `regex` crate: `[\"]` matches `\`/`"`.
             '\\' => {
-                out.push_str("\\\\");
-                buf.push('\\');
+                push_member('\\', out, &mut buf);
+                copy_range(it, out, &mut buf)?;
             }
-            // POSIX class `[:alpha:]`.
-            '[' if it.peek() == Some(&':') => {
-                let mut name = String::new();
-                let mut raw = String::from("[");
-                for n in it.by_ref() {
-                    raw.push(n);
-                    if n == ']' {
-                        break;
+            // Either a POSIX class `[:alpha:]` or an ordinary `[` member — the
+            // same question Emacs asks with `re_wctype_parse`, and it has to be
+            // asked its way: `[[:a]b]` is NOT a class (there is no `:]`), so the
+            // `[`, `:` and `a` are members and `b]` follows the alternative.
+            // Scanning to the first `]` instead made it a class and swallowed
+            // the rest.
+            '[' => match wctype_at(it) {
+                Some(name) => {
+                    if !CLASS_NAMES.contains(&name.as_str()) {
+                        return Err(INVALID_CLASS_NAME.into());
                     }
-                    if n != ':' {
-                        name.push(n);
+                    match posix_class(&name) {
+                        Some(repl) => out.push_str(repl),
+                        // The crate's own definition already agrees with Emacs.
+                        None => out.push_str(&format!("[:{name}:]")),
                     }
+                    // No range check: Emacs `continue`s the member loop here,
+                    // so `[[:alpha:]-` is unmatched-bracket, not premature-end.
                 }
-                match posix_class(&name) {
-                    Some(repl) => out.push_str(repl),
-                    None => out.push_str(&raw),
+                // A bare `[` is an ordinary member in elisp/POSIX bracket
+                // expressions (e.g. `[{[]` matches `{` or `[`), but the `regex`
+                // crate rejects an unescaped `[` inside a class — escape it.
+                None => {
+                    push_member('[', out, &mut buf);
+                    copy_range(it, out, &mut buf)?;
                 }
-            }
-            // A bare `[` is an ordinary member in elisp/POSIX bracket expressions
-            // (e.g. `[{[]` matches `{` or `[`), but the `regex` crate rejects an
-            // unescaped `[` inside a class — escape it.
-            '[' => {
-                out.push_str("\\[");
-                buf.push('[');
-            }
+            },
             ']' => {
                 out.push(']');
                 closed = true;
                 break;
             }
             _ => {
-                out.push(c);
-                buf.push(c);
+                push_member(c, out, &mut buf);
+                copy_range(it, out, &mut buf)?;
             }
         }
     }
@@ -553,9 +643,92 @@ fn copy_class(
     // match rather than letting the engine reject the pattern.
     if has_reversed_range(&buf) {
         out.truncate(out_start);
-        out.push_str("[^\\s\\S]");
+        out.push_str(NEVER_MATCHES);
     }
     Ok(())
+}
+
+/// Emit one member character of a character alternative. Elisp gives `\`, `[`
+/// and a `]` that is not the terminator no special meaning inside `[...]` —
+/// `[{[]` matches `{` or `[`, and `[]-a]` is the range `]` through `a` — but
+/// the `regex` crate reads all three, so they are escaped on the way out and
+/// recorded unescaped in `buf`, which [`has_reversed_range`] reads.
+fn push_member(c: char, out: &mut String, buf: &mut String) {
+    match c {
+        '\\' => out.push_str("\\\\"),
+        '[' => out.push_str("\\["),
+        ']' => out.push_str("\\]"),
+        _ => out.push(c),
+    }
+    buf.push(c);
+}
+
+/// Consume the `-END` of a range, `it` sitting just past the member that opens
+/// it. Emacs reads BOTH characters as soon as it sees the `-` (`regex-emacs.c`:
+/// `if (p < pend && p[0] == '-' && p[1] != ']')`, then two `PATFETCH`es), which
+/// decides two things this has to reproduce:
+///
+/// * a pattern that ends on the `-` fails inside the fetch, so `[a-` and `[]-`
+///   report `PATFETCH`'s `Premature end of regular expression` rather than the
+///   unmatched-bracket message the member loop would give one turn later;
+/// * the range is consumed whole, so the trailing `-` of `[a-b-` is read as an
+///   ordinary member — its own turn of the loop, with no range check — and that
+///   pattern IS unmatched-bracket.
+///
+/// `-]` is not a range at all: the `-` stays an ordinary member.
+fn copy_range(
+    it: &mut std::iter::Peekable<std::str::Chars>,
+    out: &mut String,
+    buf: &mut String,
+) -> Result<(), String> {
+    let mut la = it.clone();
+    if la.next() != Some('-') {
+        return Ok(());
+    }
+    match la.next() {
+        Some(']') => Ok(()),
+        None => Err(PREMATURE_END.into()),
+        Some(end) => {
+            it.next();
+            it.next();
+            out.push('-');
+            buf.push('-');
+            push_member(end, out, buf);
+            Ok(())
+        }
+    }
+}
+
+/// Emacs's `re_wctype_parse` (`regex-emacs.c`), with the opening `[` already
+/// taken from `it`. `Some(name)` consumes the whole `[:NAME:]` and reports the
+/// text between the delimiters — validity of the NAME is the caller's business,
+/// because an unknown one is an error rather than a fallback. `None` is the C's
+/// -1: this is not a class construct at all and the `[` is an ordinary member.
+/// `it` is left untouched in that case.
+///
+/// The bounds are the C's: fewer than four characters from the `[`, or no `:]`
+/// within the remaining count, and it is not a class — which is why `[[:]` and
+/// `[[:a]b]` compile as ordinary members.
+fn wctype_at(it: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
+    let rest: Vec<char> = std::iter::once('[').chain(it.clone()).collect();
+    if rest.len() < 4 || rest[1] != ':' {
+        return None;
+    }
+    let mut limit = rest.len() - 3;
+    let mut i = 2;
+    while !(rest.get(i) == Some(&':') && rest.get(i + 1) == Some(&']')) {
+        limit -= 1;
+        if limit == 0 {
+            return None;
+        }
+        i += 1;
+    }
+    // `i + 2` characters of `rest` are consumed; one of them is the `[` the
+    // caller already took.
+    for _ in 0..i + 1 {
+        it.next();
+    }
+    Some(rest[2..i].iter().collect())
 }
 
 /// Whether a class body contains a range whose end sorts before its start.
@@ -601,7 +774,11 @@ mod tests {
     #[test]
     fn classes_pass_through() {
         assert_eq!(t(r"[a-z]+"), "[a-z]+");
-        assert_eq!(t(r"[]ab]"), "[]ab]");
+        // A `]` that is not the terminator is escaped, not passed through: the
+        // crate reads a bare one as the terminator, so the range in `[]-a]`
+        // came out as the two members `-` and `a` and stopped matching `^`.
+        assert_eq!(t(r"[]ab]"), r"[\]ab]");
+        assert_eq!(t(r"[]-a]"), r"[\]-a]");
         // A POSIX class does NOT pass through: the regex crate's own
         // `[:alpha:]` is ASCII-only, so `posix_class` rewrites it to the
         // Unicode properties. Without that rewrite
@@ -645,8 +822,54 @@ mod tests {
         }
     }
 
+    /// A backreference names an EMACS group number. It only coincides with the
+    /// emitted group's position while the pattern uses plain `\(`; under
+    /// explicit numbering the translator has to remap it, and a number no group
+    /// ever writes has to become something that cannot match.
     #[test]
-    fn backreference_passes_through() {
+    fn backreference_maps_to_the_emitted_group() {
         assert_eq!(t(r"\(a\)\1"), r"(a)\1");
+        assert_eq!(t(r"\(?3:a\)\3"), r"(a)\1");
+        assert_eq!(t(r"\(?2:a\)\1"), r"(a)[^\s\S]");
+    }
+
+    /// `regex-emacs.c` rejects `\N` at compile time when the group has not been
+    /// opened, and when it is open but its `\)` has not been read.
+    #[test]
+    fn out_of_range_and_self_referential_backreferences_are_rejected() {
+        for pat in [
+            r"\1",
+            r"x\2",
+            r"\(a\)\2",
+            r"\(?:a\)\1",
+            r"\(a\1\)",
+            r"\(\1\)",
+        ] {
+            assert_eq!(
+                translate(pat).unwrap_err(),
+                "Invalid back reference",
+                "{pat} must not compile"
+            );
+        }
+    }
+
+    /// The character alternative's three other `regex-emacs.c` diagnostics.
+    #[test]
+    fn character_alternative_diagnostics() {
+        assert_eq!(
+            translate(r"[a-").unwrap_err(),
+            "Premature end of regular expression"
+        );
+        // The trailing `-` is a member on its own turn of the loop, not a
+        // range's dash, so this one runs out of ALTERNATIVE rather than pattern.
+        assert_eq!(translate(r"[a-b-").unwrap_err(), "Unmatched [ or [^");
+        assert_eq!(
+            translate(r"[[:foo:]]").unwrap_err(),
+            "Invalid character class name"
+        );
+        // Not a class at all — no `:]` within the count — so these compile, and
+        // `b]` in the second is outside the alternative.
+        assert_eq!(t(r"[[:]"), r"[\[:]");
+        assert_eq!(t(r"[[:a]b]"), r"[\[:a]b]");
     }
 }
