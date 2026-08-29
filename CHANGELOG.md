@@ -97,6 +97,36 @@ All notable changes to elisprs are documented here. The format follows
   value of the wrong type fails the clause instead of signalling out of it.
 
 ### Fixed
+- **`cl-member` with no keywords is `memql`, not a lisp walk.** `cl-seq.el`
+  delegates the no-keyword case straight to `memql`, which walks the list in C,
+  so `CHECK_LIST_END` names the WHOLE list: `(cl-member 1 '(2 . 3))` is
+  `(wrong-type-argument listp (2 . 3))` and not `… listp 3`. `cl-set-difference`,
+  `cl-intersection` and `cl--adjoin` route their no-keyword comparisons through
+  it and inherited the wrong error data. The keyword path is still a lisp walk
+  and still names the tail, exactly as Emacs's does.
+- **A pattern backreference `\N` was never validated**, so an out-of-range one
+  surfaced the regex crate's own wording inside the `invalid-regexp` error data
+  (`"Error compiling regex: Invalid back reference to group 1"`) and a
+  self-referential one was not diagnosed at all — `\(\1\)` compiled and
+  matched. `regex-emacs.c` rejects both while reading the pattern, as
+  `(invalid-regexp "Invalid back reference")`. Tracking Emacs's `re_nsub` and
+  its compile stack to do that also fixed two group-numbering bugs: an explicit
+  `\(?N:` only ever RAISES the counter, so `\(a\)\(b\)\(?1:c\)\(d\)`
+  numbers `d` 3 rather than reusing 2 and dropping a register from `match-data`;
+  and `\N` names an EMACS group number, which under explicit numbering is not
+  the position fancy-regex gave the group, so `\(?3:a\)\3` is now compiled
+  instead of refused.
+- **Three character-alternative diagnostics.** A range's two characters are
+  fetched as soon as a member is followed by `-`, so `[a-` and `[]-` are
+  `(invalid-regexp "Premature end of regular expression")` — while the trailing
+  `-` of `[a-b-` is an ordinary member and that stays unmatched-bracket. An
+  unknown class name is `(invalid-regexp "Invalid character class name")`
+  rather than literal class-body text, so `[[:foo:]]`, `[[:Alpha:]]` and
+  `[[::]]` no longer compile. And `[:NAME:]` is recognized on Emacs's terms
+  (`re_wctype_parse` needs a real `:]` within the count) instead of by scanning
+  to the next `]`, so `[[:a]b]` is the members `[`, `:`, `a` followed by the
+  literals `b]`. A `]` that is not the terminator is also escaped on the way to
+  the engine now, which makes the range in `[]-a]` a range again.
 - **`regexp-opt` built the right language in the wrong shape.** It joined the
   strings with `\|`; Emacs factors common prefixes and suffixes and folds
   one-character alternatives into a character set, so

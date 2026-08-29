@@ -5186,6 +5186,186 @@ choke points, but `unbind_to` also runs during ERROR UNWINDING, where calling
 elisp that may itself signal is the hazardous part. That is the work, and it is
 still not done.
 
+## Round 27 — `cl-member` is `memql`, and the regexp reader's own diagnostics
+
+**Oracle for this round: GNU Emacs 31.1.** The pinned oracle is 30.2 (top of
+this file) and `scripts/fuzz_parity.sh` still refuses anything else without
+`EMACS_VERSION_EXPECT`; 30.2 was not installed on the machine this round ran on,
+so every measurement below was taken against 31.1 with that override. That is
+only sound where the two agree, so each finding names the upstream source it was
+checked against on the **emacs-30** branch as well — `regex-emacs.c` and
+`cl-seq.el`'s `cl-member` are byte-identical on those lines across 30 and 31, so
+the expectations hold for the pinned oracle. Nothing here was retargeted to 31.
+
+Two fuzz runs: 3 000 forms at seed 20260829 and 8 000 forms at seed 777, depth 4.
+Almost every divergence either run reports is the documented `split-string` /
+`end-of-file` drift below, which is why they were run against 31.1 in the first
+place. What was left came down to two mechanisms, and closing them took the
+counts to the drift floor:
+
+| run | before | after | what remains |
+|---|---|---|---|
+| `-n 3000 -s 20260829` | 10 | 9 | 9 `split-string` drift |
+| `-n 8000 -s 777 -d 4` | 20 | 18 | 17 `split-string` drift, 1 `end-of-file` drift |
+
+### R27-A. ✅ FIXED — `cl-member` with no keywords is `memql`, not a lisp walk
+
+`cl-seq.el` (identical on emacs-30 and emacs-31):
+
+```elisp
+(defun cl-member (cl-item cl-list &rest cl-keys)
+  (if cl-keys
+      (cl--parsing-keywords (:test :test-not :key :if :if-not) ()
+	(while (and cl-list (not (cl--check-test cl-item (car cl-list))))
+	  (setq cl-list (cdr cl-list)))
+	cl-list)
+    (memql cl-item cl-list)))
+```
+
+The no-keyword path is not a shortcut, it is the contract: `memql` walks the
+list in C, and `CHECK_LIST_END` names the WHOLE list in the `wrong-type-argument`
+data. elisprs ran the lisp walk in both cases, so it stopped on the dotted tail
+and named that instead — and `cl-set-difference`, `cl-intersection`, `cl-union`
+and `cl--adjoin` route a numeric element's comparison through `cl-member`, so
+they can inherit it. `cl-set-difference` is where both fuzz runs found it;
+`cl-intersection` and `cl-union` take `(length LIST2)` first, so their dotted
+list is caught before `cl-member` is reached and they were already right.
+
+| form | Emacs | elisprs before |
+|---|---|---|
+| `(cl-member 1 '(2 . 3))` | `(wrong-type-argument listp (2 . 3))` | `… listp 3` |
+| `(cl-member 3 '(1 2 . 3))` | `… listp (1 2 . 3)` | `… listp 3` |
+| `(cl-set-difference '(1 2) '(3 . 4))` | `… listp (3 . 4)` | `… listp 4` |
+| `(cl-set-difference '(3.14 nil) (cons (ftruncate 9.3e+18) (max-char)))` | `… listp (9.3e+18 . 4194303))` | `… listp 4194303` |
+
+The keyword path still names the tail, on both engines — the two are *supposed*
+to disagree, which is why `(cl-member 1 '(2 . 3) :test #'eql)` is unchanged. So
+are `cl-intersection` and `cl-union`, which walk their own list in lisp before
+they reach `cl-member`. Regression test: `tests/parity_list_walks.rs`,
+`cl_member_without_keywords_is_memql`.
+
+### R27-B. ✅ FIXED — `\N` was never validated, so the crate's wording leaked
+
+`regex-emacs.c` rejects a back reference at COMPILE time, two ways:
+
+```c
+	    regnum_t reg = c - '0';
+
+	    if (reg > bufp->re_nsub || reg < 1
+		/* Can't back reference to a subexp before its end.  */
+		|| group_in_compile_stack (compile_stack, reg))
+	      FREE_STACK_RETURN (REG_ESUBREG);
+```
+
+`REG_ESUBREG` is `"Invalid back reference"`. elisprs passed `\1`..`\9` straight
+through to fancy-regex, so the first shape surfaced the *crate's* text inside the
+elisp error data and the second was not diagnosed at all:
+
+| form | Emacs 31.1 | elisprs before |
+|---|---|---|
+| `(string-match "\\1" "")` | `(invalid-regexp "Invalid back reference")` | `(invalid-regexp "Error compiling regex: Invalid back reference to group 1")` |
+| `(string-match "\\9" "")` | same | `… "Parsing error at position 6: Invalid back reference"` |
+| `(string-match "\\(?:a\\)\\1" "a")` | same | `… "Error compiling regex: …"` |
+| `(string-match "\\(a\\1\\)" "aa")` | same | `nil` — compiled, `1` read as a literal |
+| `(string-match "\\(\\1\\)" "")` | same | `nil` |
+
+The translator now tracks Emacs's `bufp->re_nsub` and its compile stack. Two
+things fell out of doing that faithfully:
+
+* **An explicit number only ever RAISES the counter.** `re_nsub` is a running
+  maximum and a plain `\(` takes `++re_nsub`, so a number BELOW the count
+  reached so far leaves it alone. The translator set its counter to `N + 1`
+  unconditionally, so a later plain group reused a number already taken and
+  `match-data` lost a register: `\(a\)\(b\)\(?1:c\)\(d\)` on `"abcd"` is
+  `(0 4 2 3 1 2 3 4)` in Emacs and was `(0 4 2 3 3 4)` here.
+* **A back reference names an Emacs group number**, and fancy-regex numbers its
+  captures positionally, so `\N` has to be remapped to the emitted group's
+  position — `\(?3:a\)\3` has one emitted group, numbered 3 there and 1 here,
+  and passing `\3` through made the crate refuse the pattern outright. A number
+  explicit numbering skipped over (`\(?2:a\)\1`) is a register no group ever
+  writes, and Emacs's `duplicate` on an unset register always fails, so it
+  compiles to something that cannot match.
+
+Regression tests: `tests/parity_fuzz_findings.rs`,
+`backreference_validity_is_a_compile_error`; and
+`tests/parity_explicit_group_numbers.rs`,
+`an_explicit_number_below_the_count_does_not_rewind_it` /
+`back_references_are_remapped_to_the_emitted_group`.
+
+### R27-C. ✅ FIXED — a character alternative's three other diagnostics
+
+Found by probing around R27-B rather than by the fuzzer, and in the same reader.
+
+**`Premature end of regular expression`.** Emacs reads a range's two characters
+as soon as a member is followed by `-`:
+
+```c
+		if (p < pend && p[0] == '-' && p[1] != ']')
+		  {
+		    /* Discard the '-'. */
+		    PATFETCH (c1);
+		    /* Fetch the character which ends the range. */
+		    PATFETCH (c1);
+		  }
+```
+
+`PATFETCH` on an exhausted pattern is `REG_EEND`, so `[a-` and `[]-` report that
+— not the unmatched-bracket message the member loop would give one turn later.
+But only there: the range is consumed *whole*, so the trailing `-` of `[a-b-` is
+read as an ordinary member on its own turn and that pattern IS `REG_EBRACK`, and
+a class `continue`s the loop before the range check so `[[:alpha:]-` is
+`REG_EBRACK` too. elisprs answered `Unmatched [ or [^` for all four — right for
+the last two by accident, since it had no range fetch to run out of.
+
+**`Invalid character class name`.** `re_wctype` knows exactly 17 names and
+returns `RECC_ERROR` for anything else, which is `REG_ECTYPE`; it does not fall
+back to treating the text as ordinary members. elisprs kept the unknown name as
+literal class-body text, so `[[:foo:]]`, `[[:Alpha:]]`, `[[:alpha :]]` and
+`[[::]]` all compiled and matched something. The name check is exact — no case
+folding, no trimming — and it runs before the unterminated-alternative check, so
+`[[:foo:]` is `REG_ECTYPE` and not `REG_EBRACK`.
+
+**`[:NAME:]` needs a real terminator.** `re_wctype_parse` returns -1 — the `[` is
+an ordinary member — when fewer than four characters remain or there is no `:]`
+within the count it is allowed to scan. elisprs scanned to the first `]` instead,
+which turned `[[:a]b]` into a class and swallowed the rest of the pattern:
+`(string-match "[[:a]b]" "b")` answered 0 where Emacs answers nil, because in
+Emacs the alternative is `{[, :, a}` followed by the literals `b]`.
+
+One more fell out of the same rewrite: a `]` that is not the terminator is a
+member and can open a range, so `[]-a]` is `]` through `a`. It was emitted
+unescaped, which the crate reads as the terminator, so the range became two
+separate members and stopped matching `^`. Members now go through one
+`push_member`, which escapes `\`, `[` and `]` alike. Regression test:
+`tests/parity_fuzz_findings.rs`, `character_alternative_diagnostics_match_emacs`.
+
+### Residue this round did NOT close
+
+- **`cl-member`'s `:if` / `:if-not` keywords.** `cl--parsing-keywords` lists them
+  on both emacs-30 and emacs-31 even though the docstring does not, and
+  `cl--check-test-nokey` consults `cl-if` when `cl-test` is nil:
+  `(cl-member 1 '(1 2) :if #'cl-evenp)` is `(2)` in Emacs and `(1 2)` here.
+  elisprs's `cl--seq-match` has no `if`/`if-not` clause and is called from
+  thirteen sites, so closing this is a change to the whole keyword-parsing
+  helper, not to `cl-member`.
+- **`cl-nunion`, `cl-nintersection`, `cl-nset-difference`, `cl-nsubst` are
+  void.** In Emacs each is a two-line delegation to its non-destructive
+  counterpart (`cl-seq.el`), and elisprs already has all four counterparts plus
+  the sibling `cl-nset-exclusive-or` / `cl-nsubstitute`. Measured, not fixed.
+- **Ninety-eight other names present in Emacs and void here**, from a sweep of
+  every `cl-*` / `seq-*` / `string-*` / `hash-table-*` / `obarray-*` function
+  interned after `(require 'cl-lib)`: the 21 remaining `c[ad]{3,4}r` accessors,
+  `cl-mapc` / `cl-mapl` / `cl-mapcon`, `cl-copy-seq`, `cl-svref`,
+  `cl-tree-equal`, `cl-get`, `cl-gentemp`, `cl-random` and its state functions,
+  `seq-copy`, `seq-random-elt`, `hash-table-contains-p`, `obarray-clear` /
+  `obarray-remove` / `obarray-size`, and the `cl-generic` / `cl-print` /
+  `cl-struct` machinery. The list is reproducible: intern the names under Emacs,
+  then `(fboundp …)` each under `elisp`.
+- **A backreference to a group Emacs's register shares between two
+  explicitly-numbered groups** picks the last emitted one here. Emacs has a
+  single register per number and elisprs has two distinct fancy-regex groups, so
+  no positional mapping can be right for both branches.
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string` and `end-of-file`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the
@@ -5231,6 +5411,17 @@ A STRING that IS a sequence but not a string still answers `stringp` on both, so
 `(split-string '(1 2) "x")` and `(split-string [97 98] "b")` are unchanged. The
 31 order is length-of-STRING before concat-of-TRIM, so `(split-string 5 "_" nil 'car)`
 names `5` there.
+
+The reordering is observable beyond the predicate NAME, because building TRIM
+now happens before the first `string-match`. An invalid SEPARATORS regexp used
+to be diagnosed first and is now reached only if TRIM is acceptable:
+
+```text
+form                                    30.2 (elisprs)            31.1
+(split-string "1e+19" "a\{" t 'car)     (invalid-regexp           (wrong-type-argument
+                                         "Unmatched \{")           sequencep car)
+(split-string 'sym [1 2])               … stringp [1 2]           … sequencep sym
+```
 
 ### `end-of-file` data: unconditional load path (30) → per-source (31)
 
