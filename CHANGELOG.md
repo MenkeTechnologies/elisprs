@@ -5,6 +5,100 @@ All notable changes to elisprs are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A cache hit dropped every prelude-installed cell on a builtin symbol.** The
+  heap image starts at `builtin_count` — a builtin object is rebuilt by
+  `builtins::install` on every run, and an `Obj::Subr` has a function pointer
+  that `SerObj` cannot represent at all — but the prelude *writes* to symbols
+  below that line. `save-current-buffer`, `save-excursion`, `save-restriction`
+  and `interactive` are installed as special forms and then given a macro
+  function cell by the prelude, and the image carried none of it:
+
+  ```text
+  $ elisp probe.el      # cold: (macrop 'save-current-buffer) => t
+  $ elisp probe.el      # warm: (macrop 'save-current-buffer) => nil
+  ```
+
+  The disagreement was not cosmetic: the macro that lowers those forms was gone
+  on a warm run, so anything compiled *after* the hit — `eval` of a read form, a
+  macro expanding into `with-current-buffer` — failed outright with "special form
+  `save-current-buffer` not yet lowered". The image now carries the builtin
+  prefix's value/function cells alongside it (`cache::SHARD_FORMAT_VERSION`
+  11 -> 12), and a 3,625-symbol cold-vs-warm audit of `fboundp`/`macrop`/
+  `boundp`/`symbol-plist` now differs in zero places.
+- **A symbol the running program interned leaked into the next run of the same
+  script.** The image re-claims the global obarray name of every symbol it
+  carries, and it carried the ones the *run* created — so one invocation's data
+  reached an invocation that had never seen it:
+
+  ```text
+  FUZZ_CORPUS=interns-x.el elisp drive.el   # writes the cache
+  FUZZ_CORPUS=asks-only.el elisp drive.el   # warm: =x
+  FUZZ_CORPUS=asks-only.el elisp drive.el   # cold: =nil   (and Emacs: nil)
+  ```
+
+  The host now records which symbols were interned while READING or COMPILING a
+  file — its literals, whose handles the cached chunks reference — and only
+  those claim their name back on import.
+- **`seq-elt` reported the wrong object for a dotted list.** seq.el defines it as
+  `(cl-defgeneric seq-elt (sequence n) (elt sequence n))` and Emacs ships
+  seq.elc, so the body that runs is byte-compiled — and the byte compiler emits
+  the `Belt` opcode rather than a call to `Felt`. On a cons with an index in
+  `[0, SMALL_LIST_LEN_MAX]` `Belt` walks the cdrs inline and reports the TAIL it
+  choked on, where `Felt` -> `Fnthcdr` reports the original list
+  (bytecode.c:1578-1599 vs fns.c:1755-1866). `(seq-elt (cons "" 'sym) 2)` is
+  `(wrong-type-argument listp sym)`, not `(wrong-type-argument listp ("" . sym))`.
+- **The arity error named the callee where Emacs names the arity template.** A
+  wrong-arity call to a function Emacs implements in *byte-compiled Lisp* never
+  reaches `funcall_lambda`'s signal: its integral arglist goes to
+  `exec_byte_code`, which reports `(MANDATORY . NONREST)` instead
+  (bytecode.c:519-529). elisprs implements 48 of those in Rust, so
+  `(split-string)` answered `(wrong-number-of-arguments split-string 0)` where
+  Emacs answers `(wrong-number-of-arguments (1 . 4) 0)`. NONREST counts the
+  formals before `&rest`, which is why `error` is `(1 . many)` by `func-arity`
+  and `(1 . 1)` here.
+- **The re-entrant intrinsics raised a message string instead of an error
+  object.** `funcall`, `apply`, `mapcar`, `mapc`, `sort`, `maphash`, `mapatoms`,
+  `eval`, `macroexpand`, `macroexpand-1`, `macroexpand-all` and `load` are
+  dispatched by name above the `Resolved::Subr` arity gate, so each raises its
+  own — and the string the reader turned back into data collapsed the designator
+  to a bare symbol and, for half of them, carried no argument count at all.
+  `(funcall #'mapcar)` now reports `(wrong-number-of-arguments #<subr mapcar> 0)`
+  and `(funcall #'macroexpand-1)` reports `(wrong-number-of-arguments (1 . 2) 0)`.
+- **`make-hash-table` accepted a malformed keyword list.** `Fmake_hash_table`
+  (fns.c:5749-5815) does not scan its arguments pairwise: `get_key_arg` searches
+  the whole vector for each keyword it knows, marking the pair it consumed, and a
+  second pass rejects whatever is left. `(make-hash-table 1)`,
+  `(make-hash-table :size)` and `(make-hash-table 'foo 1)` all built a table and
+  returned it; each now signals `(error "Invalid argument list" ARG)`. `:size`
+  and `:weakness` validate their values, and the obsolete `:rehash-size` /
+  `:rehash-threshold` are skipped *with* their value rather than rejected.
+
+### Changed
+- **The fuzz oracle is a (binary, argv) pair, and the run header prints both.**
+  `scripts/fuzz_parity.sh` gated the Emacs *version* but left the argv invisible,
+  and the argv decides answers the version number never mentions: `emacs -Q
+  --batch -l FILE` evaluates in `*scratch*` under `lisp-interaction-mode` while
+  `emacs --script FILE` evaluates in a fundamental-mode ` *load*` buffer, so
+  `(char-syntax ?.)` is 95 in the first and 46 in the second. The binary is now
+  resolved to an absolute, symlink-free path; the two flag vectors are named once
+  and printed; and `scripts/fuzz/entry.el` runs through the exact argv on both
+  engines before the corpus, so an entry-point mismatch stops the run instead of
+  producing a wall of syntax "divergences" that are really a door mismatch.
+- **Fuzz hits are delta-debugged.** `-S N` shrinks the first N diverging forms to
+  a minimal still-diverging one. `scripts/fuzz/shrink.el` proposes candidates and
+  knows nothing about which head symbols matter, so it cannot shrink *towards* a
+  believed-in bug; the differential oracle is the only accept test, and a
+  candidate is kept only if Emacs still answers with the same signature, so the
+  minimal form explains the hit it came from rather than drifting to another bug.
+- **The corpus generator covers three new shapes**, each of which found a real
+  divergence on its first run: zero-argument calls written five ways (`(F)`,
+  `(funcall #'F)`, `(funcall 'F)`, `(apply #'F nil)`, `(apply 'F nil)`) across C
+  subrs, byte-compiled Lisp functions and re-entrant intrinsics; `make-hash-table`
+  keyword lists built one element at a time so odd lengths occur; and list walks
+  over freshly-built improper lists, where which object a `listp` error names is
+  the whole parity surface.
+
 ### Added
 - **Strings are mutable objects.** `aset` on a string signalled
   `(wrong-type-argument arrayp "ab")`; `store-substring` and `clear-string` were

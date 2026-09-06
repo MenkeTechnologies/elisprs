@@ -82,11 +82,17 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// string objects at all: they would print correctly and then signal
 /// `arrayp` on the first write, which is the pre-fix behaviour served from a
 /// warm cache.
+/// v12 adds `builtin_cells`: the value/function cells the prelude installs on
+/// symbols that already exist when `builtins::install` finishes. A v11 shard has
+/// none, so replaying it leaves those symbols as `install` made them — which is
+/// how `(macrop 'save-current-buffer)` answered `t` cold and `nil` warm, and how
+/// a warm run then failed to compile a `save-current-buffer` form at all.
+///
 /// v11 adds a hash table's `define-hash-table-test` functions
 /// (`SerObj::HashTable::user_test`). A v10 shard replays such a table as one
 /// with NO user test, which is worse than rejecting it: the table would come
 /// back answering `eql` and silently miss every key it used to find.
-pub const SHARD_FORMAT_VERSION: u32 = 11;
+pub const SHARD_FORMAT_VERSION: u32 = 12;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next
@@ -138,6 +144,12 @@ struct Entry {
     /// builds, so a cache hit has to restore it or `(fboundp 'when)` answers nil
     /// on a warm run and `t` on a cold one.
     introspection_cells: Vec<u8>,
+    /// bincode `Vec<Option<SymbolBaseline>>` — the cells of the arena's builtin
+    /// prefix, indexed by handle. `heap` deliberately starts at `builtin_count`
+    /// (a builtin object is rebuilt by `install`, and an `Obj::Subr` cannot be
+    /// serialized at all), but the prelude WRITES to symbols below that line, and
+    /// those writes belong to the image just as much as the objects above it.
+    builtin_cells: Vec<u8>,
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize)]
@@ -293,6 +305,7 @@ pub struct CachedScript {
     pub heap: Vec<SerObj>,
     pub oclosure_meta: Vec<(u32, u32, Vec<u32>)>,
     pub introspection_cells: Vec<(u32, fusevm::Value)>,
+    pub builtin_cells: Vec<Option<crate::host::SymbolBaseline>>,
 }
 
 /// `schema_key` must match the key the entry was written under (see `schema_key`).
@@ -330,11 +343,14 @@ pub fn get(path: &str, mtime_ns: i64, schema_key: &str) -> Option<CachedScript> 
         bincode::deserialize(&entry.oclosure_meta).ok()?;
     let introspection_cells: Vec<(u32, fusevm::Value)> =
         bincode::deserialize(&entry.introspection_cells).ok()?;
+    let builtin_cells: Vec<Option<crate::host::SymbolBaseline>> =
+        bincode::deserialize(&entry.builtin_cells).ok()?;
     Some(CachedScript {
         chunks,
         heap,
         oclosure_meta,
         introspection_cells,
+        builtin_cells,
     })
 }
 
@@ -348,6 +364,7 @@ pub fn put(
     heap: &[SerObj],
     oclosure_meta: &[(u32, u32, Vec<u32>)],
     introspection_cells: &[(u32, fusevm::Value)],
+    builtin_cells: &[Option<crate::host::SymbolBaseline>],
 ) {
     if !cache_enabled() {
         return;
@@ -366,6 +383,9 @@ pub fn put(
         return;
     };
     let Ok(introspection_blob) = bincode::serialize(introspection_cells) else {
+        return;
+    };
+    let Ok(builtin_cells_blob) = bincode::serialize(builtin_cells) else {
         return;
     };
 
@@ -391,6 +411,7 @@ pub fn put(
             heap: heap_blob,
             oclosure_meta: oclosure_blob,
             introspection_cells: introspection_blob,
+            builtin_cells: builtin_cells_blob,
         },
     );
     shard.header.built_at_secs = now_secs() as u64;
@@ -462,6 +483,7 @@ mod tests {
                 heap: vec![1, 2],
                 oclosure_meta: vec![3, 4],
                 introspection_cells: vec![5, 6],
+                builtin_cells: vec![7, 8],
             },
         );
         let bytes = rkyv::to_bytes::<_, 4096>(&shard).unwrap();
@@ -474,6 +496,10 @@ mod tests {
         // record of the special-form / intrinsic-macro function cells, which a
         // cache hit cannot rebuild (it skips the prelude that registers them).
         assert_eq!(back.entries["/tmp/x.el"].introspection_cells, vec![5, 6]);
+        // Same for the v12 builtin-prefix cells: `heap` starts above
+        // `builtin_count`, so this blob is the only record of what the prelude
+        // wrote to a symbol that `builtins::install` had already created.
+        assert_eq!(back.entries["/tmp/x.el"].builtin_cells, vec![7, 8]);
         assert_eq!(back.header.magic, SHARD_MAGIC);
     }
 

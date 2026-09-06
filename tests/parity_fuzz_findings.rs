@@ -1321,3 +1321,185 @@ fn character_alternative_diagnostics_match_emacs() {
     assert_eq!(eval(r#"(string-match "[[:alpha:]]" "Ü")"#), "0");
     assert_eq!(eval(r#"(string-match "[z-a]" "b")"#), "nil");
 }
+
+/// `seq-elt` is `(cl-defgeneric seq-elt (sequence n) (elt sequence n))` in
+/// seq.el, and Emacs ships seq.elc — so the body that runs is byte-compiled, and
+/// the byte compiler emits the `Belt` opcode instead of a call to `Felt`. On a
+/// cons with a small non-negative index `Belt` walks the cdrs inline and reports
+/// the TAIL it choked on, where `Felt` → `Fnthcdr` reports the original list
+/// (bytecode.c:1578-1599 vs fns.c:1755-1866). The two therefore answer
+/// differently for the same dotted list, which is the whole point of pinning it:
+///
+/// ```text
+/// (elt     (cons "" 'sym) 2)  =>  (wrong-type-argument listp ("" . sym))
+/// (seq-elt (cons "" 'sym) 2)  =>  (wrong-type-argument listp sym)
+/// ```
+#[test]
+fn seq_elt_reports_the_failing_tail_where_elt_reports_the_list() {
+    let err = |src: &str| eval(&format!("(condition-case e {src} (error e))"));
+
+    assert_eq!(
+        err("(seq-elt (cons \"\" 'sym) 2)"),
+        "(wrong-type-argument listp sym)"
+    );
+    assert_eq!(
+        err("(elt (cons \"\" 'sym) 2)"),
+        "(wrong-type-argument listp (\"\" . sym))"
+    );
+    assert_eq!(
+        err("(seq-elt (cons 1 2) 1)"),
+        "(wrong-type-argument listp 2)"
+    );
+
+    // The fast path is guarded by `RANGED_FIXNUMP (0, v2, SMALL_LIST_LEN_MAX)`
+    // with SMALL_LIST_LEN_MAX = 127 (lisp.h), so 127 still walks inline and 128
+    // falls through to `Felt` — which lands on the same tail here only because
+    // `nthcdr` reaches it without having to cdr past it.
+    assert_eq!(
+        err("(seq-elt (append (make-list 127 1) 'sym) 127)"),
+        "(wrong-type-argument listp sym)"
+    );
+    assert_eq!(
+        err("(seq-elt (append (make-list 128 1) 'sym) 128)"),
+        "(wrong-type-argument listp sym)"
+    );
+
+    // A negative index is not `RANGED_FIXNUMP`, so it takes the `Felt` branch,
+    // where `nthcdr` treats it as zero.
+    assert_eq!(eval("(seq-elt (cons \"\" 'sym) -1)"), "\"\"");
+    // Everything else is unchanged: a proper list that runs out answers nil, and
+    // a non-sequence is still `sequencep`.
+    assert_eq!(eval("(seq-elt (list 1 2) 5)"), "nil");
+    assert_eq!(eval("(seq-elt nil 0)"), "nil");
+    assert_eq!(err("(seq-elt 5 0)"), "(wrong-type-argument sequencep 5)");
+    assert_eq!(eval("(seq-elt \"abc\" 1)"), "98");
+    assert_eq!(eval("(seq-elt [1 2 3] 2)"), "3");
+}
+
+/// A wrong-arity call to a function Emacs implements in *byte-compiled Lisp*
+/// never reaches `funcall_lambda`'s signal: the integral arglist sends it to
+/// `exec_byte_code`, which checks the arity itself and reports the packed
+/// template rather than the callee (bytecode.c:519-529):
+///
+/// ```text
+///   Fsignal (Qwrong_number_of_arguments,
+///            list2 (Fcons (make_fixnum (mandatory), make_fixnum (nonrest)),
+///                   make_fixnum (nargs)));
+/// ```
+///
+/// elisprs implements a number of those in Rust, where the natural datum is the
+/// callee — so each one needs the template. NONREST is not `func-arity`'s cdr:
+/// it counts the formals before `&rest`, which is why `error` is `(1 . many)` by
+/// `func-arity` and `(1 . 1)` here.
+#[test]
+fn byte_compiled_functions_report_their_arity_template() {
+    let err = |src: &str| eval(&format!("(condition-case e {src} (error e))"));
+
+    assert_eq!(
+        err("(split-string)"),
+        "(wrong-number-of-arguments (1 . 4) 0)"
+    );
+    assert_eq!(
+        err("(string-join)"),
+        "(wrong-number-of-arguments (1 . 2) 0)"
+    );
+    assert_eq!(err("(lsh 1)"), "(wrong-number-of-arguments (2 . 2) 1)");
+    assert_eq!(
+        err("(funcall #'macroexpand-all)"),
+        "(wrong-number-of-arguments (1 . 2) 0)"
+    );
+    // `&rest` makes no difference to the datum.
+    assert_eq!(err("(error)"), "(wrong-number-of-arguments (1 . 1) 0)");
+    assert_eq!(err("(user-error)"), "(wrong-number-of-arguments (1 . 1) 0)");
+    // Too many, not too few — `backward-word` is `(0 . 1)`.
+    assert_eq!(
+        err("(funcall #'backward-word 1 2 3 4 5 6 7)"),
+        "(wrong-number-of-arguments (0 . 1) 7)"
+    );
+
+    // A real C subr is unaffected: `eval_sub` names the symbol the caller wrote,
+    // and `Ffuncall` names the object it resolved.
+    assert_eq!(err("(car)"), "(wrong-number-of-arguments car 0)");
+    assert_eq!(
+        err("(funcall #'car)"),
+        "(wrong-number-of-arguments #<subr car> 0)"
+    );
+    // …and so are the re-entrant intrinsics, which are dispatched by name above
+    // the ordinary subr arity gate and used to lose the argument count entirely.
+    assert_eq!(err("(eval)"), "(wrong-number-of-arguments eval 0)");
+    assert_eq!(
+        err("(funcall #'eval)"),
+        "(wrong-number-of-arguments #<subr eval> 0)"
+    );
+    assert_eq!(
+        err("(funcall #'mapcar)"),
+        "(wrong-number-of-arguments #<subr mapcar> 0)"
+    );
+    assert_eq!(
+        err("(funcall #'load)"),
+        "(wrong-number-of-arguments #<subr load> 0)"
+    );
+    // An interpreted closure still names itself.
+    assert_eq!(
+        err("(funcall (lambda (a b) a) 1)"),
+        "(wrong-number-of-arguments #[(a b) (a) (t)] 1)"
+    );
+}
+
+/// `Fmake_hash_table` (fns.c:5749-5815) does not scan its keyword list
+/// pairwise. `get_key_arg` searches the whole vector for each keyword it knows,
+/// marking the pair it consumed, and a second pass then rejects everything left
+/// over — so a stray argument, an unknown keyword, or a keyword with no value
+/// signals `(error "Invalid argument list" ARG)` instead of being ignored.
+#[test]
+fn make_hash_table_rejects_a_malformed_argument_list() {
+    let err = |src: &str| eval(&format!("(condition-case e {src} (error e))"));
+
+    assert_eq!(
+        err("(make-hash-table 1)"),
+        "(error \"Invalid argument list\" 1)"
+    );
+    assert_eq!(
+        err("(make-hash-table :size)"),
+        "(error \"Invalid argument list\" :size)"
+    );
+    assert_eq!(
+        err("(make-hash-table 'foo 1)"),
+        "(error \"Invalid argument list\" foo)"
+    );
+    // `:test` is found wherever it sits, and the leftover is what is reported —
+    // a pairwise scan would have blamed `:test` instead of the stray `1`.
+    assert_eq!(
+        err("(make-hash-table 1 :test 'eq)"),
+        "(error \"Invalid argument list\" 1)"
+    );
+    // A trailing keyword has no pair, so `get_key_arg` never consumes it.
+    assert_eq!(
+        err("(make-hash-table :test 'eq :size)"),
+        "(error \"Invalid argument list\" :size)"
+    );
+
+    assert_eq!(
+        err("(make-hash-table :size -1)"),
+        "(error \"Invalid hash table size\" -1)"
+    );
+    assert_eq!(
+        err("(make-hash-table :size \"x\")"),
+        "(error \"Invalid hash table size\" \"x\")"
+    );
+    assert_eq!(
+        err("(make-hash-table :weakness 'bogus)"),
+        "(error \"Invalid hash table weakness\" bogus)"
+    );
+
+    // The obsolete keywords are skipped along with their value, not rejected,
+    // and every well-formed list still builds a table.
+    assert_eq!(
+        eval("(make-hash-table :rehash-size 2.0 :test 'eq)"),
+        "#s(hash-table test eq)"
+    );
+    assert_eq!(eval("(make-hash-table :purecopy t)"), "#s(hash-table)");
+    assert_eq!(eval("(make-hash-table :size nil)"), "#s(hash-table)");
+    assert_eq!(eval("(hash-table-size (make-hash-table :size 5))"), "5");
+    assert_eq!(eval("(make-hash-table :weakness t)"), "#s(hash-table)");
+}

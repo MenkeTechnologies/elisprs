@@ -114,13 +114,31 @@ pub(crate) fn run_top_forms(src: &str) -> Result<(Vec<fusevm::Chunk>, Value), St
     // Rewrite any inline `rust { ... }` FFI block into a `(__rust-compile ...)`
     // call before the reader runs (no-op when the source has no `rust` token).
     let src = rust_ffi::desugar(src);
-    let forms = host::with_host(|h| reader::read_all(h, &src).map(|fs| splice_top_forms(h, fs)))?;
+    // The READER is what interns a file's literal symbols, so it counts as
+    // compiling too: without this the image stopped carrying them and
+    // `(intern-soft "a-symbol-this-file-mentions")` answered nil on a warm cache
+    // and the symbol on a cold one.
+    let prev_read = host::with_host(|h| h.set_compiling_form(true));
+    let forms = host::with_host(|h| reader::read_all(h, &src).map(|fs| splice_top_forms(h, fs)));
+    host::with_host(|h| h.set_compiling_form(prev_read));
+    let forms = forms?;
     let mut chunks = Vec::with_capacity(forms.len());
     let mut last = Value::Undef;
     for form in &forms {
-        // Macro-expand before lowering (a prior form's `defmacro` is in effect).
-        let expanded = host::macroexpand_all(form)?;
-        let chunk = host::with_host(|h| compiler::compile_top(h, &expanded))?;
+        // Macro-expand + lower with the host marked as COMPILING, so a symbol
+        // interned here is recorded as a literal of the file rather than as
+        // something the program interned while running. Only the first kind
+        // belongs in the cached heap image's obarray (see
+        // `ElispHost::compile_interned`); the guard is restored even on the error
+        // path, because `macroexpand_all` runs user macro bodies and one of them
+        // signalling must not leave the host stuck in compile mode.
+        let prev = host::with_host(|h| h.set_compiling_form(true));
+        let lowered = (|| -> Result<fusevm::Chunk, String> {
+            let expanded = host::macroexpand_all(form)?;
+            host::with_host(|h| compiler::compile_top(h, &expanded))
+        })();
+        host::with_host(|h| h.set_compiling_form(prev));
+        let chunk = lowered?;
         chunks.push(chunk.clone());
         last = host::run_chunk(chunk)?;
     }
@@ -359,6 +377,7 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
             heap,
             oclosure_meta,
             introspection_cells,
+            builtin_cells,
         } = cached;
         if debug {
             eprintln!("elisprs: cache HIT  {path} ({} chunks)", chunks.len());
@@ -374,6 +393,10 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
             // theirs from the prelude, so without this a warm run answers
             // `(fboundp 'when)` nil where a cold one answers `t`.
             h.import_intrinsic_macro_cells(introspection_cells);
+            // The prelude's writes to symbols BELOW `builtin_count` — the ones
+            // `heap` cannot carry because it starts at that line. Without this a
+            // warm run lost every prelude-installed cell on a builtin symbol.
+            h.import_builtin_cells(builtin_cells);
         });
         install_entry_point_state(path, &src, entry);
         return with_load_file_name(path, || {
@@ -400,6 +423,9 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
     // the cached image and the next run's `install_entry_point_state` is the only
     // thing that sets it.
     let clean_prelude = host::with_host(|h| h.export_heap_range(builtin_count, prelude_end));
+    // Captured with `clean_prelude` and for the same reason: this is the state a
+    // hit replays the cached chunks onto, so it must predate the file's own run.
+    let clean_builtin_cells = host::with_host(|h| h.export_builtin_cells());
     install_entry_point_state(path, &src, entry);
 
     // Bind load-file-name only while the forms run; unbind before the clean heap
@@ -416,6 +442,7 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
         &heap,
         &oclosure_meta,
         &introspection_cells,
+        &clean_builtin_cells,
     );
     Ok(last)
 }

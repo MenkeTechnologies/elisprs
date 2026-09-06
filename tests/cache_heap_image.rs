@@ -283,3 +283,97 @@ fn warm_cache_keeps_the_introspection_function_cells() {
         "a warm cache must not lose the intrinsic-macro / special-form cells"
     );
 }
+
+/// A cell the prelude installs on a symbol that already existed when
+/// `builtins::install` finished must survive a cache hit.
+///
+/// The image `heap` deliberately starts at `builtin_count`: a builtin object is
+/// rebuilt by `install` on every run, and an `Obj::Subr` has a function pointer
+/// that `SerObj` cannot represent at all. But the prelude *writes* to symbols
+/// below that line — `save-current-buffer`, `save-excursion`, `save-restriction`
+/// and `interactive` are installed as special forms and then given a macro
+/// function cell by the prelude — and those writes were dropped from the image:
+///
+/// ```text
+/// $ elisp probe.el      # cold: (macrop 'save-current-buffer) => t
+/// $ elisp probe.el      # warm: (macrop 'save-current-buffer) => nil
+/// ```
+///
+/// The disagreement was not cosmetic. The macro that lowers those forms was gone
+/// on a warm run, so anything compiled *after* the hit — `eval` of a read form,
+/// a macro expanding into `with-current-buffer` — failed outright with "special
+/// form `save-current-buffer` not yet lowered".
+#[test]
+fn warm_cache_keeps_the_prelude_cells_on_builtin_symbols() {
+    let (cold, warm) = run_cold_then_warm(
+        "builtin-cells",
+        "(prin1 (mapcar (lambda (s) (and (macrop s) t))\n\
+         '(save-current-buffer save-excursion save-restriction interactive)))",
+    );
+    assert_eq!(cold, warm, "cold and warm disagree");
+    assert_eq!(cold, "(t t t t)");
+}
+
+/// The same gap, at the point where it actually broke a program: a form the
+/// compiler lowers by macro-expansion, compiled at *run* time so the cached
+/// chunks cannot cover it.
+#[test]
+fn warm_cache_can_still_compile_a_lowered_special_form() {
+    let (cold, warm) = run_cold_then_warm(
+        "lowered-special",
+        "(prin1 (eval (read \"(with-temp-buffer (insert \\\"ab\\\") (buffer-string))\") t))",
+    );
+    assert_eq!(cold, warm, "cold and warm disagree");
+    assert_eq!(cold, "\"ab\"");
+}
+
+/// A symbol the *running program* interns must not be baked into the image.
+///
+/// The image re-claims the global obarray name of every symbol it carries, and
+/// it carried the ones the run created too — so one invocation's data leaked
+/// into the next invocation of the same script, with input the script had never
+/// seen. The script below interns a name only when its argument says to, and
+/// then asks whether that name exists; the second run says no, and so does
+/// Emacs. Only symbols interned while READING or COMPILING the file — its
+/// literals, whose handles the cached chunks reference — belong in the image.
+#[test]
+fn warm_cache_does_not_leak_a_symbol_the_run_interned() {
+    let exe = env!("CARGO_BIN_EXE_elisp");
+    let dir = std::env::temp_dir().join(format!("elisprs-cache-leak-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("script.el");
+    // The name is built at run time so it is not a literal of the file: the
+    // reader must never see the token `zq-leaked` while reading this source.
+    std::fs::write(
+        &path,
+        "(let ((n (concat \"zq\" \"-leaked\")))\n\
+           (when (getenv \"DO_INTERN\") (intern n))\n\
+           (prin1 (and (intern-soft n) t)))\n",
+    )
+    .expect("write script");
+    let run = |do_intern: bool| -> String {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg(&path).env("HOME", &dir);
+        if do_intern {
+            cmd.env("DO_INTERN", "1");
+        }
+        let out = cmd.output().expect("run elisp");
+        assert!(
+            out.status.success(),
+            "elisp failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(
+        run(true),
+        "t",
+        "the interning run should find its own symbol"
+    );
+    assert_eq!(
+        run(false),
+        "nil",
+        "a later run must not inherit the previous run's obarray entry"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

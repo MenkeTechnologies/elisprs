@@ -291,7 +291,31 @@ pub const PRELUDE: &str = r#"
 (defun seq-count (pred l) (setq l (append l nil)) (let ((n 0)) (while l (if (funcall pred (car l)) (setq n (1+ n))) (setq l (cdr l))) n))
 (defun seq-empty-p (l) (= 0 (length l)))
 (defun seq-length (l) (length l))
-(defun seq-elt (l n) (elt l n))
+;; `seq-elt' is `(cl-defgeneric seq-elt (sequence n) (elt sequence n))' in
+;; seq.el and Emacs ships seq.elc, so the body that actually runs is the
+;; byte-compiled one -- and the byte compiler emits the `Belt' opcode for
+;; `(elt SEQ N)' rather than a call to `Felt'.  `Belt' does NOT delegate to
+;; `Felt' for a cons with a small non-negative index: it walks the cdrs inline
+;; and reports the TAIL it choked on, where `Felt' -> `Fnthcdr' reports the
+;; original list (bytecode.c:1578-1599 vs fns.c:1755-1866 on emacs-30):
+;;
+;;   (elt     (cons "" 'sym) 2)  =>  (wrong-type-argument listp ("" . sym))
+;;   (seq-elt (cons "" 'sym) 2)  =>  (wrong-type-argument listp sym)
+;;
+;; The fast path is guarded by `RANGED_FIXNUMP (0, v2, SMALL_LIST_LEN_MAX)' --
+;; SMALL_LIST_LEN_MAX is 127 (lisp.h) -- so a negative, bignum or >127 index
+;; falls through to `elt' exactly as the opcode falls through to `Felt', and so
+;; does every non-cons sequence.  A cons walk that lands on nil answers nil.
+(defun seq-elt (l n)
+  (if (and (consp l) (integerp n) (>= n 0) (<= n 127))
+      (let ((tail l) (k n))
+        (while (and (> k 0) (consp tail))
+          (setq tail (cdr tail))
+          (setq k (1- k)))
+        (cond ((consp tail) (car tail))
+              ((null tail) nil)
+              (t (signal 'wrong-type-argument (list 'listp tail)))))
+    (elt l n)))
 (defun seq-do (f l) (mapc f l))
 (defun seqp (object) (sequencep object))
 (defun seq-contains-p (seq elt &optional testfn)

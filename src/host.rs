@@ -18,7 +18,7 @@ use fusevm::{Chunk, NumOp, VMResult, Value, VM};
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
@@ -768,6 +768,86 @@ impl FnKind {
     }
 }
 
+/// Emacs's `exec_byte_code` arity template — `(MANDATORY, NONREST)` — for every
+/// function elisprs implements as a Rust subr while Emacs implements it in
+/// *byte-compiled Lisp*.
+///
+/// The two differ only in what a wrong-arity call reports, and only because
+/// elisprs moved the implementation into Rust. Emacs reaches these through
+/// `exec_byte_code`, which signals `(wrong-number-of-arguments (MANDATORY .
+/// NONREST) NARGS)`; a Rust subr would otherwise report the callee, so
+/// `(split-string)` answered `(wrong-number-of-arguments split-string 0)` where
+/// Emacs answers `(wrong-number-of-arguments (1 . 4) 0)`. Every entry in the
+/// list was measured, not inferred: it is `(logand ARGLIST 127)` and `(ash
+/// ARGLIST -8)` read off the compiled object's own arglist word under the pinned
+/// oracle. NONREST is NOT `func-arity`'s cdr — `error` is `(1 . many)` by
+/// `func-arity` and `(1 . 1)` here, because NONREST counts formals before
+/// `&rest`.
+///
+/// A name belongs here if and only if `(subrp (symbol-function NAME))` is nil in
+/// Emacs and non-nil in elisprs. Porting one of these into the prelude as real
+/// Lisp removes its entry; adding a new Rust subr that shadows a Lisp function
+/// adds one.
+const LISP_LEVEL_ARITY: &[(&str, u16, u16)] = &[
+    ("backward-word", 0, 1),
+    ("bignump", 1, 1),
+    ("caadr", 1, 1),
+    ("cadar", 1, 1),
+    ("cdaar", 1, 1),
+    ("cdadr", 1, 1),
+    ("cddar", 1, 1),
+    ("char-uppercase-p", 1, 1),
+    ("count-lines", 2, 3),
+    ("delete-file", 1, 2),
+    ("error", 1, 1),
+    ("fixnump", 1, 1),
+    ("generate-new-buffer", 1, 2),
+    ("getenv", 1, 2),
+    ("hash-table-keys", 1, 1),
+    ("hash-table-values", 1, 1),
+    ("looking-at-p", 1, 1),
+    ("lsh", 2, 2),
+    ("macroexpand-1", 1, 2),
+    ("macroexpand-all", 1, 2),
+    ("macrop", 1, 1),
+    ("make-directory", 1, 2),
+    ("mark", 0, 1),
+    ("match-string", 1, 2),
+    ("member-ignore-case", 2, 2),
+    ("oclosure--copy", 2, 2),
+    ("oclosure--fix-type", 2, 2),
+    ("oclosure--get", 3, 3),
+    ("oclosure--set", 3, 3),
+    ("oclosure-type", 1, 1),
+    ("process-lines", 1, 1),
+    ("set-mark", 1, 1),
+    ("setenv", 1, 3),
+    ("sha1", 1, 4),
+    ("shell-command-to-string", 1, 1),
+    ("special-form-p", 1, 1),
+    ("split-string", 1, 4),
+    ("store-substring", 3, 3),
+    ("string-empty-p", 1, 1),
+    ("string-join", 1, 2),
+    ("string-match-p", 2, 3),
+    ("string-prefix-p", 2, 3),
+    ("string-suffix-p", 2, 3),
+    ("string-to-list", 1, 1),
+    ("string-to-vector", 1, 1),
+    ("url-hexify-string", 1, 2),
+    ("url-unhex-string", 1, 2),
+    ("user-error", 1, 1),
+];
+
+/// The `(MANDATORY, NONREST)` template for a subr Emacs implements in
+/// byte-compiled Lisp. See [`LISP_LEVEL_ARITY`].
+fn lisp_level_arity(name: &str) -> Option<(u16, u16)> {
+    LISP_LEVEL_ARITY
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, m, r)| (*m, *r))
+}
+
 /// print.c `PRINT_CIRCLE`: the max print nesting depth. With `print-circle`
 /// nil, an object nested this deep signals "Apparently circular structure being
 /// printed" instead of printing (Emacs errors at exactly this depth).
@@ -802,6 +882,27 @@ pub struct ElispHost {
     /// `(macro . FUNCTION)` stand-ins for the macros the compiler lowers as
     /// intrinsics — see [`ElispHost::introspect_function_cell`].
     intrinsic_macro_cells: HashMap<u32, Value>,
+    /// Whether the code now running is *compiling* rather than executing: set
+    /// around the macro-expand + lower half of each top-level form. See
+    /// [`Self::compile_interned`].
+    compiling_form: bool,
+    /// Symbols the COMPILER interned, as opposed to symbols the running program
+    /// interned. A cached heap image has to tell them apart, because it re-claims
+    /// the global obarray name of every symbol it carries: a symbol a run created
+    /// with `(intern "x")` was baked into the image and re-interned on every
+    /// later hit of the same script, so the script answered differently on a warm
+    /// cache than on a cold one — with input it had never seen:
+    ///
+    /// ```text
+    ///   FUZZ_CORPUS=interns-zqleak.el elisp drive.el   # writes the cache
+    ///   FUZZ_CORPUS=asks-only.el      elisp drive.el   # warm: =zqleak
+    ///   FUZZ_CORPUS=asks-only.el      elisp drive.el   # cold: =nil  (and Emacs: nil)
+    /// ```
+    ///
+    /// A symbol the compiler interned is different: it is a literal of the file,
+    /// the chunk references its handle, and a hit does not compile — so the image
+    /// must carry it interned or the replay resolves a name to nothing.
+    compile_interned: HashSet<u32>,
     /// Per-scope unwind info: (saved lexical env, specstack depth at entry).
     frame_stack: Vec<(Lex, usize)>,
     pub(crate) error: Option<String>,
@@ -964,7 +1065,7 @@ pub struct ClosureSrc {
 /// it runs so a cached heap image can roll them back (the cached chunks replay
 /// every one of them on a hit). `special` is absent on purpose: the compiler sets
 /// it, and a cache hit does not compile.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct SymbolBaseline {
     pub value: Option<Value>,
     pub function: Option<Value>,
@@ -1082,6 +1183,8 @@ impl ElispHost {
             eval_depth: 0,
             max_depth_sym: None,
             intrinsic_macro_cells: HashMap::new(),
+            compiling_form: false,
+            compile_interned: HashSet::new(),
             frame_stack: Vec::new(),
             error: None,
             pending_throw: None,
@@ -1441,6 +1544,9 @@ impl ElispHost {
             alias_of: None,
         }));
         self.obarray.insert(name.to_string(), id);
+        if self.compiling_form {
+            self.compile_interned.insert(id);
+        }
         Value::Obj(id)
     }
     /// Allocate a fresh *uninterned* symbol: it carries `name` but is not put in
@@ -2660,6 +2766,18 @@ impl ElispHost {
         self.obarray.get(&s.name) == Some(&id)
     }
 
+    /// Mark the macro-expand + lower phase of a top-level form. Returns the
+    /// previous setting, which the caller restores — `load` and `eval` nest.
+    pub fn set_compiling_form(&mut self, on: bool) -> bool {
+        std::mem::replace(&mut self.compiling_form, on)
+    }
+
+    /// Whether the symbol at `id` was interned while compiling. See
+    /// [`Self::compile_interned`].
+    fn interned_at_compile_time(&self, id: u32) -> bool {
+        self.compile_interned.contains(&id)
+    }
+
     /// A fingerprint of the builtin object layout: the ordered names of every
     /// interned builtin symbol. Compiled chunks bake in builtin arena handles, so
     /// adding / removing / reordering subrs must invalidate the on-disk bytecode
@@ -2812,6 +2930,45 @@ impl ElispHost {
             .collect()
     }
 
+    /// The cells the prelude installed on symbols that already existed when
+    /// `builtins::install` finished — the arena's `[0, builtin_count)` prefix.
+    ///
+    /// `export_heap_range` starts AT `builtin_count`, because a builtin object is
+    /// rebuilt by `install` on every run and re-importing one would be wrong (an
+    /// `Obj::Subr` has a function pointer and does not survive `SerObj` at all).
+    /// But the prelude *writes* to symbols in that prefix, and those writes were
+    /// silently dropped from every heap image:
+    ///
+    /// ```text
+    ///   elisp probe.el   # cold: (macrop 'save-current-buffer) => t
+    ///   elisp probe.el   # warm: (macrop 'save-current-buffer) => nil
+    /// ```
+    ///
+    /// and the warm run then could not compile a `save-current-buffer` form at
+    /// all, because the macro that lowers it was gone. `install` is
+    /// deterministic, so the prefix's *objects* are identical on both runs and
+    /// only their cells need carrying — which is what this exports and
+    /// [`Self::import_builtin_cells`] applies.
+    pub fn export_builtin_cells(&self) -> Vec<Option<SymbolBaseline>> {
+        self.snapshot_values(0, self.builtin_count)
+    }
+
+    /// Apply an [`Self::export_builtin_cells`] snapshot. Indices beyond this
+    /// build's builtin prefix are ignored: a shard from a binary with a
+    /// different builtin set is already rejected by the schema key, and
+    /// tolerating a short or long vector here costs nothing.
+    pub fn import_builtin_cells(&mut self, cells: Vec<Option<SymbolBaseline>>) {
+        for (i, cell) in cells.into_iter().enumerate() {
+            let (Some(cell), Some(Obj::Symbol(sym))) = (cell, self.arena.get_mut(i)) else {
+                continue;
+            };
+            sym.value = cell.value;
+            sym.function = cell.function;
+            sym.buffer_local_auto = cell.buffer_local_auto;
+            sym.alias_of = cell.alias_of;
+        }
+    }
+
     pub fn snapshot_values(&self, start: usize, end: usize) -> Vec<Option<SymbolBaseline>> {
         (start..end)
             .map(|i| match self.arena.get(i) {
@@ -2862,7 +3019,10 @@ impl ElispHost {
                     special: s.special,
                     buffer_local_auto: false,
                     alias_of: None,
-                    interned: self.symbol_is_interned(s, id),
+                    // NOT `symbol_is_interned`: a symbol the RUN interned is not
+                    // part of the file, and re-claiming its name on every later
+                    // hit leaks one invocation's data into the next.
+                    interned: self.symbol_is_interned(s, id) && self.interned_at_compile_time(id),
                 },
                 other => self.ser_obj(other, id),
             };
@@ -4836,15 +4996,61 @@ impl ElispHost {
     /// re-reading it (which is how the other error helpers build their data) cannot
     /// work here: a closure prints as `#[(x) (x) (t)]`, and no reader can turn that
     /// back into the closure it came from.
+    ///
+    /// FUNCTION is the object only for a C subr and an interpreted closure. A
+    /// *byte-compiled* function never reaches `funcall_lambda`'s signal at all:
+    /// its integral arglist sends it straight to `exec_byte_code`, which checks
+    /// the arity itself and reports the packed template instead of the callee
+    /// (bytecode.c:519-529 on emacs-30):
+    ///
+    /// ```text
+    ///   bool rest      = (args_template & 128) != 0;
+    ///   int  mandatory =  args_template & 127;
+    ///   ptrdiff_t nonrest = args_template >> 8;
+    ///   if (! (mandatory <= nargs && (rest || nargs <= nonrest)))
+    ///     Fsignal (Qwrong_number_of_arguments,
+    ///              list2 (Fcons (make_fixnum (mandatory), make_fixnum (nonrest)),
+    ///                     make_fixnum (nargs)));
+    /// ```
+    ///
+    /// so the datum is `(MANDATORY . NONREST)` — NONREST counts the non-`&rest`
+    /// formals, which is why `error`, whose `&rest` makes `func-arity` say
+    /// `(1 . many)`, still reports `(1 . 1)`. See [`lisp_level_arity`] for why
+    /// elisprs has to know which of its subrs Emacs implements this way.
     pub fn signal_wrong_nargs(&mut self, callee: &Value, argc: usize) -> String {
         let sym = self.intern("wrong-number-of-arguments");
         let count = Value::Int(argc as i64);
-        let data = self.list_from(vec![callee.clone(), count]);
-        let display = format!("{} {}", self.print(callee, true), argc);
+        let subject = match self.byte_compiled_arity_template(callee) {
+            Some((mandatory, nonrest)) => {
+                self.cons(Value::Int(mandatory as i64), Value::Int(nonrest as i64))
+            }
+            None => callee.clone(),
+        };
+        let data = self.list_from(vec![subject.clone(), count]);
+        let display = format!("{} {}", self.print(&subject, true), argc);
         let obj = self.cons(sym, data);
         let msg = format!("wrong-number-of-arguments: {display}");
         self.set_pending_error(&msg, obj);
         msg
+    }
+
+    /// The `(MANDATORY . NONREST)` template `exec_byte_code` would report for
+    /// `callee`, or `None` when Emacs reaches this call through a path that
+    /// names the callee itself (a C subr, an interpreted closure).
+    ///
+    /// Only a subr designator can qualify: a closure elisprs built from a
+    /// `defun` is the interpreted shape in Emacs too, and `funcall_lambda`
+    /// names it.
+    fn byte_compiled_arity_template(&self, callee: &Value) -> Option<(u16, u16)> {
+        let mut cur = callee.clone();
+        for _ in 0..64 {
+            match self.obj(&cur) {
+                Some(Obj::Subr { name, .. }) => return lisp_level_arity(name),
+                Some(Obj::Symbol(s)) => cur = s.function.clone()?,
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// `(wrong-type-argument PRED VALUE)` with VALUE carried as the *object*.
@@ -4876,6 +5082,35 @@ impl ElispHost {
         let sym = self.intern("error");
         let m = self.new_string(message);
         let data = self.list_from(vec![m, datum.clone()]);
+        let obj = self.cons(sym, data);
+        self.set_pending_error(&msg, obj);
+        msg
+    }
+
+    /// Signal Emacs's `signal_error (S, ARG)` (eval.c:2000-2007, emacs-30.2):
+    ///
+    /// ```text
+    ///   if (NILP (Fproper_list_p (arg)))
+    ///     arg = list1 (arg);
+    ///   xsignal (Qerror, Fcons (build_string (s), arg));
+    /// ```
+    ///
+    /// so the error data is `("S" . ARG)`, and ARG is SPLICED when it is already
+    /// a proper list rather than nested inside one. That is not the same shape as
+    /// [`Self::signal_error_with`], which ports `xsignal2` and always nests: for
+    /// a symbol or a number the two agree, for a list they do not, and for nil
+    /// this one produces the message alone. C code reaches for whichever it
+    /// means, so both exist here.
+    pub fn signal_error_arg(&mut self, message: &str, arg: &Value) -> String {
+        let msg = format!("error: {message} {}", self.print(arg, true));
+        let sym = self.intern("error");
+        let m = self.new_string(message);
+        let mut items = vec![m];
+        match self.list_vec(arg) {
+            Some(tail) => items.extend(tail),
+            None => items.push(arg.clone()),
+        }
+        let data = self.list_from(items);
         let obj = self.cons(sym, data);
         self.set_pending_error(&msg, obj);
         msg
@@ -5161,6 +5396,28 @@ pub fn set_prelude_compiling(b: bool) {
 /// Call a function designator with already-evaluated args. The single
 /// re-entrant entry point: it never holds the host borrow across a callee, so a
 /// closure body (run on a nested fusevm VM) can re-borrow the host freely.
+/// `(wrong-number-of-arguments FUNCTION NARGS)` for the re-entrant intrinsics.
+///
+/// They are dispatched by NAME at the top of [`call_function`], above the
+/// `Resolved::Subr` arity gate that every other subr is checked by, so each has
+/// to raise its own. They used to do it by building a message string, which the
+/// reader turned back into data with the designator collapsed to a bare symbol
+/// — and, for the `ok_or` sites, with no argument count at all:
+///
+/// ```text
+///   (funcall #'mapcar)          emacs (wrong-number-of-arguments #<subr mapcar> 0)
+///                               was   (wrong-number-of-arguments mapcar 0)
+///   (funcall #'macroexpand-1)   emacs (wrong-number-of-arguments (1 . 2) 0)
+///                               was   (wrong-number-of-arguments macroexpand-1)
+/// ```
+///
+/// `signal_wrong_nargs` carries the designator as an object, so it reports the
+/// symbol for `(mapcar)` and the subr for `(funcall #'mapcar)` exactly as Emacs
+/// does, and applies the byte-compiled arity template where one is due.
+fn intrinsic_wrong_nargs(f: &Value, argc: usize) -> String {
+    with_host(|h| h.signal_wrong_nargs(f, argc))
+}
+
 pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
     // A special form is fbound but not callable. Emacs's `funcall` sees a subr
     // with `max_args == UNEVALLED` and signals `(invalid-function #<subr if>)`
@@ -5189,14 +5446,14 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 // `(funcall)` with no function designator: Emacs signals
                 // `(wrong-number-of-arguments funcall 0)`, not a panic.
                 if args.is_empty() {
-                    return Err("wrong-number-of-arguments: funcall 0".to_string());
+                    return Err(intrinsic_wrong_nargs(f, 0));
                 }
                 let f = with_host(|h| h.function_designator(&args[0]));
                 return call_function(&f, &args[1..]);
             }
             "apply" => {
                 if args.is_empty() {
-                    return Err("wrong-number-of-arguments: apply 0".to_string());
+                    return Err(intrinsic_wrong_nargs(f, 0));
                 }
                 // apply spreads its LAST argument, which must be a list; with a
                 // single argument that last IS `args[0]` (so `(apply '+)` fails
@@ -5227,7 +5484,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             }
             "mapcar" => {
                 if args.len() < 2 {
-                    return Err(format!("wrong-number-of-arguments: mapcar {}", args.len()));
+                    return Err(intrinsic_wrong_nargs(f, args.len()));
                 }
                 // An improper list names its tail; a non-sequence names itself.
                 let seq = with_host(|h| h.seq_vec_checked(&args[1]))?;
@@ -5240,7 +5497,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             }
             "mapc" => {
                 if args.len() < 2 {
-                    return Err(format!("wrong-number-of-arguments: mapc {}", args.len()));
+                    return Err(intrinsic_wrong_nargs(f, args.len()));
                 }
                 let seq = with_host(|h| h.seq_vec_checked(&args[1]))?;
                 let f = with_host(|h| h.function_designator(&args[0]));
@@ -5256,7 +5513,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 // falls back to the default `value<` ordering. Re-enters elisp
                 // for PRED/:key so it lives here, not as a plain subr.
                 if args.is_empty() {
-                    return Err("wrong-number-of-arguments: sort 0".to_string());
+                    return Err(intrinsic_wrong_nargs(f, 0));
                 }
                 let (items, was_vec) = match with_host(|h| match h.obj(&args[0]) {
                     Some(Obj::Vector(v)) => Some((v.clone(), true)),
@@ -5376,7 +5633,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             }
             "maphash" => {
                 if args.len() < 2 {
-                    return Err(format!("wrong-number-of-arguments: maphash {}", args.len()));
+                    return Err(intrinsic_wrong_nargs(f, args.len()));
                 }
                 let entries = with_host(|h| match h.obj(&args[1]) {
                     Some(Obj::HashTable(t)) => Some(t.pairs().cloned().collect::<Vec<_>>()),
@@ -5396,7 +5653,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             "gethash" | "puthash" | "remhash" => {
                 let table_at = if name == "puthash" { 2 } else { 1 };
                 let Some(table) = args.get(table_at) else {
-                    return Err(format!("wrong-number-of-arguments: {name} {}", args.len()));
+                    return Err(intrinsic_wrong_nargs(f, args.len()));
                 };
                 if let Some(t) = crate::builtins::ht_user_test(table) {
                     return match name.as_str() {
@@ -5455,10 +5712,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             }
             "mapatoms" => {
                 if args.is_empty() {
-                    return Err(format!(
-                        "wrong-number-of-arguments: mapatoms {}",
-                        args.len()
-                    ));
+                    return Err(intrinsic_wrong_nargs(f, args.len()));
                 }
                 // The obarray defaults to the global one (the `obarray` variable).
                 let ob = match args.get(1) {
@@ -5477,11 +5731,13 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             // `load` reads a file's forms and evaluates them in the live host —
             // re-entrant (nested VM per form) and it dynamically rebinds
             // `load-file-name` &c, so it lives here, outside any host borrow.
-            "load" => return intrinsic_load(args),
+            "load" => return intrinsic_load(f, args),
             // `eval` macroexpands, compiles, and runs a form — re-entrant, so it
             // lives here (outside any host borrow), like the other intrinsics.
             "eval" => {
-                let form = args.first().ok_or("wrong-number-of-arguments: eval")?;
+                let form = args
+                    .first()
+                    .ok_or_else(|| intrinsic_wrong_nargs(f, args.len()))?;
                 // `t` is a self-evaluating constant symbol (Emacs `eval_sub`:
                 // its value slot holds itself).  It is represented as
                 // `Value::Bool(true)`, which `compile_top` would lower to the
@@ -5516,7 +5772,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             "macroexpand-1" => {
                 let form = args
                     .first()
-                    .ok_or("wrong-number-of-arguments: macroexpand-1")?;
+                    .ok_or_else(|| intrinsic_wrong_nargs(f, args.len()))?;
                 // A user macro (if any) wins; otherwise fall back to the intrinsic
                 // `when`/`unless` expansions the compiler lowers as special forms.
                 if let Some(e) = macroexpand_1(form)? {
@@ -5528,7 +5784,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 // Expand the head to a fixpoint; don't recurse into sub-forms.
                 let mut f = args
                     .first()
-                    .ok_or("wrong-number-of-arguments: macroexpand")?
+                    .ok_or_else(|| intrinsic_wrong_nargs(f, args.len()))?
                     .clone();
                 loop {
                     if let Some(e) = macroexpand_1(&f)? {
@@ -5546,7 +5802,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             "macroexpand-all" => {
                 return macroexpand_all_builtin(
                     args.first()
-                        .ok_or("wrong-number-of-arguments: macroexpand-all")?,
+                        .ok_or_else(|| intrinsic_wrong_nargs(f, args.len()))?,
                 )
             }
             // (`replace-regexp-in-string` needs no interception: it is a Lisp
@@ -6333,7 +6589,7 @@ pub(crate) fn load_abspath(candidate: &str) -> std::path::PathBuf {
 /// While the file's forms run, `load-file-name`, `load-true-file-name` and
 /// `load-in-progress` are dynamically bound and restored afterward — even if a
 /// form errors (the specstack is unwound to the pre-load depth).
-fn intrinsic_load(args: &[Value]) -> Result<Value, String> {
+fn intrinsic_load(f: &Value, args: &[Value]) -> Result<Value, String> {
     let file = match args
         .first()
         .map(|v| (v, with_host(|h| h.str_text(v).map(str::to_string))))
@@ -6345,7 +6601,11 @@ fn intrinsic_load(args: &[Value]) -> Result<Value, String> {
                 other.as_str_cow()
             ))
         }
-        None => return Err("wrong-number-of-arguments: load".to_string()),
+        // The designator is threaded in rather than re-interned: Emacs reports
+        // `load' for a direct `(load)' and `#<subr load>' for `(funcall #'load)',
+        // which is the difference between the symbol the caller wrote and the
+        // object `funcall' resolved -- and only the caller knows which it was.
+        None => return Err(intrinsic_wrong_nargs(f, args.len())),
     };
     let noerror = args.get(1).is_some_and(el_truthy);
     let nosuffix = args.get(3).is_some_and(el_truthy);

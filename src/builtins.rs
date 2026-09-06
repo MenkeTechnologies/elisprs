@@ -2856,38 +2856,105 @@ fn ht_find(h: &mut ElispHost, table: &Value, key: &Value) -> Result<(u64, Option
 /// [`crate::host::call_function`] rather than here, because the declaration is
 /// kept on the symbol's `hash-table-test` property — an elisp plist, so reading
 /// it CALLS elisp, which cannot happen inside this host borrow.
+/// `get_key_arg` (fns.c:4633-4647, emacs-30.2): the first index whose
+/// PREDECESSOR is KEY and whose pair is still unconsumed, marking both as used.
+///
+/// The scan starts at 1 and returns the index of the VALUE, so a keyword in the
+/// last slot has no pair and is never found — which is exactly why
+/// `(make-hash-table :size)` reports a leftover argument instead of quietly
+/// ignoring it. C returns 0 for "absent"; `Option` says it without the sentinel.
+fn get_key_arg(h: &ElispHost, key: &str, a: &[Value], used: &mut [bool]) -> Option<usize> {
+    for i in 1..a.len() {
+        if !used[i - 1] && h.sym_name(&a[i - 1]).as_deref() == Some(key) {
+            used[i - 1] = true;
+            used[i] = true;
+            return Some(i);
+        }
+    }
+    None
+}
+
 pub(crate) fn make_hash_table_with(
     h: &mut ElispHost,
     a: &[Value],
     user: Option<(Value, Value, Value)>,
 ) -> R {
-    let mut test = 1u8; // eql default
-    let mut size = 0usize;
-    let mut weakness = Value::Undef;
-    let mut i = 0;
-    while i + 1 < a.len() {
-        match h.sym_name(&a[i]).as_deref() {
-            Some(":test") => {
-                test = match h.sym_name(&a[i + 1]).as_deref() {
-                    Some("eq") => 0,
-                    Some("equal") => 2,
-                    // A name the caller resolved to a user test; anything else
-                    // is `eql` (including the `eql` spelling itself).
-                    Some(other) if other != "eql" && user.is_some() => 3,
-                    _ => 1,
-                };
+    // Port of `Fmake_hash_table' (fns.c:5749-5815, emacs-30.2). The keyword list
+    // is NOT scanned pairwise. `get_key_arg' searches the whole vector for each
+    // keyword the function knows, marking the pair it consumed, and only then
+    // does a second pass reject whatever is left over. Both halves of that are
+    // observable, and the pairwise loop this replaces had neither:
+    //
+    //   (make-hash-table 1)             (error "Invalid argument list" 1)
+    //   (make-hash-table :size)         (error "Invalid argument list" :size)
+    //   (make-hash-table :test 'eq :size)
+    //                                   (error "Invalid argument list" :size)
+    //   (make-hash-table 'foo 1)        (error "Invalid argument list" foo)
+    //
+    // where every one of them used to build a table and return it. `:size' and
+    // `:weakness' validate their values too, and the obsolete `:rehash-size' /
+    // `:rehash-threshold' are skipped WITH their value rather than rejected.
+    let mut used = vec![false; a.len()];
+    let test = match get_key_arg(h, ":test", a, &mut used) {
+        None => 1u8, // eql default
+        Some(i) => match h.sym_name(&a[i]).as_deref() {
+            Some("eq") => 0,
+            Some("equal") => 2,
+            // A name the caller resolved to a user test; anything else
+            // is `eql` (including the `eql` spelling itself).
+            Some(other) if other != "eql" && user.is_some() => 3,
+            _ => 1,
+        },
+    };
+    // Consumed but unused: elisprs has no pure space, and a `:purecopy' left
+    // unmarked would be rejected as a stray argument.
+    let _ = get_key_arg(h, ":purecopy", a, &mut used);
+    // `:size' is the initial allocation, reported back by `hash-table-size'
+    // until the table outgrows it. `FIXNATP' rejects a negative or non-integer
+    // size outright; nil selects the default, which is elisprs's 0.
+    let size = match get_key_arg(h, ":size", a, &mut used) {
+        None => 0usize,
+        Some(i) => match &a[i] {
+            v if crate::host::el_nil(v) => 0,
+            Value::Int(n) if *n >= 0 => *n as usize,
+            v => {
+                let v = v.clone();
+                return Err(h.signal_error_arg("Invalid hash table size", &v));
             }
-            // `:size` is the initial allocation, reported back by
-            // `hash-table-size` until the table outgrows it.
-            Some(":size") => {
-                if let Value::Int(n) = a[i + 1] {
-                    size = n.max(0) as usize;
+        },
+    };
+    let weakness = match get_key_arg(h, ":weakness", a, &mut used) {
+        None => Value::Undef,
+        Some(i) => {
+            let w = a[i].clone();
+            let named = h.sym_name(&w);
+            let ok = crate::host::el_nil(&w)
+                || matches!(w, Value::Bool(true))
+                || matches!(
+                    named.as_deref(),
+                    Some("key") | Some("value") | Some("key-or-value") | Some("key-and-value")
+                );
+            if !ok {
+                return Err(h.signal_error_arg("Invalid hash table weakness", &w));
+            }
+            w
+        }
+    };
+    // "Now, all args should have been used up, or there's a problem."
+    let mut i = 0;
+    while i < a.len() {
+        if !used[i] {
+            match h.sym_name(&a[i]).as_deref() {
+                // Obsolete since Emacs 29 and ignored, along with the value that
+                // follows it (the C bumps `i' a second time inside the loop).
+                Some(":rehash-threshold") | Some(":rehash-size") => i += 1,
+                _ => {
+                    let v = a[i].clone();
+                    return Err(h.signal_error_arg("Invalid argument list", &v));
                 }
             }
-            Some(":weakness") => weakness = a[i + 1].clone(),
-            _ => {}
         }
-        i += 2;
+        i += 1;
     }
     let mut t = ElHashTable::new(test, size, weakness);
     if test == 3 {

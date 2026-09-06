@@ -270,11 +270,16 @@ The [`examples/*.el`](examples) scripts are self-testing: each uses the prelude'
 ```bash
 bash scripts/fuzz_parity.sh              # 500 random forms, seed 1
 bash scripts/fuzz_parity.sh -n 5000 -s 42
+bash scripts/fuzz_parity.sh -S 20        # shrink the first 20 hits
 ```
 
-[`scripts/fuzz_parity.sh`](scripts/fuzz_parity.sh) generates a corpus of random elisp forms from a seeded grammar ([`scripts/fuzz/gen.el`](scripts/fuzz/gen.el)), evaluates every form under **both** `emacs -Q --batch` (ground truth) and `elisp` through one shared driver ([`scripts/fuzz/drive.el`](scripts/fuzz/drive.el)), and reports every form whose value — or whose signalled error — differs. Errors are compared too: Emacs's error symbol and error data are as much of the contract as the return value.
+[`scripts/fuzz_parity.sh`](scripts/fuzz_parity.sh) generates a corpus of random elisp forms from a seeded grammar ([`scripts/fuzz/gen.el`](scripts/fuzz/gen.el)), evaluates every form under **both** `emacs -Q --batch -l` (ground truth) and `elisp` through one shared driver ([`scripts/fuzz/drive.el`](scripts/fuzz/drive.el)), and reports every form whose value — or whose signalled error — differs. Errors are compared too: Emacs's error symbol and error data are as much of the contract as the return value.
 
-The seed makes a divergence reproduce exactly on any machine, and a crash or hang in one form is isolated rather than losing the rest of the corpus. It needs a real `emacs` on `PATH`; the parity gaps it has already closed are recorded in [BUGS.md](BUGS.md).
+The seed makes a divergence reproduce exactly on any machine, and a crash or hang in one form is isolated rather than losing the rest of the corpus. The parity gaps it has already closed are recorded in [BUGS.md](BUGS.md).
+
+**The oracle is a (binary, argv) pair, and the run header prints both.** The binary is resolved to an absolute, symlink-free path and gated on the version pinned in BUGS.md, because a different Emacs does not fail loudly — it reports a different divergence set, which reads like a regression. The *argv* decides answers the version number never mentions: `emacs -Q --batch -l FILE` evaluates in `*scratch*` under `lisp-interaction-mode` while `emacs --script FILE` evaluates in a fundamental-mode ` *load*` buffer, so `(char-syntax ?.)` is 95 in the first and 46 in the second — same binary, same version, different answer. The two flag vectors are named once in the script, printed in the header, and checked before the corpus runs: [`scripts/fuzz/entry.el`](scripts/fuzz/entry.el) reports the current buffer and a spread of `char-syntax` answers through the *exact* argv each engine will use, and a mismatch stops the run rather than producing a wall of syntax "divergences" that are really a door mismatch.
+
+**Hits are delta-debugged.** A raw hit is a depth-3 tree with three unrelated distractions bolted onto the one call that actually diverges. `-S N` shrinks the first N of them: [`scripts/fuzz/shrink.el`](scripts/fuzz/shrink.el) proposes strictly-smaller candidates — it is a purely syntactic generator and knows nothing about which head symbols matter, so it cannot shrink *towards* a bug anyone already believes in — and the differential oracle is the only accept test. A candidate is kept only if Emacs still answers with the same signature (a value, or the same error symbol), so the minimal form still explains the hit it came from rather than wandering off to a different bug. Minimal reproducers land in `target/fuzz/shrunk.txt`.
 
 A zero divergence count only means something if the corpus actually exercised the engines, so each run also prints **how many forms the reference evaluated**. Two ways a run can score a false zero are reported rather than hidden:
 

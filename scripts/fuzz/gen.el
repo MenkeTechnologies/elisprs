@@ -615,14 +615,127 @@ later form in the corpus."
             (list 'ignore-errors (cons 'fzwc args))
             'n)))))
 
+;;; ── designator / arity-datum forms ───────────────────────────────────────────
+
+;; WHO the wrong-arity error names is a parity surface in its own right, and it
+;; is not one axis but three, none of which the value or the error SYMBOL shows:
+;;
+;;   * how the caller wrote the callee.  `eval_sub' signals with the symbol, so
+;;     `(car)' names `car'; `Ffuncall' signals with the resolved object, so
+;;     `(funcall #'car)' names `#<subr car>'.
+;;   * how EMACS implements it.  A C subr names the callee; a byte-compiled Lisp
+;;     function never reaches that signal at all -- its integral arglist goes to
+;;     `exec_byte_code', which reports the packed `(MANDATORY . NONREST)'
+;;     template instead (bytecode.c:519-529).  `(split-string)' is `(1 . 4)',
+;;     not `split-string'.
+;;   * whether elisprs routes the call through its ordinary subr arity gate.
+;;     The re-entrant intrinsics (`funcall', `mapcar', `eval', `load', …) are
+;;     dispatched by name above that gate and have to raise their own.
+;;
+;; Every name below has a minimum arity of at least one, so a zero-argument call
+;; is rejected before the body runs: nothing here can touch the filesystem, the
+;; clock or a buffer no matter which name is drawn.
+
+(defvar fz-callees-c
+  '(car cdr aref elt nth nthcdr length symbol-name intern concat append
+    member memq assq assoc substring string-match expt mod ash logand
+    make-string make-list vconcat reverse format prin1-to-string)
+  "Functions Emacs implements as C subrs: the error names the callee.")
+
+(defvar fz-callees-lisp
+  '(split-string string-join string-prefix-p string-suffix-p string-match-p
+    member-ignore-case string-to-list string-to-vector lsh sha1 bignump fixnump
+    macrop special-form-p caadr cadar cdaar cdadr cddar string-empty-p
+    hash-table-keys hash-table-values char-uppercase-p error user-error
+    macroexpand-1 macroexpand-all)
+  "Functions Emacs implements in byte-compiled Lisp: the error names the
+`(MANDATORY . NONREST)' template, not the callee.")
+
+(defvar fz-callees-intrinsic
+  '(funcall apply mapcar mapc mapconcat sort maphash mapatoms eval macroexpand
+    load)
+  "Higher-order/re-entrant primitives, which elisprs dispatches by name.")
+
+(defun fz-designator-form ()
+  "A zero-argument call to a function that needs at least one, written five ways."
+  (let ((fn (fz-pick (fz-pick (list fz-callees-c fz-callees-lisp
+                                    fz-callees-intrinsic)))))
+    (fz-pick (list (list fn)
+                   (list 'funcall (list 'function fn))
+                   (list 'funcall (list 'quote fn))
+                   (list 'apply (list 'function fn) nil)
+                   (list 'apply (list 'quote fn) nil)))))
+
+;;; ── keyword-argument forms ───────────────────────────────────────────────────
+
+(defvar fz-ht-keywords
+  '(:test :size :weakness :purecopy :rehash-size :rehash-threshold :bogus)
+  "Keywords `make-hash-table' knows, plus the obsolete ones it skips and one it
+does not know at all.")
+
+(defvar fz-ht-values '('eq 'eql 'equal 'key 'value 'key-and-value 0 3 -1 1.5 "x" t nil))
+
+(defun fz-keyword-form ()
+  "A `make-hash-table' call with a possibly-malformed keyword list.
+
+`Fmake_hash_table' does not scan its arguments pairwise: `get_key_arg' hunts the
+whole vector for each keyword it knows and a second pass rejects the leftovers,
+so an odd count, an unknown keyword and a stray non-keyword are three different
+outcomes and none of them is \"ignore it\".  The list is built one ELEMENT at a
+time, never one pair at a time, precisely so odd lengths occur."
+  (let ((n (fz-int 6)) (args nil))
+    (while (> n 0)
+      (push (if (fz-chance 55) (fz-pick fz-ht-keywords) (fz-pick fz-ht-values))
+            args)
+      (setq n (1- n)))
+    (cons 'make-hash-table args)))
+
+;;; ── improper-list forms ──────────────────────────────────────────────────────
+
+(defvar fz-list-walkers
+  '((nth 1) (nthcdr 1) (elt 0) (seq-elt 0) (last 0) (butlast 0) (length 0)
+    (safe-length 0) (reverse 0) (memq 0) (member 0) (assq 0) (assoc 0)
+    (mapcar 0) (seq-drop 1) (seq-take 1) (cl-remove-if 0) (append 0))
+  "List walkers and where the list goes: 0 = last argument, 1 = second.")
+
+(defun fz-dotted (depth)
+  "An expression that builds a fresh improper list.
+Fresh, never a quoted literal: several of these walkers are destructive in
+Emacs, and mutating a constant would make the corpus order-dependent."
+  (let ((tail (fz-pick '('sym 2 "s" 1.5))))
+    (if (fz-chance 45)
+        (list 'cons (fz-leaf 'any) tail)
+      (list 'append (list 'make-list (1+ (fz-int 3)) (fz-leaf 'any)) tail))))
+
+(defun fz-improper-form (depth)
+  "A list walk over an improper list.
+
+Which OBJECT a `listp' error names is the parity surface: `Fnthcdr' reports the
+original list, the `Belt' opcode reports the tail it choked on, and `Fmemq' and
+friends report their own loop variable.  The value never shows the difference --
+only the error datum does."
+  (let* ((spec (fz-pick fz-list-walkers))
+         (fn (nth 0 spec))
+         (pos (nth 1 spec))
+         (l (fz-dotted depth))
+         (other (if (memq fn '(mapcar cl-remove-if)) '(function identity)
+                  (if (= pos 1) (fz-pick '(0 1 2 5 -1 130)) (fz-leaf 'any)))))
+    (cond
+     ((memq fn '(length safe-length reverse last butlast)) (list fn l))
+     ((= pos 1) (list fn other l))
+     (t (list fn other l)))))
+
 (defun fz-expr (depth)
   "A random expression with at most DEPTH levels of nesting."
   (cond
    ((<= depth 0) (fz-leaf 'any))
-   ((fz-chance 22) (fz-leaf (fz-pick '(any any list vec str))))
-   ((fz-chance 12) (fz-control depth))
-   ((fz-chance 8) (fz-format-form depth))
-   ((fz-chance 6) (fz-arity-form))
+   ((fz-chance 20) (fz-leaf (fz-pick '(any any list vec str))))
+   ((fz-chance 11) (fz-control depth))
+   ((fz-chance 7) (fz-format-form depth))
+   ((fz-chance 5) (fz-arity-form))
+   ((fz-chance 6) (fz-designator-form))
+   ((fz-chance 4) (fz-keyword-form))
+   ((fz-chance 6) (fz-improper-form depth))
    (t (fz-build (fz-pick fz-calls) (1- depth)))))
 
 ;;; ── main ─────────────────────────────────────────────────────────────────────
