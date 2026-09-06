@@ -354,18 +354,29 @@ pub fn get(path: &str, mtime_ns: i64, schema_key: &str) -> Option<CachedScript> 
     })
 }
 
+/// The five parts of a compiled script, borrowed for the write — the same five
+/// [`CachedScript`] hands back on the read.
+///
+/// One argument rather than five: `clippy::too_many_arguments` fails the build
+/// at 8 (`-D warnings` in CI), and the pieces travel together anyway.
+pub struct ScriptParts<'a> {
+    pub chunks: &'a [Chunk],
+    pub heap: &'a [SerObj],
+    pub oclosure_meta: &'a [(u32, u32, Vec<u32>)],
+    pub introspection_cells: &'a [(u32, fusevm::Value)],
+    pub builtin_cells: &'a [Option<crate::host::SymbolBaseline>],
+}
+
 /// Store a compiled script. Best-effort — any failure just skips caching. Takes
 /// an exclusive `flock` so concurrent writers can't clobber each other's shard.
-pub fn put(
-    path: &str,
-    mtime_ns: i64,
-    schema_key: &str,
-    chunks: &[Chunk],
-    heap: &[SerObj],
-    oclosure_meta: &[(u32, u32, Vec<u32>)],
-    introspection_cells: &[(u32, fusevm::Value)],
-    builtin_cells: &[Option<crate::host::SymbolBaseline>],
-) {
+pub fn put(path: &str, mtime_ns: i64, schema_key: &str, parts: ScriptParts<'_>) {
+    let ScriptParts {
+        chunks,
+        heap,
+        oclosure_meta,
+        introspection_cells,
+        builtin_cells,
+    } = parts;
     if !cache_enabled() {
         return;
     }

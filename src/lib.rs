@@ -438,11 +438,13 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
         path,
         mtime_ns,
         &schema_key,
-        &chunks,
-        &heap,
-        &oclosure_meta,
-        &introspection_cells,
-        &clean_builtin_cells,
+        cache::ScriptParts {
+            chunks: &chunks,
+            heap: &heap,
+            oclosure_meta: &oclosure_meta,
+            introspection_cells: &introspection_cells,
+            builtin_cells: &clean_builtin_cells,
+        },
     );
     Ok(last)
 }
