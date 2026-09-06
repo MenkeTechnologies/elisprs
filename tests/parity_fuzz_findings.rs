@@ -1503,3 +1503,135 @@ fn make_hash_table_rejects_a_malformed_argument_list() {
     assert_eq!(eval("(hash-table-size (make-hash-table :size 5))"), "5");
     assert_eq!(eval("(make-hash-table :weakness t)"), "#s(hash-table)");
 }
+
+/// A special form is a subr, so `eval_sub` checks its `DEFUN` arity before
+/// running it. elisprs lowers special forms by NAME in `compile_call` and so
+/// skipped that check: every form here either evaluated to a wrong answer or,
+/// for `let`/`let*`, panicked the interpreter thread while macro-expanding
+/// `elems[2..]` of a one-element list.
+///
+/// Found by the `fz-special-arity-form` generator family, which exists because
+/// a 4000-form corpus at depth 3 contained ZERO special forms written with a
+/// rejected count — the first sighting came from the shrinker reducing an
+/// unrelated `(apply #'elt nil)` hit down to `(function)`.
+///
+/// Expectations are GNU Emacs 31.1 via `emacs -Q --batch -l FILE`; the arities
+/// are the ones Emacs reports for itself, e.g.
+/// `(subr-arity (indirect-function 'let))` => `(1 . unevalled)`.
+#[test]
+fn special_forms_check_their_declared_arity() {
+    let e = |src: &str| eval(&format!("(condition-case e {src} (error e))"));
+
+    // Too few. `(let)` used to panic; the rest used to answer nil.
+    assert_eq!(e("(let)"), "(wrong-number-of-arguments let 0)");
+    assert_eq!(e("(let*)"), "(wrong-number-of-arguments let* 0)");
+    assert_eq!(e("(if)"), "(wrong-number-of-arguments if 0)");
+    assert_eq!(e("(if t)"), "(wrong-number-of-arguments if 1)");
+    assert_eq!(e("(while)"), "(wrong-number-of-arguments while 0)");
+    assert_eq!(e("(prog1)"), "(wrong-number-of-arguments prog1 0)");
+    assert_eq!(e("(catch)"), "(wrong-number-of-arguments catch 0)");
+    assert_eq!(
+        e("(unwind-protect)"),
+        "(wrong-number-of-arguments unwind-protect 0)"
+    );
+    assert_eq!(
+        e("(condition-case)"),
+        "(wrong-number-of-arguments condition-case 0)"
+    );
+    assert_eq!(e("(defvar)"), "(wrong-number-of-arguments defvar 0)");
+    assert_eq!(e("(defconst)"), "(wrong-number-of-arguments defconst 0)");
+    assert_eq!(e("(quote)"), "(wrong-number-of-arguments quote 0)");
+    assert_eq!(e("(function)"), "(wrong-number-of-arguments function 0)");
+
+    // `quote` and `function` are declared `unevalled` but reject a second
+    // argument from inside their own body, so they have a maximum too. This
+    // used to answer `a` — the extra argument was silently dropped.
+    assert_eq!(e("(quote a b)"), "(wrong-number-of-arguments quote 2)");
+    assert_eq!(
+        e("(function a b)"),
+        "(wrong-number-of-arguments function 2)"
+    );
+
+    // `setq`'s rule is parity, not a bound: its DEFUN is `(0 . unevalled)` and
+    // `Fsetq` rejects an odd count from inside the body.
+    assert_eq!(e("(setq)"), "nil");
+    assert_eq!(e("(setq a)"), "(wrong-number-of-arguments setq 1)");
+    assert_eq!(e("(setq a 1 b)"), "(wrong-number-of-arguments setq 3)");
+    assert_eq!(e("(progn (setq a 1 b 2) (list a b))"), "(1 2)");
+
+    // The check is Emacs's, so it is at EVAL time: a miscounted form that never
+    // runs never signals. Lowering it to a compile-time error would reject
+    // whole files Emacs loads without complaint.
+    assert_eq!(eval("(if nil (let))"), "nil");
+    assert_eq!(eval("(and nil (function))"), "nil");
+    assert_eq!(
+        eval("(progn (defun fz-dead () (if nil (let*))) (fz-dead))"),
+        "nil"
+    );
+
+    // Special forms whose MIN is 0 must stay silent — the negative control.
+    assert_eq!(eval("(progn)"), "nil");
+    assert_eq!(eval("(cond)"), "nil");
+    assert_eq!(eval("(or)"), "nil");
+    assert_eq!(eval("(and)"), "t");
+    assert_eq!(eval("(save-restriction)"), "nil");
+    assert_eq!(eval("(save-current-buffer)"), "nil");
+}
+
+/// `elt` is a C subr in Emacs (`Felt`, fns.c) but was an elisp `defun` in the
+/// elisprs prelude, so a wrong-arity call through a function OBJECT reported
+/// the printed closure source instead of `#<subr elt>`:
+///
+/// ```text
+///   (funcall #'elt)   emacs (wrong-number-of-arguments #<subr elt> 0)
+///                     was   (wrong-number-of-arguments #[(seq n) (…)] 0)
+/// ```
+///
+/// Found by the fuzzer as `(seq-into (vector (cl-lcm 100 5) (apply #'elt nil)) 'bar)`.
+/// The port keeps the delegation the C does — `Fnth` for a list, `Faref` for an
+/// array — so the value and type-error cases are unchanged.
+#[test]
+fn elt_is_a_subr_and_delegates_like_felt() {
+    let e = |src: &str| eval(&format!("(condition-case e {src} (error e))"));
+
+    // The designator: the symbol when written as a call, the subr when the
+    // function object is the thing being called.
+    assert_eq!(e("(elt)"), "(wrong-number-of-arguments elt 0)");
+    assert_eq!(e("(elt '(1 2))"), "(wrong-number-of-arguments elt 1)");
+    assert_eq!(
+        e("(funcall #'elt)"),
+        "(wrong-number-of-arguments #<subr elt> 0)"
+    );
+    assert_eq!(
+        e("(apply #'elt nil)"),
+        "(wrong-number-of-arguments #<subr elt> 0)"
+    );
+
+    // `CONSP (sequence) || NILP (sequence)` goes to `Fnth`, so the index check
+    // is `Fnthcdr`'s `integerp` and an over-long index is nil, not an error.
+    assert_eq!(eval("(elt '(1 2 3) 1)"), "2");
+    assert_eq!(eval("(elt '(1 2) 9)"), "nil");
+    assert_eq!(eval("(elt nil 0)"), "nil");
+    assert_eq!(
+        e("(elt '(1 2 3) 1.5)"),
+        "(wrong-type-argument integerp 1.5)"
+    );
+    assert_eq!(e("(elt (cons 1 2) 1)"), "(wrong-type-argument listp 2)");
+
+    // Everything else is `CHECK_ARRAY (sequence, Qsequencep)` then `Faref`, so
+    // the index check is `fixnump` and an over-long index is args-out-of-range.
+    assert_eq!(eval("(elt \"abc\" 1)"), "98");
+    assert_eq!(eval("(elt [1 2 3] 1)"), "2");
+    assert_eq!(eval("(elt (bool-vector t nil) 1)"), "nil");
+    assert_eq!(eval("(elt (make-char-table 'test 7) ?a)"), "7");
+    assert_eq!(e("(elt [1 2 3] 1.5)"), "(wrong-type-argument fixnump 1.5)");
+    assert_eq!(e("(elt \"abc\" 9)"), "(args-out-of-range \"abc\" 9)");
+
+    // `ARRAYP` excludes a RECORD even though `Faref` accepts one, and the
+    // predicate reported is `sequencep`, not `arrayp`.
+    assert_eq!(
+        e("(elt (record 'a 1 2) 1)"),
+        "(wrong-type-argument sequencep #s(a 1 2))"
+    );
+    assert_eq!(e("(elt 5 0)"), "(wrong-type-argument sequencep 5)");
+}

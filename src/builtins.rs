@@ -1296,6 +1296,58 @@ fn bool_vector_not(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(h.alloc(Obj::BoolVector(out)))
 }
+/// `(elt SEQUENCE N)` — port of `Felt` (fns.c).
+///
+/// ```c
+///   if (CONSP (sequence) || NILP (sequence))
+///     return Fnth (n, sequence);
+///   else
+///     {
+///       CHECK_ARRAY (sequence, Qsequencep);
+///       return Faref (sequence, n);
+///     }
+/// ```
+///
+/// It was an elisp `defun` in the prelude, which behaved the same but could not
+/// name itself the way a C primitive does. Emacs reports the SUBR when a
+/// function object is called with the wrong count, so
+/// `(funcall #'elt)` is `(wrong-number-of-arguments #<subr elt> 0)`; the prelude
+/// version answered with its own printed closure source instead — a
+/// `#[(seq n) (…)]` blob in place of `#<subr elt>`.
+///
+/// The type checks are `Fnth`'s and `Faref`'s, exactly as the C delegates them:
+/// the array path's index check is `Faref`'s `CHECK_FIXNUM`
+/// (`(elt [1 2 3] 1.5)` is `(wrong-type-argument fixnump 1.5)`), and the list
+/// path's is `Fnthcdr`'s, which accepts an integer only.
+fn elt_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    // `CONSP (sequence) || NILP (sequence)` — a list, including the empty one.
+    if is_nil(&a[0]) || matches!(h.obj(&a[0]), Some(Obj::Cons(..))) {
+        // Fnth takes (N, LIST); elt takes (SEQUENCE, N).
+        return nth_fn(h, &[a[1].clone(), a[0].clone()]);
+    }
+    // CHECK_ARRAY (sequence, Qsequencep): the TEST is `ARRAYP` but the
+    // PREDICATE reported is `sequencep`, because a non-array reaching here is
+    // not a sequence at all. `ARRAYP` is vector | string | bool-vector |
+    // char-table — a RECORD is not one, even though `Faref` accepts it:
+    //
+    //   (elt (record 'a 1 2) 1)          => (wrong-type-argument sequencep #s(a 1 2))
+    //   (elt (make-char-table 'test 7) ?a) => 7
+    //   (arrayp (record 'a 1))           => nil
+    if !matches!(
+        h.obj(&a[0]),
+        Some(Obj::Vector(_))
+            | Some(Obj::Str(_))
+            | Some(Obj::BoolVector(_))
+            | Some(Obj::CharTable(_))
+    ) {
+        return Err(format!(
+            "wrong-type-argument: sequencep {}",
+            h.print(&a[0], true)
+        ));
+    }
+    aref(h, a)
+}
+
 fn aref(h: &mut ElispHost, a: &[Value]) -> R {
     // A char-table indexes by character (0..=MAX_CHAR) with parent/default
     // fallback, unlike a plain vector's positional index.
@@ -8904,6 +8956,7 @@ pub fn install(h: &mut ElispHost) {
     );
     s("bool-vector-subsetp", 2, Some(2), bool_vector_subsetp);
     s("bool-vector-not", 1, Some(2), bool_vector_not);
+    s("elt", 2, Some(2), elt_fn);
     s("aref", 2, Some(2), aref);
     s("aset", 3, Some(3), aset);
     // overlays

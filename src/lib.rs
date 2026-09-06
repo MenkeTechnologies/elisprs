@@ -156,6 +156,12 @@ fn load_prelude() {
     if host::prelude_loaded() {
         return;
     }
+    // A thread that has loaded the prelude once keeps the resulting host, so a
+    // later `reset_host` restores it by copy rather than lowering every
+    // preloaded-Lisp form again. See `host::restore_prelude_snapshot`.
+    if host::restore_prelude_snapshot() {
+        return;
+    }
     host::set_prelude_loaded(true);
     // The prelude models Emacs's *preloaded* Lisp, which a real Emacs ships
     // byte-compiled. See `compiler::OPEN_CODED`.
@@ -179,6 +185,7 @@ fn load_prelude() {
         }
     }
     host::set_prelude_compiling(false);
+    host::save_prelude_snapshot();
 }
 
 /// Render a value (prin1 style when `readable`).

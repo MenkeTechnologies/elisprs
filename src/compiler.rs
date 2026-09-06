@@ -206,6 +206,15 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
         Some(Obj::Symbol(s)) => Some(s.name.clone()),
         _ => None,
     };
+    // Emacs checks a special form's declared arity in `eval_sub`, when the form
+    // RUNS — `(if nil (let))` is nil, and only evaluating the `(let)` signals.
+    // So a miscounted form is still lowered; it is lowered to the signal.
+    if let Some(n) = name.as_deref() {
+        if let Some(argc) = special_form_arity_error(n, elems.len() - 1) {
+            compile_wrong_nargs_signal(h, b, &head, argc)?;
+            return Ok(());
+        }
+    }
     match name.as_deref() {
         Some("quote") => load_const(b, elems.get(1).cloned().unwrap_or(Value::Undef)),
         Some("function") => {
@@ -330,6 +339,90 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
 /// evaluating either argument, and `f` is unbound when the call compiles; and a
 /// second `(fset 'f (symbol-function 'cdr))` narrows a cell that was wide enough
 /// when it did.
+/// `(NAME, MIN, MAX)` for the special forms elisprs lowers, where `MAX` is
+/// `None` for Emacs's `UNEVALLED` (no upper bound).
+///
+/// A special form is a subr like any other, so `eval_sub` checks its argument
+/// count against the `DEFUN` declaration before it runs — `(let)` signals
+/// `(wrong-number-of-arguments let 0)` rather than binding nothing. elisprs
+/// lowers these by NAME in [`compile_call`] and so skipped that check entirely:
+/// every form below either evaluated to a wrong answer or, for `let`/`let*`,
+/// panicked the interpreter thread while macro-expanding `elems[2..]` of a
+/// one-element list.
+///
+/// The numbers are the arities Emacs itself reports, not the C source read by
+/// eye:
+///
+/// ```text
+///   (subr-arity (indirect-function 'let))   => (1 . unevalled)
+///   (subr-arity (indirect-function 'if))    => (2 . unevalled)
+///   (subr-arity (indirect-function 'quote)) => (1 . unevalled)
+/// ```
+///
+/// Forms with `MIN` 0 and no maximum (`progn`, `cond`, `and`, `or`,
+/// `save-excursion`, `save-restriction`, `save-current-buffer`, `interactive`)
+/// can never be miscounted and are deliberately absent.
+///
+/// `quote` and `function` carry a MAX although their `DEFUN` says `UNEVALLED`:
+/// both reject a second argument from inside their own C body
+/// (`Fquote` signals when `XCDR (args)` is non-nil), which is why
+/// `(quote a b)` is `(wrong-number-of-arguments quote 2)`.
+///
+/// `setq` is not here because its rule is parity, not a bound — see
+/// [`special_form_arity_error`].
+pub(crate) const SPECIAL_FORM_ARITY: &[(&str, usize, Option<usize>)] = &[
+    ("quote", 1, Some(1)),
+    ("function", 1, Some(1)),
+    ("if", 2, None),
+    ("let", 1, None),
+    ("let*", 1, None),
+    ("while", 1, None),
+    ("prog1", 1, None),
+    ("catch", 1, None),
+    ("unwind-protect", 1, None),
+    ("condition-case", 2, None),
+    ("defvar", 1, None),
+    ("defconst", 2, None),
+];
+
+/// Lower `(signal 'wrong-number-of-arguments (list HEAD ARGC))` in place of a
+/// special form whose argument count its `DEFUN` rejects.
+///
+/// Emitting the signal rather than returning `Err` is what matches Emacs: the
+/// check lives in `eval_sub`, so a miscounted form in a branch that never runs
+/// never signals (`(if nil (let))` is nil under both the interpreter and the
+/// byte compiler). A compile-time error would reject whole files Emacs loads.
+fn compile_wrong_nargs_signal(
+    h: &mut ElispHost,
+    b: &mut ChunkBuilder,
+    head: &Value,
+    argc: usize,
+) -> Result<(), String> {
+    let quote = h.intern("quote");
+    let quoted = |h: &mut ElispHost, v: Value| h.list_from(vec![quote.clone(), v]);
+    let cond = h.intern("wrong-number-of-arguments");
+    let cond = quoted(h, cond);
+    let data = h.list_from(vec![head.clone(), Value::Int(argc as i64)]);
+    let data = quoted(h, data);
+    let signal = h.intern("signal");
+    let form = h.list_from(vec![signal, cond, data]);
+    compile_form(h, b, &form)
+}
+
+/// The argument count a special form would be rejected for, or `None` when the
+/// call is well-formed.
+///
+/// `setq` is the odd one out: its `DEFUN` is `(0 . unevalled)`, and it rejects
+/// an ODD count from inside `Fsetq` — `(setq a)` is
+/// `(wrong-number-of-arguments setq 1)` while `(setq)` is fine.
+pub(crate) fn special_form_arity_error(name: &str, argc: usize) -> Option<usize> {
+    if name == "setq" {
+        return (argc % 2 == 1).then_some(argc);
+    }
+    let (_, min, max) = SPECIAL_FORM_ARITY.iter().find(|(n, ..)| *n == name)?;
+    (argc < *min || max.is_some_and(|m| argc > m)).then_some(argc)
+}
+
 fn needs_arity_guard(h: &ElispHost, head: &Value, argc: usize) -> bool {
     if !matches!(h.obj(head), Some(Obj::Symbol(_))) {
         return false;

@@ -690,6 +690,91 @@ time, never one pair at a time, precisely so odd lengths occur."
       (setq n (1- n)))
     (cons 'make-hash-table args)))
 
+;;; ── miscounted special forms ─────────────────────────────────────────────────
+
+;; A special form is a subr, so `eval_sub' checks its DEFUN arity before running
+;; it -- `(let)' is `(wrong-number-of-arguments let 0)', not a `let' that binds
+;; nothing.  The corpus had ZERO coverage of this: a 4000-form corpus at depth 3
+;; contained no `(let)', `(if)', `(quote)', `(function)' or any other special
+;; form written with a count its DEFUN rejects.  `fz-control' only ever emits
+;; WELL-FORMED control forms, and every other family generates ordinary calls.
+;;
+;; The gap hid a crash, not just a wrong answer: `(let)' panicked the elisprs
+;; interpreter thread inside macro expansion.  It surfaced only because the
+;; SHRINKER happened to reduce an unrelated `(apply #'elt nil)' hit down to
+;; `(function)'.  A find that depends on the delta debugger stumbling into a
+;; whole surface is a find the generator should be making directly.
+;;
+;; Two halves are generated, because Emacs checks at EVAL time and both halves
+;; follow from that:
+;;
+;;   (let)             => (wrong-number-of-arguments let 0)
+;;   (if nil (let))    => nil          ; never evaluated, never signals
+
+(defvar fz-special-arities
+  '((quote 1 1) (function 1 1) (if 2 nil) (let 1 nil) (let* 1 nil)
+    (while 1 nil) (prog1 1 nil) (catch 1 nil) (unwind-protect 1 nil)
+    (condition-case 2 nil) (defvar 1 nil) (defconst 2 nil))
+  "`(NAME MIN MAX)' per special form, MAX nil for `unevalled'.
+Measured, not read off the C: `(subr-arity (indirect-function \\='let))' is
+`(1 . unevalled)'.  `quote' and `function' carry a MAX because both reject a
+second argument from inside their own body.")
+
+(defvar fz-special-nullary
+  '(progn cond and or save-excursion save-restriction save-current-buffer)
+  "Special forms whose MIN is 0, so a bare call is legal and must NOT signal.
+They are generated with zero arguments as the negative control: a gate that
+signals on these would be as wrong as one that stays silent on `(let)'.")
+
+(defun fz-special-arity-form ()
+  "A special form written with an argument count its DEFUN rejects.
+
+Only REJECTED counts are generated for the forms in `fz-special-arities', which
+is what keeps the family safe to evaluate: the arity check fires before the body
+runs, so no `while' loops forever, no `defconst' assigns, and no `unwind-protect'
+body executes.  `(while)' is generated but a runnable `(while COND)' never is."
+  (let* ((spec (fz-pick fz-special-arities))
+         (name (nth 0 spec))
+         (min (nth 1 spec))
+         (max (nth 2 spec))
+         ;; Too few, or -- where there is a maximum -- too many.
+         (argc (if (and max (fz-chance 40))
+                   (+ max 1 (fz-int 2))
+                 (fz-int (max 1 min))))
+         (args nil))
+    (dotimes (_ argc) (push (fz-leaf 'any) args))
+    (let ((form (cons name args)))
+      (cond
+       ;; Bare: must signal.
+       ((fz-chance 55) form)
+       ;; Unevaluated: must NOT signal, and must not be constant-folded into
+       ;; one either.
+       ((fz-chance 30) (list 'if nil form))
+       ((fz-chance 30) (list 'and nil form))
+       ((fz-chance 40) (list 'condition-case 'e form '(error e)))
+       ;; A legal zero-argument special form, as the negative control.
+       (t (list (fz-pick fz-special-nullary)))))))
+
+(defun fz-setq-parity-form ()
+  "`setq' with an odd argument count.
+
+`setq' is the one special form whose rule is parity rather than a bound: its
+DEFUN is `(0 . unevalled)' and `Fsetq' rejects an odd count from inside the
+body, so `(setq)' is legal, `(setq a)' is `(wrong-number-of-arguments setq 1)',
+and `(setq a 1 b)' is 3.  A generator that only ever emits pairs can never see
+it.  The variables are `fz-*' names so a corpus form cannot clobber a symbol
+`drive.el' or the prelude depends on."
+  (let* ((pairs (fz-int 3))
+         (args nil)
+         (i 0))
+    (while (< i pairs)
+      (push (intern (format "fz-v%d" i)) args)
+      (push (fz-leaf 'any) args)
+      (setq i (1+ i)))
+    ;; The trailing lone variable is what makes the count odd.
+    (when (fz-chance 75) (push (intern (format "fz-v%d" pairs)) args))
+    (cons 'setq (nreverse args))))
+
 ;;; ── improper-list forms ──────────────────────────────────────────────────────
 
 (defvar fz-list-walkers
@@ -735,6 +820,8 @@ only the error datum does."
    ((fz-chance 5) (fz-arity-form))
    ((fz-chance 6) (fz-designator-form))
    ((fz-chance 4) (fz-keyword-form))
+   ((fz-chance 6) (fz-special-arity-form))
+   ((fz-chance 3) (fz-setq-parity-form))
    ((fz-chance 6) (fz-improper-form depth))
    (t (fz-build (fz-pick fz-calls) (1- depth)))))
 

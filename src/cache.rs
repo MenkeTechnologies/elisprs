@@ -185,6 +185,87 @@ pub fn cache_enabled() -> bool {
     )
 }
 
+/// Default byte budget for the shard's entry blobs, in bytes (64 MiB).
+///
+/// The shard is a SINGLE file that `put` rewrites whole: it reads every byte,
+/// rkyv-validates it, inserts one entry, re-serializes and renames. That is
+/// O(shard) per script run, so an unbounded shard makes every run slower than
+/// the last — and the per-entry cost is not small, because an entry carries a
+/// complete post-prelude heap image (measured at ~6.8 MB each).
+///
+/// Left unbounded it stops being a cache and becomes a hang: a shard here
+/// reached 77 entries / 525,470,299 bytes, at which point `elisp FILE` burned
+/// 18.9s of CPU without finishing while `ELISPRS_CACHE=0 elisp FILE` needed
+/// 0.52s — the cache had become ~36x more expensive than the work it skips.
+///
+/// A budget is the fix rather than a bigger buffer: the shard has to stay small
+/// enough that a whole-file rewrite is cheaper than recompiling one script.
+pub const DEFAULT_MAX_SHARD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The shard's byte budget. `ELISPRS_CACHE_MAX_BYTES` overrides it; `0` means
+/// no budget (the pre-budget behaviour, for a deliberate benchmark).
+pub fn max_shard_bytes() -> u64 {
+    match std::env::var("ELISPRS_CACHE_MAX_BYTES") {
+        Ok(v) => v.trim().parse().unwrap_or(DEFAULT_MAX_SHARD_BYTES),
+        Err(_) => DEFAULT_MAX_SHARD_BYTES,
+    }
+}
+
+/// Serialized size of one entry's blobs — what the budget counts.
+fn entry_bytes(e: &Entry) -> u64 {
+    (e.forms.iter().map(Vec::len).sum::<usize>()
+        + e.heap.len()
+        + e.oclosure_meta.len()
+        + e.introspection_cells.len()
+        + e.builtin_cells.len()) as u64
+}
+
+/// Drop entries until the shard fits `budget`, and drop entries whose source
+/// file is gone or has been edited since (they can never be served again, so
+/// they are pure weight — the same predicate [`evict_stale`] applies on
+/// demand).
+///
+/// `keep` is the entry just written and is never evicted: evicting it would
+/// make the run that paid for the compile get nothing for it, and a shard at
+/// its budget would then never serve a hit again.
+///
+/// Eviction is by `cached_at_secs`, oldest first, so the working set of scripts
+/// a session actually re-runs survives and one-off scripts age out.
+fn enforce_budget(shard: &mut Shard, keep: &str, budget: u64) {
+    shard.entries.retain(|p, e| {
+        p == keep
+            || match file_mtime_ns(Path::new(p)) {
+                Some(ns) => ns == e.mtime_ns,
+                None => false,
+            }
+    });
+    if budget == 0 {
+        return;
+    }
+    let mut total: u64 = shard.entries.values().map(entry_bytes).sum();
+    if total <= budget {
+        return;
+    }
+    // Oldest first. `keep` is excluded from the candidate list, not just
+    // skipped, so a shard whose single entry already exceeds the budget still
+    // serves that entry rather than emptying itself every run.
+    let mut by_age: Vec<(i64, String)> = shard
+        .entries
+        .iter()
+        .filter(|(p, _)| p.as_str() != keep)
+        .map(|(p, e)| (e.cached_at_secs, p.clone()))
+        .collect();
+    by_age.sort_unstable();
+    for (_, path) in by_age {
+        if total <= budget {
+            break;
+        }
+        if let Some(e) = shard.entries.remove(&path) {
+            total -= entry_bytes(&e);
+        }
+    }
+}
+
 // ── flock guard ──────────────────────────────────────────────────────────────
 
 /// Holds an exclusive `flock` on the lock file for the guard's lifetime; the
@@ -425,6 +506,9 @@ pub fn put(path: &str, mtime_ns: i64, schema_key: &str, parts: ScriptParts<'_>) 
             builtin_cells: builtin_cells_blob,
         },
     );
+    // Bound the shard before writing it: `put` rewrites the whole file, so an
+    // unbounded shard makes every later run pay for every script ever cached.
+    enforce_budget(&mut shard, path, max_shard_bytes());
     shard.header.built_at_secs = now_secs() as u64;
     let _ = write_shard(&shard);
 }
@@ -524,5 +608,119 @@ mod tests {
         assert!(cache_enabled());
         std::env::remove_var("ELISPRS_CACHE");
         assert!(cache_enabled());
+    }
+
+    /// Build an entry of a given payload size and age, for a path that exists
+    /// on disk with a matching mtime (so only the BUDGET decides its fate, not
+    /// the staleness sweep).
+    fn sized_entry(dir: &Path, name: &str, bytes: usize, age: i64) -> (String, Entry) {
+        let p = dir.join(name);
+        std::fs::write(&p, b"x").unwrap();
+        let mtime_ns = file_mtime_ns(&p).unwrap();
+        (
+            p.to_string_lossy().into_owned(),
+            Entry {
+                mtime_ns,
+                binary_mtime_at_cache: 0,
+                cached_at_secs: age,
+                forms: vec![vec![0u8; bytes]],
+                heap: vec![],
+                oclosure_meta: vec![],
+                introspection_cells: vec![],
+                builtin_cells: vec![],
+            },
+        )
+    }
+
+    /// The shard is rewritten whole on every `put`, so it must stay bounded.
+    /// Unbounded, it reached 525 MB here and `elisp FILE` stopped terminating.
+    #[test]
+    fn budget_evicts_oldest_and_never_the_entry_just_written() {
+        let dir = std::env::temp_dir().join(format!("elisprs-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut shard = fresh_shard("v-test");
+        // 4 x 1000 bytes, ages 10 (oldest) .. 40 (newest).
+        let mut paths = Vec::new();
+        for (i, age) in [10, 20, 30, 40].iter().enumerate() {
+            let (p, e) = sized_entry(&dir, &format!("e{i}.el"), 1000, *age);
+            shard.entries.insert(p.clone(), e);
+            paths.push(p);
+        }
+        assert_eq!(shard.entries.len(), 4);
+
+        // Budget of 2500 fits two entries. The newest-written (`paths[0]`, the
+        // one "just put") is kept even though it is the OLDEST by timestamp —
+        // otherwise the run that paid for the compile caches nothing.
+        enforce_budget(&mut shard, &paths[0], 2500);
+        assert!(
+            shard.entries.contains_key(&paths[0]),
+            "the entry just written was evicted; a shard at its budget would then never serve a hit"
+        );
+        let total: u64 = shard.entries.values().map(entry_bytes).sum();
+        assert!(total <= 2500, "budget not enforced: {total} bytes remain");
+        // Of the rest, the newest survives and the oldest goes.
+        assert!(shard.entries.contains_key(&paths[3]));
+        assert!(!shard.entries.contains_key(&paths[1]));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An entry larger than the whole budget is still served. Evicting it would
+    /// make every run recompile and re-cache the same script forever.
+    #[test]
+    fn a_single_oversized_entry_survives_its_own_budget() {
+        let dir = std::env::temp_dir().join(format!("elisprs-budget1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut shard = fresh_shard("v-test");
+        let (p, e) = sized_entry(&dir, "big.el", 10_000, 1);
+        shard.entries.insert(p.clone(), e);
+        enforce_budget(&mut shard, &p, 100);
+        assert_eq!(shard.entries.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `enforce_budget` also drops entries that can never be served again —
+    /// source deleted, or edited since it was cached — but never the entry just
+    /// written, whose file it must not have to stat as a live path.
+    #[test]
+    fn budget_sweep_drops_unservable_entries() {
+        let dir = std::env::temp_dir().join(format!("elisprs-budget2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut shard = fresh_shard("v-test");
+        let (live, e1) = sized_entry(&dir, "live.el", 10, 5);
+        let (gone, e2) = sized_entry(&dir, "gone.el", 10, 5);
+        let (edited, mut e3) = sized_entry(&dir, "edited.el", 10, 5);
+        e3.mtime_ns += 1; // simulate an edit after caching
+        shard.entries.insert(live.clone(), e1);
+        shard.entries.insert(gone.clone(), e2);
+        shard.entries.insert(edited.clone(), e3);
+        std::fs::remove_file(&gone).unwrap();
+
+        // Budget of 0 = no byte cap, so ONLY the unservable sweep can act here.
+        enforce_budget(&mut shard, &live, 0);
+        assert!(shard.entries.contains_key(&live));
+        assert!(
+            !shard.entries.contains_key(&gone),
+            "deleted source retained"
+        );
+        assert!(
+            !shard.entries.contains_key(&edited),
+            "entry whose source changed since caching was retained"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn max_shard_bytes_env_override() {
+        std::env::set_var("ELISPRS_CACHE_MAX_BYTES", "4096");
+        assert_eq!(max_shard_bytes(), 4096);
+        // 0 is a real value: no budget.
+        std::env::set_var("ELISPRS_CACHE_MAX_BYTES", "0");
+        assert_eq!(max_shard_bytes(), 0);
+        // Garbage falls back to the default rather than to "unbounded".
+        std::env::set_var("ELISPRS_CACHE_MAX_BYTES", "not-a-number");
+        assert_eq!(max_shard_bytes(), DEFAULT_MAX_SHARD_BYTES);
+        std::env::remove_var("ELISPRS_CACHE_MAX_BYTES");
+        assert_eq!(max_shard_bytes(), DEFAULT_MAX_SHARD_BYTES);
     }
 }

@@ -55,7 +55,7 @@
 | Lisp-2 obarray, lexical+dynamic binding, special forms, macros, subrs | **ours** — `src/host.rs` + `src/compiler.rs` |
 | Bytecode execution, JIT, AOT | **`fusevm`** — elisprs has no VM/JIT of its own |
 
-**Status:** self-hosting elisp on `fusevm`. Each top-level form is read, macro-expanded, and lowered to a `fusevm::Chunk` (`src/compiler.rs`); fusevm executes it and calls back into the object heap (`src/host.rs`) through a registered extension handler. Core arithmetic/comparison lower to **native fusevm ops** so hot loops are JIT/AOT-able; `--aot-exe` emits **standalone native binaries**; lowered bytecode + a heap image are cached in an **rkyv** shard at `~/.elisprs`. (An earlier bootstrap built on the `rust_lisp` crate; it was replaced by this own value model — `rust_lisp` is no longer a dependency.)
+**Status:** self-hosting elisp on `fusevm`. Each top-level form is read, macro-expanded, and lowered to a `fusevm::Chunk` (`src/compiler.rs`); fusevm executes it and calls back into the object heap (`src/host.rs`) through a registered extension handler. Core arithmetic/comparison lower to **native fusevm ops** so hot loops are JIT/AOT-able; `--aot-exe` emits **standalone native binaries**; lowered bytecode + a heap image are cached in an **rkyv** shard at `~/.elisprs`, bounded to 64 MiB (`ELISPRS_CACHE_MAX_BYTES`; `ELISPRS_CACHE=0` disables it) and evicted oldest-first, because `put` rewrites the whole shard and an unbounded one made every run pay for every script ever cached. (An earlier bootstrap built on the `rust_lisp` crate; it was replaced by this own value model — `rust_lisp` is no longer a dependency.)
 
 ---
 

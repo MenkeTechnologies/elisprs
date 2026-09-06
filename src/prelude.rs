@@ -143,15 +143,6 @@ pub const PRELUDE: &str = r#"
           (while (>= from to) (setq r (cons from r)) (setq from (+ from inc)))
         (while (<= from to) (setq r (cons from r)) (setq from (+ from inc))))
       (reverse r))))
-(defun elt (seq n)
-  ;; List path defers to `nth' (signals integerp on a float index); the array
-  ;; path signals fixnump like Emacs: (elt [1 2 3] 1.5) => wrong-type-argument
-  ;; fixnump, matching aref's own contract rather than nth's integerp.
-  (cond ((listp seq) (nth n seq))
-        ((arrayp seq)
-         (unless (integerp n) (signal 'wrong-type-argument (list 'fixnump n)))
-         (aref seq n))
-        (t (signal 'wrong-type-argument (list 'sequencep seq)))))
 (defun safe-length (l)
   ;; Length of a possibly circular or dotted list, never erroring or looping
   ;; forever.  Faithful to Emacs 30.2's FOR_EACH_TAIL_SAFE (Brent's teleporting

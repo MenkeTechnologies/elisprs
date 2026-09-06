@@ -158,6 +158,7 @@ pub mod ops {
 pub type SubrFn = fn(&mut ElispHost, &[Value]) -> Result<Value, String>;
 
 /// One dynamic (`let`) binding recorded on the specstack, restored by `unbind_to`.
+#[derive(Clone)]
 enum SpecEntry {
     /// A binding of a symbol's global (default) value cell: (sym, previous value).
     Global(u32, Option<Value>),
@@ -264,6 +265,7 @@ impl Scope {
     }
 }
 
+#[derive(Clone)]
 pub struct SymbolData {
     pub name: String,
     pub value: Option<Value>,
@@ -279,6 +281,7 @@ pub struct SymbolData {
     pub alias_of: Option<u32>,
 }
 
+#[derive(Clone)]
 pub enum Obj {
     Cons(Value, Value),
     Symbol(SymbolData),
@@ -392,6 +395,7 @@ pub enum Obj {
 /// An `Obj::Obarray` payload. A private obarray owns its `symbols` map
 /// (name → symbol arena id); the global obarray (`global == true`) leaves
 /// `symbols` empty and routes every operation to `ElispHost::obarray`.
+#[derive(Clone)]
 pub struct ObarrayData {
     pub symbols: HashMap<String, u32>,
     pub global: bool,
@@ -460,6 +464,7 @@ pub struct OverlayData {
 /// mutated after insertion therefore becomes unfindable, which is Emacs's
 /// behaviour too (`(puthash k 'v h)` then `(setcar k 2)` then `(gethash k h)`
 /// answers nil in both).
+#[derive(Clone)]
 pub struct ElHashTable {
     /// Comparison test: 0 = `eq`, 1 = `eql`, 2 = `equal`, 3 = a
     /// `define-hash-table-test` test (whose functions are in `user_test`).
@@ -639,6 +644,7 @@ impl ElHashTable {
 /// Lookup (`aref`, `char-table-range`) falls back like Emacs's `char_table_ref`:
 /// own char value; if nil → `default`; if that is nil and `parent` is a char-table
 /// → recurse into the parent.
+#[derive(Clone)]
 pub struct CharTable {
     pub subtype: Value,
     pub default: Value,
@@ -853,6 +859,7 @@ fn lisp_level_arity(name: &str) -> Option<(u16, u16)> {
 /// printed" instead of printing (Emacs errors at exactly this depth).
 const PRINT_CIRCLE: usize = 200;
 
+#[derive(Clone)]
 pub struct ElispHost {
     pub(crate) arena: Vec<Obj>,
     obarray: HashMap<String, u32>,
@@ -1076,6 +1083,7 @@ pub struct SymbolBaseline {
 /// Type + slot layout attached to an [`Obj::Closure`] to make it an OClosure.
 /// `ty` is the type symbol's handle; `slots` are the slot symbols' handles in
 /// declaration order (index 0 = first slot). Values live in the closure's env.
+#[derive(Clone)]
 pub struct OClosureMeta {
     pub ty: u32,
     pub slots: Vec<u32>,
@@ -1086,7 +1094,7 @@ pub struct OClosureMeta {
 /// 1-based (`point-min` = `begv`, `point-max` = `zv`). `begv`/`zv`/`mark`/the
 /// save stacks track edits with Emacs marker semantics (see
 /// [`ElispHost::cur_insert`]/[`ElispHost::cur_delete`]).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct EditBuffer {
     /// The buffer's name, or `None` once killed (the slot is retained so existing
     /// buffer objects keep resolving; `buffer-live-p` reads this).
@@ -5353,6 +5361,69 @@ thread_local! {
     /// markers and `run_chunk` skips the tracing JIT so every marker fires
     /// through the interpreter. Off = zero overhead (no markers emitted at all).
     static DEBUG_MODE: Cell<bool> = const { Cell::new(false) };
+    /// The host exactly as the prelude left it, kept so a later `reset_host` +
+    /// `load_prelude` on this thread can restore that state by copy instead of
+    /// rebuilding it. See [`restore_prelude_snapshot`].
+    static PRELUDE_SNAPSHOT: RefCell<Option<ElispHost>> = const { RefCell::new(None) };
+    /// Off disables the snapshot entirely, so `load_prelude` rebuilds from
+    /// source. The equivalence test flips this to produce a cold reference to
+    /// compare a restored host against.
+    static PRELUDE_SNAPSHOT_ON: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Enable/disable the post-prelude snapshot (default on). Turning it off also
+/// drops any snapshot already held, so the next `load_prelude` rebuilds.
+pub fn set_prelude_snapshot_enabled(on: bool) {
+    PRELUDE_SNAPSHOT_ON.with(|c| c.set(on));
+    if !on {
+        PRELUDE_SNAPSHOT.with(|s| *s.borrow_mut() = None);
+    }
+}
+
+/// Copy the post-prelude host back over the live host, skipping the rebuild.
+///
+/// Loading the prelude means reading, macro-expanding, lowering and running
+/// ~every preloaded-Lisp form; measured at 7-8s per call in a debug build,
+/// which is what made a test that evaluates five expressions cost 40s. The
+/// state that work produces is just the `ElispHost` value, so it is taken once
+/// per thread and restored by clone thereafter.
+///
+/// The copy is sound because nothing in the arena is written through a shared
+/// handle: `Obj::Str` is replaced wholesale by
+/// [`ElispHost::set_string_text`] (a fresh `Arc`, never `Arc::make_mut`), and
+/// no `Rc`/`Arc` in `src/` is ever `get_mut`/`make_mut`'d — so two hosts may
+/// share a payload allocation and neither can observe the other's writes.
+///
+/// Returns whether a snapshot was available.
+pub fn restore_prelude_snapshot() -> bool {
+    if !PRELUDE_SNAPSHOT_ON.with(|c| c.get()) {
+        return false;
+    }
+    let Some(snap) = PRELUDE_SNAPSHOT.with(|s| s.borrow().clone()) else {
+        return false;
+    };
+    HOST.with(|h| *h.borrow_mut() = snap);
+    PRELUDE_LOADED.with(|c| c.set(true));
+    true
+}
+
+/// Record the live host as the post-prelude snapshot. Called once per thread,
+/// right after the prelude finishes loading on a cold path.
+///
+/// The copy is taken EAGERLY, on the first load, rather than being deferred
+/// until a reload proves it will be read. Deferring was measured and is the
+/// worse trade: a process that loads the prelude exactly once (`elisp FILE`,
+/// `elisp -e`) saves ~0.020s of CPU — inside the 0.030s A/A band of the same
+/// binary against itself, so not a number worth claiming — while libtest gives
+/// every test its own thread, so deferring costs each of them a SECOND full
+/// prelude rebuild. Across 196 tests that is ~94s of CPU to buy back a
+/// difference that does not clear its own noise floor.
+pub fn save_prelude_snapshot() {
+    if !PRELUDE_SNAPSHOT_ON.with(|c| c.get()) {
+        return;
+    }
+    let copy = HOST.with(|h| h.borrow().clone());
+    PRELUDE_SNAPSHOT.with(|s| *s.borrow_mut() = Some(copy));
 }
 
 /// Enable/disable DAP debug execution (statement markers + JIT-off). Set by the
@@ -6384,6 +6455,21 @@ fn macroexpand_all_impl(
         return Ok(f);
     }
     let head = with_host(|h| h.sym_name(&elems[0]));
+    // A special form whose argument count its `DEFUN` rejects is left exactly
+    // as written, so the compiler still sees the count it must signal on.
+    //
+    // Expanding it is not merely pointless, it is unsound: each arm below reads
+    // the positions the form is DECLARED to have, and `(let)` has none of them
+    // — the `let` arm sliced `elems[2..]` of a one-element list and panicked the
+    // interpreter thread outright ("range start index 2 out of range for slice
+    // of length 1"). Normalizing instead of skipping would be worse than the
+    // panic: it would manufacture the missing arguments and hide the count that
+    // `(wrong-number-of-arguments let 0)` has to report.
+    if let Some(n) = head.as_deref() {
+        if crate::compiler::special_form_arity_error(n, elems.len() - 1).is_some() {
+            return Ok(f);
+        }
+    }
     match head.as_deref() {
         // Quoted data is never expanded.
         Some("quote") => Ok(f),

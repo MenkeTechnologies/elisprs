@@ -74,6 +74,30 @@ abspath() { perl -MCwd=abs_path -e 'print abs_path($ARGV[0]) // ""' "$1"; }
 # here, so it cannot drift from the document the numbers live in;
 # `EMACS_VERSION_EXPECT' overrides it for a deliberate cross-version run.
 #
+# THE GATE HAS FIRED.  The pin is 30.2; the Emacs on this machine is now 31.1
+# (Homebrew replaced the 30.2 cellar, so 30.2 cannot be re-measured here).  This
+# is exactly the case the gate exists for, and the divergence it prevents is
+# real rather than hypothetical -- `make-hash-table' argument validation is not
+# the same function in the two releases:
+#
+#                                   30.2 (measured, round 1)          31.1 (measured)
+#   (make-hash-table 1)             (error "Invalid argument list" 1)  (error "Odd number of arguments")
+#   (make-hash-table t)             (error "Invalid argument list" t)  (error "Odd number of arguments")
+#   (make-hash-table :purecopy)     (error "Invalid argument list" :purecopy)
+#                                                                      (error "Odd number of arguments")
+#   (make-hash-table 0 'eq)         (error "Invalid argument list" 0)  (error "Invalid keyword argument" 0)
+#
+# Running with `EMACS_VERSION_EXPECT=31.1' therefore reports ~9 `make-hash-table'
+# divergences per few-hundred-form corpus that are NOT elisprs bugs: they are
+# 30.2 answers being compared against a 31.1 oracle.  Do not "fix" them without
+# first deciding, deliberately, which release this tree targets -- re-pointing
+# elisprs at 31.1 means re-measuring every expectation in BUGS.md, not editing
+# the forms the fuzzer happens to surface.
+#
+# Everything else the 31.1 run reported was version-independent and was fixed:
+# the special-form arity gate and `elt`'s designator (see
+# `tests/parity_fuzz_findings.rs`).
+#
 # The argv half is the one that used to be invisible, and it decides answers the
 # version number never mentions. `emacs -Q --batch -l FILE' evaluates in
 # `*scratch*' under `lisp-interaction-mode'; `emacs --script FILE' evaluates in
