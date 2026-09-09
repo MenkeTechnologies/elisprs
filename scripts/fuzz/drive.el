@@ -56,6 +56,20 @@ for the shapes this corpus generates.")
 ;; equally — it hides no divergence.
 (setq print-escape-newlines t)
 
+;; The corpus builds circular and shared structure on purpose (`fz-circular' in
+;; gen.el), and `prin1' of a circular list with `print-circle' nil does not
+;; terminate.  With it on, both engines print `#1=(1 2 3 . #1#)' and the
+;; comparison holds:
+;;
+;;   emacs -Q --batch  =>  (circular-list #1=(3 1 2 . #1#))
+;;   elisp             =>  (circular-list #1=(3 1 2 . #1#))
+;;
+;; Like `print-escape-newlines' this is set identically on both sides, so it
+;; changes the expected text for both and hides no divergence -- it makes
+;; shared structure VISIBLE, which is strictly more of the contract than
+;; printing it expanded.
+(setq print-circle t)
+
 (let* ((corpus (or (getenv "FUZZ_CORPUS") (error "FUZZ_CORPUS unset")))
        (start (string-to-number (or (getenv "FUZZ_START") "0")))
        (count (string-to-number (or (getenv "FUZZ_COUNT") "0")))

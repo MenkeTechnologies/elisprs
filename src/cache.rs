@@ -92,7 +92,26 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// (`SerObj::HashTable::user_test`). A v10 shard replays such a table as one
 /// with NO user test, which is worse than rejecting it: the table would come
 /// back answering `eql` and silently miss every key it used to find.
-pub const SHARD_FORMAT_VERSION: u32 = 12;
+///
+/// v13 moves the post-prelude heap out of the entry and into the SHARD. Through
+/// v12 each entry carried a whole image — measured at 6,694,994 bytes for
+/// `examples/arithmetic.el` against 1,208 bytes of actual bytecode — even
+/// though `arena[builtin_count, prelude_end)` is produced by running the
+/// prelude and nothing else, so it is the same bytes for every file compiled by
+/// this binary under this schema key. 73 entries therefore stored 73 copies of
+/// it, which is what drove the shard to 525 MB and made `put` (a whole-file
+/// rewrite) cost O(entries x prelude) per run. It is now stored once as
+/// `Shard::base`, and an entry keeps only `heap_tail` — `arena[prelude_end..]`,
+/// the objects the file itself created.
+///
+/// Old shards do not migrate in place: `header_ok` compares `format_version`,
+/// so a v12 shard misses on every `get` and the next `put` writes a fresh v13
+/// shard over it. That is deliberate — a v12 `Entry` has a `heap` field where
+/// v13 has `heap_tail` + `base_fingerprint`, and rkyv reads its archive
+/// positionally, so a v12 shard read as v13 is not a partial answer but a wrong
+/// one. Rebuilding silently costs one cold compile per script and is the same
+/// path every previous bump took.
+pub const SHARD_FORMAT_VERSION: u32 = 13;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next
@@ -132,8 +151,16 @@ struct Entry {
     cached_at_secs: i64,
     /// bincode `fusevm::Chunk`, one per top-level form.
     forms: Vec<Vec<u8>>,
-    /// bincode `Vec<SerObj>` — the clean (pre-user-run) heap image.
-    heap: Vec<u8>,
+    /// bincode `Vec<SerObj>` — `arena[prelude_end..]`, the objects THIS file
+    /// created, cleaned of its own run-time effects. The image a hit replays is
+    /// [`Shard::base`]`.heap` followed by this.
+    heap_tail: Vec<u8>,
+    /// [`BaseImage::fingerprint`] of the base this entry's handles were compiled
+    /// against. The schema key already pins the prelude source and the builtin
+    /// layout, so a mismatch means the base is not reproducible from them after
+    /// all; a hit is refused rather than replayed onto a base whose handles may
+    /// not line up.
+    base_fingerprint: u64,
     /// bincode `Vec<(u32, u32, Vec<u32>)>` — the OClosure side table
     /// (`closure-handle, type, slots`). Not derivable from `heap`: it is built
     /// when the prelude runs, which a cache hit skips.
@@ -144,18 +171,59 @@ struct Entry {
     /// builds, so a cache hit has to restore it or `(fboundp 'when)` answers nil
     /// on a warm run and `t` on a cold one.
     introspection_cells: Vec<u8>,
+}
+
+/// The post-prelude state, which every entry in the shard shares.
+///
+/// Running the prelude is the only thing that produces it, and the schema key
+/// pins the prelude source, the builtin layout and the elisprs version — so all
+/// entries under one shard replay onto identical bytes. Storing it per entry
+/// (v12 and earlier) multiplied ~6.8 MB by the number of cached scripts.
+#[derive(Archive, RkyvSerialize, RkyvDeserialize)]
+#[archive(check_bytes)]
+struct BaseImage {
+    /// bincode `Vec<SerObj>` — `arena[builtin_count, prelude_end)` as the
+    /// prelude left it, captured before any file ran.
+    heap: Vec<u8>,
     /// bincode `Vec<Option<SymbolBaseline>>` — the cells of the arena's builtin
     /// prefix, indexed by handle. `heap` deliberately starts at `builtin_count`
     /// (a builtin object is rebuilt by `install`, and an `Obj::Subr` cannot be
     /// serialized at all), but the prelude WRITES to symbols below that line, and
     /// those writes belong to the image just as much as the objects above it.
     builtin_cells: Vec<u8>,
+    /// Hash of the two blobs above; recorded in every entry written against it.
+    fingerprint: u64,
+}
+
+impl BaseImage {
+    fn fingerprint_of(heap: &[u8], builtin_cells: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        heap.hash(&mut h);
+        builtin_cells.hash(&mut h);
+        h.finish()
+    }
+
+    fn new(heap: Vec<u8>, builtin_cells: Vec<u8>) -> Self {
+        let fingerprint = Self::fingerprint_of(&heap, &builtin_cells);
+        Self {
+            heap,
+            builtin_cells,
+            fingerprint,
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        (self.heap.len() + self.builtin_cells.len()) as u64
+    }
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize)]
 #[archive(check_bytes)]
 struct Shard {
     header: ShardHeader,
+    /// Shared by every entry — see [`BaseImage`].
+    base: BaseImage,
     entries: HashMap<String, Entry>,
 }
 
@@ -185,21 +253,21 @@ pub fn cache_enabled() -> bool {
     )
 }
 
-/// Default byte budget for the shard's entry blobs, in bytes (64 MiB).
+/// Default byte budget for the shard, in bytes (64 MiB): the shared
+/// [`BaseImage`] plus every entry's blobs.
 ///
 /// The shard is a SINGLE file that `put` rewrites whole: it reads every byte,
 /// rkyv-validates it, inserts one entry, re-serializes and renames. That is
 /// O(shard) per script run, so an unbounded shard makes every run slower than
-/// the last — and the per-entry cost is not small, because an entry carries a
-/// complete post-prelude heap image (measured at ~6.8 MB each).
+/// the last.
 ///
-/// Left unbounded it stops being a cache and becomes a hang: a shard here
-/// reached 77 entries / 525,470,299 bytes, at which point `elisp FILE` burned
-/// 18.9s of CPU without finishing while `ELISPRS_CACHE=0 elisp FILE` needed
-/// 0.52s — the cache had become ~36x more expensive than the work it skips.
-///
-/// A budget is the fix rather than a bigger buffer: the shard has to stay small
-/// enough that a whole-file rewrite is cheaper than recompiling one script.
+/// Through format v12 that was ruinous, because each entry carried its own copy
+/// of the post-prelude heap (~6.8 MB): the shard here reached 77 entries /
+/// 525,470,299 bytes, at which point `elisp FILE` burned 18.9s of CPU without
+/// finishing while `ELISPRS_CACHE=0 elisp FILE` needed 0.52s. v13 stores that
+/// image once per shard, so the budget now bounds a base plus a per-entry tail
+/// of a few kB rather than a per-entry image — but it still bounds, because the
+/// rewrite is still O(shard).
 pub const DEFAULT_MAX_SHARD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The shard's byte budget. `ELISPRS_CACHE_MAX_BYTES` overrides it; `0` means
@@ -211,13 +279,13 @@ pub fn max_shard_bytes() -> u64 {
     }
 }
 
-/// Serialized size of one entry's blobs — what the budget counts.
+/// Serialized size of one entry's blobs — what the budget counts, alongside the
+/// shard's single [`BaseImage`].
 fn entry_bytes(e: &Entry) -> u64 {
     (e.forms.iter().map(Vec::len).sum::<usize>()
-        + e.heap.len()
+        + e.heap_tail.len()
         + e.oclosure_meta.len()
-        + e.introspection_cells.len()
-        + e.builtin_cells.len()) as u64
+        + e.introspection_cells.len()) as u64
 }
 
 /// Drop entries until the shard fits `budget`, and drop entries whose source
@@ -242,7 +310,10 @@ fn enforce_budget(shard: &mut Shard, keep: &str, budget: u64) {
     if budget == 0 {
         return;
     }
-    let mut total: u64 = shard.entries.values().map(entry_bytes).sum();
+    // The base counts: it is bytes `put` rewrites on every run just like an
+    // entry's, and leaving it out would let the shard exceed the budget by a
+    // whole heap image.
+    let mut total: u64 = shard.base.bytes() + shard.entries.values().map(entry_bytes).sum::<u64>();
     if total <= budget {
         return;
     }
@@ -338,8 +409,9 @@ fn read_shard() -> Option<Shard> {
     archived.deserialize(&mut rkyv::Infallible).ok()
 }
 
-fn fresh_shard(schema_key: &str) -> Shard {
+fn fresh_shard(schema_key: &str, base: BaseImage) -> Shard {
     Shard {
+        base,
         header: ShardHeader {
             magic: SHARD_MAGIC,
             format_version: SHARD_FORMAT_VERSION,
@@ -419,13 +491,23 @@ pub fn get(path: &str, mtime_ns: i64, schema_key: &str) -> Option<CachedScript> 
         .map(|b| bincode::deserialize(b))
         .collect::<Result<_, _>>()
         .ok()?;
-    let heap: Vec<SerObj> = bincode::deserialize(&entry.heap).ok()?;
+    // The entry's handles were assigned against a specific base. The schema key
+    // should already guarantee it, so a mismatch is a miss rather than an error.
+    let base_fingerprint: u64 = entry.base_fingerprint.into();
+    if base_fingerprint != BaseImage::fingerprint_of(&shard.base.heap, &shard.base.builtin_cells) {
+        return None;
+    }
+    // The full image is the shard's shared base followed by this file's tail —
+    // the same `Vec<SerObj>` v12 stored per entry, reassembled.
+    let mut heap: Vec<SerObj> = bincode::deserialize(&shard.base.heap).ok()?;
+    let tail: Vec<SerObj> = bincode::deserialize(&entry.heap_tail).ok()?;
+    heap.extend(tail);
     let oclosure_meta: Vec<(u32, u32, Vec<u32>)> =
         bincode::deserialize(&entry.oclosure_meta).ok()?;
     let introspection_cells: Vec<(u32, fusevm::Value)> =
         bincode::deserialize(&entry.introspection_cells).ok()?;
     let builtin_cells: Vec<Option<crate::host::SymbolBaseline>> =
-        bincode::deserialize(&entry.builtin_cells).ok()?;
+        bincode::deserialize(&shard.base.builtin_cells).ok()?;
     Some(CachedScript {
         chunks,
         heap,
@@ -435,16 +517,21 @@ pub fn get(path: &str, mtime_ns: i64, schema_key: &str) -> Option<CachedScript> 
     })
 }
 
-/// The five parts of a compiled script, borrowed for the write — the same five
-/// [`CachedScript`] hands back on the read.
+/// The parts of a compiled script, borrowed for the write — what
+/// [`CachedScript`] hands back on the read, split along the entry/shard line.
 ///
-/// One argument rather than five: `clippy::too_many_arguments` fails the build
+/// One argument rather than six: `clippy::too_many_arguments` fails the build
 /// at 8 (`-D warnings` in CI), and the pieces travel together anyway.
 pub struct ScriptParts<'a> {
     pub chunks: &'a [Chunk],
-    pub heap: &'a [SerObj],
+    /// `arena[builtin_count, prelude_end)` — the shared base. Written once per
+    /// shard; identical for every script this binary compiles.
+    pub prelude_heap: &'a [SerObj],
+    /// `arena[prelude_end..]` — the objects this file created.
+    pub heap_tail: &'a [SerObj],
     pub oclosure_meta: &'a [(u32, u32, Vec<u32>)],
     pub introspection_cells: &'a [(u32, fusevm::Value)],
+    /// Part of the shared base, like `prelude_heap`.
     pub builtin_cells: &'a [Option<crate::host::SymbolBaseline>],
 }
 
@@ -453,7 +540,8 @@ pub struct ScriptParts<'a> {
 pub fn put(path: &str, mtime_ns: i64, schema_key: &str, parts: ScriptParts<'_>) {
     let ScriptParts {
         chunks,
-        heap,
+        prelude_heap,
+        heap_tail,
         oclosure_meta,
         introspection_cells,
         builtin_cells,
@@ -468,7 +556,7 @@ pub fn put(path: &str, mtime_ns: i64, schema_key: &str, parts: ScriptParts<'_>) 
     else {
         return;
     };
-    let Ok(heap_blob) = bincode::serialize(heap) else {
+    let Ok(tail_blob) = bincode::serialize(heap_tail) else {
         return;
     };
     let Ok(oclosure_blob) = bincode::serialize(oclosure_meta) else {
@@ -480,17 +568,31 @@ pub fn put(path: &str, mtime_ns: i64, schema_key: &str, parts: ScriptParts<'_>) 
     let Ok(builtin_cells_blob) = bincode::serialize(builtin_cells) else {
         return;
     };
+    let Ok(prelude_blob) = bincode::serialize(prelude_heap) else {
+        return;
+    };
 
     // Serialize concurrent writers: without this, two elisprs processes each
     // read the shard, insert their own entry, and the last writer wins —
     // silently dropping the other's entry.
     let _lock = acquire_lock();
 
+    let base = BaseImage::new(prelude_blob, builtin_cells_blob);
+
     // A shard built under a different schema key / format is discarded wholesale:
     // its chunks reference a builtin layout that no longer exists.
     let mut shard = read_shard()
         .filter(|s| owned_header_ok(&s.header, schema_key))
-        .unwrap_or_else(|| fresh_shard(schema_key));
+        .unwrap_or_else(|| fresh_shard(schema_key, BaseImage::new(Vec::new(), Vec::new())));
+
+    // Every entry's handles are indices into the base, so a base that is not the
+    // one they were written against invalidates all of them. Under a matching
+    // schema key the two are the same bytes; if they ever are not, the entries
+    // go rather than being replayed onto a base they do not fit.
+    if shard.base.fingerprint != base.fingerprint {
+        shard.base = base;
+        shard.entries.clear();
+    }
 
     let bin_mtime = current_binary_mtime_secs().unwrap_or(0);
     shard.entries.insert(
@@ -500,12 +602,24 @@ pub fn put(path: &str, mtime_ns: i64, schema_key: &str, parts: ScriptParts<'_>) 
             binary_mtime_at_cache: bin_mtime,
             cached_at_secs: now_secs(),
             forms,
-            heap: heap_blob,
+            heap_tail: tail_blob,
+            base_fingerprint: shard.base.fingerprint,
             oclosure_meta: oclosure_blob,
             introspection_cells: introspection_blob,
-            builtin_cells: builtin_cells_blob,
         },
     );
+    if std::env::var_os("ELISPRS_CACHE_DEBUG").is_some() {
+        let e = &shard.entries[path];
+        eprintln!(
+            "elisprs: entry bytes forms={} heap_tail={} oclosure={} intro={}; shard base={} entries={}",
+            e.forms.iter().map(Vec::len).sum::<usize>(),
+            e.heap_tail.len(),
+            e.oclosure_meta.len(),
+            e.introspection_cells.len(),
+            shard.base.bytes(),
+            shard.entries.len()
+        );
+    }
     // Bound the shard before writing it: `put` rewrites the whole file, so an
     // unbounded shard makes every later run pay for every script ever cached.
     enforce_budget(&mut shard, path, max_shard_bytes());
@@ -519,11 +633,14 @@ pub fn stats() -> (i64, i64) {
         return (0, 0);
     };
     let count = shard.entries.len() as i64;
-    let bytes: i64 = shard
-        .entries
-        .values()
-        .map(|e| (e.forms.iter().map(|f| f.len()).sum::<usize>() + e.heap.len()) as i64)
-        .sum();
+    // The shared base is counted once, because that is how it is stored — a
+    // per-entry sum would report the v12 shape the split removed.
+    let bytes: i64 = shard.base.bytes() as i64
+        + shard
+            .entries
+            .values()
+            .map(|e| entry_bytes(e) as i64)
+            .sum::<i64>();
     (count, bytes)
 }
 
@@ -567,7 +684,7 @@ mod tests {
 
     #[test]
     fn shard_roundtrip_via_rkyv() {
-        let mut shard = fresh_shard("v-test");
+        let mut shard = fresh_shard("v-test", BaseImage::new(vec![11, 12], vec![13]));
         shard.entries.insert(
             "/tmp/x.el".to_string(),
             Entry {
@@ -575,10 +692,10 @@ mod tests {
                 binary_mtime_at_cache: 3,
                 cached_at_secs: 4,
                 forms: vec![vec![9, 9, 9]],
-                heap: vec![1, 2],
+                heap_tail: vec![1, 2],
+                base_fingerprint: 0,
                 oclosure_meta: vec![3, 4],
                 introspection_cells: vec![5, 6],
-                builtin_cells: vec![7, 8],
             },
         );
         let bytes = rkyv::to_bytes::<_, 4096>(&shard).unwrap();
@@ -591,10 +708,15 @@ mod tests {
         // record of the special-form / intrinsic-macro function cells, which a
         // cache hit cannot rebuild (it skips the prelude that registers them).
         assert_eq!(back.entries["/tmp/x.el"].introspection_cells, vec![5, 6]);
-        // Same for the v12 builtin-prefix cells: `heap` starts above
-        // `builtin_count`, so this blob is the only record of what the prelude
-        // wrote to a symbol that `builtins::install` had already created.
-        assert_eq!(back.entries["/tmp/x.el"].builtin_cells, vec![7, 8]);
+        // The v13 base is shard-level: the post-prelude heap and the v12
+        // builtin-prefix cells now round-trip once for the whole shard, and the
+        // entry carries only the tail and the fingerprint that ties it to that
+        // base. `heap` deliberately starts above `builtin_count`, so
+        // `builtin_cells` is still the only record of what the prelude wrote to a
+        // symbol `builtins::install` had already created.
+        assert_eq!(back.base.heap, vec![11, 12]);
+        assert_eq!(back.base.builtin_cells, vec![13]);
+        assert_eq!(back.entries["/tmp/x.el"].heap_tail, vec![1, 2]);
         assert_eq!(back.header.magic, SHARD_MAGIC);
     }
 
@@ -624,10 +746,10 @@ mod tests {
                 binary_mtime_at_cache: 0,
                 cached_at_secs: age,
                 forms: vec![vec![0u8; bytes]],
-                heap: vec![],
+                heap_tail: vec![],
+                base_fingerprint: 0,
                 oclosure_meta: vec![],
                 introspection_cells: vec![],
-                builtin_cells: vec![],
             },
         )
     }
@@ -638,7 +760,7 @@ mod tests {
     fn budget_evicts_oldest_and_never_the_entry_just_written() {
         let dir = std::env::temp_dir().join(format!("elisprs-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut shard = fresh_shard("v-test");
+        let mut shard = fresh_shard("v-test", BaseImage::new(vec![11, 12], vec![13]));
         // 4 x 1000 bytes, ages 10 (oldest) .. 40 (newest).
         let mut paths = Vec::new();
         for (i, age) in [10, 20, 30, 40].iter().enumerate() {
@@ -671,7 +793,7 @@ mod tests {
     fn a_single_oversized_entry_survives_its_own_budget() {
         let dir = std::env::temp_dir().join(format!("elisprs-budget1-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut shard = fresh_shard("v-test");
+        let mut shard = fresh_shard("v-test", BaseImage::new(vec![11, 12], vec![13]));
         let (p, e) = sized_entry(&dir, "big.el", 10_000, 1);
         shard.entries.insert(p.clone(), e);
         enforce_budget(&mut shard, &p, 100);
@@ -686,7 +808,7 @@ mod tests {
     fn budget_sweep_drops_unservable_entries() {
         let dir = std::env::temp_dir().join(format!("elisprs-budget2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut shard = fresh_shard("v-test");
+        let mut shard = fresh_shard("v-test", BaseImage::new(vec![11, 12], vec![13]));
         let (live, e1) = sized_entry(&dir, "live.el", 10, 5);
         let (gone, e2) = sized_entry(&dir, "gone.el", 10, 5);
         let (edited, mut e3) = sized_entry(&dir, "edited.el", 10, 5);

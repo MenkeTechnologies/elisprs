@@ -2990,15 +2990,16 @@ impl ElispHost {
             })
             .collect()
     }
-    /// Like `export_heap_image`, but reset symbol value cells to a clean baseline
-    /// so re-running cached chunks reproduces the original execution exactly
-    /// (no double-applied global mutations). Symbols below `prelude_end` get
-    /// their `baseline` value; user symbols (≥ prelude_end) reset to unbound.
-    pub fn export_heap_image_clean(
-        &self,
-        prelude_end: usize,
-        clean_prelude: &[SerObj],
-    ) -> Vec<SerObj> {
+    /// The part of a clean heap image this FILE owns: `arena[prelude_end..]`,
+    /// with every run-time mutation cleared.
+    ///
+    /// The other part — `arena[builtin_count, prelude_end)` — is
+    /// [`Self::export_heap_range`] taken before the file ran, and is the same
+    /// bytes for every file compiled by this binary against this prelude. It is
+    /// therefore stored once per shard rather than once per entry (`cache.rs`
+    /// shard format v13); the full image a cache hit replays is that base
+    /// followed by this tail, concatenated in `cache::get`.
+    pub fn export_heap_tail_clean(&self, prelude_end: usize) -> Vec<SerObj> {
         // The image a cache hit replays onto must be the heap as it stood BEFORE
         // this file ran, because the cached chunks re-apply every effect the file
         // had. Exporting the post-run heap double-applies them:
@@ -3016,7 +3017,7 @@ impl ElispHost {
         // objects the file itself created keep only what the COMPILER gave them
         // (`special` — a cache hit does not compile, so nothing would set it
         // again); everything the chunks set at run time is cleared.
-        let mut out: Vec<SerObj> = clean_prelude.to_vec();
+        let mut out: Vec<SerObj> = Vec::with_capacity(self.arena.len() - prelude_end);
         for (off, o) in self.arena[prelude_end..].iter().enumerate() {
             let id = (prelude_end + off) as u32;
             let ser = match o {
@@ -3313,14 +3314,24 @@ impl ElispHost {
     /// label"), `-N` is "label N assigned, not yet printed", `N` is "already
     /// printed as `#N=`".
     ///
-    /// Candidates are the containers `PRINT_CIRCLE_CANDIDATE_P` accepts that
-    /// elisprs's printer actually recurses into — cons, vector, record,
-    /// char-table, closure, hash-table. That is also what makes a cycle safe under
-    /// `print-circle` t: the depth ceiling does NOT run in that mode (Emacs prints
-    /// a 250-deep nest fine), so termination rests entirely on every container
-    /// that can close a cycle being labellable. Strings are candidates in print.c
-    /// but not here: an elisprs string is a `Value::Str(Arc<String>)` with no
-    /// object identity to share, the same constraint `aset`-on-a-string records.
+    /// Candidates are what `PRINT_CIRCLE_CANDIDATE_P` accepts: cons, vector,
+    /// record, char-table, closure, hash-table — and STRING, which print.c lists
+    /// first (`STRINGP (obj) || CONSP (obj) || ...`). The containers are also what
+    /// makes a cycle safe under `print-circle` t: the depth ceiling does NOT run
+    /// in that mode (Emacs prints a 250-deep nest fine), so termination rests on
+    /// every container that can close a cycle being labellable. A string closes
+    /// nothing, but it is shareable, and since shard format v10 made it an arena
+    /// object (`Obj::Str`) it has the identity the label table needs:
+    ///
+    /// ```text
+    ///   (let ((print-circle t) (s "ab")) (prin1-to-string (list s s)))
+    ///   emacs => "(#1=\"ab\" #1#)"
+    ///   elisp => "(\"ab\" \"ab\")"   [before]
+    /// ```
+    ///
+    /// which the fuzzer reached through an error datum:
+    /// `(rassoc "!" (append (make-list 3 "foo10") 2))` signals with a list whose
+    /// three elements are one string object.
     fn print_preprocess(&self, v: &Value) {
         let mut stack: Vec<Value> = Vec::new();
         let mut obj = v.clone();
@@ -3338,6 +3349,9 @@ impl ElispHost {
                         Some(kids)
                     }
                     Some(Obj::Vector(items)) | Some(Obj::Record(items)) => Some(items.clone()),
+                    // A candidate with no children: it can be shared but can
+                    // never be part of a cycle.
+                    Some(Obj::Str(_)) => Some(Vec::new()),
                     Some(Obj::CharTable(t)) => {
                         Some(vec![t.default.clone(), t.parent.clone(), t.subtype.clone()])
                     }
@@ -4957,20 +4971,36 @@ impl ElispHost {
     ///
     /// An improper list names its offending TAIL (`(reverse (cons 1 2))` is
     /// `(wrong-type-argument listp 2)`), while a non-sequence names itself.
-    pub fn seq_vec_checked(&self, v: &Value) -> Result<Vec<Value>, String> {
+    pub fn seq_vec_checked(&mut self, v: &Value) -> Result<Vec<Value>, String> {
+        // A cons is walked with `FOR_EACH_TAIL` FIRST, because that walk is the
+        // only one that terminates on a circular list. `Fmapconcat`, `Fmapcar`
+        // and `Fmapc` all begin with `Flength (sequence)` for exactly this
+        // reason, and this is the gate they reach it through here; without it
+        // `(mapconcat #'identity CIRCULAR ",")` ran forever where Emacs signals
+        // `(circular-list …)`.
+        if matches!(self.obj(v), Some(Obj::Cons(..))) {
+            let mut out = Vec::new();
+            let mut w = crate::builtins::TailWalk::new(v);
+            while let Some((car, cdr)) = w.cons(self) {
+                out.push(car);
+                if w.step(cdr) {
+                    let tail = w.tail.clone();
+                    return Err(self.signal_circular_list(&tail));
+                }
+            }
+            if !el_nil(&w.tail) {
+                // `CHECK_LIST_END`: an improper list names its TAIL here, not the
+                // whole list — `(mapconcat #'identity (cons "a" 9))` is
+                // `(wrong-type-argument listp 9)`.
+                return Err(format!(
+                    "wrong-type-argument: listp {}",
+                    self.print(&w.tail, true)
+                ));
+            }
+            return Ok(out);
+        }
         if let Some(items) = self.seq_vec(v) {
             return Ok(items);
-        }
-        // A cons that `seq_vec` rejected is an improper list: walk to the tail.
-        if matches!(self.obj(v), Some(Obj::Cons(..))) {
-            let mut cur = v.clone();
-            while let Some(Obj::Cons(_, cdr)) = self.obj(&cur) {
-                cur = cdr.clone();
-            }
-            return Err(format!(
-                "wrong-type-argument: listp {}",
-                self.print(&cur, true)
-            ));
         }
         Err(format!(
             "wrong-type-argument: sequencep {}",
@@ -5059,6 +5089,23 @@ impl ElispHost {
             }
         }
         None
+    }
+
+    /// lisp.h `circular_list (list)` — `xsignal1 (Qcircular_list, list)`, the
+    /// signal `FOR_EACH_TAIL` raises when the hare catches the tortoise.
+    ///
+    /// The datum is the tail the walk was standing on, carried as the object so
+    /// `condition-case` binds the real list. The MESSAGE deliberately does not
+    /// render it: this printer walks the cdr chain, and the only reason the
+    /// signal exists is that the chain has no end. `length` states the same
+    /// limitation from the other direction.
+    pub fn signal_circular_list(&mut self, list: &Value) -> String {
+        let sym = self.intern("circular-list");
+        let data = self.list_from(vec![list.clone()]);
+        let obj = self.cons(sym, data);
+        let msg = "circular-list: circular list".to_string();
+        self.set_pending_error(&msg, obj);
+        msg
     }
 
     /// `(wrong-type-argument PRED VALUE)` with VALUE carried as the *object*.
@@ -5565,6 +5612,69 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                     out.push(call_function(&f, &[e])?);
                 }
                 return Ok(with_host(|h| h.list_from(out)));
+            }
+            "assoc" => {
+                // fns.c `Fassoc`. TESTFN is called back into elisp, so the walk
+                // cannot live inside a subr body's host borrow — but the walk
+                // itself is `FOR_EACH_TAIL` exactly as `assq`/`member` use it,
+                // driven here one cons at a time.
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(intrinsic_wrong_nargs(f, args.len()));
+                }
+                let key = args[0].clone();
+                let alist = args[1].clone();
+                let testfn = args.get(2).cloned().unwrap_or(Value::Undef);
+                // `if (eq_comparable_value (key) && NILP (testfn)) return Fassq`.
+                if !el_truthy(&testfn) && with_host(|h| crate::builtins::eq_comparable(h, &key)) {
+                    return with_host(|h| crate::builtins::assq(h, &[key, alist]));
+                }
+                let mut w = crate::builtins::TailWalk::new(&alist);
+                while let Some((car, cdr)) = with_host(|h| w.cons(h)) {
+                    // `if (!CONSP (car)) continue;`
+                    if let Some((elt_key, _)) = with_host(|h| match h.obj(&car) {
+                        Some(Obj::Cons(k, v)) => Some((k.clone(), v.clone())),
+                        _ => None,
+                    }) {
+                        let hit = if el_truthy(&testfn) {
+                            let tf = with_host(|h| h.function_designator(&testfn));
+                            el_truthy(&call_function(&tf, &[elt_key, key.clone()])?)
+                        } else {
+                            with_host(|h| crate::builtins::equal_or_eq(h, &elt_key, &key))
+                        };
+                        if hit {
+                            return Ok(car);
+                        }
+                    }
+                    if w.step(cdr) {
+                        return Err(with_host(|h| h.signal_circular_list(&w.tail)));
+                    }
+                }
+                let tail = w.tail.clone();
+                with_host(|h| crate::builtins::check_end(h, &tail, &alist))?;
+                return Ok(Value::Undef);
+            }
+            "mapconcat" => {
+                // fns.c `Fmapconcat`: `Flength` first (which is what signals on a
+                // circular or non-sequence SEQUENCE), then `mapcar1`, then
+                // `Fconcat` over the results interleaved with SEPARATOR. A nil or
+                // empty SEPARATOR drops the interleave entirely rather than
+                // concatenating empty strings, which is the same answer.
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(intrinsic_wrong_nargs(f, args.len()));
+                }
+                let seq = with_host(|h| h.seq_vec_checked(&args[1]))?;
+                let fun = with_host(|h| h.function_designator(&args[0]));
+                let mut parts: Vec<Value> = Vec::with_capacity(2 * seq.len());
+                let sep = args.get(2).cloned().unwrap_or(Value::Undef);
+                let sep_empty = !el_truthy(&sep)
+                    || with_host(|h| h.str_text(&sep).map(|s| s.is_empty()).unwrap_or(false));
+                for (i, e) in seq.into_iter().enumerate() {
+                    if i > 0 && !sep_empty {
+                        parts.push(sep.clone());
+                    }
+                    parts.push(call_function(&fun, &[e])?);
+                }
+                return with_host(|h| crate::builtins::concat(h, &parts));
             }
             "mapc" => {
                 if args.len() < 2 {

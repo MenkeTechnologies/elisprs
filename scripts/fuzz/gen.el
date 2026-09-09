@@ -779,8 +779,9 @@ it.  The variables are `fz-*' names so a corpus form cannot clobber a symbol
 
 (defvar fz-list-walkers
   '((nth 1) (nthcdr 1) (elt 0) (seq-elt 0) (last 0) (butlast 0) (length 0)
-    (safe-length 0) (reverse 0) (memq 0) (member 0) (assq 0) (assoc 0)
-    (mapcar 0) (seq-drop 1) (seq-take 1) (cl-remove-if 0) (append 0))
+    (safe-length 0) (reverse 0) (memq 0) (memql 0) (member 0) (assq 0) (assoc 0)
+    (rassq 0) (rassoc 0) (mapconcat 0) (mapcar 0) (seq-drop 1) (seq-take 1)
+    (cl-remove-if 0) (append 0))
   "List walkers and where the list goes: 0 = last argument, 1 = second.")
 
 (defun fz-dotted (depth)
@@ -792,6 +793,31 @@ Emacs, and mutating a constant would make the corpus order-dependent."
         (list 'cons (fz-leaf 'any) tail)
       (list 'append (list 'make-list (1+ (fz-int 3)) (fz-leaf 'any)) tail))))
 
+(defun fz-circular (depth)
+  "An expression that builds a fresh CIRCULAR list.
+
+A walker meets three list shapes, not two: proper, improper, and circular.  The
+corpus had the first two and, counted over 4,000 forms at depth 3, exactly ZERO
+of the third -- so nothing tested the one behaviour that separates a terminating
+walk from a non-terminating one.  What that hid: `memq' `memql' `member' `assq'
+`assoc' `rassq' `rassoc' and `mapconcat' were prelude `defun's walking with a
+bare `while (consp l)', which HANGS where Emacs signals `(circular-list ...)'.
+
+The list is built with `setcdr' onto a fresh list rather than read as `#1=(...)',
+because the reader form would be shared across the whole corpus and several of
+these walkers mutate their argument."
+  (let ((n (1+ (fz-int 3))))
+    (list 'let (list (list 'c (cons 'list (let ((v nil) (i 0))
+                                            (while (< i n)
+                                              (push (fz-leaf 'any) v)
+                                              (setq i (1+ i)))
+                                            v))))
+          ;; `last' is the final cons, so this closes the loop onto the head for
+          ;; a full cycle, or onto the second cell for a rho shape (a tail the
+          ;; walk enters but whose head is not part of the loop).
+          (list 'setcdr '(last c) (if (fz-chance 70) 'c '(cdr c)))
+          'c)))
+
 (defun fz-improper-form (depth)
   "A list walk over an improper list.
 
@@ -802,12 +828,16 @@ only the error datum does."
   (let* ((spec (fz-pick fz-list-walkers))
          (fn (nth 0 spec))
          (pos (nth 1 spec))
-         (l (fz-dotted depth))
-         (other (if (memq fn '(mapcar cl-remove-if)) '(function identity)
-                  (if (= pos 1) (fz-pick '(0 1 2 5 -1 130)) (fz-leaf 'any)))))
+         ;; A third of these walks are over a CIRCULAR list -- see `fz-circular'.
+         (l (if (fz-chance 33) (fz-circular depth) (fz-dotted depth)))
+         (other (cond ((memq fn '(mapcar cl-remove-if mapconcat)) '(function identity))
+                      ((= pos 1) (fz-pick '(0 1 2 5 -1 130)))
+                      (t (fz-leaf 'any)))))
     (cond
      ((memq fn '(length safe-length reverse last butlast)) (list fn l))
-     ((= pos 1) (list fn other l))
+     ;; `mapconcat' takes FUNCTION first and the sequence second, and its third
+     ;; argument is a separator rather than another element.
+     ((eq fn 'mapconcat) (list fn other l (fz-pick '(nil "" "-" (list ?-)))))
      (t (list fn other l)))))
 
 (defun fz-expr (depth)

@@ -377,3 +377,146 @@ fn warm_cache_does_not_leak_a_symbol_the_run_interned() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Shard format v13: the post-prelude heap is stored ONCE per shard, not once
+/// per entry.
+///
+/// Through v12 every entry carried its own copy. Measured with
+/// `ELISPRS_CACHE_DEBUG=1` on `examples/arithmetic.el`: `heap=6694994` against
+/// `forms=1208` of actual bytecode, and the shard file grew 6,703,176 →
+/// 13,475,288 → 20,424,240 bytes over three unrelated scripts. Since `put`
+/// rewrites the whole file, that made every run pay for every script ever
+/// cached, and the 64 MiB budget was reached at nine entries.
+///
+/// The base is `arena[builtin_count, prelude_end)`, which running the prelude is
+/// the only thing that produces — so it is the same bytes for every script this
+/// binary compiles, which is what makes hoisting it sound. This test pins the
+/// consequence that matters: N scripts in one shard cost ONE base, not N.
+#[test]
+fn the_shard_stores_one_post_prelude_image_for_all_of_its_entries() {
+    let exe = env!("CARGO_BIN_EXE_elisp");
+    let dir = std::env::temp_dir().join(format!("elisprs-cache-share-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    let shard = dir.join(".elisprs/scripts.rkyv");
+    let run = |name: &str, body: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, body).expect("write script");
+        let out = Command::new(exe)
+            .arg(&p)
+            .env("HOME", &dir)
+            .output()
+            .expect("run elisp");
+        assert!(
+            out.status.success(),
+            "elisp failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    assert_eq!(run("one.el", "(princ (+ 1 2))"), "3");
+    let one = std::fs::metadata(&shard).expect("shard after 1").len();
+    for i in 2..=5 {
+        assert_eq!(
+            run(&format!("s{i}.el"), &format!("(princ (* {i} 10))")),
+            format!("{}", i * 10)
+        );
+    }
+    let five = std::fs::metadata(&shard).expect("shard after 5").len();
+
+    // Four more entries must not cost four more heap images. The images measured
+    // ~6.6 MB each, so a per-entry image would put `five` above 4x `one`; a
+    // shared base puts the growth in the tails, which are tens of kB.
+    assert!(
+        five < one + one / 4,
+        "five entries cost {five} bytes where one cost {one}: the post-prelude \
+         image is still being stored per entry"
+    );
+
+    // And the entries all still serve: a warm hit on the FIRST script, whose
+    // base was written by that run and has since been read by four others.
+    assert_eq!(run("one.el", "(princ (+ 1 2))"), "3");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A v12 shard must not be read as v13.
+///
+/// `Entry` lost `heap` and gained `heap_tail` + `base_fingerprint`, and rkyv
+/// reads its archive positionally — so a v12 shard interpreted as v13 is not a
+/// partial answer but a wrong one. The guard is `format_version` in the header,
+/// checked before any entry is touched; the effect a user sees is one cold
+/// compile, silently. This test writes a shard whose bytes are not v13 at all
+/// and requires the run to succeed anyway and to replace it.
+#[test]
+fn a_shard_from_an_older_format_is_rebuilt_rather_than_misread() {
+    let exe = env!("CARGO_BIN_EXE_elisp");
+    let dir = std::env::temp_dir().join(format!("elisprs-cache-v12-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join(".elisprs")).expect("temp dir");
+    let shard = dir.join(".elisprs/scripts.rkyv");
+    // Not a v13 archive: an old shard, a truncated one and a corrupt one all
+    // reach `get` the same way — as bytes that must not be trusted.
+    std::fs::write(&shard, vec![0xABu8; 4096]).expect("write shard");
+
+    let p = dir.join("x.el");
+    std::fs::write(&p, "(princ (list 'a (member 1 '(0 1))))").expect("write script");
+    let run = || {
+        let out = Command::new(exe)
+            .arg(&p)
+            .env("HOME", &dir)
+            .output()
+            .expect("run elisp");
+        assert!(
+            out.status.success(),
+            "elisp failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(run(), "(a (1))", "a stale shard must not break the run");
+    assert_eq!(run(), "(a (1))", "the rebuilt shard must serve a warm hit");
+    assert_ne!(
+        std::fs::read(&shard).expect("shard"),
+        vec![0xABu8; 4096],
+        "the stale shard was left in place"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `emacs-build-time` is a constant of the BUILD, not of the run.
+///
+/// `lisp/version.el` says `(defconst emacs-build-time (if emacs-build-system
+/// (current-time)))`, and that `current-time` is evaluated while the binary is
+/// being dumped — so one Emacs answers the same list forever:
+///
+/// ```text
+///   $ for i in 1 2 3; do emacs -Q --batch --eval '(prin1 emacs-build-time)'; done
+///   (27285 4897 897505 0)(27285 4897 897505 0)(27285 4897 897505 0)
+/// ```
+///
+/// elisprs has no dump step and called `current-time` when the prelude ran, so
+/// every invocation answered differently — and a cache hit, which does not run
+/// the prelude, replayed whichever value the compiling run happened to see. It
+/// now comes from the executable's mtime (`--build-time--`), which is the same
+/// fixed point.
+///
+/// This lives beside the cache tests because it is also what makes the shared
+/// post-prelude image possible: a value that differs per process cannot go in an
+/// image that every entry replays.
+#[test]
+fn emacs_build_time_is_fixed_for_the_binary_and_survives_a_cache_hit() {
+    let script = "(prin1 emacs-build-time)";
+    let (cold, warm) = run_cold_then_warm("build-time", script);
+    assert_eq!(warm, cold, "a cache hit replayed a different build time");
+    // A second *cold* process (its own HOME, so its own empty shard) must agree
+    // too — that is the property `current-time` did not have.
+    let (cold2, _) = run_cold_then_warm("build-time2", script);
+    assert_eq!(
+        cold2, cold,
+        "two runs of one binary disagree on emacs-build-time"
+    );
+    assert!(
+        cold.starts_with('(') && cold.matches(' ').count() == 3,
+        "expected a `current-time' 4-list, got {cold}"
+    );
+}

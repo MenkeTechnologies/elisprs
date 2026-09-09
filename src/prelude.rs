@@ -44,10 +44,16 @@ pub const PRELUDE: &str = r#"
 ;; `emacs-build-system'/`emacs-build-time'/`emacs-build-number' are defined in
 ;; lisp/version.el exactly like this (minus the Android build branches, which
 ;; never apply here); kept here because version.el is not preloaded. Because
-;; `emacs-build-system' is non-nil, `emacs-build-time' evaluates to a
-;; `current-time' timestamp, matching a normally-dumped `emacs -Q --batch'.
+;; `emacs-build-system' is non-nil, `emacs-build-time' is a `current-time'
+;; timestamp, matching a normally-dumped `emacs -Q --batch'.
+;;
+;; version.el evaluates that `(current-time)' while the binary is being DUMPED,
+;; so the value is a constant of the build and every run of one Emacs reports
+;; the same list. elisprs has no dump step, so `--build-time--' supplies the
+;; corresponding fixed point (the executable's mtime); calling `current-time'
+;; here instead gave a different answer on every invocation.
 (defconst emacs-build-system (system-name))
-(defconst emacs-build-time (if emacs-build-system (current-time)))
+(defconst emacs-build-time (if emacs-build-system (--build-time--)))
 (defconst emacs-build-number 1)
 ;; `system-type' (Vsystem_type) is platform-derived; the Rust primitive maps the
 ;; running OS to Emacs's symbol (darwin/gnu-linux/berkeley-unix/windows-nt).
@@ -168,27 +174,10 @@ pub const PRELUDE: &str = r#"
 (defun caar-safe (x) (if (consp x) (car x) nil))
 
 ;;; ---- membership / search ----
-(defun mem--end-check (tail whole)
-  ;; Emacs's CHECK_LIST_END: a non-nil, non-cons tail signals `listp' naming the
-  ;; WHOLE list -- (memq 1 (cons 9 3)) => (wrong-type-argument listp (9 . 3)).
-  (unless (or (null tail) (consp tail))
-    (signal 'wrong-type-argument (list 'listp whole)))
-  tail)
-(defun memq (x l)
-  (let ((whole l))
-    (while (and (consp l) (not (eq x (car l)))) (setq l (cdr l)))
-    (mem--end-check l whole)
-    (and (consp l) l)))
-(defun member (x l)
-  (let ((whole l))
-    (while (and (consp l) (not (equal x (car l)))) (setq l (cdr l)))
-    (mem--end-check l whole)
-    (and (consp l) l)))
-(defun memql (x l)
-  (let ((whole l))
-    (while (and (consp l) (not (eql x (car l)))) (setq l (cdr l)))
-    (mem--end-check l whole)
-    (and (consp l) l)))
+;; `memq'/`memql'/`member'/`assq'/`assoc'/`rassq'/`rassoc'/`mapconcat' are C
+;; subrs in fns.c, and are Rust subrs here (see `builtins::TailWalk'). They were
+;; prelude `defun's, whose bare `while (consp l)' walk had no cycle check and so
+;; ran forever on a circular list where Emacs signals `circular-list'.
 (defun assoc-string (key alist &optional case-fold)
   ;; First ALIST element equal to KEY as a string (elements may be strings or
   ;; (STRING . VALUE) conses); CASE-FOLD ignores case.  A matched element may
@@ -204,37 +193,6 @@ pub const PRELUDE: &str = r#"
                  (if case-fold (string-equal-ignore-case k s) (string= k s)))
             (setq r el done t)
           (setq alist (cdr alist)))))
-    r))
-;; assq/assoc/rassq skip non-cons list elements (Emacs C `FOR_EACH_TAIL' + a
-;; `CONSP' guard), so e.g. a docstring string in a body list is ignored rather
-;; than signalling `wrong-type-argument listp' — cl-generic relies on this via
-;; `(assq 'interactive BODY)'.
-(defun assq (k l)
-  ;; A dotted tail signals via CHECK_LIST_END naming the WHOLE list:
-  ;; (assq 'a (cons -1 10)) => (wrong-type-argument listp (-1 . 10)).
-  (let ((r nil) (whole l))
-    (while (and (consp l) (not r))
-      (if (and (consp (car l)) (eq (car (car l)) k))
-          (setq r (car l))
-        (setq l (cdr l))))
-    (unless r (mem--end-check l whole))
-    r))
-(defun assoc (k l &optional testfn)
-  (let ((r nil) (whole l))
-    (while (and (consp l) (not r))
-      (if (and (consp (car l))
-               (if testfn (funcall testfn (car (car l)) k) (equal (car (car l)) k)))
-          (setq r (car l))
-        (setq l (cdr l))))
-    (unless r (mem--end-check l whole))
-    r))
-(defun rassq (v l)
-  (let ((r nil) (whole l))
-    (while (and (consp l) (not r))
-      (if (and (consp (car l)) (eq (cdr (car l)) v))
-          (setq r (car l))
-        (setq l (cdr l))))
-    (unless r (mem--end-check l whole))
     r))
 (defun alist-get (k al &optional default _remove testfn)
   ;; Value associated with K in alist AL (DEFAULT if absent); TESTFN overrides eq.
@@ -314,21 +272,6 @@ pub const PRELUDE: &str = r#"
     (while (and l (not r)) (when (funcall test elt (car l)) (setq r t)) (setq l (cdr l)))
     r))
 (defun seq-reverse (l) (reverse l))
-(defun mapconcat (f seq &optional sep)
-  ;; Fmapconcat: `length' validates SEQ up front (a dotted list names its
-  ;; tail: (mapconcat #'identity (cons "a" 9)) => wrong-type-argument listp 9);
-  ;; F runs over EVERY element before any concatenation; then the results and
-  ;; the separator all go to `concat', which enforces its own contract --
-  ;; results/separator must be strings or char lists/vectors, so
-  ;; (mapconcat (lambda (x) (cons x x)) "ab") => (wrong-type-argument listp 97)
-  ;; and a non-sequence separator only signals when there are >= 2 elements.
-  (length seq)
-  (let ((results (mapcar f seq)) (out nil) (first t))
-    (while results
-      (if first (setq first nil) (setq out (cons sep out)))
-      (setq out (cons (car results) out))
-      (setq results (cdr results)))
-    (apply #'concat (nreverse out))))
 
 ;;; ---- set-ish list ops ----
 (defun remove (elt seq)
@@ -1666,15 +1609,6 @@ With VECTORS-AND-RECORDS non-nil, traverse and copy vectors and records too."
           (setq found t value (if (consp elt) (cdr elt) default))))
       (setq tail (cdr tail)))
     value))
-(defun rassoc (val alist)
-  ;; Frassoc walks conses and CHECK_LIST_END names the WHOLE list on a dotted
-  ;; tail: (rassoc 'a (cons -1 10)) => (wrong-type-argument listp (-1 . 10)).
-  (let ((res nil) (whole alist))
-    (while (and (consp alist) (not res))
-      (if (and (consp (car alist)) (equal (cdr (car alist)) val)) (setq res (car alist)))
-      (setq alist (cdr alist)))
-    (unless res (mem--end-check alist whole))
-    res))
 (defun assoc-delete-all (key alist &optional test)
   ;; Faithful subr.el port (destructive, like rassq-delete-all): `(car alist)'
   ;; on a non-list signals listp naming it.

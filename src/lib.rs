@@ -438,7 +438,9 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
     // Bind load-file-name only while the forms run; unbind before the clean heap
     // image is captured so the cached image carries no transient load binding.
     let (chunks, last) = with_load_file_name(path, || run_top_forms(&src))?;
-    let heap = host::with_host(|h| h.export_heap_image_clean(prelude_end, &clean_prelude));
+    // Only the part of the image this FILE owns: `clean_prelude` is the rest,
+    // and the cache stores it once per shard rather than once per entry.
+    let heap_tail = host::with_host(|h| h.export_heap_tail_clean(prelude_end));
     let oclosure_meta = host::with_host(|h| h.export_oclosure_meta());
     let introspection_cells = host::with_host(|h| h.export_intrinsic_macro_cells());
     cache::put(
@@ -447,7 +449,8 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
         &schema_key,
         cache::ScriptParts {
             chunks: &chunks,
-            heap: &heap,
+            prelude_heap: &clean_prelude,
+            heap_tail: &heap_tail,
             oclosure_meta: &oclosure_meta,
             introspection_cells: &introspection_cells,
             builtin_cells: &clean_builtin_cells,

@@ -862,39 +862,34 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
             }
             Some(Obj::BoolVector(bits)) => Ok(Value::Int(bits.len() as i64)),
             Some(Obj::Cons(..)) => {
-                // Walk the cons spine, Floyd-detecting cycles. A non-nil, non-cons
-                // tail is an improper list -> `wrong-type-argument listp TAIL`
-                // (e.g. `(length '(1 2 . 3))` signals with 3); a circular list
-                // signals `circular-list`.
-                let mut fast = a[0].clone();
-                let mut slow = a[0].clone();
+                // fns.c `list_length`, which is `Flength`'s cons arm:
+                //
+                //   ptrdiff_t i = 0;
+                //   FOR_EACH_TAIL (list) i++;
+                //   CHECK_LIST_END (list, list);
+                //
+                // Both signals name the LOOP VARIABLE, not the original argument:
+                // an improper list reports its tail (`(length '(1 2 . 3))` signals
+                // with 3) and a circular one reports the tail Brent's walk was
+                // standing on when the hare caught the tortoise. A Floyd walk here
+                // found the cycle but could not name that tail, and passed a
+                // placeholder string as the datum instead:
+                //
+                //   (butlast (let ((c (list 9 3 2.5))) (setcdr (last c) (cdr c)) c))
+                //   emacs => (circular-list #1=(2.5 3 . #1#))
+                //   elisp => (circular-list "circular list")   [before]
                 let mut n: i64 = 0;
-                loop {
-                    for _ in 0..2 {
-                        match h.obj(&fast) {
-                            Some(Obj::Cons(_, d)) => {
-                                fast = d.clone();
-                                n += 1;
-                            }
-                            _ if is_nil(&fast) => return Ok(Value::Int(n)),
-                            _ => {
-                                return Err(format!(
-                                    "wrong-type-argument: listp {}",
-                                    h.print(&fast, true)
-                                ))
-                            }
-                        }
-                    }
-                    if let Some(Obj::Cons(_, d)) = h.obj(&slow) {
-                        slow = d.clone();
-                    }
-                    if h.values_eq(&slow, &fast) {
-                        // Faithful error symbol; the exact DATA payload (the list
-                        // itself) needs cycle-aware printing (host.rs), so we omit
-                        // it here rather than infinite-loop trying to render it.
-                        return Err("circular-list: circular list".to_string());
+                let mut w = TailWalk::new(&a[0]);
+                while let Some((_, cdr)) = w.cons(h) {
+                    n += 1;
+                    if w.step(cdr) {
+                        let tail = w.tail.clone();
+                        return Err(h.signal_circular_list(&tail));
                     }
                 }
+                let tail = w.tail.clone();
+                check_list_end(h, &tail, &tail)?;
+                Ok(Value::Int(n))
             }
             // A bool-vector/char-table/record has a length; a symbol, a subr, a
             // buffer … do not — Emacs signals rather than answering 0.
@@ -912,14 +907,17 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// fns.c `CHECK_LIST_END (x, y)`: `CHECK_TYPE (NILP (x), Qlistp, y)` — a nil tail
 /// is a proper end, anything else names the WHOLE list under `listp`.
-fn check_list_end(h: &ElispHost, tail: &Value, list: &Value) -> Result<(), String> {
+fn check_list_end(h: &mut ElispHost, tail: &Value, list: &Value) -> Result<(), String> {
     if is_nil(tail) {
         Ok(())
     } else {
-        Err(format!(
-            "wrong-type-argument: listp {}",
-            h.print(list, true)
-        ))
+        // The offender travels as the OBJECT. Rendering it into the message and
+        // re-reading it — which is what this did — loses any list the reader
+        // cannot reconstruct, and `print-circle` t makes that the common case:
+        // the text becomes `(#1="foo10" #1# #1# . 2)`, the re-read fails, and the
+        // condition came back as a bare `(wrong-type-argument listp)` with no
+        // offender at all.
+        Err(h.signal_wrong_type("listp", list))
     }
 }
 
@@ -1048,6 +1046,223 @@ fn nthcdr_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// identical immediates. Enough for cycle detection, where only conses can match.
 fn value_eq_obj(a: &Value, b: &Value) -> bool {
     matches!((a, b), (Value::Obj(x), Value::Obj(y)) if x == y)
+}
+
+// ── fns.c list search (FOR_EACH_TAIL) ────────────────────────────────────────
+
+/// lisp.h `struct for_each_tail_internal` plus the advance clause of
+/// `FOR_EACH_TAIL_INTERNAL`, ported as a driver so a walk can be run from a subr
+/// body (which holds the host borrow) and from `host::call_function` (which must
+/// release it between elisp calls) with one implementation.
+///
+/// The C is Brent's teleporting tortoise-hare, and the schedule is not
+/// incidental — it decides *which* tail the `circular-list` signal names:
+///
+/// ```text
+///   for (struct for_each_tail_internal li = { tail, 2, 0, 2 };
+///        CONSP (tail);
+///        ((tail) = XCDR (tail),
+///     ((--li.q != 0
+///       || ((check_quit) ? maybe_quit () : (void) 0, 0 < --li.n)
+///       || (li.q = li.n = li.max <<= 1, li.n >>= USHRT_WIDTH,
+///           li.tortoise = (tail), false))
+///      && BASE_EQ (tail, li.tortoise))
+///     ? (cycle) : (void) 0))
+/// ```
+///
+/// This replaces seven prelude `defun`s (`memq`, `memql`, `member`, `assq`,
+/// `assoc`, `rassq`, `rassoc`) that walked with a bare `while (consp l)` and so
+/// **did not terminate at all** on a circular list, where Emacs signals:
+///
+/// ```text
+///   $ emacs -Q --batch -l circ.el    # (circular-list (3 1 2 3 1 . #2))
+///   $ elisp circ.el                  # hangs
+/// ```
+pub struct TailWalk {
+    /// The C loop variable: the current cons while walking, the terminating
+    /// non-cons once the loop exits.
+    pub tail: Value,
+    tortoise: Value,
+    max: i64,
+    n: i64,
+    q: u16,
+}
+
+impl TailWalk {
+    pub fn new(list: &Value) -> Self {
+        // `struct for_each_tail_internal li = { tail, 2, 0, 2 }`.
+        Self {
+            tail: list.clone(),
+            tortoise: list.clone(),
+            max: 2,
+            n: 0,
+            q: 2,
+        }
+    }
+
+    /// The loop's `CONSP (tail)` test, returning `(car, cdr)` while it holds.
+    pub fn cons(&self, h: &ElispHost) -> Option<(Value, Value)> {
+        match h.obj(&self.tail) {
+            Some(Obj::Cons(car, cdr)) => Some((car.clone(), cdr.clone())),
+            _ => None,
+        }
+    }
+
+    /// The `for` statement's third clause. `cdr` is `XCDR (tail)` read while the
+    /// host was borrowed. Returns whether a cycle was just detected — the point
+    /// at which `FOR_EACH_TAIL` evaluates `circular_list (tail)`.
+    #[must_use]
+    pub fn step(&mut self, cdr: Value) -> bool {
+        self.tail = cdr;
+        self.q = self.q.wrapping_sub(1);
+        let advanced = if self.q != 0 {
+            true
+        } else {
+            self.n -= 1;
+            if self.n > 0 {
+                true
+            } else {
+                // `li.q = li.n = li.max <<= 1, li.n >>= USHRT_WIDTH,
+                //  li.tortoise = (tail), false` — the teleport, which yields
+                // false so the `BASE_EQ` that follows is short-circuited away.
+                self.max <<= 1;
+                self.n = self.max;
+                self.q = (self.n & 0xffff) as u16;
+                self.n >>= 16;
+                self.tortoise = self.tail.clone();
+                false
+            }
+        };
+        advanced && value_eq_obj(&self.tail, &self.tortoise)
+    }
+}
+
+/// fns.c `eq_comparable_value`: `SYMBOLP (x) || FIXNUMP (x)`. `member`, `assoc`
+/// and `rassoc` route to their `eq` siblings for such a key, which is why
+/// `(member 1 L)` reports `memq`'s walk and not `equal`'s.
+fn eq_comparable_value(h: &ElispHost, v: &Value) -> bool {
+    match v {
+        Value::Int(_) | Value::Bool(_) | Value::Undef => true,
+        Value::Obj(_) => matches!(h.obj(v), Some(Obj::Symbol(_))),
+        _ => false,
+    }
+}
+
+/// Run a `FOR_EACH_TAIL` walk inside a single host borrow: `hit` decides, per
+/// cons, whether this is the answer. Returns nil after `CHECK_LIST_END`.
+fn for_each_tail(
+    h: &mut ElispHost,
+    list: &Value,
+    mut hit: impl FnMut(&ElispHost, &Value, &Value) -> Option<Value>,
+) -> R {
+    let mut w = TailWalk::new(list);
+    while let Some((car, cdr)) = w.cons(h) {
+        if let Some(found) = hit(h, &car, &w.tail) {
+            return Ok(found);
+        }
+        if w.step(cdr) {
+            return Err(h.signal_circular_list(&w.tail));
+        }
+    }
+    check_list_end(h, &w.tail, list)?;
+    Ok(Value::Undef)
+}
+
+/// fns.c `Fmemq`.
+fn memq_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let elt = a[0].clone();
+    for_each_tail(h, &a[1], |h, car, tail| {
+        el_eq(h, car, &elt).then(|| tail.clone())
+    })
+}
+
+/// fns.c `Fmemql`. Only a float or a bignum takes the by-value path; every other
+/// element type is `Fmemq`'s job, which is why `(memql "a" (list "a"))` is nil.
+fn memql_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let elt = a[0].clone();
+    let float = matches!(elt, Value::Float(_));
+    let bignum = matches!(h.obj(&elt), Some(Obj::Bignum(_)));
+    if !float && !bignum {
+        return memq_fn(h, a);
+    }
+    for_each_tail(h, &a[1], |h, car, tail| {
+        let same = if float {
+            matches!(car, Value::Float(_)) && el_eql(h, &elt, car)
+        } else {
+            matches!(h.obj(car), Some(Obj::Bignum(_))) && el_eql(h, &elt, car)
+        };
+        same.then(|| tail.clone())
+    })
+}
+
+/// fns.c `Fmember`.
+fn member_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    if eq_comparable_value(h, &a[0]) {
+        return memq_fn(h, a);
+    }
+    let elt = a[0].clone();
+    for_each_tail(h, &a[1], |h, car, tail| {
+        el_equal(h, &elt, car).then(|| tail.clone())
+    })
+}
+
+/// fns.c `Fassq`. A non-cons element is skipped, not an error.
+fn assq_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let key = a[0].clone();
+    for_each_tail(h, &a[1], |h, car, _| match h.obj(car) {
+        Some(Obj::Cons(k, _)) if el_eq(h, k, &key) => Some(car.clone()),
+        _ => None,
+    })
+}
+
+/// fns.c `Frassq`.
+fn rassq_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let key = a[0].clone();
+    for_each_tail(h, &a[1], |h, car, _| match h.obj(car) {
+        Some(Obj::Cons(_, v)) if el_eq(h, v, &key) => Some(car.clone()),
+        _ => None,
+    })
+}
+
+// `assoc` and `mapconcat` call back into elisp (TESTFN, FUNCTION), so their
+// bodies live in `host::call_function` rather than in a subr that would already
+// hold the host borrow. These are the pieces of the fns.c ports they reuse.
+
+/// fns.c `eq_comparable_value`, for the `Fassoc` fast path.
+pub fn eq_comparable(h: &ElispHost, v: &Value) -> bool {
+    eq_comparable_value(h, v)
+}
+
+/// fns.c `Fassq`, callable from the `assoc` intercept.
+pub fn assq(h: &mut ElispHost, a: &[Value]) -> R {
+    assq_fn(h, a)
+}
+
+/// `Fassoc`'s default test: `EQ (XCAR (car), key) || !NILP (Fequal (…))`.
+pub fn equal_or_eq(h: &ElispHost, a: &Value, b: &Value) -> bool {
+    el_eq(h, a, b) || el_equal(h, a, b)
+}
+
+/// fns.c `CHECK_LIST_END`, callable from the `assoc` intercept.
+pub fn check_end(h: &mut ElispHost, tail: &Value, list: &Value) -> Result<(), String> {
+    check_list_end(h, tail, list)
+}
+
+/// fns.c `Fconcat`, callable from the `mapconcat` intercept.
+pub fn concat(h: &mut ElispHost, a: &[Value]) -> R {
+    concat_fn(h, a)
+}
+
+/// fns.c `Frassoc`.
+fn rassoc_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    if eq_comparable_value(h, &a[0]) {
+        return rassq_fn(h, a);
+    }
+    let key = a[0].clone();
+    for_each_tail(h, &a[1], |h, car, _| match h.obj(car) {
+        Some(Obj::Cons(_, v)) if el_eq(h, v, &key) || el_equal(h, v, &key) => Some(car.clone()),
+        _ => None,
+    })
 }
 
 fn nth_fn(h: &mut ElispHost, a: &[Value]) -> R {
@@ -6827,6 +7042,37 @@ fn current_time(_h: &mut ElispHost, _a: &[Value]) -> R {
     ]))
 }
 
+// `emacs-build-time' (lisp/version.el) is `(current-time)' evaluated while the
+// binary is being DUMPED, so in a real Emacs it is a constant of the build:
+//
+//   $ for i in 1 2 3; do emacs -Q --batch --eval '(prin1 emacs-build-time)'; done
+//   (27285 4897 897505 0)(27285 4897 897505 0)(27285 4897 897505 0)
+//
+// elisprs has no dump step, and evaluating `(current-time)' when the prelude
+// runs made the value change on every invocation. The fixed point that
+// corresponds to "when this build was made" here is the executable's mtime,
+// which is what this returns, in `current-time' list form.
+//
+// It is also what makes the cache's shared post-prelude base reproducible: the
+// base is one image for every entry in the shard, so a value that differs per
+// process cannot live in it. A `(current-time)' there additionally meant a warm
+// run replayed an older timestamp than a cold run computed — a cold/warm
+// disagreement on the side Emacs does not have.
+fn build_time(h: &mut ElispHost, _a: &[Value]) -> R {
+    use std::os::unix::fs::MetadataExt;
+    let (isec, nsec) = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| (m.mtime(), m.mtime_nsec()))
+        .unwrap_or((0, 0));
+    Ok(h.list_from(vec![
+        Value::Int(isec >> 16),
+        Value::Int(isec & 0xffff),
+        Value::Int(nsec / 1000),
+        Value::Int(0),
+    ]))
+}
+
 fn format_time_string(h: &mut ElispHost, a: &[Value]) -> R {
     let fmt = as_string(h, &a[0])?;
     let secs = time_arg_secs(h, a.get(1))?;
@@ -8895,6 +9141,16 @@ pub fn install(h: &mut ElispHost) {
     s("eq", 2, Some(2), eq_fn);
     s("eql", 2, Some(2), eql_fn);
     s("equal", 2, Some(2), equal_fn);
+    // fns.c list search. These were prelude `defun`s, which made `subrp` nil where
+    // Emacs says t, named the closure in a wrong-arity signal, and — because a
+    // `while (consp l)` loop has no cycle check — did not terminate on a circular
+    // list at all.
+    s("memq", 2, Some(2), memq_fn);
+    s("memql", 2, Some(2), memql_fn);
+    s("member", 2, Some(2), member_fn);
+    s("assq", 2, Some(2), assq_fn);
+    s("rassq", 2, Some(2), rassq_fn);
+    s("rassoc", 2, Some(2), rassoc_fn);
     s("null", 1, Some(1), null_fn);
     s("consp", 1, Some(1), consp);
     s("listp", 1, Some(1), listp);
@@ -9058,6 +9314,12 @@ pub fn install(h: &mut ElispHost) {
     s("apply", 1, None, intercepted_subr);
     s("mapcar", 2, Some(2), intercepted_subr);
     s("mapc", 2, Some(2), intercepted_subr);
+    // `assoc` calls TESTFN and `mapconcat` calls FUNCTION, so both re-enter elisp
+    // and both are driven from `host::call_function`. Registering the cell keeps
+    // `subrp` / `subr-name` / `func-arity` / `symbol-function` answering as Emacs
+    // does for a C subr in fns.c.
+    s("assoc", 2, Some(3), intercepted_subr);
+    s("mapconcat", 2, Some(3), intercepted_subr);
     s("maphash", 2, Some(2), intercepted_subr);
     s("mapatoms", 1, Some(2), intercepted_subr);
     s("load", 1, Some(5), intercepted_subr);
@@ -9102,6 +9364,7 @@ pub fn install(h: &mut ElispHost) {
     s("subr-name", 1, Some(1), subr_name);
     s("--current-directory--", 0, Some(0), current_directory);
     s("--system-type--", 0, Some(0), system_type);
+    s("--build-time--", 0, Some(0), build_time);
     s("system-name", 0, Some(0), system_name);
     s("--temp-directory--", 0, Some(0), temp_directory);
     s("file-exists-p", 1, Some(1), file_exists_p);

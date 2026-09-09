@@ -1635,3 +1635,134 @@ fn elt_is_a_subr_and_delegates_like_felt() {
     );
     assert_eq!(e("(elt 5 0)"), "(wrong-type-argument sequencep 5)");
 }
+
+/// `memq`, `memql`, `member`, `assq`, `assoc`, `rassq`, `rassoc` and `mapconcat`
+/// are C subrs in `fns.c`; they were prelude `defun`s here, and every observable
+/// that distinguishes the two disagreed with Emacs.
+///
+/// The load-bearing one is not the naming: the prelude walked with a bare
+/// `while (consp l)` loop, which has no cycle check, so a circular list did not
+/// terminate at all where Emacs signals. Measured under `emacs -Q --batch -l`:
+///
+/// ```text
+///   (let ((c (list 1 2 3))) (setcdr (nthcdr 2 c) c) (member 9 c))
+///   emacs  => (circular-list (3 1 2 3 1 . #2))
+///   elisp  => hangs
+/// ```
+///
+/// The port is `fns.c` verbatim over lisp.h's `FOR_EACH_TAIL` (Brent's
+/// teleporting tortoise) — see `builtins::TailWalk`.
+#[test]
+fn fns_list_search_is_a_subr_with_for_each_tails_walk() {
+    let e = |src: &str| eval(&format!("(condition-case e {src} (error e))"));
+    // `(subrp (symbol-function F))` and `(subr-name …)` under the pinned oracle.
+    assert_eq!(
+        eval(
+            "(mapcar (lambda (f) (and (subrp (symbol-function f)) (subr-name (symbol-function f))))\
+             '(memq memql member assq assoc rassq rassoc mapconcat))"
+        ),
+        "(\"memq\" \"memql\" \"member\" \"assq\" \"assoc\" \"rassq\" \"rassoc\" \"mapconcat\")"
+    );
+    // A wrong-arity call therefore names the SYMBOL, as `eval_sub` does for a
+    // subr, not the closure a prelude `defun` would have produced.
+    assert_eq!(e("(member 1)"), "(wrong-number-of-arguments member 1)");
+    assert_eq!(
+        e("(assoc 1 nil nil 5)"),
+        "(wrong-number-of-arguments assoc 4)"
+    );
+    assert_eq!(
+        e("(mapconcat #'identity)"),
+        "(wrong-number-of-arguments mapconcat 1)"
+    );
+
+    // A cycle signals instead of spinning. The datum is the tail the walk stood
+    // on, so it is a cons — printing it needs `print-circle`, which is why the
+    // assertion checks the shape rather than the rendering.
+    let circ = |call: &str| {
+        eval(&format!(
+            "(let ((c (list 1 2 3)))\
+               (setcdr (nthcdr 2 c) c)\
+               (let ((r (condition-case e {call} (error e))))\
+                 (list (car r) (length (cdr r)) (and (consp (cadr r)) t))))"
+        ))
+    };
+    for call in [
+        "(member 9 c)",
+        "(memq 9 c)",
+        "(memql 9.0 c)",
+        "(assoc 9 c)",
+        "(assq 9 c)",
+        "(rassoc 9 c)",
+        "(rassq 9 c)",
+        "(mapconcat #'identity c \",\")",
+    ] {
+        assert_eq!(
+            circ(call),
+            "(circular-list 1 t)",
+            "no cycle signal for {call}"
+        );
+    }
+
+    // `CHECK_LIST_END` names the WHOLE list for the search family and the TAIL
+    // for `mapconcat` (whose check is `Flength`'s, not `CHECK_LIST_END`'s).
+    assert_eq!(
+        e("(member 9 '(1 2 . 3))"),
+        "(wrong-type-argument listp (1 2 . 3))"
+    );
+    assert_eq!(
+        e("(assq 9 '((1 . 2) . 3))"),
+        "(wrong-type-argument listp ((1 . 2) . 3))"
+    );
+    assert_eq!(
+        e("(mapconcat #'identity (cons \"a\" 9) \"-\")"),
+        "(wrong-type-argument listp 9)"
+    );
+    // A hit BEFORE the improper tail returns rather than signalling.
+    assert_eq!(eval("(member 1 '(1 2 . 3))"), "(1 2 . 3)");
+
+    // `eq_comparable_value` routes a symbol or fixnum key to the `eq` sibling,
+    // and `memql` only takes the by-value path for a float or a bignum.
+    assert_eq!(eval("(memql 1.0 '(1 1.0 2))"), "(1.0 2)");
+    assert_eq!(eval("(memql 1 '(1.0 1 2))"), "(1 2)");
+    assert_eq!(eval("(member \"b\" '(\"a\" \"b\" \"c\"))"), "(\"b\" \"c\")");
+    // A non-cons element is skipped, not an error.
+    assert_eq!(
+        eval("(assoc \"k\" '(\"s\" (1 . 2) (\"k\" . 3)))"),
+        "(\"k\" . 3)"
+    );
+    // TESTFN is called as `(TESTFN ELEMENT-KEY KEY)`, in that order.
+    assert_eq!(
+        eval("(assoc 3 '((1 . a) (2 . b)) (lambda (x y) (< x y)))"),
+        "(1 . a)"
+    );
+
+    // `Fmapconcat`: nil or an empty separator drops the interleave; SEPARATOR
+    // may be any sequence; `Fconcat` enforces the element contract.
+    assert_eq!(eval("(mapconcat #'identity '(\"a\" \"b\"))"), "\"ab\"");
+    assert_eq!(eval("(mapconcat #'identity '(\"a\" \"b\") \"\")"), "\"ab\"");
+    assert_eq!(eval("(mapconcat #'char-to-string \"ab\" \"-\")"), "\"a-b\"");
+    assert_eq!(
+        eval("(mapconcat #'number-to-string [1 2] \"-\")"),
+        "\"1-2\""
+    );
+    assert_eq!(
+        eval("(mapconcat #'identity '(\"a\" \"b\") '(?-))"),
+        "\"a-b\""
+    );
+    assert_eq!(eval("(mapconcat #'ignore '(1 2) \"-\")"), "\"-\"");
+    assert_eq!(eval("(mapconcat #'identity '() \"-\")"), "\"\"");
+    // A bad separator only matters once there are two elements to separate.
+    assert_eq!(eval("(mapconcat #'identity '(\"a\") 5)"), "\"a\"");
+    assert_eq!(
+        e("(mapconcat #'identity '(\"a\" \"b\") 5)"),
+        "(wrong-type-argument sequencep 5)"
+    );
+    assert_eq!(
+        e("(mapconcat #'identity '(?a ?b) \"-\")"),
+        "(wrong-type-argument sequencep 97)"
+    );
+    assert_eq!(
+        e("(mapconcat #'identity 5 \"-\")"),
+        "(wrong-type-argument sequencep 5)"
+    );
+}
