@@ -5366,7 +5366,7 @@ separate members and stopped matching `^`. Members now go through one
   single register per number and elisprs has two distinct fancy-regex groups, so
   no positional mapping can be right for both branches.
 
-## Oracle drift — what GNU Emacs 31.1 changed under `split-string` and `end-of-file`
+## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the
 top of this file), and `scripts/fuzz_parity.sh` refuses any other oracle unless
@@ -5464,3 +5464,48 @@ which is why the divergence only appears through the fuzz driver's loaded file.
 Retargeting elisprs to 31.x is a decision about which Emacs it tracks, not a bug
 fix: making either of these match 31 breaks the 30.2 expectations this file and
 the whole corpus are measured against.
+
+### `#NrDIGITS` radix gate: `n < 0` (30) → `n < 2` (31)
+
+Emacs 30.2 checks only the upper bound before handing the digits to
+`read_integer` (`src/lread.c`, 4241-4242):
+
+```c
+if (c == 'r' || c == 'R')
+  {
+    /* #NrDIGITS -- radix-N number */
+    if (n < 0 || n > 36)
+      invalid_radix_integer (n, readcharfun);
+    obj = read_integer (readcharfun, n);
+```
+
+Emacs 31.1 rejects a radix under 2 at the same gate (4026-4027):
+
+```c
+		    /* #NrDIGITS -- radix-N number */
+		    if (n < 2 || n > 36)
+		      invalid_radix_integer (n, source);
+```
+
+So on 30 a radix of 0 or 1 reaches `read_integer`, whose leading-zero branch
+sets `valid = 1` before any digit is tested; `string_to_number` then reads its
+own leading digit with `digit_to_number`, which in radix 1 still calls `0`
+digit 0 and in radix 0 finds no digit at all.
+
+Measured, `emacs -Q --batch` on 31.1, against what the 30.2 source produces:
+
+```text
+form        30.2 (elisprs)                             31.1
+#1r0        0                                          (invalid-read-syntax "integer, radix 1")
+#1r00       0                                          (invalid-read-syntax "integer, radix 1")
+#0r0        nil                                        (invalid-read-syntax "integer, radix 0")
+#0r00       nil                                        (invalid-read-syntax "integer, radix 0")
+#1r1        (invalid-read-syntax "integer, radix 1")   same
+#37r1       (invalid-read-syntax "integer, radix 37")  same
+```
+
+The drift is confined to the all-zeros spelling, which is the only digit string
+a radix under 2 can accept. Every spelling whose digits the radix cannot supply
+is rejected on both versions with the same text, because the message comes from
+`invalid_radix_integer` either way. `tests/parity_read_labels.rs`
+(`radix_under_two_follows_the_thirty_two_gate`) pins the 30.2 column.
