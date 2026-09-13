@@ -1531,6 +1531,26 @@ impl ElispHost {
     }
     pub fn intern(&mut self, name: &str) -> Value {
         if let Some(&id) = self.obarray.get(name) {
+            // The compiler RESOLVING a name claims it exactly as creating it
+            // does: the chunk that comes out references this handle, and a warm
+            // hit does not compile, so the image has to carry the symbol
+            // interned or the replay hands the call site an orphan.
+            //
+            // Only creation was recorded before, and elisprs compiles and runs
+            // form by form — so a name a RUNNING form interned first (`(setf
+            // point3--z)`, which `oclosure-define` installs at run time) and a
+            // LATER form compiled against was written out uninterned. On the
+            // warm hit the restored symbol was not the obarray's, the replayed
+            // `oclosure-define` defined the function on the obarray's one, and
+            // the call site answered `void-function (setf point3--z)` —
+            // examples/oclosure.el passed cold and failed warm.
+            //
+            // The `zqleak` leak this flag exists to stop is untouched: a symbol
+            // a run interns out of DATA is only claimed here if the compiler
+            // asked for that name too, which means the file spells it.
+            if self.compiling_form {
+                self.compile_interned.insert(id);
+            }
             return Value::Obj(id);
         }
         let id = self.arena.len() as u32;
