@@ -127,7 +127,10 @@ fn make_list_is_a_subr_not_a_closure() {
     );
     // The function cell itself, and everything that reads it.
     assert_eq!(eval("(subrp (symbol-function 'make-list))"), "t");
-    assert_eq!(eval("(subr-name (symbol-function 'make-list))"), "\"make-list\"");
+    assert_eq!(
+        eval("(subr-name (symbol-function 'make-list))"),
+        "\"make-list\""
+    );
     assert_eq!(eval("(type-of (symbol-function 'make-list))"), "subr");
     assert_eq!(eval("(symbol-function 'make-list)"), "#<subr make-list>");
     assert_eq!(eval("(func-arity 'make-list)"), "(2 . 2)");

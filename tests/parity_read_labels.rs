@@ -50,7 +50,10 @@ fn a_cons_label_closes_onto_its_own_placeholder() {
     // Shared but NOT circular: one object named twice, which must stay ONE
     // object rather than being copied.
     assert_eq!(eval("(let ((o '(#1=(a) #1#))) (eq (car o) (cadr o)))"), "t");
-    assert_eq!(eval("(let ((o '[#1=(1) #1#])) (eq (aref o 0) (aref o 1)))"), "t");
+    assert_eq!(
+        eval("(let ((o '[#1=(1) #1#])) (eq (aref o 0) (aref o 1)))"),
+        "t"
+    );
 }
 
 /// A label on anything that is NOT a cons cannot repurpose the placeholder, so
@@ -90,13 +93,17 @@ fn print_and_read_round_trip_through_the_label() {
         "\"#1=[1 #1#]\""
     );
     assert_eq!(
-        eval("(let ((print-circle t)) (prin1-to-string (car (read-from-string \"(#1=(a) #1#)\"))))"),
+        eval(
+            "(let ((print-circle t)) (prin1-to-string (car (read-from-string \"(#1=(a) #1#)\"))))"
+        ),
         "\"(#1=(a) #1#)\""
     );
     // The label NUMBER is chosen by the printer, so a corpus label of `0` comes
     // back as `1` — the structure round-trips, the spelling need not.
     assert_eq!(
-        eval("(let ((print-circle t)) (prin1-to-string (car (read-from-string \"#0=(#0# . 2)\"))))"),
+        eval(
+            "(let ((print-circle t)) (prin1-to-string (car (read-from-string \"#0=(#0# . 2)\"))))"
+        ),
         "\"#1=(#1# . 2)\""
     );
 }
@@ -108,23 +115,29 @@ fn print_and_read_round_trip_through_the_label() {
 #[test]
 fn a_cycle_through_a_text_property_is_labelled() {
     assert_eq!(
-        eval("(let ((print-circle t) (s (copy-sequence \"ab\"))) \
-              (put-text-property 0 2 'p s s) (prin1-to-string s))"),
+        eval(
+            "(let ((print-circle t) (s (copy-sequence \"ab\"))) \
+              (put-text-property 0 2 'p s s) (prin1-to-string s))"
+        ),
         "\"#1=#(\\\"ab\\\" 0 2 (p #1#))\""
     );
     // A value shared by one RUN of characters is one interval, so it is reached
     // once and earns no label. Emacs walks intervals; this heap stores a plist
     // per character, and counting per character would label this `#1=(1)`.
     assert_eq!(
-        eval("(let ((print-circle t) (s (copy-sequence \"abc\"))) \
-              (put-text-property 0 3 'p '(1) s) (prin1-to-string s))"),
+        eval(
+            "(let ((print-circle t) (s (copy-sequence \"abc\"))) \
+              (put-text-property 0 3 'p '(1) s) (prin1-to-string s))"
+        ),
         "\"#(\\\"abc\\\" 0 3 (p (1)))\""
     );
     // The same value in two SEPARATE runs is reached twice, and is labelled.
     assert_eq!(
-        eval("(let ((print-circle t) (s (copy-sequence \"abcd\")) (v (list 1))) \
+        eval(
+            "(let ((print-circle t) (s (copy-sequence \"abcd\")) (v (list 1))) \
               (put-text-property 0 1 'p v s) (put-text-property 3 4 'p v s) \
-              (prin1-to-string s))"),
+              (prin1-to-string s))"
+        ),
         "\"#(\\\"abcd\\\" 0 1 (p #1=(1)) 3 4 (p #1#))\""
     );
 }
@@ -134,7 +147,10 @@ fn a_cycle_through_a_text_property_is_labelled() {
 /// form's label.
 #[test]
 fn a_label_does_not_escape_its_own_top_level_form() {
-    assert_eq!(err("(progn '#1=(1) nil) (progn '#1#)"), "invalid-read-syntax: #1#");
+    assert_eq!(
+        err("(progn '#1=(1) nil) (progn '#1#)"),
+        "invalid-read-syntax: #1#"
+    );
 }
 
 /// The error datum is `invalid_syntax (read_buffer, …)` (lread.c:3931-3935):
