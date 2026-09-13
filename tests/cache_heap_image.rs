@@ -520,3 +520,42 @@ fn emacs_build_time_is_fixed_for_the_binary_and_survives_a_cache_hit() {
         "expected a `current-time' 4-list, got {cold}"
     );
 }
+
+/// A symbol the RUNNING program interned and the COMPILER then referenced has to
+/// come back interned, or the chunk and the replay resolve the same name to two
+/// different objects.
+///
+/// `compile_interned` decides which symbols the image re-claims their name for,
+/// and it was recorded only where `intern` ALLOCATES. That made membership turn
+/// on which phase reached a name first rather than on whether a chunk baked in
+/// its handle. `gv`'s function-setter fallback hits the losing order every time:
+/// `(defalias (gv-setter 'bx) …)` interns `(setf bx)` while the program runs,
+/// one form before the compiler lowers `(setf (bx …) …)` to a call through that
+/// symbol's handle.
+///
+/// So the image restored the symbol with no obarray entry and no function cell,
+/// the warm run's own `gv-setter` call interned a SECOND symbol and gave that one
+/// the definition, and the chunk went on calling the first:
+///
+/// ```text
+/// $ elisp setter.el     # cold: 7
+/// $ elisp setter.el     # warm: (void-function (setf bx))
+/// ```
+///
+/// Every `(setf FN)` setter reached the cache through that path — `gv`'s
+/// fallback, and so every `cl-defstruct` and `oclosure` mutable slot with it.
+#[test]
+fn warm_cache_keeps_a_setter_symbol_the_run_interned_and_the_compiler_used() {
+    let script = r#"
+(defvar box (list 0))
+(defun bx (o) (car o))
+(defalias (gv-setter 'bx) (lambda (v o) (setcar o v) v))
+(setf (bx box) 7)
+(princ (format "%S %S\n"
+               (car box)
+               (eq (gv-setter 'bx) (intern-soft "(setf bx)"))))
+"#;
+    let (cold, warm) = run_cold_then_warm("setter-sym", script);
+    assert_eq!(cold, "7 t\n", "cold run");
+    assert_eq!(warm, cold, "a cache hit lost the (setf bx) setter");
+}
