@@ -133,10 +133,6 @@ pub const PRELUDE: &str = r#"
    ;; where Emacs answers the whole improper list, `("z" . 1.5)'. The two agree
    ;; on every proper list.
    (t (nthcdr (max 0 (- (safe-length l) n)) l))))
-(defun make-list (n x)
-  (unless (and (integerp n) (>= n 0) (<= n most-positive-fixnum))
-    (signal 'wrong-type-argument (list 'wholenump n)))
-  (let ((r nil)) (while (> n 0) (setq r (cons x r)) (setq n (1- n))) r))
 (defun number-sequence (from &optional to inc)
   ;; With only FROM, or FROM=TO, the sequence is (FROM); INC defaults to 1.
   (if (or (null to) (= from to))

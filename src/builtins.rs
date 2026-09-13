@@ -107,6 +107,22 @@ fn check_array_len_val(h: &ElispHost, v: &Value) -> Result<usize, String> {
     check_array_len(as_num(h, v)?.0)
 }
 
+/// `CHECK_FIXNAT (V)`: V must be an integer in `[0, most-positive-fixnum]`, and
+/// anything else — a negative fixnum, a float, a bignum, a string, nil — is
+/// `wrong-type-argument wholenump V` naming the value itself.
+///
+/// [`check_array_len_val`] is the same test for a caller that goes on to
+/// ALLOCATE the length; this one is for a caller that only counts with it.
+fn check_fixnat(h: &ElispHost, v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Int(n) if (0..=MOST_POSITIVE_FIXNUM).contains(n) => Ok(*n),
+        _ => Err(format!(
+            "wrong-type-argument: wholenump {}",
+            h.print(v, true)
+        )),
+    }
+}
+
 /// Validate a requested array/string length the way Emacs's `CHECK_FIXNAT`
 /// does: a negative value or one above `most-positive-fixnum` (a bignum) is not
 /// a wholenum, so signal `wrong-type-argument wholenump N` rather than
@@ -1393,6 +1409,23 @@ fn vectorp(h: &mut ElispHost, a: &[Value]) -> R {
 fn vector_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.alloc(Obj::Vector(a.to_vec())))
 }
+/// `(make-list LENGTH INIT)` — port of `Fmake_list` (alloc.c:2991-3005).
+///
+/// This was a prelude `defun` with the same semantics, which made every
+/// observable that names the FUNCTION disagree: Emacs reports
+/// `#<subr make-list>` and elisprs printed the whole closure, so
+/// `(apply #'make-list nil)` differed in its error, and `subrp`, `subr-name`
+/// and `type-of` all answered for an interpreted function. The values and the
+/// `wholenump` rejections already matched; only the identity did not.
+fn make_list(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = check_fixnat(h, &a[0])?;
+    let mut val = Value::Undef;
+    for _ in 0..n {
+        val = h.cons(a[1].clone(), val);
+    }
+    Ok(val)
+}
+
 fn make_vector(h: &mut ElispHost, a: &[Value]) -> R {
     let n = check_array_len_val(h, &a[0])?;
     // Fallible allocation: a length that fits `most-positive-fixnum` can still
@@ -9199,6 +9232,7 @@ pub fn install(h: &mut ElispHost) {
     // vectors
     s("vector", 0, None, vector_fn);
     s("make-vector", 2, Some(2), make_vector);
+    s("make-list", 2, Some(2), make_list);
     s("record", 1, None, record_fn);
     s("make-record", 3, Some(3), make_record);
     s("make-bool-vector", 2, Some(2), make_bool_vector);

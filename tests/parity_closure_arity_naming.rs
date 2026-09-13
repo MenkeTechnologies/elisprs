@@ -101,3 +101,60 @@ fn an_empty_closure_body_prints_as_nil() {
     );
     assert_eq!(eval("(funcall (lambda ()))"), "nil");
 }
+
+/// `make-list` is a C subr in `alloc.c` (`Fmake_list`, 2991-3005) and was a
+/// prelude `defun` here, so every observable that names the FUNCTION rather
+/// than its value disagreed. The differential fuzzer found it as
+/// `(apply #'make-list nil)`, where `apply` resolves before calling and Emacs
+/// therefore names the subr object rather than the symbol.
+#[test]
+fn make_list_is_a_subr_not_a_closure() {
+    // Resolved before the call: Emacs names `#<subr make-list>`, and elisprs
+    // used to print the whole `#[(n x) …]` closure here.
+    assert_eq!(
+        eval("(condition-case e (apply #'make-list nil) (error e))"),
+        "(wrong-number-of-arguments #<subr make-list> 0)"
+    );
+    assert_eq!(
+        eval("(condition-case e (funcall #'make-list 1) (error e))"),
+        "(wrong-number-of-arguments #<subr make-list> 1)"
+    );
+    // Written directly, a subr names the symbol the caller wrote — the same
+    // split `a_subr_still_reports_the_designator` pins for the other subrs.
+    assert_eq!(
+        eval("(condition-case e (make-list 1 2 3) (error e))"),
+        "(wrong-number-of-arguments make-list 3)"
+    );
+    // The function cell itself, and everything that reads it.
+    assert_eq!(eval("(subrp (symbol-function 'make-list))"), "t");
+    assert_eq!(eval("(subr-name (symbol-function 'make-list))"), "\"make-list\"");
+    assert_eq!(eval("(type-of (symbol-function 'make-list))"), "subr");
+    assert_eq!(eval("(symbol-function 'make-list)"), "#<subr make-list>");
+    assert_eq!(eval("(func-arity 'make-list)"), "(2 . 2)");
+    // `CHECK_FIXNAT` names the offending value, whatever type it is. These
+    // already matched through the prelude `defun`'s explicit `integerp` test
+    // and must keep matching through the C one.
+    assert_eq!(
+        eval("(condition-case e (make-list -1 'x) (error e))"),
+        "(wrong-type-argument wholenump -1)"
+    );
+    assert_eq!(
+        eval("(condition-case e (make-list 1.5 'x) (error e))"),
+        "(wrong-type-argument wholenump 1.5)"
+    );
+    assert_eq!(
+        eval("(condition-case e (make-list nil 'x) (error e))"),
+        "(wrong-type-argument wholenump nil)"
+    );
+    assert_eq!(
+        eval("(condition-case e (make-list 2305843009213693952 'x) (error e))"),
+        "(wrong-type-argument wholenump 2305843009213693952)"
+    );
+    // One INIT object, shared by every cell — `Fcons (init, val)` in a loop.
+    assert_eq!(
+        eval("(let* ((x (list 1)) (l (make-list 2 x))) (eq (car l) (cadr l)))"),
+        "t"
+    );
+    assert_eq!(eval("(make-list 0 'x)"), "nil");
+    assert_eq!(eval("(make-list 3 'x)"), "(x x x)");
+}
