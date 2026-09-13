@@ -3369,9 +3369,44 @@ impl ElispHost {
                         Some(kids)
                     }
                     Some(Obj::Vector(items)) | Some(Obj::Record(items)) => Some(items.clone()),
-                    // A candidate with no children: it can be shared but can
-                    // never be part of a cycle.
-                    Some(Obj::Str(_)) => Some(Vec::new()),
+                    // print.c:1431-1436 — "A string may have text properties,
+                    // which can be circular": the children are the plists of the
+                    // string's text-property INTERVALS, reached through
+                    // `traverse_intervals_noorder`.
+                    //
+                    // Emacs walks intervals; this heap stores one plist per
+                    // CHARACTER, so the run grouping has to be reconstructed with
+                    // exactly the test `string_prop_intervals` prints with, or the
+                    // counts disagree with Emacs's. Visiting per character instead
+                    // makes every value inside a multi-character run look shared and
+                    // earns it a `#N=` label Emacs does not print:
+                    // `(put-text-property 0 3 'p '(1) (copy-sequence "abc"))`
+                    // printed `#("abc" 0 3 (p #1=(1)))` against Emacs's
+                    // `#("abc" 0 3 (p (1)))`.
+                    //
+                    // Without this arm at all, a cycle THROUGH a text property —
+                    // which `#1=#("x" 0 1 (p #1#))` reads and `put-text-property`
+                    // builds — was never labelled and the printer recursed into it
+                    // until the stack overflowed.
+                    Some(Obj::Str(a)) => {
+                        let props = self.string_props_vec(a).unwrap_or_default();
+                        let mut kids = Vec::new();
+                        let mut i = 0;
+                        while i < props.len() {
+                            let mut j = i + 1;
+                            while j < props.len()
+                                && (self.values_eq(&props[i], &props[j])
+                                    || self.plist_struct_eq(&props[i], &props[j]))
+                            {
+                                j += 1;
+                            }
+                            if el_truthy(&props[i]) {
+                                kids.push(props[i].clone());
+                            }
+                            i = j;
+                        }
+                        Some(kids)
+                    }
                     Some(Obj::CharTable(t)) => {
                         Some(vec![t.default.clone(), t.parent.clone(), t.subtype.clone()])
                     }

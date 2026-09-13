@@ -9,20 +9,22 @@
 use crate::host::{el_truthy, ElHashTable, ElispHost, Obj};
 use fusevm::Value;
 use num_bigint::BigInt;
+use std::collections::{HashMap, HashSet};
 
 pub fn read_all(h: &mut ElispHost, src: &str) -> Result<Vec<Value>, String> {
     let chars: Vec<char> = src.chars().collect();
-    let mut r = Reader {
-        newlines: newline_positions(&chars),
-        chars,
-        pos: 0,
-    };
+    let mut r = Reader::new(chars, 0);
     let mut out = Vec::new();
     loop {
         r.skip_ws();
         if r.pos >= r.chars.len() {
             break;
         }
+        // Emacs rebuilds `read_objects_map` for every top-level read, so a
+        // label is scoped to ONE form: `#1=(1) #1#` is two reads and the
+        // second one is invalid syntax, not a reference back into the first.
+        r.labels.clear();
+        r.completed.clear();
         out.push(r.read_form(h)?);
     }
     Ok(out)
@@ -33,11 +35,7 @@ pub fn read_all(h: &mut ElispHost, src: &str) -> Result<Vec<Value>, String> {
 pub fn read_one(h: &mut ElispHost, src: &str, start: usize) -> Result<(Value, usize), String> {
     let chars: Vec<char> = src.chars().collect();
     let pos = start.min(chars.len());
-    let mut r = Reader {
-        newlines: newline_positions(&chars),
-        chars,
-        pos,
-    };
+    let mut r = Reader::new(chars, pos);
     r.skip_ws();
     if r.pos >= r.chars.len() {
         return Err("end-of-file".into());
@@ -53,6 +51,28 @@ struct Reader {
     /// instead of rescanning from the start for each form (the DAP needs a
     /// source line for every list it reads).
     newlines: Vec<usize>,
+    /// lread.c `read_objects_map`: label number → the object (or, while the
+    /// labelled object is still being read, its placeholder cons) that `#N#`
+    /// resolves to. Emacs allocates this table fresh per top-level read
+    /// (lread.c:2744-2775), so `read_all` clears it between forms and each
+    /// `read_one` starts empty.
+    labels: HashMap<i64, Value>,
+    /// lread.c `read_objects_completed`: the arena ids of objects that came in
+    /// through a `#N=`, so `substitute_object_recurse` knows which nodes can be
+    /// the entry point of a cycle and must be marked seen before descending.
+    completed: HashSet<u32>,
+}
+
+impl Reader {
+    fn new(chars: Vec<char>, pos: usize) -> Reader {
+        Reader {
+            newlines: newline_positions(&chars),
+            chars,
+            pos,
+            labels: HashMap::new(),
+            completed: HashSet::new(),
+        }
+    }
 }
 
 /// Char-indices of every newline in `chars` (ascending), for `Reader::line_at`.
@@ -62,6 +82,21 @@ fn newline_positions(chars: &[char]) -> Vec<usize> {
         .enumerate()
         .filter_map(|(i, &c)| (c == '\n').then_some(i))
         .collect()
+}
+
+/// `digit_to_number` (lread.c:3095-3113): the value CHARACTER stands for in
+/// RADIX. `None` is the C `-2` — not a digit character in ANY radix, so the
+/// literal ends here — and `Some(None)` is the C `-1`: a letter or digit that
+/// this radix does not have, which is consumed and invalidates the literal.
+#[allow(clippy::unnecessary_wraps)]
+fn digit_to_number(c: char, radix: u32) -> Option<Option<u32>> {
+    let digit = match c {
+        '0'..='9' => c as u32 - '0' as u32,
+        'a'..='z' => c as u32 - 'a' as u32 + 10,
+        'A'..='Z' => c as u32 - 'A' as u32 + 10,
+        _ => return None,
+    };
+    Some((digit < radix).then_some(digit))
 }
 
 fn is_delim(c: char) -> bool {
@@ -489,9 +524,14 @@ impl Reader {
         Ok(val)
     }
 
-    /// Read a radix-prefixed integer: `#x1f` / `#b101` / `#o17` (and uppercase),
-    /// or the general `#NNr…` form (e.g. `#16rFF`). An optional sign may follow
-    /// the prefix.
+    /// Read a `#`-then-digits form: `#NNr…` (a radix-N integer, e.g. `#16rFF`),
+    /// `#N=OBJ` (label OBJ with N) or `#N#` (the object labelled N). `#x1f` /
+    /// `#b101` / `#o17` (and uppercase) come here too, as the fixed-base
+    /// spellings of the radix form.
+    ///
+    /// Port of `read0`'s `case '#'` digit arm (lread.c:4225-4289, emacs-30.2):
+    /// the digits are scanned first and the character that ENDS them picks the
+    /// form, which is why `#1r0` is a radix error and `#1=` is not.
     fn read_radix(&mut self, h: &mut ElispHost) -> Result<Value, String> {
         self.pos += 1; // consume '#'
         let c = self.peek().ok_or("unterminated radix literal")?;
@@ -509,45 +549,297 @@ impl Reader {
                 2
             }
             '0'..='9' => {
-                let mut n = 0u32;
-                while let Some(d) = self.peek().and_then(|c| c.to_digit(10)) {
-                    n = n * 10 + d;
+                // lread.c:4226-4237. The first digit is already consumed by the
+                // dispatch; each further character is read and APPENDED TO THE
+                // ERROR BUFFER before it is tested, which is why an overflowing
+                // `#99999999999999999999=` reports `#9999999999999999999` — the
+                // digits up to and including the one that overflowed, and no `=`.
+                let dstart = self.pos;
+                let mut n: i64 = c.to_digit(10).unwrap_or(0) as i64;
+                self.pos += 1;
+                let ended: char;
+                loop {
+                    let Some(ch) = self.peek() else {
+                        return Err(self.hash_syntax_err(dstart));
+                    };
                     self.pos += 1;
+                    let Some(d) = ch.to_digit(10) else {
+                        ended = ch;
+                        break;
+                    };
+                    match n.checked_mul(10).and_then(|v| v.checked_add(d as i64)) {
+                        Some(v) => n = v,
+                        None => return Err(self.hash_syntax_err(dstart)),
+                    }
                 }
-                match self.peek() {
-                    Some('r') | Some('R') => self.pos += 1,
-                    _ => return Err("malformed radix literal (expected `r`)".to_string()),
+                match ended {
+                    // `#NrDIGITS` — a radix-N integer.
+                    //
+                    // ORACLE DRIFT, pinned to 30.2. The gate here is
+                    // `if (n < 0 || n > 36)` in emacs-30.2 (lread.c:4241-4242)
+                    // and `if (n < 2 || n > 36)` in emacs-31.1 (lread.c:4026-4027),
+                    // so radix 0 and 1 reach `read_integer` on the pin and are
+                    // rejected at the gate on 31.1. The two agree on every
+                    // spelling whose digits the radix cannot supply — `#1r1` is
+                    // `integer, radix 1` either way — and differ only for `#0r0`
+                    // and `#1r0`, where 30.2 goes on to `string_to_number`.
+                    // `n` is built from digits, so it is never negative; the
+                    // lower half of the 30.2 test can never fire.
+                    'r' | 'R' => {
+                        if n > 36 {
+                            return Err(format!("invalid-read-syntax: integer, radix {n}"));
+                        }
+                        return self.read_integer(h, n as u32);
+                    }
+                    // `#N=OBJ` — assign number N to OBJ.
+                    '=' if n <= crate::host::MOST_POSITIVE_FIXNUM => {
+                        return self.read_labelled(h, n);
+                    }
+                    // `#N#` — a reference to the object already numbered N.
+                    '#' if n <= crate::host::MOST_POSITIVE_FIXNUM => {
+                        return self
+                            .labels
+                            .get(&n)
+                            .cloned()
+                            .ok_or_else(|| self.hash_syntax_err(dstart));
+                    }
+                    _ => return Err(self.hash_syntax_err(dstart)),
                 }
-                if !(2..=36).contains(&n) {
-                    return Err(format!("invalid radix {n}"));
-                }
-                n
             }
             _ => return Err(format!("unsupported reader macro #{c}")),
         };
+        self.read_integer(h, base)
+    }
+
+    /// `invalid_syntax (read_buffer, …)` for the `#`-then-digits form
+    /// (lread.c:3931-3935): the datum is every character the reader had buffered,
+    /// which is the `#`, the digits scanned so far, and the character that ended
+    /// them — `self.pos` already stands past that character. `dstart` is the index
+    /// of the first digit.
+    fn hash_syntax_err(&self, dstart: usize) -> String {
+        let seen: String = self.chars[dstart..self.pos].iter().collect();
+        format!("invalid-read-syntax: #{seen}")
+    }
+
+    /// Port of `read_integer` (lread.c:3129-3185): the digits of a radix-RADIX
+    /// integer, with an optional leading sign.
+    ///
+    /// The loop runs while `digit_to_number` is `>= -1`, which is the whole of the
+    /// behaviour worth porting: `-1` is "a letter or digit that this radix does
+    /// not have" — it is CONSUMED and marks the literal invalid — while `-2` is
+    /// "not a digit character at all", which ends the literal without consuming
+    /// it. So `#x1.5` reads the integer `1` and leaves `.5` for the next read,
+    /// where scanning to the next delimiter instead made the whole `1.5` a bad
+    /// token, and `#2r2` is an error rather than the integer `2`.
+    ///
+    /// A failure is always `invalid-read-syntax` with `invalid_radix_integer`'s
+    /// text (lread.c:3115-3122) — the radix, never the digits — so a radix of 0
+    /// or 1, which no digit can satisfy, reports the same way `#2r2` does.
+    fn read_integer(&mut self, h: &mut ElispHost, radix: u32) -> Result<Value, String> {
+        let bad = || format!("invalid-read-syntax: integer, radix {radix}");
+        let mut digits = String::new();
+        // `-1` is lread.c's "incomplete": no digit has been accepted yet.
+        let mut valid: i8 = -1;
         let mut sign = 1i64;
-        match self.peek() {
-            Some('+') => self.pos += 1,
-            Some('-') => {
+        let mut c = self.peek();
+        if c == Some('-') || c == Some('+') {
+            if c == Some('-') {
                 sign = -1;
+            }
+            self.pos += 1;
+            c = self.peek();
+        }
+        if c == Some('0') {
+            digits.push('0');
+            valid = 1;
+            // "Ignore redundant leading zeros, so the buffer doesn't fill up
+            // with them" (lread.c:3152-3156).
+            loop {
                 self.pos += 1;
+                c = self.peek();
+                if c != Some('0') {
+                    break;
+                }
+            }
+        }
+        while let Some(ch) = c {
+            match digit_to_number(ch, radix) {
+                None => break,
+                Some(d) => {
+                    if d.is_none() {
+                        valid = 0;
+                    }
+                    if valid < 0 {
+                        valid = 1;
+                    }
+                    digits.push(ch);
+                }
+            }
+            self.pos += 1;
+            c = self.peek();
+        }
+        if valid != 1 {
+            return Err(bad());
+        }
+        // `string_to_number (buffer, radix, NULL)` with a radix under 2, which
+        // only 30.2's gate lets through and only for the all-zeros spelling the
+        // leading-zero branch above accepted. `string_to_number` reads its own
+        // leading digit with the same `digit_to_number`: in radix 1 a `0` is
+        // still digit 0, so the value is 0, and in radix 0 nothing is a digit,
+        // so there is no numeric prefix and the result is nil.
+        if radix < 2 {
+            return Ok(if radix == 1 {
+                h.make_integer(BigInt::from(0))
+            } else {
+                Value::Undef
+            });
+        }
+        // An integer literal has no width limit: `#xFFFFFFFFFFFFFFFF` is a bignum
+        // in Emacs, not a reader error, so parse into a `BigInt` and let
+        // `make_integer` decide whether it fits a fixnum.
+        let n = BigInt::parse_bytes(digits.as_bytes(), radix).ok_or_else(bad)?;
+        Ok(h.make_integer(n * sign))
+    }
+
+    /// `#N=OBJ` — read OBJ and give it label N. Port of `read0`'s `RE_numbered`
+    /// push (lread.c:4248-4268) and the matching pop (lread.c:4552-4606).
+    ///
+    /// The label has to be resolvable *while* OBJ is still being read, or
+    /// `#1=(1 2 . #1#)` could not name its own tail. Emacs binds the number to a
+    /// fresh placeholder cons first, reads OBJ with that in the table, and then
+    /// closes the loop one of two ways:
+    ///
+    /// * OBJ is a cons — the placeholder is already a cons, so Emacs repurposes
+    ///   it: copy OBJ's car and cdr into the placeholder and hand the
+    ///   *placeholder* back as the value. Every `#N#` inside OBJ already points
+    ///   at it, so nothing needs rewriting.
+    /// * OBJ is anything else — the placeholder cannot become it, so every
+    ///   reference to the placeholder inside OBJ is rewritten to OBJ
+    ///   ([`Reader::substitute`]) and the table is repointed at OBJ.
+    fn read_labelled(&mut self, h: &mut ElispHost, n: i64) -> Result<Value, String> {
+        let placeholder = h.cons(Value::Undef, Value::Undef);
+        let Value::Obj(ph_id) = placeholder else {
+            return Err("invalid-read-syntax: #".to_string());
+        };
+        self.labels.insert(n, placeholder.clone());
+        let obj = self.read_form(h)?;
+        let obj_cons = matches!(h.obj(&obj), Some(Obj::Cons(_, _)));
+        if obj_cons {
+            if obj == placeholder {
+                // lread.c:4558-4560 — "Catch silly games like #1=#1#".
+                return Err("invalid-read-syntax: nonsensical self-reference".to_string());
+            }
+            let Some(Obj::Cons(car, cdr)) = h.obj(&obj) else {
+                return Err("invalid-read-syntax: #".to_string());
+            };
+            let (car, cdr) = (car.clone(), cdr.clone());
+            if let Some(Obj::Cons(a, d)) = h.arena.get_mut(ph_id as usize) {
+                *a = car;
+                *d = cdr;
+            }
+            self.completed.insert(ph_id);
+            return Ok(placeholder);
+        }
+        // lread.c:4582-4583 — a symbol, a number or a string with no text
+        // properties cannot contain another object, so it can never be the entry
+        // point of a cycle and is not recorded.
+        if let Value::Obj(id) = &obj {
+            if Reader::can_contain(h, &obj) {
+                self.completed.insert(*id);
+            }
+        }
+        let mut seen: HashSet<u32> = HashSet::new();
+        self.substitute(h, &obj, ph_id, &obj.clone(), &mut seen);
+        self.labels.insert(n, obj.clone());
+        Ok(obj)
+    }
+
+    /// lread.c:4582-4583 / 4641-4644: can this object hold a reference to
+    /// another one? Symbols, numbers and property-free strings cannot.
+    fn can_contain(h: &ElispHost, v: &Value) -> bool {
+        match h.obj(v) {
+            Some(Obj::Symbol(_)) => false,
+            Some(Obj::Str(a)) => h
+                .string_props_vec(a)
+                .is_some_and(|p| p.iter().any(el_truthy)),
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Port of `substitute_object_recurse` (lread.c:4632-4708): inside `subtree`,
+    /// replace every reference to the placeholder at `ph_id` with `object`.
+    ///
+    /// `seen` is `subst->seen`: a node is remembered only when it is in
+    /// `completed` — i.e. only a node that arrived through a `#N=` can close a
+    /// cycle — which is what keeps the walk finite without paying a set insert
+    /// per node.
+    ///
+    /// The containers walked are the ones the reader can BUILD: conses, vectors,
+    /// records and a string's text-property intervals. A hash table is
+    /// deliberately not walked, which is not an omission: measured on the
+    /// installed Emacs, `#1=#s(hash-table data (a #1#))` reads back as
+    /// `#s(hash-table data (a (nil)))` — Emacs leaves the raw placeholder cons in
+    /// the table, because `substitute_object_recurse` walks the hash table's
+    /// pseudovector *header* slots and not its key/value storage.
+    fn substitute(
+        &self,
+        h: &mut ElispHost,
+        object: &Value,
+        ph_id: u32,
+        subtree: &Value,
+        seen: &mut HashSet<u32>,
+    ) -> Value {
+        let Value::Obj(id) = *subtree else {
+            return subtree.clone();
+        };
+        if id == ph_id {
+            return object.clone();
+        }
+        if !Reader::can_contain(h, subtree) {
+            return subtree.clone();
+        }
+        if seen.contains(&id) {
+            return subtree.clone();
+        }
+        if self.completed.contains(&id) {
+            seen.insert(id);
+        }
+        match h.arena.get(id as usize) {
+            Some(Obj::Cons(car, cdr)) => {
+                let (car, cdr) = (car.clone(), cdr.clone());
+                let car = self.substitute(h, object, ph_id, &car, seen);
+                let cdr = self.substitute(h, object, ph_id, &cdr, seen);
+                if let Some(Obj::Cons(a, d)) = h.arena.get_mut(id as usize) {
+                    *a = car;
+                    *d = cdr;
+                }
+            }
+            Some(Obj::Vector(items)) | Some(Obj::Record(items)) => {
+                let items = items.clone();
+                let next: Vec<Value> = items
+                    .iter()
+                    .map(|x| self.substitute(h, object, ph_id, x, seen))
+                    .collect();
+                match h.arena.get_mut(id as usize) {
+                    Some(Obj::Vector(slots)) | Some(Obj::Record(slots)) => *slots = next,
+                    _ => {}
+                }
+            }
+            // lread.c:4693-4702 — a string recurses into each interval's plist.
+            Some(Obj::Str(a)) => {
+                let a = a.clone();
+                if let Some(props) = h.string_props_vec(&a) {
+                    let next: Vec<Value> = props
+                        .iter()
+                        .map(|x| self.substitute(h, object, ph_id, x, seen))
+                        .collect();
+                    h.string_set_props_vec(&a, next);
+                }
             }
             _ => {}
         }
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if is_delim(c) {
-                break;
-            }
-            self.pos += 1;
-        }
-        let tok: String = self.chars[start..self.pos].iter().collect();
-        // A radix literal is an integer of any width: `#xFFFFFFFFFFFFFFFF` is a
-        // bignum in Emacs, not a reader error, so parse into a `BigInt` and let
-        // `make_integer` decide whether it fits a fixnum.
-        let n = BigInt::parse_bytes(tok.as_bytes(), base)
-            .ok_or_else(|| format!("invalid digits for base {base}: {tok}"))?;
-        Ok(h.make_integer(n * sign))
+        subtree.clone()
     }
 
     /// Read a `#s(…)` literal: a hash-table (`#s(hash-table test … data (k v …))`)
