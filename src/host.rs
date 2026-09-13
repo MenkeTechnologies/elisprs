@@ -5073,7 +5073,7 @@ impl ElispHost {
     ///
     /// so the datum is `(MANDATORY . NONREST)` — NONREST counts the non-`&rest`
     /// formals, which is why `error`, whose `&rest` makes `func-arity` say
-    /// `(1 . many)`, still reports `(1 . 1)`. See [`lisp_level_arity`] for why
+    /// `(1 . many)`, still reports `(1 . 1)`. See `lisp_level_arity` for why
     /// elisprs has to know which of its subrs Emacs implements this way.
     pub fn signal_wrong_nargs(&mut self, callee: &Value, argc: usize) -> String {
         let sym = self.intern("wrong-number-of-arguments");

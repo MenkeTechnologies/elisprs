@@ -254,7 +254,7 @@ pub fn cache_enabled() -> bool {
 }
 
 /// Default byte budget for the shard, in bytes (64 MiB): the shared
-/// [`BaseImage`] plus every entry's blobs.
+/// `BaseImage` plus every entry's blobs.
 ///
 /// The shard is a SINGLE file that `put` rewrites whole: it reads every byte,
 /// rkyv-validates it, inserts one entry, re-serializes and renames. That is
