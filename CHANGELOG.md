@@ -6,6 +6,49 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **The reader rejected `#N=` / `#N#`, the syntax its own printer emits.**
+  `#1=(1 2 . #1#)` reached the radix path, which had already consumed the
+  digits and demanded an `r`, so it came back as
+  `malformed radix literal (expected \`r\`)`. The printer has emitted `#N=`
+  since the `print-circle` work, so nothing elisprs printed with a label could
+  be read back and no shared or circular datum could be written as a literal.
+  Ported from `read0`'s `RE_numbered` (lread.c:4248-4268, 4552-4606) and
+  `substitute_object_recurse` (4632-4708): a label binds a placeholder cons so
+  a `#N#` resolves while the object is still being read, a cons then repurposes
+  that placeholder in place, and anything else has every reference to it
+  rewritten.
+
+  ```text
+  $ elisp -e '(car (read-from-string "#1=(1 2 . #1#)"))'
+  before:  error: malformed radix literal (expected `r`)
+  after:   #1=(1 2 . #1#)
+  ```
+
+- **A cycle through a string's TEXT PROPERTIES overflowed the stack.**
+  `print_preprocess` treated a string as a leaf where print.c:1431-1436 runs
+  `traverse_intervals_noorder` over its interval plists, so such a cycle was
+  never labelled and the printer recursed into it forever.
+  `(put-text-property 0 2 'p s s)` reached this without any reader support.
+  The plists are now children, grouped into runs with exactly the test the
+  `#(…)` printer groups with — this heap stores a plist per character where
+  Emacs stores one per interval, and counting per character labelled
+  `#("abc" 0 3 (p #1=(1)))` where Emacs prints `(p (1))`.
+
+- **`#NrDIGITS` scanned to the next delimiter instead of porting
+  `read_integer`.** `digit_to_number`'s -1/-2 split (lread.c:3095-3113) is the
+  whole of it: -2 ends the literal without consuming, so `#x1.5` is the integer
+  `1` followed by `.5`; -1 is consumed and invalidates, so `#2r2` signals.
+  Every failure is now `invalid_radix_integer`'s text, which names the radix
+  and never the digits — `(invalid-read-syntax "integer, radix 16")` where
+  elisprs raised a bare `(error "invalid digits for base 16: ZZ")`.
+
+- **`make-list` was a prelude `defun` where Emacs has a C subr.** Found by the
+  differential fuzzer as `(apply #'make-list nil)`, which resolves the
+  designator before calling: Emacs names `#<subr make-list>` and elisprs
+  printed the whole closure. Ported from `Fmake_list` (alloc.c:2991-3005).
+  Eleven observables disagreed — the three arity signals, `subrp`,
+  `subr-name`, `type-of`, `symbol-function`, `indirect-function` and the
+  `apply`/`funcall` forms — and all eleven now match.
 - **A cache hit dropped every prelude-installed cell on a builtin symbol.** The
   heap image starts at `builtin_count` — a builtin object is rebuilt by
   `builtins::install` on every run, and an `Obj::Subr` has a function pointer

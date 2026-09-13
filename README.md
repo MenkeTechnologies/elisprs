@@ -51,7 +51,7 @@
 | Layer | Where |
 |---|---|
 | Value model — interned symbols, real cons cells (dotted), vectors, hash tables, closures | **ours** — an `ElispHost` object heap; objects ride the VM as `Value::Obj(u32)` handles |
-| Reader (`1+`/`1-`, `#'foo`, `?c`, `:kw`, backquote, dotted pairs) | **ours** — an elisp-correct S-expression reader |
+| Reader (`1+`/`1-`, `#'foo`, `?c`, `:kw`, backquote, dotted pairs, `#N=` labels) | **ours** — an elisp-correct S-expression reader |
 | Lisp-2 obarray, lexical+dynamic binding, special forms, macros, subrs | **ours** — `src/host.rs` + `src/compiler.rs` |
 | Bytecode execution, JIT, AOT | **`fusevm`** — elisprs has no VM/JIT of its own |
 
@@ -95,7 +95,7 @@ elisp --version
 
 ## [0x03] LANGUAGE COVERAGE
 
-**Reader syntax.** integers, floats, strings (with escapes), symbols (including `1+` / `1-` / `<=` / `:keywords`), `nil` / `t`, `'quote`, `#'function`, `?c` char literals, `;` comments.
+**Reader syntax.** integers, floats, strings (with escapes), symbols (including `1+` / `1-` / `<=` / `:keywords`), `nil` / `t`, `'quote`, `#'function`, `?c` char literals, `;` comments, backquote (`` ` `` / `,` / `,@`), radix literals (`#x1f` / `#o17` / `#b101` / `#16rFF`), `#:uninterned` and `##` (the empty-named symbol), `#s(NAME …)` records and `#s(hash-table …)`, `#&N"…"` bool-vectors, `#("text" START END PLIST …)` propertized strings, and `#N=` / `#N#` labels for shared and circular structure — so anything the printer emits under `print-circle` reads back to the same object graph.
 
 **Special forms (21).** `quote` `function` `lambda` `progn` `prog1` `if` `when` `unless` `cond` `and` `or` `while` `setq` `let` `let*` `defun` `defmacro` `defvar` `defconst` `condition-case` `unwind-protect`.
 
@@ -208,7 +208,7 @@ The grid reflects the current state of the tree.
 
 | Component | State |
 |---|---|
-| Elisp-correct reader (`1+`/`#'`/`?c`/`:kw`, `nil`/`t`, `'quote`) | Working |
+| Elisp-correct reader (`1+`/`#'`/`?c`/`:kw`, `nil`/`t`, `'quote`, `#N=` labels) | Working |
 | `Value` / `List` / `Symbol` model (`rust_lisp`) | Reused |
 | Lisp-2 obarray (value + function cells) | Working |
 | Dynamic binding (`let`/`let*`, special vars) | Working |
