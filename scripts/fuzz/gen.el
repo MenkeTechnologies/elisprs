@@ -840,6 +840,72 @@ only the error datum does."
      ((eq fn 'mapconcat) (list fn other l (fz-pick '(nil "" "-" (list ?-)))))
      (t (list fn other l)))))
 
+;; ── reader literals: shared structure, circular structure, `#…' types ────────
+;;
+;; Counted over a 2100-form corpus (seven seeds x 300, depth 3): ZERO `#N=',
+;; ZERO `#N#', ZERO `#s(…)' and ZERO `#&N"…"'.  Every hash-table in the corpus
+;; is BUILT by a `make-hash-table' call, every bool-vector by a `bool-vector'
+;; call and every cycle by `fz-circular's `setcdr', so the reader's own syntax
+;; for those types -- and the whole of its `#N=' label machinery -- was never
+;; exercised by the fuzzer at all.
+;;
+;; A corpus line is `prin1' of the form, so the way to put `#N=' into one is to
+;; build a form that CONTAINS shared structure and let the printer write it.
+;; That is what the `print-circle' binding in the main loop below is for; it is
+;; the same switch drive.el sets, so the corpus is written in exactly the syntax
+;; the driver reads back.
+;;
+;; `fz-circular' explains why IT builds its cycles by mutation rather than as
+;; `#1=(…)': several of the walkers it feeds mutate their argument.  That does
+;; not apply here -- every operation below is read-only -- so this family can
+;; use the literal, which is the point of it.
+;;
+;; Every operation here terminates on a circular argument.  The bare datum and
+;; `identity' are printed by drive.el under `print-circle'; `length' signals
+;; `circular-list'; `nth' is bounded by a small index; `car'/`cdr'/`type-of'
+;; look at one cell.  `copy-sequence', `equal' and `append' are deliberately
+;; absent: each runs forever on a circular list in BOTH engines, and a form that
+;; hangs both sides is reported as parity rather than as a hang.
+
+(defvar fz-literal-ops
+  '(identity length safe-length car cdr type-of prin1-to-string listp arrayp
+    recordp vectorp bool-vector-p sequencep)
+  "Operations that terminate even when their argument is circular.")
+
+(defun fz-literal-datum ()
+  "A datum printed with read syntax the rest of the corpus never produces."
+  (let ((n (fz-int 7)))
+    (cond
+     ;; A circular list: the last cdr points back at the head -- `#1=(… . #1#)'.
+     ((= n 0) (let ((l (list (fz-leaf 'any) (fz-leaf 'any) (fz-leaf 'any))))
+                (setcdr (nthcdr 2 l) l) l))
+     ;; A self-referential vector -- `#1=[… #1#]'.
+     ((= n 1) (let ((v (vector (fz-leaf 'any) nil))) (aset v 1 v) v))
+     ;; Shared but NOT circular: one cons reached from two places, which is the
+     ;; case that separates a label from a cycle.
+     ((= n 2) (let ((x (list (fz-leaf 'any)))) (list x x (fz-leaf 'any))))
+     ;; A record -- `#s(NAME …)'.
+     ((= n 3) (record 'fzr (fz-leaf 'any) (fz-leaf 'any)))
+     ;; A bool-vector -- `#&N"…"'.
+     ((= n 4) (bool-vector (fz-chance 50) (fz-chance 50) (fz-chance 50)))
+     ;; A propertized string -- `#("…" START END PLIST)'.
+     ((= n 5) (propertize "ab" 'p (list (fz-leaf 'any))))
+     ;; A string whose own text property points back at the string: the only
+     ;; cycle that runs THROUGH a text-property plist.
+     (t (let ((s (copy-sequence "ab"))) (put-text-property 0 2 'p s s) s)))))
+
+(defun fz-literal-form ()
+  "An operation over a quoted datum with shared, circular or `#…' read syntax."
+  (let ((d (list 'quote (fz-literal-datum))))
+    (cond
+     ((fz-chance 35) d)
+     ((fz-chance 25) (list 'nth (fz-int 4) d))
+     ;; Both arms name the SAME object, so the printer labels it once and writes
+     ;; `#N#' for the second -- a label reference that crosses argument
+     ;; positions rather than nesting inside its own definition.
+     ((fz-chance 25) (list 'eq d d))
+     (t (list (fz-pick fz-literal-ops) d)))))
+
 (defun fz-expr (depth)
   "A random expression with at most DEPTH levels of nesting."
   (cond
@@ -853,6 +919,7 @@ only the error datum does."
    ((fz-chance 6) (fz-special-arity-form))
    ((fz-chance 3) (fz-setq-parity-form))
    ((fz-chance 6) (fz-improper-form depth))
+   ((fz-chance 5) (fz-literal-form))
    (t (fz-build (fz-pick fz-calls) (1- depth)))))
 
 ;;; ── main ─────────────────────────────────────────────────────────────────────
@@ -865,6 +932,26 @@ only the error datum does."
   ;; One form per line is the corpus contract, and `prin1' prints a newline
   ;; inside a string literally unless this is set.
   (setq print-escape-newlines t)
+  ;; `fz-literal-form' builds forms that CONTAIN shared and circular structure,
+  ;; and `prin1' of a circular datum does not terminate without this. It is the
+  ;; same binding drive.el makes, so the corpus is written in the syntax the
+  ;; driver reads back. It also makes accidental sharing elsewhere in a form
+  ;; visible as `#N#' rather than silently expanded into a second copy.
+  (setq print-circle t)
+  ;; A bool-vector prints its packed bits as raw BYTES -- `(bool-vector nil nil
+  ;; nil)' is `#&3"\0"' with a literal NUL in it -- and a corpus file carrying a
+  ;; NUL is detected as binary by `insert-file-contents', which reads the WHOLE
+  ;; file unibyte. That silently changes every multibyte string in the corpus on
+  ;; the ORACLE side only: a 1200-form run reported `"\303\234\303\261…"'
+  ;; against elisprs's `"ÜñîçøðÉ"' for the bare form `"ÜñîçøðÉ"', and five of
+  ;; its thirty-seven divergences were this and not a parity gap at all. The
+  ;; giveaway was that re-running a hit ALONE made it agree, because a
+  ;; single-form corpus has no bool-vector in it.
+  ;;
+  ;; Escaping control characters keeps the corpus pure ASCII whatever the
+  ;; generator emits, and both engines read `#&3"\^@"' back to the same
+  ;; bool-vector.
+  (setq print-escape-control-characters t)
   ;; Discard the first few words: a small seed's first xorshift outputs are
   ;; poorly mixed, which would make low seeds generate near-identical corpora.
   (dotimes (_ 8) (fz-next))
