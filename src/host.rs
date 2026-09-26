@@ -6138,6 +6138,16 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 // count it was given.
                 return Err(with_host(|h| h.signal_wrong_nargs(&callee, args.len())));
             }
+            // An alias of an intercepted primitive — `(defalias 'my-map
+            // 'mapcar)`, or cl-lib's `(defalias 'cl-multiple-value-call
+            // #'apply)` — resolves here to that primitive's placeholder body,
+            // because the intercept above matched on the ALIAS's name. Arity
+            // was checked against the alias, which is what eval_sub names;
+            // dispatch the call itself through the primitive's own name.
+            if std::ptr::fn_addr_eq(f, crate::builtins::intercepted_subr as SubrFn) {
+                let target = with_host(|h| h.intern(&name));
+                return call_function(&target, args);
+            }
             // Promote a string a subr built as a bare `Value::Str` transient
             // into a string CELL before it can be stored anywhere: an elisp
             // value that reaches a variable, a cons, or a hash table has to be

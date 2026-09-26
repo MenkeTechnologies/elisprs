@@ -184,3 +184,28 @@ fn ash_with_a_huge_count() {
     assert_eq!(eval("(ash 1 70)"), "1180591620717411303424");
     assert_eq!(eval("(ash 1024 -3)"), "128");
 }
+
+/// An alias of a primitive that `host::call_function` intercepts by name
+/// (`apply`, `mapcar`, `sort`, `gethash`, …) used to reach the primitive's
+/// placeholder body and fail with an internal error when called by the alias's
+/// name. Arity is still checked against the alias, which is what Emacs names.
+#[test]
+fn an_alias_of_an_intercepted_primitive_is_callable() {
+    assert_eq!(eval("(progn (fset 'my-ap 'apply) (my-ap #'+ '(1 2)))"), "3");
+    assert_eq!(
+        eval("(progn (defalias 'my-mc 'mapcar) (defalias 'my-mc2 'my-mc) (my-mc2 #'1+ [1 2]))"),
+        "(2 3)"
+    );
+    assert_eq!(
+        eval("(progn (defalias 'my-s 'sort) (my-s (list 3 1 2) #'<))"),
+        "(1 2 3)"
+    );
+    assert_eq!(
+        err("(progn (defalias 'my-mc 'mapcar) (my-mc #'1+))"),
+        "(wrong-number-of-arguments my-mc 1)"
+    );
+    assert_eq!(
+        err("(progn (defalias 'my-mc 'mapcar) (funcall 'my-mc #'1+))"),
+        "(wrong-number-of-arguments #<subr mapcar> 1)"
+    );
+}

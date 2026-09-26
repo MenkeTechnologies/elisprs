@@ -5243,7 +5243,7 @@ fn symbol_function(h: &mut ElispHost, a: &[Value]) -> R {
 /// `func-arity`, `subrp`, `indirect-function` and `symbol-function` — reports
 /// what Emacs reports. Reaching it means a call site bypassed the intercept,
 /// which is a routing bug, not a user error.
-fn intercepted_subr(_h: &mut ElispHost, _a: &[Value]) -> R {
+pub(crate) fn intercepted_subr(_h: &mut ElispHost, _a: &[Value]) -> R {
     Err(
         "internal: an intercepted higher-order primitive was called through its \
          subr body; host::call_function should have matched it by name"
