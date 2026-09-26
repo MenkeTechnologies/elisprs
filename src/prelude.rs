@@ -1760,9 +1760,12 @@ With VECTORS-AND-RECORDS non-nil, traverse and copy vectors and records too."
   ;; reported even when SEQ is not a sequence at all:
   ;; (seq-into 0 'foo) => (error "Not a sequence type name: foo"), NOT
   ;; (wrong-type-argument sequencep 0). Coercing SEQ up front reversed that.
-  (cond ((eq type 'vector) (apply (function vector) (append seq nil)))
-        ((eq type 'string) (apply (function string) (append seq nil)))
-        ((eq type 'list) (append seq nil))
+  ;; Each `seq--into-*' hands back SEQUENCE itself when it already has the
+  ;; target type — (eq l (seq-into l 'list)) is t, and a dotted list is
+  ;; returned whole rather than walked — and only converts otherwise.
+  (cond ((eq type 'vector) (if (vectorp seq) seq (vconcat seq)))
+        ((eq type 'string) (if (stringp seq) seq (concat seq)))
+        ((eq type 'list) (if (listp seq) seq (append seq nil)))
         (t (error "Not a sequence type name: %S" type))))
 (defun seq-difference (a b &optional testfn)
   (seq-filter (lambda (x) (not (seq-contains-p b x testfn))) a))
@@ -2819,7 +2822,9 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
   ;; Apply FN across N sequences in parallel, stopping at the shortest:
   ;; (seq-mapn #'+ '(1 2) '(3 4)) => (4 6). Accepts any sequence types.
   (let ((r nil))
-    (setq seqs (mapcar (lambda (s) (append s nil)) seqs))
+    ;; seq.el converts with `(seq-into s 'list)', which leaves a list as it
+    ;; is: a dotted tail is reached by the `car' walk below, not by `append'.
+    (setq seqs (mapcar (lambda (s) (seq-into s 'list)) seqs))
     (while (not (memq nil seqs))
       (setq r (cons (apply fn (mapcar (function car) seqs)) r))
       (setq seqs (mapcar (function cdr) seqs)))
