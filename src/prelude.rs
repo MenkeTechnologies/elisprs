@@ -795,6 +795,10 @@ pub const PRELUDE: &str = r#"
 ;; that the Rust printer — which reads the symbol's dynamic value cell — never sees,
 ;; so shared structure printed unlabelled and a circular list had nothing to stop it.
 (defvar print-circle nil)
+;; print.c `standard-output': where a print primitive given a nil PRINTCHARFUN
+;; sends its output. t is stdout in batch; a buffer, marker or function is
+;; honoured exactly as when passed as PRINTCHARFUN.
+(defvar standard-output t)
 (defvar gensym-counter 0)
 (defun gensym (&optional prefix)
   (let ((n gensym-counter))
@@ -1199,15 +1203,6 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 (defmacro defvar-local (var val &optional doc)
   `(progn (defvar ,var ,val ,doc) (make-variable-buffer-local ',var)))
 (defmacro with-demoted-errors (fmt &rest body) `(condition-case --err-- (progn ,@body) (error (message ,fmt --err--) nil)))
-;; with-output-to-string: capture princ/prin1/print/terpri output into a string.
-;; (No buffer model — standard-output redirection isn't supported; this captures
-;; the standard print builtins via an output-capture stack in the host.)
-(defmacro with-output-to-string (&rest body)
-  `(let ((--wots-- nil))
-     (--push-output-capture--)
-     (unwind-protect (progn ,@body)
-       (setq --wots-- (--pop-output-capture--)))
-     --wots--))
 
 ;; Evaluate BODY with the regexp match data preserved: any `string-match` inside
 ;; BODY won't clobber the caller's match state.
@@ -4136,6 +4131,19 @@ remote, otherwise search locally."
      (unwind-protect
          (with-current-buffer --tb-- ,@body)
        (kill-buffer --tb--))))
+;; subr.el's `with-output-to-string': BODY prints into a fresh buffer bound as
+;; `standard-output', whose text is the value.
+(defmacro with-output-to-string (&rest body)
+  "Execute BODY, return the text it sent to `standard-output', as a string."
+  (declare (indent 0) (debug t))
+  `(let ((standard-output (generate-new-buffer " *string-output*" t)))
+     (unwind-protect
+         (progn
+           (let ((standard-output standard-output))
+             ,@body)
+           (with-current-buffer standard-output
+             (buffer-string)))
+       (kill-buffer standard-output))))
 (defun insert-and-inherit (&rest args)
   "Insert ARGS at point, inheriting text properties from the adjacent text.
 The inserted text takes the properties of the character BEFORE point, except

@@ -2124,9 +2124,169 @@ fn boundp(h: &mut ElispHost, a: &[Value]) -> R {
 fn identity(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(a[0].clone())
 }
-fn terpri(h: &mut ElispHost, _a: &[Value]) -> R {
-    h.emit("\n");
-    Ok(Value::Bool(true))
+/// Where a print primitive's output goes: print.c `PRINTPREPARE`'s reading of
+/// PRINTCHARFUN. nil means the value of `standard-output`; t is stdout in
+/// batch; a buffer inserts at its point; a marker inserts at the marker and
+/// moves it past the text; anything else is called once per character.
+pub(crate) enum PrintDest {
+    Stdout,
+    Buffer(usize),
+    Marker(Value),
+    Function(Value),
+}
+
+/// Resolve PRINTCHARFUN (absent = nil) the way `PRINTPREPARE` does.
+pub(crate) fn print_dest(h: &ElispHost, pcf: Option<&Value>) -> Result<PrintDest, String> {
+    let mut v = pcf.cloned().unwrap_or(Value::Undef);
+    if is_nil(&v) {
+        v = h
+            .find_symbol("standard-output")
+            .and_then(|s| h.get_value(&s).ok())
+            .unwrap_or(Value::Bool(true));
+    }
+    if is_nil(&v) {
+        // `standard-output' itself nil: print.c then prints to the echo area,
+        // which is stdout in batch.
+        return Ok(PrintDest::Stdout);
+    }
+    if matches!(v, Value::Bool(true)) {
+        return Ok(PrintDest::Stdout);
+    }
+    match h.obj(&v) {
+        Some(Obj::Buffer(idx)) => {
+            if h.buffers.get(*idx).is_none_or(|b| b.name.is_none()) {
+                return Err("error: Selecting deleted buffer".to_string());
+            }
+            Ok(PrintDest::Buffer(*idx))
+        }
+        Some(Obj::Marker(m)) => {
+            if m.borrow().buffer.is_none() {
+                return Err("error: Marker does not point anywhere".to_string());
+            }
+            Ok(PrintDest::Marker(v.clone()))
+        }
+        _ => Ok(PrintDest::Function(v)),
+    }
+}
+
+/// Send S to a non-function destination (`PRINTFINISH` for a buffer or a
+/// marker: the text goes in at the insertion position, the marker ends after
+/// it, the target buffer's point moves with the insertion, and the current
+/// buffer is restored).
+pub(crate) fn print_to(h: &mut ElispHost, dest: &PrintDest, s: &str) -> Result<(), String> {
+    match dest {
+        PrintDest::Stdout => h.emit(s),
+        PrintDest::Buffer(idx) => {
+            let old = h.current;
+            h.current = *idx;
+            h.cur_insert(s.chars().collect(), true);
+            h.current = old;
+        }
+        PrintDest::Marker(mv) => {
+            let Some(Obj::Marker(m)) = h.obj(mv) else {
+                unreachable!("print_dest only yields markers here")
+            };
+            let m = m.clone();
+            let (bi, pos) = {
+                let md = m.borrow();
+                (md.buffer.expect("checked in print_dest"), md.pos)
+            };
+            let old = h.current;
+            h.current = bi;
+            let (begv, zv, old_point) = {
+                let b = h.cur_buf_ref();
+                (b.begv, b.zv, b.point)
+            };
+            if pos < begv || pos > zv {
+                h.current = old;
+                return Err(
+                    h.signal_error_arg("Marker is outside the accessible part of the buffer", mv)
+                );
+            }
+            h.cur_buf().point = pos;
+            let n = s.chars().count();
+            h.cur_insert(s.chars().collect(), true);
+            m.borrow_mut().pos = pos + n;
+            h.cur_buf().point = if old_point >= pos {
+                old_point + n
+            } else {
+                old_point
+            };
+            h.current = old;
+        }
+        PrintDest::Function(_) => {
+            unreachable!("function destinations are driven by host::call_function")
+        }
+    }
+    Ok(())
+}
+
+/// The text a print primitive produces, for the function-destination path in
+/// `host::call_function`, which calls PRINTCHARFUN once per character outside
+/// any host borrow. Returns None for an arity the subr itself must reject.
+pub(crate) fn print_text(
+    h: &mut ElispHost,
+    name: &str,
+    a: &[Value],
+) -> Result<Option<String>, String> {
+    Ok(Some(match name {
+        "princ" if !a.is_empty() => h.print_checked(&a[0], false)?,
+        "prin1" if !a.is_empty() => h.print_checked(&a[0], true)?,
+        "print" if !a.is_empty() => format!("\n{}\n", h.print_checked(&a[0], true)?),
+        "terpri" => "\n".to_string(),
+        "write-char" if !a.is_empty() => {
+            let c = write_char_code(h, &a[0])?;
+            char::from_u32(c).unwrap_or('\u{fffd}').to_string()
+        }
+        _ => return Ok(None),
+    }))
+}
+
+/// print.c `Fwrite_char`: `CHECK_FIXNUM (character)`.
+fn write_char_code(h: &mut ElispHost, v: &Value) -> Result<u32, String> {
+    match v {
+        Value::Int(n) => Ok(*n as u32),
+        _ => Err(h.signal_wrong_type("fixnump", v)),
+    }
+}
+/// `bolp` at POS (1-based) in TEXT whose accessible start is BEGV.
+fn at_bol(text: &[char], begv: usize, pos: usize) -> bool {
+    pos <= begv || text[pos - 2] == '\n'
+}
+/// `(terpri &optional PRINTCHARFUN ENSURE)`. With ENSURE, print.c writes the
+/// newline only when the output is not already at the start of a line: for
+/// stdout that is the last byte written there, for a buffer or marker it is
+/// `bolp` at the insertion position, and a function destination is an error.
+fn terpri(h: &mut ElispHost, a: &[Value]) -> R {
+    let dest = print_dest(h, a.first())?;
+    let ensure = a.get(1).is_some_and(|v| !is_nil(v));
+    let needed = if !ensure {
+        true
+    } else {
+        match &dest {
+            PrintDest::Stdout => h.stdout_last != '\n',
+            PrintDest::Buffer(idx) => {
+                let b = &h.buffers[*idx];
+                !at_bol(&b.text, b.begv, b.point)
+            }
+            PrintDest::Marker(mv) => match h.obj(mv) {
+                Some(Obj::Marker(m)) => {
+                    let md = m.borrow();
+                    let b = &h.buffers[md.buffer.expect("checked in print_dest")];
+                    !at_bol(&b.text, b.begv, md.pos)
+                }
+                _ => true,
+            },
+            PrintDest::Function(f) => {
+                let f = f.clone();
+                return Err(h.signal_error_arg("Unsupported function argument", &f));
+            }
+        }
+    };
+    if needed {
+        print_to(h, &dest, "\n")?;
+    }
+    Ok(nil_or(needed))
 }
 /// `(print OBJECT &optional PRINTCHARFUN)` — `prin1` surrounded by newlines.
 /// print.c writes a newline BEFORE the object as well as after ("Output a
@@ -2134,19 +2294,23 @@ fn terpri(h: &mut ElispHost, _a: &[Value]) -> R {
 /// `print` calls; emitting only the trailing one made
 /// `(with-output-to-string (print 'a))` answer "a\n" instead of "\na\n".
 fn print_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let dest = print_dest(h, a.get(1))?;
     let s = h.print_checked(&a[0], true)?;
-    h.emit("\n");
-    h.emit(&s);
-    h.emit("\n");
+    print_to(h, &dest, &format!("\n{s}\n"))?;
     Ok(a[0].clone())
 }
-fn push_output_capture(h: &mut ElispHost, _a: &[Value]) -> R {
-    h.output_capture.push(String::new());
-    Ok(Value::Undef)
-}
-fn pop_output_capture(h: &mut ElispHost, _a: &[Value]) -> R {
-    let captured = h.output_capture.pop().unwrap_or_default();
-    Ok(h.new_string(captured))
+/// `(write-char CHAR &optional PRINTCHARFUN)` — output one character; returns
+/// CHAR. print.c checks CHAR with `CHECK_FIXNUM`, so a non-integer is
+/// `(wrong-type-argument fixnump X)`.
+fn write_char_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let c = write_char_code(h, &a[0])?;
+    let dest = print_dest(h, a.get(1))?;
+    print_to(
+        h,
+        &dest,
+        &char::from_u32(c).unwrap_or('\u{fffd}').to_string(),
+    )?;
+    Ok(a[0].clone())
 }
 fn prin1_to_string(h: &mut ElispHost, a: &[Value]) -> R {
     // `(prin1-to-string OBJECT &optional NOESCAPE)` — a non-nil NOESCAPE prints
@@ -2939,13 +3103,15 @@ fn message_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 fn princ_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let dest = print_dest(h, a.get(1))?;
     let s = h.print_checked(&a[0], false)?;
-    h.emit(&s);
+    print_to(h, &dest, &s)?;
     Ok(a[0].clone())
 }
 fn prin1_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let dest = print_dest(h, a.get(1))?;
     let s = h.print_checked(&a[0], true)?;
-    h.emit(&s);
+    print_to(h, &dest, &s)?;
     Ok(a[0].clone())
 }
 fn number_to_string(h: &mut ElispHost, a: &[Value]) -> R {
@@ -9351,7 +9517,8 @@ pub fn install(h: &mut ElispHost) {
     s("macroexpand-all", 1, Some(2), intercepted_subr);
     s("sort", 1, None, intercepted_subr);
     s("identity", 1, Some(1), identity);
-    s("terpri", 0, Some(1), terpri);
+    s("terpri", 0, Some(2), terpri);
+    s("write-char", 1, Some(2), write_char_fn);
     s("print", 1, Some(2), print_fn);
     s("prin1-to-string", 1, Some(3), prin1_to_string);
     // nonlocal exits (catch/unwind-protect/condition-case are compiler intrinsics)
@@ -9610,8 +9777,6 @@ pub fn install(h: &mut ElispHost) {
     s("message", 1, None, message_fn);
     s("princ", 1, Some(2), princ_fn);
     s("prin1", 1, Some(2), prin1_fn);
-    s("--push-output-capture--", 0, Some(0), push_output_capture);
-    s("--pop-output-capture--", 0, Some(0), pop_output_capture);
     s("number-to-string", 1, Some(1), number_to_string);
     // numeric: float→int rounding + integer bit ops
     s("floor", 1, Some(2), floor_fn);

@@ -94,17 +94,8 @@ fn category_of(e: &Entry) -> &'static str {
         | "string-to-char"
         | "substring"
         | "upcase" => "Strings & Characters",
-        "--pop-output-capture--"
-        | "--push-output-capture--"
-        | "format"
-        | "message"
-        | "prin1"
-        | "prin1-to-string"
-        | "princ"
-        | "print"
-        | "read"
-        | "read-from-string"
-        | "terpri" => "I/O, Print & Format",
+        "format" | "message" | "prin1" | "prin1-to-string" | "princ" | "print" | "read"
+        | "read-from-string" | "terpri" | "write-char" => "I/O, Print & Format",
         "apply" | "error" | "eval" | "func-arity" | "funcall" | "identity" | "pcase" | "signal"
         | "subr-arity" | "throw" | "user-error" => "Control & Functional",
         "clrhash" | "copy-hash-table" | "gethash" | "hash-table-count" | "hash-table-keys"

@@ -950,9 +950,9 @@ pub struct ElispHost {
     /// string plus char-position spans for the whole match (group 0) and each
     /// capture group. `match-beginning`/`match-end`/`match-string` read it.
     pub(crate) match_data: Option<MatchData>,
-    /// Output-capture stack for `with-output-to-string`: when non-empty,
-    /// `princ`/`prin1`/`print`/`terpri` append to the top buffer instead of stdout.
-    pub(crate) output_capture: Vec<String>,
+    /// print.c `printchar_stdout_last`: the last character written to stdout,
+    /// which is what `(terpri t t)` consults in batch. NUL before any output.
+    pub(crate) stdout_last: char,
     /// Set by `print_inner` when nesting reaches `PRINT_CIRCLE`; the print entry
     /// points (`prin1`/`print`/`princ`/`format`) read it to signal Emacs's
     /// `error "Apparently circular structure being printed"`. `Cell` so the
@@ -1222,7 +1222,7 @@ impl ElispHost {
             catch_tags: Vec::new(),
             pending_error: None,
             match_data: None,
-            output_capture: Vec::new(),
+            stdout_last: '\0',
             print_overflow: Cell::new(false),
             print_labels: RefCell::new(HashMap::new()),
             print_next_label: Cell::new(1),
@@ -3981,21 +3981,19 @@ impl ElispHost {
         self.error.take()
     }
 
-    /// Write program output, honoring an active `with-output-to-string` capture.
+    /// Write program output to stdout (a PRINTCHARFUN of t in batch).
     pub fn emit(&mut self, s: &str) {
-        if let Some(buf) = self.output_capture.last_mut() {
-            buf.push_str(s);
-        } else {
-            use std::io::Write;
-            print!("{s}");
-            let _ = std::io::stdout().flush();
-            // print.c `printchar` / `strout`: every batch write to stdout sets
-            // `noninteractive_need_newline = 1`, and the next `message` flushes
-            // it as a newline on *stderr* so the two streams do not collide on
-            // one line. Captured output (`with-output-to-string`) never reaches
-            // stdout, so it must not set the flag.
-            self.need_newline = true;
+        use std::io::Write;
+        print!("{s}");
+        let _ = std::io::stdout().flush();
+        if let Some(c) = s.chars().last() {
+            self.stdout_last = c;
         }
+        // print.c `printchar` / `strout`: every batch write to stdout sets
+        // `noninteractive_need_newline = 1`, and the next `message` flushes
+        // it as a newline on *stderr* so the two streams do not collide on
+        // one line.
+        self.need_newline = true;
     }
 
     /// The current editing buffer.
@@ -5968,6 +5966,32 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                     }
                 };
                 return with_host(|h| crate::builtins::make_hash_table_with(h, args, user));
+            }
+            // A function PRINTCHARFUN is called once per output character
+            // (print.c `printchar`), which re-enters elisp, so that path runs
+            // here; stdout, buffer and marker destinations fall through to
+            // the subr. An arity the subr rejects also falls through.
+            "princ" | "prin1" | "print" | "terpri" | "write-char" => {
+                let (min, pcf) = if name == "terpri" { (0, 0) } else { (1, 1) };
+                let ensure = name == "terpri" && args.get(1).is_some_and(el_truthy);
+                if (min..=2).contains(&args.len()) && !ensure {
+                    let dest = with_host(|h| crate::builtins::print_dest(h, args.get(pcf)))?;
+                    if let crate::builtins::PrintDest::Function(pf) = dest {
+                        if let Some(text) =
+                            with_host(|h| crate::builtins::print_text(h, &name, args))?
+                        {
+                            let pf = with_host(|h| h.function_designator(&pf));
+                            for c in text.chars() {
+                                call_function(&pf, &[Value::Int(c as i64)])?;
+                            }
+                            return Ok(if name == "terpri" {
+                                Value::Bool(true)
+                            } else {
+                                args[0].clone()
+                            });
+                        }
+                    }
+                }
             }
             "mapatoms" => {
                 if args.is_empty() {
