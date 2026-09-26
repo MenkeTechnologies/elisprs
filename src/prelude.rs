@@ -227,6 +227,13 @@ pub const PRELUDE: &str = r#"
 (defun seq-count (pred l) (setq l (append l nil)) (let ((n 0)) (while l (if (funcall pred (car l)) (setq n (1+ n))) (setq l (cdr l))) n))
 (defun seq-empty-p (l) (= 0 (length l)))
 (defun seq-length (l) (length l))
+;; seq.el: `seq-copy' is `copy-sequence' and `seq-random-elt' indexes a random
+;; position, refusing an empty sequence with seq.el's own message.
+(defun seq-copy (sequence) (copy-sequence sequence))
+(defun seq-random-elt (sequence)
+  (if (seq-empty-p sequence)
+      (error "Sequence cannot be empty")
+    (seq-elt sequence (random (seq-length sequence)))))
 ;; `seq-elt' is `(cl-defgeneric seq-elt (sequence n) (elt sequence n))' in
 ;; seq.el and Emacs ships seq.elc, so the body that actually runs is the
 ;; byte-compiled one -- and the byte compiler emits the `Belt' opcode for
@@ -602,10 +609,92 @@ pub const PRELUDE: &str = r#"
   (apply 'cl-nsublis (list (cons nil new)) tree :if-not pred keys))
 ;; NOTE: `push'/`dolist' are defined later in this file, so these helpers use
 ;; explicit `while'/`setq'/`cons' loops to stay valid at load time.
-(defun cl-maplist (fn list)
-  (let ((r nil))
-    (while list (setq r (cons (funcall fn list) r) list (cdr list)))
-    (nreverse r)))
+;; cl-extra.el's `cl-maplist' / `cl-mapl' / `cl-mapcon' / `cl-mapc', verbatim
+;; but for `push'/`pop' (not yet defined here). With several LISTs they step
+;; every list at once and stop at the first that runs out.
+(defun cl-maplist (func list &rest rest)
+  (if rest
+      (let ((res nil) (args (cons list (copy-sequence rest))) p)
+        (while (not (memq nil args))
+          (setq res (cons (apply func args) res))
+          (setq p args)
+          (while p (setcar p (cdr (car p))) (setq p (cdr p))))
+        (nreverse res))
+    (let ((res nil))
+      (while list
+        (setq res (cons (funcall func list) res))
+        (setq list (cdr list)))
+      (nreverse res))))
+(defun cl-mapl (func list &rest rest)
+  (if rest
+      (let ((args (cons list (copy-sequence rest))) p)
+        (while (not (memq nil args))
+          (apply func args)
+          (setq p args)
+          (while p (setcar p (cdr (car p))) (setq p (cdr p)))))
+    (let ((p list))
+      (while p (funcall func p) (setq p (cdr p)))))
+  list)
+(defun cl-mapcon (func list &rest rest)
+  (apply (function nconc) (apply (function cl-maplist) func list rest)))
+;; `cl-mapc' returns SEQ, not the results. Two lists step together in lisp; any
+;; other shape goes through `cl-mapcar', which already handles mixed sequence
+;; types (cl--mapcar-many without the accumulator).
+(defun cl-mapc (func seq &rest rest)
+  (if rest
+      (if (or (cdr rest) (nlistp seq) (nlistp (car rest)))
+          (progn (apply (function cl-mapcar) func seq rest) seq)
+        (let ((x seq) (y (car rest)))
+          (while (and x y)
+            (funcall func (car x) (car y))
+            (setq x (cdr x) y (cdr y)))
+          seq))
+    (mapc func seq)))
+;; cl-seq.el: the destructive set operations delegate to their copying forms
+;; after the same empty-list shortcuts. elisprs never shares structure it was
+;; not asked to, so the result is the same list Emacs returns.
+(defun cl-nunion (list1 list2 &rest cl-keys)
+  (cond ((null list1) list2) ((null list2) list1)
+        (t (apply (function cl-union) list1 list2 cl-keys))))
+(defun cl-nintersection (list1 list2 &rest cl-keys)
+  (and list1 list2 (apply (function cl-intersection) list1 list2 cl-keys)))
+(defun cl-nset-difference (list1 list2 &rest cl-keys)
+  (if (or (null list1) (null list2)) list1
+    (apply (function cl-set-difference) list1 list2 cl-keys)))
+(defun cl-nsubst (new old tree &rest cl-keys)
+  (apply (function cl-nsublis) (list (cons old new)) tree cl-keys))
+;; cl-seq.el's `cl-tree-equal': conses are walked, leaves go through
+;; `cl--check-match' — :key applied to BOTH sides, :test (default `eql') or
+;; :test-not negated — and `cl--parsing-keywords' rejects any other keyword.
+(defun cl-tree-equal (x y &rest cl-keys)
+  (let* ((test (car (cdr (memq :test cl-keys))))
+         (test-not-fn (car (cdr (memq :test-not cl-keys))))
+         (test-not (and test-not-fn (setq test test-not-fn) t))
+         (key (car (cdr (memq :key cl-keys))))
+         (rest cl-keys))
+    (while rest
+      (or (memq (car rest) (quote (:test :test-not :key)))
+          (car (cdr (memq :allow-other-keys cl-keys)))
+          (error "Bad keyword argument %s" (car rest)))
+      (setq rest (cdr (cdr rest))))
+    (cl--tree-equal-rec x y test test-not key)))
+(defun cl--tree-equal-rec (x y test test-not key)
+  (while (and (consp x) (consp y)
+              (cl--tree-equal-rec (car x) (car y) test test-not key))
+    (setq x (cdr x) y (cdr y)))
+  (and (not (consp x)) (not (consp y))
+       (let ((x (if key (funcall key x) x)) (y (if key (funcall key y) y)))
+         (if test (eq (not (funcall test x y)) test-not) (eql x y)))))
+;; cl-lib.el aliases and one-liners (`defalias' is defined further down, and
+;; is `fset' here).
+(fset (quote cl-copy-seq) (function copy-sequence))
+(fset (quote cl-svref) (function aref))
+(fset (quote cl-multiple-value-call) (function apply))
+(defun cl-multiple-value-list (expression) expression)
+(defun cl-multiple-value-apply (function expression) (apply function expression))
+;; cl-extra.el: the property is read through `cl-getf' so DEF is honoured;
+;; setf on it is `put' (its gv-setter declaration).
+(defun cl-get (sym tag &optional def) (cl-getf (symbol-plist sym) tag def))
 (defun cl-stable-sort (seq pred &rest keys) (apply 'cl-sort seq pred keys))
 (defun cl-delete-duplicates (seq &rest keys) (apply 'cl-remove-duplicates seq keys))
 ;; cl-lib.el's `cl-adjoin', verbatim. The two fast paths are not an
@@ -5604,6 +5693,9 @@ reports and the one a hash table's slots are observable in."
        ((eq head 'symbol-function) (list 'fset (car args) val))
        ;; (setf (get SYM PROP) V) -> (put SYM PROP V).
        ((eq head 'get) (list 'put (car args) (car (cdr args)) val))
+       ;; (setf (cl-get SYM PROP DEF) V) -> (put SYM PROP V); DEF is ignored, as in
+       ;; cl-extra.el's gv-setter.
+       ((eq head 'cl-get) (list 'put (car args) (car (cdr args)) val))
        ;; (setf (cl--find-class NAME) CLASS) -> (put NAME 'cl--class CLASS).
        ;; `cl--find-class' stores class descriptors on the symbol's plist, exactly
        ;; as cl-preloaded.el does; this is its gv setter.

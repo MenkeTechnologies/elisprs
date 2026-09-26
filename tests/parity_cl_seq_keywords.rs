@@ -105,3 +105,102 @@ fn every_cxr_composition_exists_is_a_place_and_reports_byte_code_arity() {
         "(1 (2 13))"
     );
 }
+
+/// cl-seq.el's destructive set operations delegate to their copying forms after
+/// the same empty-list shortcuts, and `cl-tree-equal` compares leaves through
+/// `cl--check-match` with `cl--parsing-keywords`' keyword check.
+#[test]
+fn destructive_set_operations_and_tree_equal() {
+    assert_eq!(eval("(cl-nunion (list 1 2 3) (list 3 4))"), "(4 1 2 3)");
+    assert_eq!(eval("(cl-nunion nil (list 3 4))"), "(3 4)");
+    assert_eq!(
+        eval("(cl-nintersection (list 1 2 3) (list 3 2 9))"),
+        "(2 3)"
+    );
+    assert_eq!(
+        eval("(cl-nintersection (list \"a\" \"b\") (list \"b\") :test #'equal)"),
+        "(\"b\")"
+    );
+    assert_eq!(eval("(cl-nset-difference (list 1 2 3) (list 2))"), "(1 3)");
+    assert_eq!(
+        eval("(cl-nsubst 'x 2 (list 1 2 (list 2 3)))"),
+        "(1 x (x 3))"
+    );
+    assert_eq!(
+        err("(cl-nsubst 'x 2 (list 1 2 (list 2 3)) :test #'<)"),
+        "(wrong-type-argument number-or-marker-p (1 2 (2 3)))"
+    );
+    assert_eq!(eval("(cl-tree-equal '(1 (2 3)) '(1 (2 3)))"), "t");
+    assert_eq!(eval("(cl-tree-equal '(1 (2 \"a\")) '(1 (2 \"a\")))"), "nil");
+    assert_eq!(
+        eval("(cl-tree-equal '(1 (2 \"a\")) '(1 (2 \"a\")) :test #'equal)"),
+        "t"
+    );
+    assert_eq!(eval("(cl-tree-equal '(1 2 . 3) '(1 2 . 3))"), "t");
+    assert_eq!(eval("(cl-tree-equal '(1 2) '(1 2 3))"), "nil");
+    assert_eq!(eval("(cl-tree-equal '(1 2) '(1 2) :test-not #'eql)"), "nil");
+    assert_eq!(
+        err("(cl-tree-equal 1 1 :foo 2)"),
+        "(error \"Bad keyword argument :foo\")"
+    );
+}
+
+/// cl-extra.el's mapping family: `cl-mapc`/`cl-mapl` return their first
+/// sequence, several lists step together and stop at the shortest, and
+/// `cl-mapcon` splices `cl-maplist`'s results.
+#[test]
+fn cl_mapping_family() {
+    assert_eq!(
+        eval(
+            "(let (acc) (list (cl-mapc (lambda (x y) (push (+ x y) acc)) '(1 2 3) '(10 20)) acc))"
+        ),
+        "((1 2 3) (22 11))"
+    );
+    assert_eq!(
+        eval("(let (acc) (list (cl-mapc (lambda (x y z) (push (list x y z) acc)) [1 2] '(3 4) \"ab\") acc))"),
+        "([1 2] ((2 4 98) (1 3 97)))"
+    );
+    assert_eq!(
+        eval(
+            "(let (acc) (list (cl-mapl (lambda (x y) (push (list x y) acc)) '(1 2 3) '(a b)) acc))"
+        ),
+        "((1 2 3) (((2 3) (b)) ((1 2 3) (a b))))"
+    );
+    assert_eq!(
+        eval("(cl-maplist #'append '(1 2 3) '(a b))"),
+        "((1 2 3 a b) (2 3 b))"
+    );
+    assert_eq!(
+        eval("(cl-mapcon (lambda (x y) (list (car x) (car y))) '(1 2 3) '(a b))"),
+        "(1 a 2 b)"
+    );
+}
+
+/// cl-lib.el aliases, `cl-get` with its `put` place, the multiple-value shims,
+/// and seq.el's `seq-copy` / `seq-random-elt`.
+#[test]
+fn cl_aliases_and_seq_copy() {
+    assert_eq!(eval("(symbol-function 'cl-copy-seq)"), "copy-sequence");
+    assert_eq!(eval("(symbol-function 'cl-svref)"), "aref");
+    assert_eq!(eval("(cl-svref [5 6] 1)"), "6");
+    assert_eq!(eval("(let ((l (list 1 2))) (eq l (seq-copy l)))"), "nil");
+    assert_eq!(eval("(seq-copy \"ab\")"), "\"ab\"");
+    assert_eq!(
+        eval("(and (memq (seq-random-elt '(7 8 9)) '(7 8 9)) t)"),
+        "t"
+    );
+    assert_eq!(
+        err("(seq-random-elt nil)"),
+        "(error \"Sequence cannot be empty\")"
+    );
+    assert_eq!(
+        eval("(progn (put 'zz 'p 4) (list (cl-get 'zz 'p) (cl-get 'zz 'q 5)))"),
+        "(4 5)"
+    );
+    assert_eq!(
+        eval("(let ((s (make-symbol \"s\"))) (setf (cl-get s 'k) 7) (get s 'k))"),
+        "7"
+    );
+    assert_eq!(eval("(cl-multiple-value-apply #'+ '(1 2))"), "3");
+    assert_eq!(eval("(cl-multiple-value-call #'+ 1 '(2 3))"), "6");
+}
