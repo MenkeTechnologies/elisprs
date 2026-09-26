@@ -2004,7 +2004,7 @@ impl LineIndex {
 // ── diagnostics ──────────────────────────────────────────────────────────────
 
 /// Position-aware scan mirroring the reader's error rules: unmatched parens,
-/// unterminated strings, and the unsupported backquote/unquote syntax.
+/// and unterminated strings.
 fn diagnostics(text: &str) -> Vec<Diagnostic> {
     let chars: Vec<char> = text.chars().collect();
     let idx = LineIndex::new(text);
@@ -2054,12 +2054,6 @@ fn diagnostics(text: &str) -> Vec<Diagnostic> {
                 if stack.pop().is_none() {
                     out.push(diag(idx.range(i, i + 1), "unexpected `)`"));
                 }
-            }
-            '`' | ',' => {
-                out.push(diag(
-                    idx.range(i, i + 1),
-                    "backquote/unquote not supported yet",
-                ));
             }
             _ => {}
         }

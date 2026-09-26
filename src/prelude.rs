@@ -8,6 +8,43 @@
 //! every macro is defined before its first use.
 
 pub const PRELUDE: &str = r#"
+;;; backquote.el. The reader makes `X, ,X and ,@X into (\` X), (\, X) and
+;;; (\,@ X), as Emacs's does; these macros expand them through
+;;; `backquote-process' (src/backquote.rs). Defined first because every later
+;;; macro in this prelude is written with backquote.
+(defun backquote-list*-function (first &rest list)
+  (if list
+      (let* ((rest list) (newlist (cons first nil)) (last newlist))
+        (while (cdr rest)
+          (setcdr last (cons (car rest) nil))
+          (setq last (cdr last)
+                rest (cdr rest)))
+        (setcdr last (car rest))
+        newlist)
+    first))
+;; backquote.el reverses with `nreverse', which this prelude defines later;
+;; the list is freshly consed, so `reverse' is indistinguishable.
+(defmacro backquote-list*-macro (first &rest list)
+  (setq list (reverse (cons first list))
+        first (car list)
+        list (cdr list))
+  (if list
+      (let* ((second (car list))
+             (rest (cdr list))
+             (newlist (list 'cons second first)))
+        (while rest
+          (setq newlist (list 'cons (car rest) newlist)
+                rest (cdr rest)))
+        newlist)
+    first))
+(fset 'backquote-list* (symbol-function 'backquote-list*-macro))
+(defconst backquote-backquote-symbol '\`)
+(defconst backquote-unquote-symbol '\,)
+(defconst backquote-splice-symbol '\,@)
+(defmacro backquote (structure)
+  (cdr (backquote-process structure)))
+(fset '\` (symbol-function 'backquote))
+
 ;;; The c[ad]+r family (caar .. cddddr) is Rust subrs: src/builtins.rs `cxr`.
 
 ;; Regexp matching folds case unless this is let-bound to nil (Emacs default t).
@@ -3200,6 +3237,9 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (defun get (sym prop)
   (symbol-plist--check sym)
   (plist-get (gethash sym symbol-plist--table) prop))
+;; backquote.el marks the two unquote symbols as reader constructs.
+(put '\, 'reader-construct t)
+(put '\,@ 'reader-construct t)
 ;; `Fdefine_hash_table_test' (fns.c) is exactly this `put': the declaration
 ;; lives on NAME's `hash-table-test' property as (TESTFN HASHFN), and
 ;; `make-hash-table' reads it back.  The value is the property list `put'
@@ -5650,7 +5690,7 @@ reports and the one a hash table's slots are observable in."
 ;; two-level c[ad][ad]r accessors, nth, elt, aref, gethash, and symbol-value.
 ;; Each setter returns VALUE, so (setf …) yields the last assigned value, as in
 ;; Emacs. Backquote-pattern places (cl-struct slots, alist-get) wait on more
-;; setter primitives / lazy backquote.
+;; setter primitives.
 ;; Maps a cl-defstruct accessor symbol to its slot index (populated by
 ;; `cl-defstruct' when it runs, consulted by `setf--expand' when expanding later
 ;; top-level forms — which works because forms are processed in order).
@@ -6002,13 +6042,9 @@ Do nothing if HOOK does not currently contain FUNCTION."
 ;;   (guard EXPR)   matches when EXPR — which can read earlier bindings — is non-nil
 ;;   (and PAT...)   matches when every PAT matches (bindings accumulate)
 ;;   (or PAT...)    matches when any PAT matches
-;; Backquote patterns (`(,a ,b)) are NOT supported here: this reader expands
-;; backquote eagerly at read time, so no `\`' form survives for pcase to
-;; destructure. They need lazy backquote first.
-(defun pcase--list->cons (pats)
-  ;; (P1 P2 ...) -> (cons P1 (cons P2 ... nil)) so a `list' pattern reuses the
-  ;; `cons' structural matcher.
-  (if (null pats) nil (list 'cons (car pats) (pcase--list->cons (cdr pats)))))
+;;   `QPAT          pcase.el's backquote pattern: (Q1 . Q2) matches a cons,
+;;                  [Q...] a vector of that length, ,PAT matches PAT, and
+;;                  any other atom is compared with `equal'
 ;; How `pred'/`app' call FN on the value: a lambda or symbol gets VAL as its one
 ;; argument; a partial application (F ARGS…) appends VAL.
 (defun pcase--apply (fn val)
@@ -6483,6 +6519,36 @@ or the result is already atomic/grouped."
 
 (defun pcase--literal-p (pat)
   (or (numberp pat) (stringp pat) (keywordp pat) (eq pat t) (null pat)))
+;; pcase.el's `\`' pattern, as `pcase-defmacro \`' defines it: a cons is
+;; (and (pred consp) (app car-safe `Q1) (app cdr-safe `Q2)), a vector
+;; (and (pred vectorp) (app length LEN) (app (aref _ I) `QI)...), ,PAT is PAT,
+;; and a string, number or symbol is 'QPAT. The element readers are guarded,
+;; because `pcase--clause' establishes the binders before the tests run.
+(defun pcase--compile-qpat (qpat val)
+  (cond
+   ((eq (car-safe qpat) '\,) (pcase--compile (car (cdr qpat)) val))
+   ((eq (car-safe qpat) '\,@) (error "Unsupported QPAT: %S" qpat))
+   ((vectorp qpat)
+    (let* ((len (length qpat))
+           (ok (list 'and (list 'vectorp val) (list '= (list 'length val) len)))
+           (tests (list (list 'vectorp val) (list 'equal (list 'length val) len)))
+           (binds nil)
+           (i 0))
+      (while (< i len)
+        (let ((r (pcase--compile-qpat (aref qpat i)
+                                      (list 'if ok (list 'aref val i)))))
+          (setq tests (append tests (car r)))
+          (setq binds (append binds (cdr r))))
+        (setq i (1+ i)))
+      (cons tests binds)))
+   ((consp qpat)
+    (let ((cr (pcase--compile-qpat (car qpat) (list 'car-safe val)))
+          (cd (pcase--compile-qpat (cdr qpat) (list 'cdr-safe val))))
+      (cons (cons (list 'consp val) (append (car cr) (car cd)))
+            (append (cdr cr) (cdr cd)))))
+   ((or (stringp qpat) (numberp qpat) (symbolp qpat))
+    (pcase--compile (list 'quote qpat) val))
+   (t (error "Unknown QPAT: %S" qpat))))
 (defun pcase--compile (pat val)
   ;; Return (TESTS . BINDS): TESTS a list of boolean forms over VAL, BINDS a
   ;; list of (SYM ACCESSOR) let*-bindings. In this subset every binder captures
@@ -6531,27 +6597,7 @@ or the result is already atomic/grouped."
               (setq alts (append alts (list (cons 'and (car r)))))
               (setq binds (append binds (cdr r)))))
           (cons (list (cons 'or alts)) binds)))
-       ;; Backquote patterns: this reader expands `(,a ,b) to (cons a (cons b
-       ;; nil)) at read time, so a `cons' form here is a structural cons pattern.
-       ;; Sub-accessors use car-safe/cdr-safe and are gated by a `consp' test.
-       ((eq head 'cons)
-        (let ((cr (pcase--compile (nth 1 pat) (list 'car-safe val)))
-              (cd (pcase--compile (nth 2 pat) (list 'cdr-safe val))))
-          (cons (cons (list 'consp val) (append (car cr) (car cd)))
-                (append (cdr cr) (cdr cd)))))
-       ;; `(a b) with no unquotes expands to (list 'a 'b); treat as a cons chain.
-       ((eq head 'list)
-        (pcase--compile (pcase--list->cons (cdr pat)) val))
-       ;; Backquoted vector pattern `[,a ,b]: the reader expands it to
-       ;; (vconcat (cons a (cons b nil))). Require a vector, then match the
-       ;; cons-pattern against its elements as a list. The `lv' binding is
-       ;; guarded so a non-vector VAL just fails the match (never errors).
-       ((eq head 'vconcat)
-        (let* ((lv (make-symbol "vl"))
-               (r (pcase--compile (nth 1 pat) lv)))
-          (cons (cons (list 'vectorp val) (car r))
-                (cons (list lv (list 'if (list 'vectorp val) (list 'append val nil) nil))
-                      (cdr r)))))
+       ((eq head '\`) (pcase--compile-qpat (car (cdr pat)) val))
        ;; (map KEY...): map.el's pattern. An element is a bare SYMBOL (bound to
        ;; the value at 'SYMBOL), a KEYWORD :k (binding k to the value at :k), or
        ;; a (KEY VAR [DEFAULT]) list whose KEY and DEFAULT are *evaluated*
@@ -6644,13 +6690,8 @@ or the result is already atomic/grouped."
   "A `lambda' whose parameters may be pcase PATTERNS instead of names.
 Each pattern parameter becomes a fresh name that a `pcase-let*' destructures
 around BODY, so `(funcall (pcase-lambda (`(,a ,b)) (+ a b)) (list 1 2))' is 3."
-  ;; Emacs tests each parameter for a `\=`' head, because there a backquote
-  ;; pattern survives macroexpansion as a `(\=` PAT)' form.  This reader
-  ;; expands backquote EAGERLY, so `\=`(,a ,b)' arrives already as the
-  ;; `(cons a (cons b nil))' pattern -- which is exactly the structural pattern
-  ;; `pcase--compile' takes.  The test is therefore "is it a cons": a symbol
-  ;; (including `&optional'/`&rest') is an ordinary parameter, anything else is
-  ;; a pattern.
+  ;; As in pcase.el: a symbol (including `&optional'/`&rest') is an ordinary
+  ;; parameter, anything else -- a `(\=` PAT)' form among them -- is a pattern.
   (let ((bindings nil) (parameters nil) (i 0))
     (dolist (pat lambda-list)
       (if (consp pat)

@@ -13,8 +13,8 @@
 //!   calling it runs that chunk on a nested fusevm VM
 //! - `let`/`let*` lower to dynamic bind/unbind ops around the body
 //!
-//! Not yet lowered (next milestone): macro expansion, backquote, and the
-//! nonlocal-exit forms (catch/throw/condition-case/unwind-protect).
+//! Macros (backquote among them, see `crate::backquote`) are expanded before
+//! lowering, by `host::macroexpand_all`.
 
 use crate::host;
 use crate::host::{ops, ElispHost, FnKind, Obj};

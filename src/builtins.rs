@@ -9519,6 +9519,7 @@ pub fn install(h: &mut ElispHost) {
     s("identity", 1, Some(1), identity);
     s("terpri", 0, Some(2), terpri);
     s("write-char", 1, Some(2), write_char_fn);
+    s("backquote-process", 1, Some(2), backquote_process_fn);
     s("print", 1, Some(2), print_fn);
     s("prin1-to-string", 1, Some(3), prin1_to_string);
     // nonlocal exits (catch/unwind-protect/condition-case are compiler intrinsics)
@@ -10013,4 +10014,16 @@ mod tests {
         // Empty list -> nil.
         assert_eq!(eval("(member-ignore-case \"a\" nil)"), "nil");
     }
+}
+
+/// `(backquote-process S &optional LEVEL)` — backquote.el's expander; returns
+/// `(TAG . CODE)`. See `crate::backquote`.
+fn backquote_process_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let level = match a.get(1) {
+        Some(Value::Int(n)) => *n,
+        Some(v) if !is_nil(v) => return Err(h.signal_wrong_type("number-or-marker-p", v)),
+        _ => 0,
+    };
+    let (tag, code) = crate::backquote::process(h, &a[0], level)?;
+    Ok(h.cons(Value::Int(tag as i64), code))
 }

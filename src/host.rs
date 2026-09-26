@@ -958,6 +958,9 @@ pub struct ElispHost {
     /// `error "Apparently circular structure being printed"`. `Cell` so the
     /// `&self` printer can record it. Reset at the top of every `print` call.
     pub(crate) print_overflow: Cell<bool>,
+    /// print.c `new_backquote_output`: how many enclosing `` (\` X) `` forms the
+    /// printer is inside, which is what lets `(\, X)` print as `,X`.
+    pub(crate) print_backquote_depth: Cell<u32>,
     /// `print-circle` label table for ONE print call: arena id → print.c's status
     /// field, using the same encoding `Vprint_number_table` does. `0` is `Qt`
     /// ("candidate, seen once, no label"); `-N` is "label N assigned by
@@ -1224,6 +1227,7 @@ impl ElispHost {
             match_data: None,
             stdout_last: '\0',
             print_overflow: Cell::new(false),
+            print_backquote_depth: Cell::new(0),
             print_labels: RefCell::new(HashMap::new()),
             print_next_label: Cell::new(1),
             print_being: RefCell::new(Vec::new()),
@@ -3325,6 +3329,7 @@ impl ElispHost {
     // ── printing ──
     pub fn print(&self, v: &Value, readable: bool) -> String {
         self.print_overflow.set(false);
+        self.print_backquote_depth.set(0);
         self.print_labels.borrow_mut().clear();
         self.print_being.borrow_mut().clear();
         self.print_next_label.set(1);
@@ -3863,14 +3868,20 @@ impl ElispHost {
         let nd = depth + 1;
         // Emacs abbreviates the two-element forms `(quote X)`/`(function X)`/`` (` X) ``
         // as `'X`/`#'X`/`` `X ``; longer lists with those heads print in full.
-        // Honored only when `print-quoted` is non-nil (its default).
+        // `(\, X)` / `(\,@ X)` abbreviate to `,X` / `,@X` only inside a
+        // backquote, and each one uses up a level of it (print.c
+        // `new_backquote_output`). Honored only when `print-quoted` is non-nil
+        // (its default).
         if let Some(Obj::Cons(head, tail)) = self.obj(v) {
+            let depth_now = self.print_backquote_depth.get();
             let prefix = if self.print_flag_or("print-quoted", true) {
                 match self.obj(head) {
                     Some(Obj::Symbol(s)) => match s.name.as_str() {
-                        "quote" => Some("'"),
-                        "function" => Some("#'"),
-                        "`" => Some("`"),
+                        "quote" => Some(("'", depth_now)),
+                        "function" => Some(("#'", depth_now)),
+                        "`" => Some(("`", depth_now + 1)),
+                        "," if depth_now > 0 => Some((",", depth_now - 1)),
+                        ",@" if depth_now > 0 => Some((",@", depth_now - 1)),
                         _ => None,
                     },
                     _ => None,
@@ -3878,10 +3889,13 @@ impl ElispHost {
             } else {
                 None
             };
-            if let Some(prefix) = prefix {
+            if let Some((prefix, inner_depth)) = prefix {
                 if let Some(Obj::Cons(arg, rest)) = self.obj(tail) {
                     if !el_truthy(rest) {
-                        return format!("{prefix}{}", self.print_inner(arg, readable, nd));
+                        self.print_backquote_depth.set(inner_depth);
+                        let body = self.print_inner(arg, readable, nd);
+                        self.print_backquote_depth.set(depth_now);
+                        return format!("{prefix}{body}");
                     }
                 }
             }

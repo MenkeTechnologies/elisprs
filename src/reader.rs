@@ -170,17 +170,17 @@ impl Reader {
             '`' => {
                 self.pos += 1;
                 let f = self.read_form(h)?;
-                Ok(bq_expand(h, &f))
+                Ok(marker(h, "`", f))
             }
             ',' => {
                 self.pos += 1;
                 if self.peek() == Some('@') {
                     self.pos += 1;
                     let f = self.read_form(h)?;
-                    Ok(marker(h, "unquote-splicing", f))
+                    Ok(marker(h, ",@", f))
                 } else {
                     let f = self.read_form(h)?;
-                    Ok(marker(h, "unquote", f))
+                    Ok(marker(h, ",", f))
                 }
             }
             // A string LITERAL is an object, allocated once by the reader: Emacs
@@ -1051,118 +1051,12 @@ fn quoted(h: &mut ElispHost, head: &str, form: Value) -> Value {
     h.list_from(vec![q, form])
 }
 
-/// Build `(NAME FORM)` — the internal unquote / unquote-splicing markers.
+/// Build `(NAME FORM)` for the reader constructs `` ` ``, `,` and `,@`, which
+/// Emacs reads as `` (\` FORM) ``, `(\, FORM)` and `(\,@ FORM)`; the `` \` ``
+/// macro (`crate::backquote`) expands them.
 fn marker(h: &mut ElispHost, name: &str, form: Value) -> Value {
     let s = h.intern(name);
     h.list_from(vec![s, form])
-}
-
-/// Recognize an unquote marker: returns ("unquote"|"unquote-splicing", payload).
-fn unquote_kind(h: &ElispHost, e: &Value) -> Option<(String, Value)> {
-    let v = h.list_vec(e)?;
-    if v.len() == 2 {
-        if let Some(name) = h.sym_name(&v[0]) {
-            if name == "unquote" || name == "unquote-splicing" {
-                return Some((name, v[1].clone()));
-            }
-        }
-    }
-    None
-}
-
-fn call_form(h: &mut ElispHost, fname: &str, a: Value, b: Value) -> Value {
-    let f = h.intern(fname);
-    h.list_from(vec![f, a, b])
-}
-
-/// Expand `` `FORM `` at read time into `cons`/`append`/`quote` calls (the
-/// standard backquote decomposition from the manual). The result is ordinary
-/// elisp that builds the templated structure at run time.
-fn bq_expand(h: &mut ElispHost, form: &Value) -> Value {
-    // `,x  →  x   (a top-level unquote)
-    if let Some((kind, payload)) = unquote_kind(h, form) {
-        if kind == "unquote" {
-            return payload;
-        }
-        // `,@x at top level is ill-formed; fall through to quoting.
-    }
-    // A (possibly dotted) list: walk the cons spine collecting elements, then
-    // fold right. The tail may be nil (proper list), a `,x` unquote in the dotted
-    // position (`(a . ,x) -> the final cdr is x), or another atom.
-    if matches!(h.obj(form), Some(Obj::Cons(..))) {
-        let mut elems: Vec<Value> = Vec::new();
-        let mut cur = form.clone();
-        let tail;
-        loop {
-            match h.obj(&cur) {
-                Some(Obj::Cons(car, cdr)) => {
-                    let (car, cdr) = (car.clone(), cdr.clone());
-                    // A `,x in the dotted-cdr position becomes the final cdr.
-                    if let Some((kind, payload)) = unquote_kind(h, &cdr) {
-                        if kind == "unquote" {
-                            elems.push(car);
-                            tail = payload;
-                            break;
-                        }
-                    }
-                    elems.push(car);
-                    cur = cdr;
-                }
-                _ => {
-                    tail = if matches!(cur, Value::Undef) {
-                        Value::Undef
-                    } else {
-                        bq_expand(h, &cur)
-                    };
-                    break;
-                }
-            }
-        }
-        let mut rest = tail;
-        for e in elems.iter().rev() {
-            match unquote_kind(h, e) {
-                Some((kind, payload)) if kind == "unquote-splicing" => {
-                    rest = call_form(h, "append", payload, rest);
-                }
-                Some((_unquote, payload)) => {
-                    rest = call_form(h, "cons", payload, rest);
-                }
-                None => {
-                    let sub = bq_expand(h, e);
-                    rest = call_form(h, "cons", sub, rest);
-                }
-            }
-        }
-        return rest;
-    }
-    // A vector template `[…]: fold the elements like a list, then `vconcat' the
-    // resulting list back into a vector. (`pcase--compile' recognises the
-    // `vconcat' head as a vector pattern.)
-    if let Some(Obj::Vector(items)) = h.obj(form) {
-        let items = items.clone();
-        let mut rest = Value::Undef;
-        for e in items.iter().rev() {
-            match unquote_kind(h, e) {
-                Some((kind, payload)) if kind == "unquote-splicing" => {
-                    rest = call_form(h, "append", payload, rest);
-                }
-                Some((_unquote, payload)) => {
-                    rest = call_form(h, "cons", payload, rest);
-                }
-                None => {
-                    let sub = bq_expand(h, e);
-                    rest = call_form(h, "cons", sub, rest);
-                }
-            }
-        }
-        let f = h.intern("vconcat");
-        return h.list_from(vec![f, rest]);
-    }
-    // Atom: symbols must be quoted; self-evaluating atoms can stand as-is.
-    match form {
-        Value::Obj(_) => quoted(h, "quote", form.clone()),
-        _ => form.clone(),
-    }
 }
 
 // Emacs character modifier bits (see `Character Type` in the manual).

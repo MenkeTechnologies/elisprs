@@ -7,6 +7,7 @@
 
 pub mod aot;
 pub mod aot_runtime;
+pub mod backquote;
 pub mod banner;
 pub mod builtins;
 pub mod cache;

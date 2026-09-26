@@ -63,9 +63,8 @@ fn cl_defgeneric_answers_nil_and_still_takes_a_default_body() {
     assert_eq!(eval("(progn (cl-defgeneric gy (x) 5) (gy 1))"), "5");
 }
 
-/// A `pcase-lambda` parameter may be a pattern. This reader expands backquote
-/// eagerly, so `` `(,a ,b) `` arrives as the `(cons a (cons b nil))` pattern —
-/// which is why the old error reported that cons as the function.
+/// A `pcase-lambda` parameter may be a pattern, such as the `` `(,a ,b) ``
+/// backquote pattern.
 #[test]
 fn pcase_lambda_destructures_its_parameters() {
     assert_eq!(
