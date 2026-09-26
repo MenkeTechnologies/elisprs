@@ -2056,10 +2056,8 @@ fn diagnostics(text: &str) -> Vec<Diagnostic> {
                 continue;
             }
             '(' => stack.push(i),
-            ')' => {
-                if stack.pop().is_none() {
-                    out.push(diag(idx.range(i, i + 1), "unexpected `)`"));
-                }
+            ')' if stack.pop().is_none() => {
+                out.push(diag(idx.range(i, i + 1), "unexpected `)`"));
             }
             _ => {}
         }

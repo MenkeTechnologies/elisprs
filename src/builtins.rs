@@ -2242,6 +2242,18 @@ pub(crate) fn print_text(
     }))
 }
 
+/// `(backquote-process S &optional LEVEL)` — backquote.el's expander; returns
+/// `(TAG . CODE)`. See `crate::backquote`.
+fn backquote_process_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let level = match a.get(1) {
+        Some(Value::Int(n)) => *n,
+        Some(v) if !is_nil(v) => return Err(h.signal_wrong_type("number-or-marker-p", v)),
+        _ => 0,
+    };
+    let (tag, code) = crate::backquote::process(h, &a[0], level)?;
+    Ok(h.cons(Value::Int(tag as i64), code))
+}
+
 /// print.c `Fwrite_char`: `CHECK_FIXNUM (character)`.
 fn write_char_code(h: &mut ElispHost, v: &Value) -> Result<u32, String> {
     match v {
@@ -10014,16 +10026,4 @@ mod tests {
         // Empty list -> nil.
         assert_eq!(eval("(member-ignore-case \"a\" nil)"), "nil");
     }
-}
-
-/// `(backquote-process S &optional LEVEL)` — backquote.el's expander; returns
-/// `(TAG . CODE)`. See `crate::backquote`.
-fn backquote_process_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let level = match a.get(1) {
-        Some(Value::Int(n)) => *n,
-        Some(v) if !is_nil(v) => return Err(h.signal_wrong_type("number-or-marker-p", v)),
-        _ => 0,
-    };
-    let (tag, code) = crate::backquote::process(h, &a[0], level)?;
-    Ok(h.cons(Value::Int(tag as i64), code))
 }
