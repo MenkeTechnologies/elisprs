@@ -5087,16 +5087,20 @@ reports and the one a hash table's slots are observable in."
                   (setq steps (cons (list 'setq usevar (list '1+ usevar)) steps)))
                 (setq steps (cons (list 'setq tv (list 'cdr tv)) steps))
                 (setq c r)))))
-         ;; for V = INIT [then STEP] — bind to INIT, step at end of each iteration
-         ;; (so V is current when later until/while tests run); no `then' re-evaluates
-         ;; INIT each pass.
+         ;; for V = INIT [then STEP] -- cl-macs.el sets V at the top of every
+         ;; iteration, in clause order with the other `for' clauses (so INIT can
+         ;; read a variable an earlier `for ... in' just stepped): to INIT on the
+         ;; first pass and STEP after it, or to INIT every pass without `then'.
          ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "="))
-          (let ((var (nth 1 c)) (initv (nth 3 c)) (r (nthcdr 4 c)) (stepv nil))
+          (let ((var (nth 1 c)) (initv (nth 3 c)) (r (nthcdr 4 c)))
+            (setq binds (cons (list var nil) binds))
             (if (equal (cl-loop--kw (car r)) "then")
-                (setq stepv (nth 1 r) r (nthcdr 2 r))
-              (setq stepv initv))
-            (setq binds (cons (list var initv) binds))
-            (setq steps (cons (list 'setq var stepv) steps))
+                (let ((first (make-symbol "--cl-var--")))
+                  (setq binds (cons (list first t) binds))
+                  (setq pre (cons (list 'setq var (list 'if first initv (nth 1 r))) pre))
+                  (setq steps (cons (list 'setq first nil) steps))
+                  (setq r (nthcdr 2 r)))
+              (setq pre (cons (list 'setq var initv) pre)))
             (setq c r)))
          ;; for V [from A] [to/below/downto/above B] [by S]  (from defaults to 0)
          ((and (member kw '("for" "as"))
