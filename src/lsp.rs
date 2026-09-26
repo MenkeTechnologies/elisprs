@@ -644,14 +644,14 @@ pub const SUBRS: &[Entry] = &[
     Entry {
         name: "princ",
         kind: Kind::Function,
-        sig: "(princ OBJECT)",
-        doc: "Output OBJECT (no quoting).",
+        sig: "(princ OBJECT &optional PRINTCHARFUN)",
+        doc: "Output OBJECT (no quoting) to PRINTCHARFUN: a buffer, a marker, a function called per character, t for stdout, or nil for `standard-output`.",
     },
     Entry {
         name: "prin1",
         kind: Kind::Function,
-        sig: "(prin1 OBJECT)",
-        doc: "Output OBJECT in read syntax.",
+        sig: "(prin1 OBJECT &optional PRINTCHARFUN)",
+        doc: "Output OBJECT in read syntax to PRINTCHARFUN (as for `princ`).",
     },
     Entry {
         name: "number-to-string",
@@ -1090,13 +1090,19 @@ pub const SUBRS: &[Entry] = &[
     Entry {
         name: "terpri",
         kind: Kind::Function,
-        sig: "(terpri &optional STREAM)",
-        doc: "Output a newline.",
+        sig: "(terpri &optional PRINTCHARFUN ENSURE)",
+        doc: "Output a newline to PRINTCHARFUN. With ENSURE, only when not already at the start of a line; return t if a newline was output.",
+    },
+    Entry {
+        name: "write-char",
+        kind: Kind::Function,
+        sig: "(write-char CHARACTER &optional PRINTCHARFUN)",
+        doc: "Output CHARACTER to PRINTCHARFUN (as for `princ`); return CHARACTER.",
     },
     Entry {
         name: "print",
         kind: Kind::Function,
-        sig: "(print OBJECT &optional STREAM)",
+        sig: "(print OBJECT &optional PRINTCHARFUN)",
         doc: "Output OBJECT in read syntax, surrounded by newlines; return OBJECT.",
     },
     Entry {

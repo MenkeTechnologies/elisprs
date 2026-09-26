@@ -5448,6 +5448,94 @@ dispatch internals, `cl-print`, `cl-struct-define`, `cl-tagbody` / `cl-prog`,
 `string-glyph-*` / multibyte editing helpers, and `hash-table-contains-p`,
 which is new in 31 and absent from the pinned 30.2 oracle.
 
+## Round 29 — backquote as data, PRINTCHARFUN, macro environments, and round 28's cl-lib residue
+
+**Oracle: GNU Emacs 31.1.** Every definition ported here was read from the 31.1
+sources (`backquote.el`, `subr.el`, `macroexp.el`, `cl-macs.el`,
+`cl-extra.el`, `cl-lib.el`, `pcase.el`) and every expected value was taken from
+`emacs -Q --batch` on 31.1.
+
+### R29-A. ✅ FIXED — PRINTCHARFUN and `standard-output` were ignored
+
+`princ`, `prin1`, `print` and `terpri` wrote to stdout whatever their
+PRINTCHARFUN was, and binding `standard-output` did nothing:
+
+| form | Emacs | elisprs before |
+|---|---|---|
+| `(let (acc) (princ "ab" (lambda (c) (push c acc))) acc)` | `(98 97)` | `nil` (and `ab` on stdout) |
+| `(with-temp-buffer (princ "hi" (current-buffer)) (buffer-string))` | `"hi"` | `""` |
+| `(terpri nil t)` | a newline only off column 0 | `wrong-number-of-arguments` |
+| `(write-char ?k)` | `k` | `void-function` |
+
+The destination is now resolved as print.c's `PRINTPREPARE` does (nil →
+`standard-output`, t → stdout, buffer, marker, anything else called per
+character), `with-output-to-string` is subr.el's buffer-backed macro, `terpri`
+takes ENSURE (`bolp`, or the last byte written to stdout), and `write-char`
+exists. Regression test: `tests/parity_printcharfun.rs`.
+
+### R29-B. ✅ FIXED — `macroexpand`'s ENVIRONMENT argument was ignored
+
+`(macroexpand '(go x) (list (cons 'go (lambda (l) (list 'throw l)))))` is
+`(throw x)` in Emacs and was `(go x)`; a `(NAME . nil)` entry did not stop
+expansion; `macroexpand-all` did not bind `macroexpand-all-environment`. All
+three entry points now consult `(assq HEAD ENVIRONMENT)` first, as
+macroexp.el's `macroexpand-1` does. `cl-tagbody` depends on it. Regression
+test: `tests/parity_macro_environment.rs`.
+
+### R29-C. ✅ FIXED — backquote was expanded by the reader
+
+`` `X `` became `cons`/`append` calls at read time, so:
+
+| form | Emacs | elisprs before |
+|---|---|---|
+| `` (car '`(a ,b)) `` | `` \` `` | `cons` |
+| `` (let ((x 'y)) ``(a ,,x)) `` | `` `(a ,y) `` | `(cons 'a (cons y nil))` |
+| `` (macroexpand '`(a ,@b c)) `` | `(cons 'a (append b '(c)))` | the form unchanged (already expanded) |
+
+The reader now produces `` (\` X) `` / `(\, X)` / `(\,@ X)`; `backquote-process`
+is a port of backquote.el; the printer abbreviates `(\, X)` only inside a
+backquote (print.c `new_backquote_output`); pcase compiles pcase.el's
+`` \` `` QPAT pattern (conses, fixed-length vectors, `,PAT`, atoms). Nested
+backquote is what cl-once-only is written in. Regression test:
+`tests/parity_backquote_reader_constructs.rs`.
+
+### R29-D. ✅ FIXED — `cl-loop`'s `for VAR = INIT` ran before the other clauses stepped
+
+VAR was bound to INIT before the loop and reassigned after the body, so INIT
+reading a variable of an earlier `for … in` clause saw nil on the first pass.
+cl-macs.el sets it at the top of each iteration in clause order. Regression
+test: `tests/parity_cl_loop_for_equals.rs`.
+
+### R29-E. ✅ FIXED — round 28's void cl-lib names
+
+Ported: `cl-with-gensyms`, `cl-once-only`, `cl-tagbody`, `cl-prog`,
+`cl-prog*`, `cl-do-symbols`, `cl-do-all-symbols`, `cl-load-time-value`,
+`cl-declare`, `cl-define-compiler-macro`, `cl-compiler-macroexpand`,
+`cl-defsubst`, `cl-gentemp`, `cl-random`, `cl-make-random-state`,
+`cl-random-state-p` (ran3, so `(cl-make-random-state 42)` yields Emacs's
+sequence), `cl-float-limits` and its eight constants, `cl-floatp-safe`,
+`hash-table-contains-p`, `cl-fresh-line`. Also: `gensym` formats a symbol
+PREFIX with `%s`, `cl-gensym` takes an integer PREFIX as the number, and
+`gensym-counter` is 0 after startup (Emacs's preloaded Lisp is byte-compiled,
+so its macros never advance it). Regression test:
+`tests/parity_cl_macs_remaining_surface.rs`.
+
+`cl-defsubst` defines the function but not the inlining compiler macro
+cl-macs.el attaches through `cl--defsubst-expand`; the rewrite changes how a
+call is compiled, not its value.
+
+### Still open after round 29
+
+Round 27's sweep (every `cl-*` / `seq-*` / `string-*` / `hash-table-*` /
+`c[ad]+r` name `fboundp` under `emacs -Q` after `(require 'cl-lib)`, then
+`(fboundp …)` under `elisp`) went from 63 void names to 43. The remainder is
+the `cl-generic` / `cl-find-method` dispatch internals, `cl-print-object` /
+`cl-print-to-string-with-limit`, `cl-struct-define` /
+`cl-struct-sequence-type`, the `cl-derived-type-class-*` accessors,
+`cl-with-accessors`, `cl-iter-defun`, `cl-prettyexpand`, `string-edit`, the
+`string-*rectangle` helpers, `string-glyph-compose` / `-decompose`, and
+`string-make-unibyte` / `string-make-multibyte`.
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the

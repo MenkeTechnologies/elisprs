@@ -116,7 +116,7 @@ elisp --version
 | Predicates | `eq eql equal null not numberp integerp floatp stringp symbolp consp listp atom functionp` |
 | Symbols/cells | `set symbol-value symbol-function fset boundp fboundp symbol-name intern make-symbol` |
 | Strings | `concat string= string-equal string< upcase downcase number-to-string string-to-number string-split` |
-| IO/format | `format message princ prin1 prin1-to-string print terpri` |
+| IO/format | `format message princ prin1 prin1-to-string print terpri write-char` (PRINTCHARFUN is honoured as in print.c: a buffer inserts at its point, a marker at itself, a function is called per character, nil defers to `standard-output`; `with-output-to-string` binds `standard-output` to a buffer, and `terpri`'s ENSURE tests `bolp`) |
 | Functional | `funcall apply mapcar mapc sort identity` |
 | Regexp | `string-match string-match-p match-beginning match-end match-string match-data set-match-data replace-regexp-in-string regexp-quote regexp-opt regexp-opt-charset regexp-opt-depth looking-at looking-back re-search-forward re-search-backward` (+ `save-match-data`; `regexp-opt` and `rx` reproduce Emacs's *output*, not just its language) |
 | Markers | `make-marker point-marker copy-marker set-marker move-marker marker-position marker-buffer markerp marker-insertion-type set-marker-insertion-type` |
@@ -144,9 +144,9 @@ elisp --version
 **Now supported** (own cons model — `Obj::Cons(Value, Value)` heap cells, not `rust_lisp`'s list-only cdr):
 
 - **Dotted pairs.** `(cons 1 2)` / `(a . b)` read, print (`(1 . 2)`), and round-trip; alists may use `(key . value)`.
-- **Backquote / unquote.** `` ` ``, `,`, and `,@` are read and expanded.
+- **Backquote / unquote.** `` ` ``, `,`, and `,@` read as `` (\` X) ``, `(\, X)` and `(\,@ X)`, exactly as Emacs reads them, and the `` \` `` macro expands them with a port of backquote.el, so nested backquotes keep their levels, `'`(a ,b)` is data, and `macroexpand` shows backquote.el's `list`/`cons`/`append`/`backquote-list*` output. The printer abbreviates `(\, X)` as `,X` only inside a backquote.
 - **`setcar` / `setcdr`** mutate cons cells in place.
-- **`pcase`.** Structural dispatch over `_`, literals, `'x`, symbol binders, `(pred FN)`, `(guard EXPR)`, `(and …)`, `(or …)`, and **backquote patterns** `` `(,a ,b) `` / `` `(,a . ,rest) `` (incl. nested), recognized from the reader's eager backquote expansion.
+- **`pcase`.** Structural dispatch over `_`, literals, `'x`, symbol binders, `(pred FN)`, `(guard EXPR)`, `(and …)`, `(or …)`, and **backquote patterns** `` `(,a ,b) `` / `` `(,a . ,rest) `` (incl. nested) and vector patterns `` `[,a ,b] ``, compiled as pcase.el's `` \` `` QPAT pattern.
 - **Regexps.** `string-match` & friends translate elisp regexp syntax (`\(` `\|` `\{`, `\<`/`\>`, backreferences `\1`..`\9`) to a backing engine, honor `case-fold-search`, and record char-indexed match data; `replace-regexp-in-string` is the subr.el Lisp definition (function-valued REP, `\&`/`\N` templates, FIXEDCASE/LITERAL/SUBEXP/START). The syntax-class escapes `\sC`, `\SC`, `\w` and `\W` are resolved against the syntax table in force where the regexp is compiled, so `with-syntax-table` and `modify-syntax-entry` change what they match.
 - **Vector literals.** `[1 2 3]` reads as a self-evaluating vector (elements unevaluated); `aref` / `elt` / `length` / `append` / `sort` operate on it.
 - **Generalized `setf`** over the common places: `car`, `cdr`, `nth`, `elt`, `aref`, `gethash`, `symbol-value`, plus plain variables and multiple place/value pairs.

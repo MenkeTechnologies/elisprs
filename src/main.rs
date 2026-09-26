@@ -347,7 +347,7 @@ fn print_help() {
                 "  elisp -e EXPR            \x1b[32m//\x1b[0m evaluate an expression and print its value\n",
                 "  elisp                    \x1b[32m//\x1b[0m start a REPL\n",
                 "  elisp --repl             \x1b[32m//\x1b[0m start the reedline REPL (Tab-completion + stats banner)\n",
-                "  elisp --lsp              \x1b[32m//\x1b[0m language server over stdio (stub)\n",
+                "  elisp --lsp              \x1b[32m//\x1b[0m language server over stdio\n",
                 "  elisp --dap              \x1b[32m//\x1b[0m line-level debug adapter over stdio (breakpoints, stepping, variables)\n",
                 "  elisp --aot FILE -o OUT  \x1b[32m//\x1b[0m lower to a fusevm chunk / native object\n",
                 "  elisp --dump-tokens FILE \x1b[32m//\x1b[0m print the reader's lexical token stream\n",

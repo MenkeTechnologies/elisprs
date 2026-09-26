@@ -5,7 +5,7 @@
 .TH ELISPALL 1 "2026-09-26" "elisprs 0.1.16" "User Commands"
 .SH NAME
 elispall \- the elisprs comprehensive reference (invocation, reader, special
-forms, standard library, architecture, milestone status, roadmap)
+forms, standard library, architecture)
 .SH OVERVIEW
 This is the all-in-one
 .B elisprs
@@ -18,8 +18,8 @@ fifth language hosted on the
 .B fusevm
 bytecode VM, after
 .BR zshrs ", " stryke ", " awkrs ", and " vimlrs .
-At milestone 1 it executes on a self-contained tree-walk evaluator; the fusevm
-lowering is the milestone-2 seam.
+Each form is macroexpanded and lowered to fusevm bytecode, which fusevm runs
+(with its JIT tiers), calling back into the elisprs object heap.
 .SH INVOCATION
 .B elisp
 [\fIOPTIONS\fR] [\fIFILE\fR | \fB\-e\fR \fIPROGRAM\fR]
@@ -40,27 +40,26 @@ Emacs Lisp is a Lisp-2 (separate value and function cells per symbol) and is, by
 default, dynamically scoped. No general-purpose embeddable Lisp provides those,
 so elisprs splits the problem:
 .TP
-.B Reused \(em data model
-The
-.B rust_lisp
-crate (MIT) supplies \fBValue\fR/\fBList\fR/\fBSymbol\fR. Function objects ride
-in \fBValue::Foreign(Rc<dyn Any>)\fR, so closures, macros, and subrs are added
-without forking the value enum.
+.B Own \(em the data model
+Cons cells, symbols, strings, vectors, closures, buffers and the rest live on
+the elisprs heap (\fIsrc/host.rs\fR) as \fBObj\fR values addressed by fusevm
+\fBValue\fR handles.
 .TP
 .B Own \(em the reader
-rust_lisp's number-greedy tokenizer splits \fB1+\fR/\fB1\-\fR and lacks
-\fB#'\fR, \fB?c\fR, and dotted pairs.
 .I src/reader.rs
-is a small elisp-correct reader emitting rust_lisp values.
+is an elisp-correct reader: \fB1+\fR/\fB1\-\fR are symbols, and \fB#'\fR,
+\fB?c\fR, dotted pairs, vectors, records and backquote read as in Emacs.
 .TP
 .B Own \(em the semantics
-The obarray (value + function cells), dynamic binding (a specstack that saves and
-restores prior value cells), the special forms, and the standard library are all
-in-crate. rust_lisp's Lisp-1, lexical evaluator is not used.
+The obarray (value + function cells), dynamic and lexical binding, the special
+forms, the compiler to fusevm bytecode, and the standard library are all
+in-crate.
 .SH "READER SYNTAX"
 Integers, floats, strings with escapes, symbols (including \fB1+\fR, \fB1\-\fR,
 \fB<=\fR, \fB:keywords\fR), \fBnil\fR/\fBt\fR, \fB'\fRquote, \fB#'\fRfunction,
-\fB?c\fR character literals, and \fB;\fR comments.
+\fB?c\fR character literals, \fB;\fR comments, dotted pairs, vectors, and
+backquote (\fB`\fR, \fB,\fR, \fB,@\fR, read as \fB(\e` X)\fR, \fB(\e, X)\fR,
+\fB(\e,@ X)\fR).
 .SH "SPECIAL FORMS"
 .B quote function lambda progn prog1 if when unless cond and or while setq let
 .B let* defun defmacro defvar defconst condition-case unwind-protect
@@ -69,7 +68,7 @@ Lambda lists accept \fB&optional\fR and \fB&rest\fR. Macros expand and are
 re-evaluated.
 .B condition-case
 matches the \fBerror\fR umbrella and specific error symbols.
-.SH "STANDARD LIBRARY (~65 SUBRS)"
+.SH "STANDARD LIBRARY (A SELECTION)"
 .TP
 .B Arithmetic
 + \- * / % mod 1+ 1\- abs max min = /= < > <= >=
@@ -94,32 +93,21 @@ format message princ prin1 print terpri
 .TP
 .B Functional
 funcall apply mapcar mapc identity
-.SH "PATH TO FUSEVM (MILESTONE 2)"
-The lowering follows the same frontend pattern as
-.IR strykelang/strykelang/fusevm_native.rs :
-.IP 1. 4
-Add \fBValue::{Cons, Symbol}\fR to \fBfusevm/src/value.rs\fR and a dynamic-binding
-stack to the \fBVM\fR struct \(em the one invasive core change.
-.IP 2. 4
-Reserve an elisp \fBOp::Extended(id, arg)\fR range; register a handler via
-\fBvm.set_extension_handler(...)\fR for quote, funcall, special-var bind, and
-cons navigation.
-.IP 3. 4
-Lower each top-level form in \fBcompiler.rs\fR; lambda bodies become sub-chunks.
-.IP 4. 4
-Bind the subr library through \fBvm.register_builtin(...)\fR.
-.PP
-The three-tier Cranelift JIT and the
+.SH EXECUTION
+Each top-level form is macroexpanded and lowered by \fIsrc/compiler.rs\fR to a
+\fBfusevm::Chunk\fR; lambda bodies become sub-chunks. Elisp operations run
+through an \fBOp::Extended\fR handler that calls back into the heap, while core
+arithmetic and comparison lower to native fusevm ops, so fusevm's Cranelift
+JIT tiers and the
 .B \-\-aot
-path (via \fBfusevm::aot::compile_object\fR) then come for free.
+path (\fBfusevm::aot\fR) apply to them.
 .SH LIMITATIONS
-No dotted pairs, backquote/unquote, \fBlexical-binding\fR, or
-\fBsetcar\fR/\fBsetcdr\fR at milestone 1; unsupported reader syntax errors
-loudly. Not buffer-aware.
+Known divergences from GNU Emacs are recorded in \fIBUGS.md\fR in the source
+tree. No display: buffers exist, windows and frames do not.
 .SH "SEE ALSO"
 .BR elisp (1).
 Reference and engineering report: https://menketechnologies.github.io/elisprs/ .
 .SH AUTHOR
 MenkeTechnologies <https://github.com/MenkeTechnologies>.
 .SH LICENSE
-MIT OR Apache-2.0. Bundles rust_lisp (MIT).
+MIT OR Apache-2.0.

@@ -2,7 +2,7 @@
 .\" Contact https://github.com/MenkeTechnologies/elisprs to correct errors or omissions.
 .TH ELISP 1 "2026-09-26" "elisprs 0.1.16" "User Commands"
 .SH NAME
-elisp \- Emacs Lisp interpreter (run .el outside Emacs; Lisp-2 obarray with dynamic binding, on the rust_lisp value model)
+elisp \- Emacs Lisp interpreter (run .el outside Emacs; Lisp-2 obarray with lexical and dynamic binding, compiled to fusevm bytecode)
 .SH SYNOPSIS
 .B elisp
 [\fIOPTIONS\fR] [\fIFILE\fR | \fB\-e\fR \fIPROGRAM\fR]
@@ -21,19 +21,11 @@ and
 .BR vimlrs ).
 .PP
 Emacs Lisp is a Lisp-2 \(em every symbol carries a separate value cell and
-function cell \(em and is, by default, dynamically scoped. elisprs reuses the
-.B rust_lisp
-crate (MIT) for its \fBValue\fR/\fBList\fR/\fBSymbol\fR data model, but the
-reader, the obarray, dynamic binding, the special forms, and the standard
-library are its own; rust_lisp's Lisp-1, lexically scoped evaluator is not used.
-.PP
-At milestone 1 the program runs on a self-contained tree-walk evaluator. The
-.B fusevm
-lowering is staged in
-.I src/compiler.rs
-and is not yet wired; it backs the
-.B \-\-aot
-path.
+function cell \(em with dynamic binding by default and lexical binding under a
+\fBlexical\-binding\fR cookie. The reader, the object heap, the obarray and the
+standard library are elisprs's own. Each top-level form is read, macroexpanded
+and lowered to a \fBfusevm\fR chunk (\fIsrc/compiler.rs\fR), which fusevm runs,
+calling back into the heap (\fIsrc/host.rs\fR).
 .SH OPTIONS
 .TP
 .I FILE
@@ -58,15 +50,15 @@ terminal, \fBelisp\fR launches this REPL automatically; piped input falls back
 to a plain line-buffered reader.
 .TP
 .B \-\-lsp
-Run the language server over stdio. Stub at milestone 1.
+Run the language server over stdio: completion, hover, signature help,
+document symbols and reader diagnostics.
 .TP
 .B \-\-dap
-Run the debug adapter over stdio. Stub at milestone 1.
+Run the line-level debug adapter over stdio (breakpoints, stepping, variables).
 .TP
 .BR \-\-aot " " \fIFILE\fR " " \fB\-o\fR " " \fIOUT\fR
 Ahead-of-time compile \fIFILE\fR to a native object \fIOUT\fR via
-\fBfusevm::aot::compile_object\fR. Requires the milestone-2 lowering; reports a
-not-implemented signal until then.
+\fBfusevm::aot::compile_object\fR (the lowered chunk plus its heap image).
 .TP
 .BR \-\-dump\-tokens " " \fIFILE\fR
 Print the reader's lexical token stream for \fIFILE\fR (one \fBline  Tok\fR per
@@ -99,18 +91,20 @@ so multi-line forms work; Ctrl-D exits.
 .SH LANGUAGE
 Reader syntax: integers, floats, strings with escapes, symbols (including
 \fB1+\fR / \fB1\-\fR / \fB<=\fR / \fB:keywords\fR), \fBnil\fR / \fBt\fR,
-\fB'\fRquote, \fB#'\fRfunction, \fB?c\fR character literals, and \fB;\fR comments.
+\fB'\fRquote, \fB#'\fRfunction, \fB?c\fR character literals, \fB;\fR comments,
+dotted pairs, vectors, and backquote: \fB`\fR, \fB,\fR and \fB,@\fR read as
+\fB(\e` X)\fR, \fB(\e, X)\fR and \fB(\e,@ X)\fR, as in Emacs, and the \fB`\fR
+macro expands them.
 .PP
 Special forms: \fBquote function lambda progn prog1 if when unless cond and or
 while setq let let* defun defmacro defvar defconst condition-case
 unwind-protect\fR.
-A standard library of roughly 65 subrs covers lists, arithmetic, strings,
-predicates, I/O/format, and functional operators.
+Rust subrs and a preloaded elisp prelude cover lists, arithmetic, strings,
+buffers, regexps, printing, cl\-lib, pcase, seq and subr\-x.
 .SH LIMITATIONS
-Milestone 1 does not support dotted pairs \fB(a . b)\fR, backquote/unquote,
-\fBlexical-binding\fR, or \fBsetcar\fR/\fBsetcdr\fR. Unsupported reader syntax
-errors loudly rather than being silently misread. The interpreter is not
-buffer-aware (no buffers, point, or markers).
+Known divergences from GNU Emacs, and the ones still open, are recorded in
+\fIBUGS.md\fR in the source tree. There is no display: buffers, point and
+markers exist, windows and frames do not.
 .SH EXIT STATUS
 .B elisp
 exits 0 on success and non-zero if a file cannot be read or evaluation signals
@@ -139,4 +133,4 @@ https://github.com/MenkeTechnologies/fusevm .
 .SH AUTHOR
 MenkeTechnologies <https://github.com/MenkeTechnologies>.
 .SH LICENSE
-MIT OR Apache-2.0. Bundles rust_lisp (MIT).
+MIT OR Apache-2.0.

@@ -6,6 +6,34 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Backquote was expanded by the reader.** `` `X ``, `,X` and `,@X` now read
+  as `` (\` X) ``, `(\, X)` and `(\,@ X)` and expand through a port of
+  backquote.el, so nested backquotes keep their levels (cl-once-only's
+  expansion was wrong), `` '`(a ,b) `` is data, a constant template is one
+  object, and `macroexpand` shows backquote.el's output. The printer writes
+  `,X` only inside a backquote; pcase takes pcase.el's `` \` `` pattern,
+  vectors included.
+
+  ```text
+  $ elisp -e "(let ((x 'y)) \`\`(a ,,x))"
+  before:  (cons 'a (cons y nil))
+  after:   `(a ,y)
+  ```
+
+- **PRINTCHARFUN and `standard-output` were ignored.** `princ` / `prin1` /
+  `print` / `terpri` now send output to a buffer (at its point), a marker (at
+  the marker, which advances), a function (called per character) or stdout,
+  with nil deferring to `standard-output`; `with-output-to-string` is subr.el's
+  buffer-backed macro; `terpri` takes ENSURE; `write-char` exists.
+- **`macroexpand`, `macroexpand-1` and `macroexpand-all` ignored ENVIRONMENT.**
+  An expander in it now runs before the function cell is consulted, a nil
+  entry stops expansion, and `macroexpand-all` binds
+  `macroexpand-all-environment`.
+- **`cl-loop`'s `for VAR = INIT` was evaluated before the other `for` clauses
+  stepped**, so INIT reading an earlier `for … in` variable saw nil on the
+  first pass.
+- **`gensym` rejected a symbol PREFIX, `cl-gensym` an integer one**, and
+  `gensym-counter` was not 0 at startup.
 - **cl-seq's keyword entry points ignored `:if` / `:if-not`.**
   `cl--parsing-keywords` binds `cl-if` for `cl-member`, `cl-assoc`,
   `cl-rassoc`, `cl-position`, `cl-count`, `cl-find`, `cl-remove`,
@@ -35,6 +63,14 @@ All notable changes to elisprs are documented here. The format follows
   converts through it, so its argument order now matches Emacs as well.
 
 ### Added
+- cl-macs.el's `cl-with-gensyms`, `cl-once-only`, `cl-tagbody`, `cl-prog`,
+  `cl-prog*`, `cl-do-symbols`, `cl-do-all-symbols`, `cl-load-time-value`,
+  `cl-declare`, `cl-define-compiler-macro`, `cl-compiler-macroexpand`,
+  `cl-defsubst` and `cl-gentemp`; cl-extra.el's `cl-random`,
+  `cl-make-random-state`, `cl-random-state-p`, `cl-float-limits` and
+  `cl-fresh-line`; cl-lib.el's float constants and `cl-floatp-safe`; subr.el's
+  `hash-table-contains-p`; print.c's `write-char`; backquote.el's
+  `backquote-process` and `backquote-list*`.
 - cl-extra.el's `cl-mapc`, `cl-mapl`, `cl-mapcon`, and `cl-maplist` over
   several lists; cl-seq.el's `cl-nunion`, `cl-nintersection`,
   `cl-nset-difference`, `cl-nsubst` and `cl-tree-equal`; cl-lib.el's
