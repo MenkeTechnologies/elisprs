@@ -185,6 +185,13 @@ fn load_prelude() {
             }
         }
     }
+    // Emacs's preloaded Lisp is byte-compiled, so the macros it expands never
+    // advance `gensym-counter' at startup: `emacs -Q' answers `g0' to its first
+    // `(gensym)'. Expanding the prelude here did advance it.
+    host::with_host(|h| {
+        let counter = h.intern("gensym-counter");
+        let _ = h.set_raw_global(&counter, Value::Int(0));
+    });
     host::set_prelude_compiling(false);
     host::save_prelude_snapshot();
 }

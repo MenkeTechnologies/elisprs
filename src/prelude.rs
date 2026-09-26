@@ -837,10 +837,11 @@ pub const PRELUDE: &str = r#"
 ;; honoured exactly as when passed as PRINTCHARFUN.
 (defvar standard-output t)
 (defvar gensym-counter 0)
+;; subr.el: PREFIX is spliced with %s, so a symbol prefix works too.
 (defun gensym (&optional prefix)
-  (let ((n gensym-counter))
-    (setq gensym-counter (1+ gensym-counter))
-    (make-symbol (concat (or prefix "g") (number-to-string n)))))
+  (let ((num (prog1 gensym-counter
+               (setq gensym-counter (1+ gensym-counter)))))
+    (make-symbol (format "%s%d" (or prefix "g") num))))
 ;; `keywordp' is a subr (see `builtins::install'): the test is not the spelling
 ;; but whether the symbol is the one the standard obarray holds, which only the
 ;; host can answer.
@@ -1381,9 +1382,22 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
         ((eq type 'character) object)
         (t object)))
 (defvar cl--gensym-counter 0)
+;; cl-macs.el: a string PREFIX replaces "G", an integer PREFIX is the number
+;; itself (the counter is left alone), anything else is ignored.
 (defun cl-gensym (&optional prefix)
-  (prog1 (make-symbol (concat (or prefix "G") (number-to-string cl--gensym-counter)))
-    (setq cl--gensym-counter (1+ cl--gensym-counter))))
+  (let ((pfix (if (stringp prefix) prefix "G"))
+        (num (if (integerp prefix) prefix
+               (prog1 cl--gensym-counter
+                 (setq cl--gensym-counter (1+ cl--gensym-counter))))))
+    (make-symbol (format "%s%d" pfix num))))
+(defvar cl--gentemp-counter 0)
+;; cl-macs.el: an INTERNED symbol whose name no existing symbol has.
+(defun cl-gentemp (&optional prefix)
+  (let ((pfix (if (stringp prefix) prefix "T"))
+        name)
+    (while (intern-soft (setq name (format "%s%d" pfix cl--gentemp-counter)))
+      (setq cl--gentemp-counter (1+ cl--gentemp-counter)))
+    (intern name)))
 (defun cl-digit-char-p (char &optional radix)
   (let ((r (or radix 10))
         (v (cond ((and (>= char ?0) (<= char ?9)) (- char ?0))
@@ -13008,6 +13022,243 @@ and if a matching region is found, place point at the start of the region."
     (setq predicate (lambda (val p-val)
                       (not (equal val p-val))))))
   (funcall predicate value prop-value))
+
+;;; ---- cl-macs.el / cl-extra.el: the remaining macro and number surface ----
+;; Ported from GNU Emacs 31.1's cl-macs.el, cl-extra.el and cl-lib.el.
+
+(defmacro cl-with-gensyms (names &rest body)
+  "Bind each of NAMES to an uninterned symbol and evaluate BODY."
+  (declare (debug (sexp body)) (indent 1))
+  `(let ,(cl-loop for name in names collect
+                  `(,name (gensym (symbol-name ',name))))
+     ,@body))
+
+(defmacro cl-once-only (names &rest body)
+  "Generate code to evaluate each of NAMES just once in BODY."
+  (declare (debug (sexp body)) (indent 1))
+  (setq names (mapcar #'ensure-list names))
+  (let ((our-gensyms (cl-loop for _ in names collect (gensym))))
+    `(let ,(cl-loop for sym in our-gensyms collect `(,sym (gensym)))
+       `(let ,(list
+               ,@(cl-loop for name in names for gensym in our-gensyms
+                          for to-eval = (or (cadr name) (car name))
+                          collect ``(,,gensym ,,to-eval)))
+          ,(let ,(cl-loop for name in names for gensym in our-gensyms
+                          collect `(,(car name) ,gensym))
+             ,@body)))))
+
+;; `cl-tagbody': each label starts a block of a `cl-case' dispatched from a
+;; `while' loop; `go' is a local macro, supplied through `macroexpand-all''s
+;; ENVIRONMENT, that throws the next label to the loop's catch.
+(defvar cl--tagbody-alist nil)
+(defmacro cl-tagbody (&rest labels-or-stmts)
+  "Execute statements while providing for control transfers to labels."
+  (let ((blocks '())
+        (first-label (if (consp (car labels-or-stmts))
+                         'cl--preamble (pop labels-or-stmts))))
+    (let ((block (list first-label)))
+      (dolist (label-or-stmt labels-or-stmts)
+        (if (consp label-or-stmt) (push label-or-stmt block)
+          (unless (eq 'go (car-safe (car-safe block)))
+            (push `(go ,label-or-stmt) block))
+          (push (nreverse block) blocks)
+          (setq block (list label-or-stmt))))
+      (unless (eq 'go (car-safe (car-safe block)))
+        (push '(go cl--exit) block))
+      (push (nreverse block) blocks))
+    (let ((catch-tag (make-symbol "cl--tagbody-tag"))
+          (cl--tagbody-alist cl--tagbody-alist))
+      (push (cons 'cl--exit catch-tag) cl--tagbody-alist)
+      (dolist (block blocks)
+        (push (cons (car block) catch-tag) cl--tagbody-alist))
+      (macroexpand-all
+       `(let ((next-label ',first-label))
+          (while
+              (not (eq (setq next-label
+                             (catch ',catch-tag
+                               (cl-case next-label
+                                 ,@blocks)))
+                       'cl--exit))))
+       `((go . ,(lambda (label)
+                  (let ((catch-tag (cdr (assq label cl--tagbody-alist))))
+                    (unless catch-tag
+                      (error "Unknown cl-tagbody go label `%S'" label))
+                    `(throw ',catch-tag ',label))))
+         ,@macroexpand-all-environment)))))
+
+(defun cl--prog (binder bindings body)
+  (let (decls)
+    (while (eq 'declare (car-safe (car body)))
+      (push (pop body) decls))
+    `(cl-block nil
+       (,binder ,bindings
+         ,@(nreverse decls)
+         (cl-tagbody . ,body)))))
+(defmacro cl-prog (bindings &rest body)
+  "Run BODY like a `cl-tagbody' after setting up the BINDINGS."
+  (cl--prog 'let bindings body))
+(defmacro cl-prog* (bindings &rest body)
+  "Run BODY like a `cl-tagbody' after setting up the BINDINGS."
+  (cl--prog 'let* bindings body))
+
+(defmacro cl-do-symbols (spec &rest body)
+  "Loop over all symbols, or all symbols of OBARRAY."
+  (declare (indent 1))
+  `(cl-block nil
+     (let (,(car spec))
+       (mapatoms #'(lambda (,(car spec)) ,@body)
+                 ,@(and (cadr spec) (list (cadr spec))))
+       ,(nth 2 spec))))
+(defmacro cl-do-all-symbols (spec &rest body)
+  "Like `cl-do-symbols', but use the default obarray."
+  (declare (indent 1))
+  `(cl-do-symbols (,(car spec) nil ,(cadr spec)) ,@body))
+
+;; Outside the byte-compiler FORM is evaluated at expansion time and quoted.
+(defmacro cl-load-time-value (form &optional _read-only)
+  "Like `progn', but evaluates the body at load time."
+  `',(eval form lexical-binding))
+
+;; Declarations only matter to the byte-compiler; interpreted, this is nil.
+(defmacro cl-declare (&rest _specs)
+  "Declare SPECS about the current function while compiling."
+  nil)
+
+(defmacro cl-define-compiler-macro (func args &rest body)
+  "Define a compiler-only macro."
+  (declare (indent 2))
+  (let ((p args) (res nil))
+    (while (consp p) (push (pop p) res))
+    (setq args (nconc (nreverse res) (and p (list '&rest p)))))
+  (let ((fname (intern (concat (symbol-name func) "--cmacro"))))
+    `(eval-and-compile
+       (cl-defun ,fname ,(if (memq '&whole args) (delq '&whole args)
+                           (cons '_cl-whole-arg args))
+         ,@body)
+       (define-symbol-prop ',func 'compiler-macro #',fname))))
+
+(defun cl-compiler-macroexpand (form)
+  "Like `macroexpand', but for compiler macros."
+  (while
+      (let ((func (car-safe form)) (handler nil))
+        (while (and (symbolp func)
+                    (not (setq handler (get func 'compiler-macro)))
+                    (fboundp func)
+                    (or (not (autoloadp (symbol-function func)))
+                        (autoload-do-load (symbol-function func) func)))
+          (setq func (symbol-function func)))
+        (and handler
+             (not (eq form (setq form (apply handler form (cdr form))))))))
+  form)
+
+;; Emacs also gives the function an inlining compiler macro built on
+;; `cl--defsubst-expand'; that rewrite only changes how a call is compiled,
+;; not what it returns, and is not ported.
+(defmacro cl-defsubst (name args &rest body)
+  "Define NAME as a function, like `cl-defun'."
+  (declare (indent 2))
+  `(progn nil (cl-defun ,name ,args ,@body)))
+
+;; cl-extra.el's random-number generator: "ran3" from Numerical Recipes, an
+;; additive congruential method over a 55-entry state vector.
+(defun cl--random-time ()
+  (car (time-convert nil t)))
+(cl-defstruct (cl--random-state
+               (:copier nil)
+               (:predicate cl-random-state-p)
+               (:constructor nil)
+               (:constructor cl--make-random-state (vec)))
+  (i -1) (j 30) vec)
+(defvar cl--random-state (cl--make-random-state (cl--random-time)))
+(defun cl-random (lim &optional state)
+  "Return a pseudo-random nonnegative number less than LIM, an integer or float."
+  (or state (setq state cl--random-state))
+  (let ((vec (cl--random-state-vec state)))
+    (if (integerp vec)
+        (let ((i 0) (j (- 1357335 (abs (% vec 1357333)))) (k 1))
+          (setf (cl--random-state-vec state)
+                (setq vec (make-vector 55 nil)))
+          (aset vec 0 j)
+          (while (> (setq i (% (+ i 21) 55)) 0)
+            (aset vec i (setq j (prog1 k (setq k (- j k))))))
+          (while (< (setq i (1+ i)) 200) (cl-random 2 state))))
+    (let* ((i (cl-callf (lambda (x) (% (1+ x) 55)) (cl--random-state-i state)))
+           (j (cl-callf (lambda (x) (% (1+ x) 55)) (cl--random-state-j state)))
+           (n (aset vec i (logand 8388607 (- (aref vec i) (aref vec j))))))
+      (cond
+       ((natnump lim)
+        (if (<= lim 512) (% n lim)
+          (if (> lim 8388607) (setq n (+ (ash n 9) (cl-random 512 state))))
+          (let ((mask 1023))
+            (while (< mask (1- lim)) (setq mask (1+ (+ mask mask))))
+            (if (< (setq n (logand n mask)) lim) n (cl-random lim state)))))
+       ((< 0 lim 1.0e+INF)
+        (* (/ n '8388608e0) lim))
+       (t
+        (error "Limit %S not supported by cl-random" lim))))))
+(defun cl-make-random-state (&optional state)
+  "Return a copy of random-state STATE, or of the internal state if omitted."
+  (unless state (setq state cl--random-state))
+  (if (cl-random-state-p state)
+      (copy-sequence state)
+    (cl--make-random-state (if (integerp state) state (cl--random-time)))))
+
+;; cl-lib.el's float parameters are nil until `cl-float-limits' measures them.
+(defconst cl-most-positive-float nil)
+(defconst cl-most-negative-float nil)
+(defconst cl-least-positive-float nil)
+(defconst cl-least-negative-float nil)
+(defconst cl-least-positive-normalized-float nil)
+(defconst cl-least-negative-normalized-float nil)
+(defconst cl-float-epsilon nil)
+(defconst cl-float-negative-epsilon nil)
+(defun cl--finite-do (func a b)
+  (condition-case _
+      (let ((res (funcall func a b)))
+        (and (numberp res) (/= res (/ res 2)) res))
+    (arith-error nil)))
+(defun cl-float-limits ()
+  "Initialize the Common Lisp floating-point parameters."
+  (or cl-most-positive-float (not (numberp '2e1))
+      (let ((x '2e0) y z)
+        (while (cl--finite-do '* x x) (setq x (* x x)))
+        (while (cl--finite-do '* x (/ x 2)) (setq x (* x (/ x 2))))
+        (while (cl--finite-do '+ x x) (setq x (+ x x)))
+        (setq z x y (/ x 2))
+        (while (and (cl--finite-do '+ x y) (/= (+ x y) x))
+          (setq x (+ x y) y (/ y 2)))
+        (setq cl-most-positive-float x
+              cl-most-negative-float (- x))
+        (setq x (/ x z) y (/ 16 z) x (* x y))
+        (while (condition-case _ (and (= x (* (/ x 2) 2)) (> (/ y 2) 0))
+                 (arith-error nil))
+          (setq x (/ x 2) y (/ y 2)))
+        (setq cl-least-positive-normalized-float y
+              cl-least-negative-normalized-float (- y))
+        (setq x (/ z) y x)
+        (while (condition-case _ (> (/ x 2) 0) (arith-error nil))
+          (setq x (/ x 2)))
+        (setq cl-least-positive-float x
+              cl-least-negative-float (- x))
+        (setq x '1e0)
+        (while (/= (+ '1e0 x) '1e0) (setq x (/ x 2)))
+        (setq cl-float-epsilon (* x 2))
+        (setq x '1e0)
+        (while (/= (- '1e0 x) '1e0) (setq x (/ x 2)))
+        (setq cl-float-negative-epsilon (* x 2))))
+  nil)
+(define-obsolete-function-alias 'cl-floatp-safe 'floatp "24.4")
+
+;; subr.el: KEY is present even when its value is nil.
+(let ((missing (make-symbol "missing")))
+  (defun hash-table-contains-p (key table)
+    "Return non-nil if TABLE has an element with KEY."
+    (not (eq (gethash key table missing) missing))))
+
+;; cl-extra.el; `terpri''s ENSURE does the bolp test.
+(defun cl-fresh-line (&optional stream)
+  "Output a newline unless already at the beginning of a line."
+  (terpri stream 'ensure))
 "#;
 
 /// Faithful port of emacs-lisp/nadvice.el (Emacs 30.2) — the modern light-weight
