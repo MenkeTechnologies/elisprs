@@ -69,3 +69,39 @@ fn if_and_if_not_keywords_reach_the_keyword_entry_points() {
         "(wrong-type-argument listp (2 . 3))"
     );
 }
+
+/// subr.el defines all 28 two- to four-letter c[ad]+r compositions, cl-lib.el
+/// aliases the 24 three- and four-letter ones under `cl-`, and every one is a
+/// place (the compiler macro rewrites it to its car/cdr chain; gv follows the
+/// alias). A wrong argument count is exec_byte_code's `(1 . 1)`.
+#[test]
+fn every_cxr_composition_exists_is_a_place_and_reports_byte_code_arity() {
+    assert_eq!(eval("(caaaar '((((1)))))"), "1");
+    assert_eq!(eval("(cdddar '((1 2 3 4)))"), "(4)");
+    assert_eq!(eval("(cadadr '(1 (2 3)))"), "3");
+    assert_eq!(eval("(cl-caddar '((1 2 3)))"), "3");
+    assert_eq!(err("(caaddr '(1 2 3))"), "(wrong-type-argument listp 3)");
+    assert_eq!(err("(cadr)"), "(wrong-number-of-arguments (1 . 1) 0)");
+    assert_eq!(err("(cdaddr)"), "(wrong-number-of-arguments (1 . 1) 0)");
+    assert_eq!(
+        err("(cl-caddr 1 2)"),
+        "(wrong-number-of-arguments (1 . 1) 2)"
+    );
+    assert_eq!(eval("(symbol-function 'cl-cadadr)"), "cadadr");
+    assert_eq!(
+        eval("(let ((x (list (list (list (list 1)))))) (setf (caaaar x) 9) x)"),
+        "((((9))))"
+    );
+    assert_eq!(
+        eval("(let ((x (list 1 2 3 4 5))) (setf (cl-caddr x) 9) (setf (cadddr x) 8) x)"),
+        "(1 2 9 8 5)"
+    );
+    assert_eq!(
+        eval("(let ((x (list 1 2 3 4 5))) (setf (cddddr x) '(z)) (setf (cl-cdddr x) '(y)) x)"),
+        "(1 2 3 y)"
+    );
+    assert_eq!(
+        eval("(let ((x (list 1 (list 2 3)))) (cl-incf (cadadr x) 10) x)"),
+        "(1 (2 13))"
+    );
+}

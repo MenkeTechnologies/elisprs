@@ -8,16 +8,7 @@
 //! every macro is defined before its first use.
 
 pub const PRELUDE: &str = r#"
-;;; ---- c[ad]+r family ----
-(defun caar (x) (car (car x)))
-(defun cadr (x) (car (cdr x)))
-(defun cdar (x) (cdr (car x)))
-(defun cddr (x) (cdr (cdr x)))
-(defun caaar (x) (car (caar x)))
-(defun caddr (x) (car (cddr x)))
-(defun cdddr (x) (cdr (cddr x)))
-(defun cadddr (x) (car (cdddr x)))
-(defun cddddr (x) (cdr (cdddr x)))
+;;; The c[ad]+r family (caar .. cddddr) is Rust subrs: src/builtins.rs `cxr`.
 
 ;; Regexp matching folds case unless this is let-bound to nil (Emacs default t).
 (defvar case-fold-search t)
@@ -504,11 +495,6 @@ pub const PRELUDE: &str = r#"
     (null seq)))
 (defun cl-notany (pred seq &rest rest) (not (apply (function cl-some) pred seq rest)))
 (defun cl-notevery (pred seq &rest rest) (not (apply (function cl-every) pred seq rest)))
-;; cl- aliases for the 3+-level c[ad]r accessors (Emacs only prefixes these;
-;; the 2-level caar/cadr/cdar/cddr stay unprefixed).
-(defun cl-caddr (x) (caddr x))
-(defun cl-cdddr (x) (cdddr x))
-(defun cl-cadddr (x) (cadddr x))
 ;; cl- list utilities.
 (defun cl-list-length (l) (length l))
 (defun cl-copy-list (l) (copy-sequence l))
@@ -4622,6 +4608,15 @@ If all LST elements are zeros or LST is nil, return zero."
 (defun set-default-toplevel-value (sym val) (set-default sym val) nil)
 (defun defalias (symbol definition &optional _docstring) (fset symbol definition) symbol)
 (defalias 'string-split 'split-string)
+;; cl-lib.el: the three- and four-letter accessors under their cl- names are
+;; plain aliases, so `(symbol-function (quote cl-caddr))' is `caddr' and setf
+;; reaches them by following the alias (gv.el:112).
+(let ((names (quote (caaar caadr cadar caddr cdaar cdadr cddar cdddr
+                     caaaar caaadr caadar caaddr cadaar cadadr caddar cadddr
+                     cdaaar cdaadr cdadar cdaddr cddaar cddadr cdddar cddddr))))
+  (while names
+    (defalias (intern (concat "cl-" (symbol-name (car names)))) (car names))
+    (setq names (cdr names))))
 ;; help.el: obsolete alias for `help--make-usage' (help usage helpers ported above).
 (define-obsolete-function-alias 'help-make-usage #'help--make-usage "25.1")
 ;; with-memoization: cache BODY's value in PLACE; reuse it on later calls.
@@ -5579,19 +5574,15 @@ reports and the one a hash table's slots are observable in."
       (cond
        ((eq head 'car) (list 'setcar (car args) val))
        ((eq head 'cdr) (list 'setcdr (car args) val))
-       ((eq head 'caar) (list 'setcar (list 'car (car args)) val))
-       ((eq head 'cadr) (list 'setcar (list 'cdr (car args)) val))
-       ((eq head 'cdar) (list 'setcdr (list 'car (car args)) val))
-       ((eq head 'cddr) (list 'setcdr (list 'cdr (car args)) val))
-       ;; Triple combinators: set{car,cdr} of the inner two-step accessor.
-       ((eq head 'caaar) (list 'setcar (list 'caar (car args)) val))
-       ((eq head 'caadr) (list 'setcar (list 'cadr (car args)) val))
-       ((eq head 'cadar) (list 'setcar (list 'cdar (car args)) val))
-       ((eq head 'caddr) (list 'setcar (list 'cddr (car args)) val))
-       ((eq head 'cdaar) (list 'setcdr (list 'caar (car args)) val))
-       ((eq head 'cdadr) (list 'setcdr (list 'cadr (car args)) val))
-       ((eq head 'cddar) (list 'setcdr (list 'cdar (car args)) val))
-       ((eq head 'cdddr) (list 'setcdr (list 'cddr (car args)) val))
+       ;; c[ad]+r, two to four letters: subr.el's compiler macro rewrites each to
+       ;; its car/cdr chain, so the place is set{car,cdr} of the accessor made of
+       ;; the remaining letters — (setf (cadadr X) V) is (setcar (cdadr X) V).
+       ((and (symbolp head)
+             (string-match-p "\\`c[ad][ad][ad]?[ad]?r\\'" (symbol-name head)))
+        (let ((name (symbol-name head)))
+          (list (if (eq (aref name 1) ?a) 'setcar 'setcdr)
+                (list (intern (concat "c" (substring name 2))) (car args))
+                val)))
        ((eq head 'nth) (list 'setcar (list 'nthcdr (car args) (car (cdr args))) val))
        ;; (setf (nthcdr N L) V): N=0 replaces L; else setcdr the (N-1)th cell.
        ((eq head 'nthcdr)
@@ -5728,10 +5719,15 @@ reports and the one a hash table's slots are observable in."
               ;; (installed via `(defalias (gv-setter aname) ...)').
               (let ((me (macroexpand-1 place)))
                 (if (eq me place)
+                    ;; Follow a function alias (gv.el:112), so `cl-caddr' is
+                    ;; a place because `caddr' is.
+                    (if (and (fboundp head) (symbolp (symbol-function head))
+                             (symbol-function head))
+                        (setf--expand (cons (symbol-function head) args) val)
                     (let ((setter (intern (format "(setf %s)" head))))
                       (if (fboundp setter)
                           (cons 'funcall (cons (list 'function setter) (cons val args)))
-                        (signal 'gv-invalid-place (list place))))
+                        (signal 'gv-invalid-place (list place)))))
                   (setf--expand me val))))))))))
 (defmacro setf (&rest pairs)
   (let ((forms nil))

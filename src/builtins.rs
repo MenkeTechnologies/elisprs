@@ -1295,53 +1295,42 @@ fn nth_fn(h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── c[ad]+r combinators ──
-// Each composes `car`/`cdr`, inheriting their exact edge semantics: car/cdr of
-// nil yield nil (so short lists return nil), while car/cdr of a non-nil non-cons
-// signals `wrong-type-argument listp`. Read the letters right-to-left as the
-// order of operations (e.g. `caadr` = (car (car (cdr X)))).
-fn caadr(h: &mut ElispHost, a: &[Value]) -> R {
-    let v = cdr(h, a)?;
-    let v = car(h, &[v])?;
-    car(h, &[v])
+// subr.el defines every two-, three- and four-letter composition as Lisp
+// (`caddr` is `(car (cdr (cdr x)))`), so each one inherits car/cdr's edge
+// semantics: car/cdr of nil yield nil (a short list answers nil), while car/cdr
+// of a non-nil non-cons signals `wrong-type-argument listp` naming the value
+// reached at that step. OPS is the letters between `c` and `r`, applied
+// right-to-left: `cxr(h, a, "add")` is caddr. Every name is listed in
+// `host::LISP_LEVEL_ARITY`, because a wrong argument count in Emacs is caught
+// by exec_byte_code and reported as `(1 . 1)`, not as the function.
+fn cxr(h: &mut ElispHost, a: &[Value], ops: &str) -> R {
+    let mut v = a[0].clone();
+    for op in ops.bytes().rev() {
+        v = if op == b'a' {
+            car(h, &[v])?
+        } else {
+            cdr(h, &[v])?
+        };
+    }
+    Ok(v)
 }
-fn cadar(h: &mut ElispHost, a: &[Value]) -> R {
-    let v = car(h, a)?;
-    let v = cdr(h, &[v])?;
-    car(h, &[v])
+macro_rules! cxr_subrs {
+    ($($f:ident $ops:literal),* $(,)?) => {
+        $(fn $f(h: &mut ElispHost, a: &[Value]) -> R { cxr(h, a, $ops) })*
+        /// Every c[ad]+r subr as `(NAME, FN)`, for `install`.
+        const CXR_SUBRS: &[(&str, crate::host::SubrFn)] =
+            &[$((concat!("c", $ops, "r"), $f)),*];
+    };
 }
-fn cdaar(h: &mut ElispHost, a: &[Value]) -> R {
-    let v = car(h, a)?;
-    let v = car(h, &[v])?;
-    cdr(h, &[v])
-}
-fn cdadr(h: &mut ElispHost, a: &[Value]) -> R {
-    let v = cdr(h, a)?;
-    let v = car(h, &[v])?;
-    cdr(h, &[v])
-}
-fn cddar(h: &mut ElispHost, a: &[Value]) -> R {
-    let v = car(h, a)?;
-    let v = cdr(h, &[v])?;
-    cdr(h, &[v])
-}
-// cl-lib 2-level aliases (cl-caar/cl-cadr/cl-cdar/cl-cddr), identical to the
-// non-prefixed forms.
-fn cl_caar(h: &mut ElispHost, a: &[Value]) -> R {
-    let v = car(h, a)?;
-    car(h, &[v])
-}
-fn cl_cadr(h: &mut ElispHost, a: &[Value]) -> R {
-    let v = cdr(h, a)?;
-    car(h, &[v])
-}
-fn cl_cdar(h: &mut ElispHost, a: &[Value]) -> R {
-    let v = car(h, a)?;
-    cdr(h, &[v])
-}
-fn cl_cddr(h: &mut ElispHost, a: &[Value]) -> R {
-    let v = cdr(h, a)?;
-    cdr(h, &[v])
-}
+cxr_subrs!(
+    caar "aa", cadr "ad", cdar "da", cddr "dd",
+    caaar "aaa", caadr "aad", cadar "ada", caddr "add",
+    cdaar "daa", cdadr "dad", cddar "dda", cdddr "ddd",
+    caaaar "aaaa", caaadr "aaad", caadar "aada", caaddr "aadd",
+    cadaar "adaa", cadadr "adad", caddar "adda", cadddr "addd",
+    cdaaar "daaa", cdaadr "daad", cdadar "dada", cdaddr "dadd",
+    cddaar "ddaa", cddadr "ddad", cdddar "ddda", cddddr "dddd",
+);
 
 // ── predicates ──
 fn null_fn(_h: &mut ElispHost, a: &[Value]) -> R {
@@ -9219,16 +9208,15 @@ pub fn install(h: &mut ElispHost) {
     s("length", 1, Some(1), length_fn);
     s("nth", 2, Some(2), nth_fn);
     s("nthcdr", 2, Some(2), nthcdr_fn);
-    // c[ad]+r combinators (3-level completers + cl-lib 2-level aliases)
-    s("caadr", 1, Some(1), caadr);
-    s("cadar", 1, Some(1), cadar);
-    s("cdaar", 1, Some(1), cdaar);
-    s("cdadr", 1, Some(1), cdadr);
-    s("cddar", 1, Some(1), cddar);
-    s("cl-caar", 1, Some(1), cl_caar);
-    s("cl-cadr", 1, Some(1), cl_cadr);
-    s("cl-cdar", 1, Some(1), cl_cdar);
-    s("cl-cddr", 1, Some(1), cl_cddr);
+    // c[ad]+r compositions, two to four letters, plus the cl-lib prefixed
+    // two-letter names (the prelude aliases the three- and four-letter ones).
+    for (name, f) in CXR_SUBRS {
+        s(name, 1, Some(1), *f);
+    }
+    s("cl-caar", 1, Some(1), caar);
+    s("cl-cadr", 1, Some(1), cadr);
+    s("cl-cdar", 1, Some(1), cdar);
+    s("cl-cddr", 1, Some(1), cddr);
     // vectors
     s("vector", 0, None, vector_fn);
     s("make-vector", 2, Some(2), make_vector);
