@@ -5341,7 +5341,7 @@ separate members and stopped matching `^`. Members now go through one
 
 ### Residue this round did NOT close
 
-- **`cl-member`'s `:if` / `:if-not` keywords.** `cl--parsing-keywords` lists them
+- **`cl-member`'s `:if` / `:if-not` keywords.** *(Closed in round 28, R28-A.)* `cl--parsing-keywords` lists them
   on both emacs-30 and emacs-31 even though the docstring does not, and
   `cl--check-test-nokey` consults `cl-if` when `cl-test` is nil:
   `(cl-member 1 '(1 2) :if #'cl-evenp)` is `(2)` in Emacs and `(1 2)` here.
@@ -5349,7 +5349,7 @@ separate members and stopped matching `^`. Members now go through one
   thirteen sites, so closing this is a change to the whole keyword-parsing
   helper, not to `cl-member`.
 - **`cl-nunion`, `cl-nintersection`, `cl-nset-difference`, `cl-nsubst` are
-  void.** In Emacs each is a two-line delegation to its non-destructive
+  void.** *(Closed in round 28, R28-D.)* In Emacs each is a two-line delegation to its non-destructive
   counterpart (`cl-seq.el`), and elisprs already has all four counterparts plus
   the sibling `cl-nset-exclusive-or` / `cl-nsubstitute`. Measured, not fixed.
 - **Ninety-eight other names present in Emacs and void here**, from a sweep of
@@ -5365,6 +5365,88 @@ separate members and stopped matching `^`. Members now go through one
   explicitly-numbered groups** picks the last emitted one here. Emacs has a
   single register per number and elisprs has two distinct fancy-regex groups, so
   no positional mapping can be right for both branches.
+
+## Round 28 — round 27's residue: `:if`, the void cl-lib names, and aliases of intercepted primitives
+
+**Oracle: GNU Emacs 31.1**, for the same reason as round 27. Every definition
+ported here — `cl--parsing-keywords`, `cl--check-test-nokey`,
+`cl--check-match`, `cl-tree-equal`, the `cl-map*` family, the destructive set
+operations, subr.el's `c[ad]+r` accessors and gv.el's alias rule — was read
+from the 31.1 sources and is unchanged from emacs-30 on those lines.
+
+### R28-A. ✅ FIXED — `:if` / `:if-not` reached no keyword entry point
+
+Round 27's first residue item. `cl--parsing-keywords` binds `cl-if` for every
+function whose keyword list names it, and `cl--check-test-nokey` is
+
+```elisp
+(cond (cl-test (eq (not (funcall cl-test ,item ,x)) cl-test-not))
+      (cl-if (eq (not (funcall cl-if ,x)) cl-if-not))
+      (t (eql ,item ,x)))
+```
+
+The prelude's `cl--seq-match` had only the first and last clauses, so
+`(cl-member 1 '(1 2 3) :if #'cl-evenp)` was `(1 2 3)` where Emacs answers
+`(2 3)`, and the same for `cl-assoc`, `cl-rassoc`, `cl-position`, `cl-count`,
+`cl-find`, `cl-remove` and `cl-substitute`. It also let `:test` win over
+`:test-not`; `cl--parsing-keywords` moves `:test-not`'s function INTO `cl-test`,
+so the negated keyword wins — `(cl-member 2 '(1 2 3) :test #'< :test-not #'<)`
+is `(1 2 3)`, not `(3)`. `cl--test-fn` now builds the cond once per call from
+the keys, and `cl-sublis`, whose private copy disagreed on that precedence too,
+uses it. Regression test: `tests/parity_cl_seq_keywords.rs`,
+`if_and_if_not_keywords_reach_the_keyword_entry_points`.
+
+### R28-B. ✅ FIXED — the `c[ad]+r` family: void names, closure arity, invalid places
+
+| form | Emacs | elisprs before |
+|---|---|---|
+| `(caaaar '((((1)))))` | `1` | `(void-function caaaar)` |
+| `(cadr)` | `(wrong-number-of-arguments (1 . 1) 0)` | `… #[(x) ((car (cdr x))) (t)] 0)` |
+| `(symbol-function 'cl-caddr)` | `caddr` | `#[(x) ((caddr x)) (t)]` |
+| `(setf (caaaar x) 9)` | sets it | `Invalid place expression` |
+| `(setf (cl-caddr x) 9)` | sets it | `Invalid place expression` |
+
+subr.el defines each composition as byte-compiled Lisp, so a wrong count is
+exec_byte_code's `(1 . 1)`. They are now one Rust walker (`builtins::cxr`)
+instantiated per name and listed in `LISP_LEVEL_ARITY`; the `cl-` names are
+`defalias`es; `setf` treats any `c[ad]+r` head as set{car,cdr} of the accessor
+made of the remaining letters (what subr.el's compiler macro reduces it to) and
+follows a function alias as gv.el:112 does. Regression test:
+`every_cxr_composition_exists_is_a_place_and_reports_byte_code_arity`.
+
+### R28-C. ✅ FIXED — an alias of an intercepted primitive was not callable
+
+Found while porting `cl-multiple-value-call`, which cl-lib.el defines as
+`(defalias 'cl-multiple-value-call #'apply)`. `host::call_function` intercepts
+`apply`, `mapcar`, `sort`, `gethash` and the rest by NAME and registers a
+placeholder subr body for each; an alias missed the name match, resolved to the
+placeholder, and failed with elisprs's internal "called through its subr body"
+error. Any `(defalias 'my-map 'mapcar)` hit it. The subr branch now dispatches a
+placeholder through its target's name, after checking arity against the alias,
+so `(my-map #'1+)` still reports `(wrong-number-of-arguments my-map 1)`.
+Regression test: `tests/parity_functions_and_errors.rs`,
+`an_alias_of_an_intercepted_primitive_is_callable`.
+
+### R28-D. ✅ FIXED — void cl-lib / seq names from round 27's sweep
+
+Ported: `cl-mapc`, `cl-mapl`, `cl-mapcon`, `cl-maplist` over several lists (it
+took one), `cl-nunion`, `cl-nintersection`, `cl-nset-difference`, `cl-nsubst`,
+`cl-tree-equal` (with `cl--parsing-keywords`' "Bad keyword argument" check),
+`cl-copy-seq`, `cl-svref`, `cl-get` and its `put` place,
+`cl-multiple-value-list` / `-apply` / `-call`, `seq-copy`, `seq-random-elt`.
+Regression tests: `destructive_set_operations_and_tree_equal`,
+`cl_mapping_family`, `cl_aliases_and_seq_copy`.
+
+### Still open after round 28
+
+Rerunning round 27's sweep (every `cl-*` / `seq-*` / `string-*` /
+`hash-table-*` / `c[ad]+r` name `fboundp` under `emacs -Q` after
+`(require 'cl-lib)`, then `(fboundp …)` under `elisp`) still leaves, among others, the `cl-generic`
+dispatch internals, `cl-print`, `cl-struct-define`, `cl-tagbody` / `cl-prog`,
+`cl-defsubst`, `cl-define-compiler-macro`, `cl-with-gensyms` / `cl-once-only`,
+`cl-random` and its state, `cl-gentemp`, the `string-*rectangle` /
+`string-glyph-*` / multibyte editing helpers, and `hash-table-contains-p`,
+which is new in 31 and absent from the pinned 30.2 oracle.
 
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 

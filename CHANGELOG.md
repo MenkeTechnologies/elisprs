@@ -6,6 +6,43 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **cl-seq's keyword entry points ignored `:if` / `:if-not`.**
+  `cl--parsing-keywords` binds `cl-if` for `cl-member`, `cl-assoc`,
+  `cl-rassoc`, `cl-position`, `cl-count`, `cl-find`, `cl-remove`,
+  `cl-substitute` and `cl-sublis`, and `cl--check-test-nokey` falls back to it
+  when there is no `:test`. One matcher now builds that cond, with the negated
+  keyword winning over its positive twin as the `let*` bindings make it.
+
+  ```text
+  $ elisp -e "(cl-member 1 '(1 2 3) :if #'cl-evenp)"
+  before:  (1 2 3)
+  after:   (2 3)
+  ```
+
+- **Fourteen of the four-letter `c[ad]+r` accessors were void, and none of
+  the family reported Emacs's arity.** All two- to four-letter compositions are
+  Rust subrs generated from their letters, listed in `LISP_LEVEL_ARITY` so
+  `(cadr)` is `(wrong-number-of-arguments (1 . 1) 0)` rather than a printed
+  closure; the `cl-` three- and four-letter names are `defalias`es as in
+  cl-lib.el; and every one is a `setf` place — the four-letter ones and the
+  `cl-` aliases were `Invalid place expression`.
+- **Calling an alias of an intercepted primitive failed.** `(defalias 'my-map
+  'mapcar)` then `(my-map #'1+ '(1 2))` reached the primitive's placeholder
+  body and raised an internal error; it now dispatches through the target's
+  name after checking arity against the alias.
+- **`seq-into` rebuilt a sequence already of the target type**, so
+  `(eq l (seq-into l 'list))` was nil and a dotted list signalled; `seq-mapn`
+  converts through it, so its argument order now matches Emacs as well.
+
+### Added
+- cl-extra.el's `cl-mapc`, `cl-mapl`, `cl-mapcon`, and `cl-maplist` over
+  several lists; cl-seq.el's `cl-nunion`, `cl-nintersection`,
+  `cl-nset-difference`, `cl-nsubst` and `cl-tree-equal`; cl-lib.el's
+  `cl-copy-seq`, `cl-svref`, `cl-get` (a `setf` place), and the
+  `cl-multiple-value-list` / `-apply` / `-call` shims; seq.el's `seq-copy` and
+  `seq-random-elt`.
+
+### Fixed (earlier in this cycle)
 - **The reader rejected `#N=` / `#N#`, the syntax its own printer emits.**
   `#1=(1 2 . #1#)` reached the radix path, which had already consumed the
   digits and demanded an `r`, so it came back as
