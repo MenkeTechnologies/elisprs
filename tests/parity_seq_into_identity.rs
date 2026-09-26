@@ -28,7 +28,10 @@ fn err(src: &str) -> String {
 /// elisprs rebuilt every sequence through `append`, so all three were `nil`.
 #[test]
 fn seq_into_its_own_type_is_the_same_object() {
-    assert_eq!(eval("(let ((l (list 1 2))) (eq l (seq-into l 'list)))"), "t");
+    assert_eq!(
+        eval("(let ((l (list 1 2))) (eq l (seq-into l 'list)))"),
+        "t"
+    );
     assert_eq!(
         eval("(let ((v (vector 1 2))) (eq v (seq-into v 'vector)))"),
         "t"
@@ -46,7 +49,10 @@ fn seq_into_its_own_type_is_the_same_object() {
         err("(seq-into '(1.5) 'string)"),
         "(wrong-type-argument characterp 1.5)"
     );
-    assert_eq!(err("(seq-into 0 'vector)"), "(wrong-type-argument sequencep 0)");
+    assert_eq!(
+        err("(seq-into 0 'vector)"),
+        "(wrong-type-argument sequencep 0)"
+    );
 }
 
 /// With the dotted list kept whole, the first failure is FUNCTION's own on the
