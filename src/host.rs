@@ -6056,6 +6056,12 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 let form = args
                     .first()
                     .ok_or_else(|| intrinsic_wrong_nargs(f, args.len()))?;
+                let env = args.get(1).cloned().unwrap_or(Value::Undef);
+                match env_expand(form, &env)? {
+                    EnvHit::Expanded(e) => return Ok(e),
+                    EnvHit::Shadowed => return Ok(form.clone()),
+                    EnvHit::Miss => {}
+                }
                 // A user macro (if any) wins; otherwise fall back to the intrinsic
                 // `when`/`unless` expansions the compiler lowers as special forms.
                 if let Some(e) = macroexpand_1(form)? {
@@ -6069,7 +6075,22 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                     .first()
                     .ok_or_else(|| intrinsic_wrong_nargs(f, args.len()))?
                     .clone();
+                let env = args.get(1).cloned().unwrap_or(Value::Undef);
                 loop {
+                    match env_expand(&f, &env)? {
+                        EnvHit::Expanded(e) => {
+                            // eval.c `Fmacroexpand': an expander that answers its
+                            // own form ends the loop.
+                            let same = with_host(|h| h.values_eq(&e, &f));
+                            f = e;
+                            if same {
+                                break;
+                            }
+                            continue;
+                        }
+                        EnvHit::Shadowed => break,
+                        EnvHit::Miss => {}
+                    }
                     if let Some(e) = macroexpand_1(&f)? {
                         f = e;
                         continue;
@@ -6086,6 +6107,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 return macroexpand_all_builtin(
                     args.first()
                         .ok_or_else(|| intrinsic_wrong_nargs(f, args.len()))?,
+                    args.get(1).unwrap_or(&Value::Undef),
                 )
             }
             // (`replace-regexp-in-string` needs no interception: it is a Lisp
@@ -6424,6 +6446,46 @@ fn run_closure_inner(
     result
 }
 
+/// What a macro ENVIRONMENT says about a form's head (macroexp.el
+/// `macroexpand-1`): `(assq HEAD ENVIRONMENT)` found nothing, found an entry
+/// whose cdr is nil (the name is shadowed as a non-macro, so expansion stops
+/// there), or found an expander, which has been applied to the form's
+/// arguments.
+pub(crate) enum EnvHit {
+    Miss,
+    Shadowed,
+    Expanded(Value),
+}
+
+/// Consult ENV for FORM's head, applying the expander when there is one.
+pub(crate) fn env_expand(form: &Value, env: &Value) -> Result<EnvHit, String> {
+    let entry = with_host(|h| {
+        let Some(Obj::Cons(head, rest)) = h.obj(form) else {
+            return None;
+        };
+        let (head, rest) = (head.clone(), rest.clone());
+        let mut e = env.clone();
+        while let Some(Obj::Cons(item, next)) = h.obj(&e) {
+            if let Some(Obj::Cons(k, v)) = h.obj(item) {
+                if h.values_eq(k, &head) {
+                    return Some((v.clone(), rest));
+                }
+            }
+            e = next.clone();
+        }
+        None
+    });
+    match entry {
+        None => Ok(EnvHit::Miss),
+        Some((expander, _)) if !el_truthy(&expander) => Ok(EnvHit::Shadowed),
+        Some((expander, rest)) => {
+            let args = with_host(|h| h.list_vec(&rest)).unwrap_or_default();
+            let f = with_host(|h| h.function_designator(&expander));
+            Ok(EnvHit::Expanded(call_function(&f, &args)?))
+        }
+    }
+}
+
 /// One step of macro expansion: if `form` is `(macro-name . arg-forms)`, run the
 /// macro on the *unevaluated* arg forms and return the expansion. Else `None`.
 pub fn macroexpand_1(form: &Value) -> Result<Option<Value>, String> {
@@ -6526,7 +6588,7 @@ pub fn expand_intrinsic_macro(form: &Value) -> Option<Value> {
 /// be *both* a special variable and a macro (e.g. `delay-mode-hooks`) — expanding
 /// the binding head there loops forever.
 pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
-    macroexpand_all_impl(form, false, true)
+    macroexpand_all_impl(form, false, true, &Value::Undef)
 }
 
 /// [`macroexpand_all`] for the `eval` builtin, which does NOT apply compiler
@@ -6542,15 +6604,26 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
 /// (eval '(let ((l nil)) (add-to-list 'l 1) l) t)   ; (void-variable l)
 /// ```
 pub fn macroexpand_all_for_eval(form: &Value) -> Result<Value, String> {
-    macroexpand_all_impl(form, false, false)
+    macroexpand_all_impl(form, false, false, &Value::Undef)
 }
 
 /// `macroexpand-all` as the elisp builtin exposes it: identical to
 /// [`macroexpand_all`] but also unfolds the intrinsic `when`/`unless` macros
 /// (see [`expand_intrinsic_macro`]). Kept off the compile pipeline so the
 /// compiler's dedicated `when`/`unless` lowering (`compile_when`) still fires.
-pub fn macroexpand_all_builtin(form: &Value) -> Result<Value, String> {
-    macroexpand_all_impl(form, true, true)
+pub fn macroexpand_all_builtin(form: &Value, env: &Value) -> Result<Value, String> {
+    // macroexp.el binds `macroexpand-all-environment' around the walk, so an
+    // expander that expands its own body (`cl-tagbody', `cl-macrolet') sees
+    // the environment it was called under.
+    let depth = with_host(|h| {
+        let d = h.specdepth();
+        let sym = h.intern("macroexpand-all-environment");
+        let _ = h.specbind(&sym, env.clone());
+        d
+    });
+    let out = macroexpand_all_impl(form, true, true, env);
+    with_host(|h| h.unbind_to(depth));
+    out
 }
 
 /// `v`'s elements when it is a `(lambda ARGLIST . BODY)` form, else None.
@@ -6571,12 +6644,18 @@ fn expand_lambda_bare(
     elems: &[Value],
     expand_intrinsics: bool,
     apply_cmacros: bool,
+    env: &Value,
 ) -> Result<Value, String> {
     let mut out = Vec::with_capacity(elems.len());
     out.push(elems[0].clone());
     out.push(elems[1].clone()); // ARGLIST, untouched
     for e in &elems[2..] {
-        out.push(macroexpand_all_impl(e, expand_intrinsics, apply_cmacros)?);
+        out.push(macroexpand_all_impl(
+            e,
+            expand_intrinsics,
+            apply_cmacros,
+            env,
+        )?);
     }
     Ok(with_host(|h| h.list_from(out)))
 }
@@ -6644,9 +6723,22 @@ fn macroexpand_all_impl(
     form: &Value,
     expand_intrinsics: bool,
     apply_cmacros: bool,
+    env: &Value,
 ) -> Result<Value, String> {
     let mut f = form.clone();
     loop {
+        match env_expand(&f, env)? {
+            EnvHit::Expanded(e) => {
+                let same = with_host(|h| h.values_eq(&e, &f));
+                f = e;
+                if same {
+                    break;
+                }
+                continue;
+            }
+            EnvHit::Shadowed => break,
+            EnvHit::Miss => {}
+        }
         if let Some(e) = macroexpand_1(&f)? {
             f = e;
             continue;
@@ -6705,7 +6797,7 @@ fn macroexpand_all_impl(
             // Expand the lambda BARE — `expand_lambda_bare` does not re-add the
             // wrapper, so `#'(lambda ...)` cannot come back as
             // `#'#'(lambda ...)`.
-            let lam = expand_lambda_bare(&inner, expand_intrinsics, apply_cmacros)?;
+            let lam = expand_lambda_bare(&inner, expand_intrinsics, apply_cmacros, env)?;
             Ok(with_host(|h| h.list_from(vec![elems[0].clone(), lam])))
         }
         // Binding forms: expand each binding's INIT (never the VAR, which may name
@@ -6734,6 +6826,7 @@ fn macroexpand_all_impl(
                                         p,
                                         expand_intrinsics,
                                         apply_cmacros,
+                                        env,
                                     )?);
                                 }
                                 out.push(with_host(|h| h.list_from(np)));
@@ -6749,7 +6842,12 @@ fn macroexpand_all_impl(
             out.push(elems[0].clone());
             out.push(new_bindings);
             for e in &elems[2..] {
-                out.push(macroexpand_all_impl(e, expand_intrinsics, apply_cmacros)?);
+                out.push(macroexpand_all_impl(
+                    e,
+                    expand_intrinsics,
+                    apply_cmacros,
+                    env,
+                )?);
             }
             let _ = kw;
             Ok(with_host(|h| h.list_from(out)))
@@ -6764,7 +6862,7 @@ fn macroexpand_all_impl(
         // `cconv-make-interpreted-closure` stores the expanded body, so a
         // closure whose body contains a nested `lambda` PRINTS the `#'`.
         Some("lambda") if elems.len() >= 2 => {
-            let lam = expand_lambda_bare(&elems, expand_intrinsics, apply_cmacros)?;
+            let lam = expand_lambda_bare(&elems, expand_intrinsics, apply_cmacros, env)?;
             Ok(with_host(|h| {
                 let fsym = h.intern("function");
                 h.list_from(vec![fsym, lam])
@@ -6802,7 +6900,7 @@ fn macroexpand_all_impl(
                 // Non-nil ⇒ BODY had a `declare'; expand the rewritten form (its
                 // inner defun has the `declare' stripped, so this does not recurse).
                 if el_truthy(&replaced) {
-                    return macroexpand_all_impl(&replaced, expand_intrinsics, apply_cmacros);
+                    return macroexpand_all_impl(&replaced, expand_intrinsics, apply_cmacros, env);
                 }
             }
             let mut out = Vec::with_capacity(elems.len());
@@ -6810,7 +6908,12 @@ fn macroexpand_all_impl(
             out.push(elems[1].clone()); // NAME, untouched
             out.push(elems[2].clone()); // ARGLIST, untouched
             for e in &elems[3..] {
-                out.push(macroexpand_all_impl(e, expand_intrinsics, apply_cmacros)?);
+                out.push(macroexpand_all_impl(
+                    e,
+                    expand_intrinsics,
+                    apply_cmacros,
+                    env,
+                )?);
             }
             Ok(with_host(|h| h.list_from(out)))
         }
@@ -6823,8 +6926,10 @@ fn macroexpand_all_impl(
                 // would be `invalid-function` — `#'(lambda …)` is a form that
                 // evaluates to a closure, not a closure.
                 let expanded = match (i == 0).then(|| lambda_parts(Some(e))).flatten() {
-                    Some(parts) => expand_lambda_bare(&parts, expand_intrinsics, apply_cmacros)?,
-                    None => macroexpand_all_impl(e, expand_intrinsics, apply_cmacros)?,
+                    Some(parts) => {
+                        expand_lambda_bare(&parts, expand_intrinsics, apply_cmacros, env)?
+                    }
+                    None => macroexpand_all_impl(e, expand_intrinsics, apply_cmacros, env)?,
                 };
                 // A `defmacro' among sibling forms has to take effect BEFORE its
                 // siblings are expanded, or a macro defined and used in the same
