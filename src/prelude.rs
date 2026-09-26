@@ -427,6 +427,25 @@ pub const PRELUDE: &str = r#"
 ;; `cl-if', so a nil there also leaves both unset).
 (defun cl--if-test (pred x) (if pred (funcall pred x) (null x)))
 
+;; The same cond for the keyword entry points, built once per call from KEYS the
+;; way cl--parsing-keywords binds its variables: `:test-not' moves its function
+;; into `cl-test' and sets `cl-test-not', and `:if-not' does the same to `cl-if',
+;; so the negated keyword wins when both spellings are given. `cl-member',
+;; `cl-assoc', `cl-rassoc', `cl-position', `cl-count', `cl-find', `cl-remove',
+;; `cl-substitute' and `cl-sublis' all parse `:if'/`:if-not', so
+;; `(cl-member 1 (quote (1 2)) :if (function cl-evenp))' is `(2)', not `(1 2)'.
+;; The result is called (funcall MATCH ITEM X) — item first, element second.
+(defun cl--test-fn (keys)
+  (let* ((test (cl--getkey keys :test nil))
+         (test-not-fn (cl--getkey keys :test-not nil))
+         (test-not (and test-not-fn (setq test test-not-fn) t))
+         (if-fn (cl--getkey keys :if nil))
+         (if-not-fn (cl--getkey keys :if-not nil))
+         (if-not (and if-not-fn (setq if-fn if-not-fn) t)))
+    (cond (test (lambda (item x) (eq (not (funcall test item x)) test-not)))
+          (if-fn (lambda (_item x) (eq (not (funcall if-fn x)) if-not)))
+          (t (function eql)))))
+
 (defun cl-find-if (pred seq &rest keys)
   (let ((key (cl--getkey keys :key 'identity))
         (from-end (cl--getkey keys :from-end nil))
@@ -566,30 +585,17 @@ pub const PRELUDE: &str = r#"
   ;; Substitute per ALIST of (OLD . NEW) throughout TREE, honoring :test,
   ;; :test-not, :if, :if-not and :key against each node (including cons cells).
   ;; `:if'/`:if-not' are how `cl-subst-if' and `cl-subst-if-not' reach here.
-  (let ((test (cl--getkey keys :test nil))
-        (test-not (cl--getkey keys :test-not nil))
-        (if-fn (cl--getkey keys :if nil))
-        (if-not (cl--getkey keys :if-not nil))
-        (key (cl--getkey keys :key 'identity)))
-    (cl--sublis-rec alist tree test test-not if-fn if-not key)))
-;; cl--check-test-nokey's cond in full — :test / :test-not first, then the
-;; :if / :if-not predicate, then the implicit `eql' against the alist key.
-(defun cl--sublis-match (test test-not if-fn if-not item x)
-  (cond (test (funcall test item x))
-        (test-not (not (funcall test-not item x)))
-        (if-fn (funcall if-fn x))
-        (if-not (not (funcall if-not x)))
-        (t (eql item x))))
-(defun cl--sublis-rec (alist tree test test-not if-fn if-not key)
+  (cl--sublis-rec alist tree (cl--test-fn keys) (cl--getkey keys :key (quote identity))))
+(defun cl--sublis-rec (alist tree match key)
   (let ((keyed (funcall key tree)) (p alist) (hit nil))
     (while (and p (not hit))
-      (if (cl--sublis-match test test-not if-fn if-not (car (car p)) keyed)
+      (if (funcall match (car (car p)) keyed)
           (setq hit p)
         (setq p (cdr p))))
     (if hit (cdr (car hit))
       (if (consp tree)
-          (cons (cl--sublis-rec alist (car tree) test test-not if-fn if-not key)
-                (cl--sublis-rec alist (cdr tree) test test-not if-fn if-not key))
+          (cons (cl--sublis-rec alist (car tree) match key)
+                (cl--sublis-rec alist (cdr tree) match key))
         tree))))
 (defun cl-nsublis (alist tree &rest keys)
   ;; elisprs rebuilds the tree rather than mutating it; the return value is
@@ -1859,7 +1865,7 @@ TYPE nil maps for side effects only and returns nil."
 (defun cl-subseq (seq start &optional end) (seq-subseq seq start end))
 (defun cl--in-bounds (i start end) (and (>= i start) (or (null end) (< i end))))
 (defun cl-position (item seq &rest keys)
-  (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
+  (let ((match (cl--test-fn keys))
         (key (cl--getkey keys :key 'identity))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
         (from-end (cl--getkey keys :from-end nil))
@@ -1867,18 +1873,18 @@ TYPE nil maps for side effects only and returns nil."
     ;; With :from-end, keep scanning so R ends up the last match.
     (while (and lst (or from-end (not r)))
       (when (and (cl--in-bounds i start end)
-                 (cl--seq-match test test-not item (funcall key (car lst))))
+                 (funcall match item (funcall key (car lst))))
         (setq r i))
       (setq i (1+ i) lst (cdr lst)))
     r))
 (defun cl-count (item seq &rest keys)
-  (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
+  (let ((match (cl--test-fn keys))
         (key (cl--getkey keys :key 'identity))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
         (lst (append seq nil)) (i 0) (n 0))
     (while lst
       (when (and (cl--in-bounds i start end)
-                 (cl--seq-match test test-not item (funcall key (car lst))))
+                 (funcall match item (funcall key (car lst))))
         (setq n (1+ n)))
       (setq i (1+ i) lst (cdr lst)))
     n))
@@ -1908,13 +1914,13 @@ TYPE nil maps for side effects only and returns nil."
   (if pred (apply 'cl-position-if (lambda (x) (not (funcall pred x))) seq keys)
     (apply 'cl-position-if nil seq keys)))
 (defun cl-find (item seq &rest keys)
-  (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
+  (let ((match (cl--test-fn keys))
         (key (cl--getkey keys :key 'identity)) (from-end (cl--getkey keys :from-end nil))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
         (lst (cl--search-seq seq)) (i 0) (r nil) (found nil))
     (while (and lst (or from-end (not found)))
       (when (and (cl--in-bounds i start end)
-                 (cl--seq-match test test-not item (funcall key (car lst))))
+                 (funcall match item (funcall key (car lst))))
         (setq r (car lst) found t))
       (setq i (1+ i) lst (cdr lst)))
     r))
@@ -2617,19 +2623,19 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 ;; element's comparison through here, so they reported the tail too.
 (defun cl-member (item lst &rest keys)
   (if keys
-      (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
+      (let ((match (cl--test-fn keys))
             (key (cl--getkey keys :key 'identity)) (r nil))
         (while (and lst (not r))
-          (if (cl--seq-match test test-not item (funcall key (car lst)))
+          (if (funcall match item (funcall key (car lst)))
               (setq r lst) (setq lst (cdr lst))))
         r)
     (memql item lst)))
 (defun cl-assoc (item alist &rest keys)
-  (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
+  (let ((match (cl--test-fn keys))
         (key (cl--getkey keys :key 'identity)) (r nil))
     (while (and alist (not r))
       (let ((pair (car alist)))
-        (if (and (consp pair) (cl--seq-match test test-not item (funcall key (car pair))))
+        (if (and (consp pair) (funcall match item (funcall key (car pair))))
             (setq r pair) (setq alist (cdr alist)))))
     r))
 (defun cl-member-if (pred lst &rest keys)
@@ -2651,11 +2657,11 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
   (if pred (apply 'cl-assoc-if (lambda (x) (not (funcall pred x))) alist keys)
     (apply 'cl-assoc-if nil alist keys)))
 (defun cl-rassoc (item alist &rest keys)
-  (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
+  (let ((match (cl--test-fn keys))
         (key (cl--getkey keys :key 'identity)) (r nil))
     (while (and alist (not r))
       (let ((pair (car alist)))
-        (if (and (consp pair) (cl--seq-match test test-not item (funcall key (cdr pair))))
+        (if (and (consp pair) (funcall match item (funcall key (cdr pair))))
             (setq r pair) (setq alist (cdr alist)))))
     r))
 (defun cl-rassoc-if (pred alist &rest keys)
@@ -2668,13 +2674,6 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 (defun cl-rassoc-if-not (pred alist &rest keys)
   (if pred (apply 'cl-rassoc-if (lambda (x) (not (funcall pred x))) alist keys)
     (apply 'cl-rassoc-if nil alist keys)))
-;; Element-match predicate honoring :test / :test-not (default `eql'), mirroring
-;; cl--check-test-nokey in cl-seq.el. X is the already-:key-extracted value; the
-;; test is called (funcall TEST item x) — item first, element second.
-(defun cl--seq-match (test test-not item x)
-  (cond (test (funcall test item x))
-        (test-not (not (funcall test-not item x)))
-        (t (eql item x))))
 ;; Ascending list of indices in LST to act on: those within [START,END) for
 ;; which (funcall matchp ELT) is non-nil, limited to COUNT taken from the front,
 ;; or from the back when FROM-END is non-nil.
@@ -2704,19 +2703,19 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
     (cl--like (nreverse out) seq)))
 (defun cl-remove (item seq &rest keys)
   ;; :test/:test-not/:key/:count/:start/:end/:from-end (cl-seq.el semantics).
-  (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
+  (let ((match (cl--test-fn keys))
         (key (cl--getkey keys :key 'identity)) (count (cl--getkey keys :count nil))
         (from-end (cl--getkey keys :from-end nil))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil)))
-    (cl--remove-by (lambda (x) (cl--seq-match test test-not item (funcall key x)))
+    (cl--remove-by (lambda (x) (funcall match item (funcall key x)))
                    seq start end count from-end)))
 (defun cl-delete (item seq &rest keys) (apply (function cl-remove) item seq keys))
 (defun cl-substitute (new old seq &rest keys)
-  (let ((test (cl--getkey keys :test nil)) (test-not (cl--getkey keys :test-not nil))
+  (let ((match (cl--test-fn keys))
         (key (cl--getkey keys :key 'identity)) (count (cl--getkey keys :count nil))
         (from-end (cl--getkey keys :from-end nil))
         (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil)))
-    (cl--subst-by (lambda (x) (cl--seq-match test test-not old (funcall key x)))
+    (cl--subst-by (lambda (x) (funcall match old (funcall key x)))
                   new seq start end count from-end)))
 (defun cl-substitute-if (new pred seq &rest keys)
   (let ((key (cl--getkey keys :key 'identity)) (count (cl--getkey keys :count nil))
