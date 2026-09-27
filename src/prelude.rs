@@ -2223,6 +2223,10 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 ;; NAME -> index of its first slot: 1 for a named struct (a record, or a
 ;; `:type'd one with `:named'), 0 for an unnamed `:type list'/`:type vector'.
 (defvar cl-struct--base nil)
+;; NAME -> its `:type' option: `list', `vector', or nil for a record.  This is
+;; cl-macs.el's `cl--struct-class-type', read by `cl-struct-sequence-type' and
+;; `cl-struct-slot-info'.
+(defvar cl-struct--type nil)
 (defun cl-struct--is-a (tag target)
   (let ((res nil))
     (while (and tag (not res))
@@ -2332,6 +2336,7 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
     ;; time so a later (:include this) can read them.
     (setq cl-struct--slots (cons (cons name all-slots) cl-struct--slots))
     (setq cl-struct--base (cons (cons name base) cl-struct--base))
+    (setq cl-struct--type (cons (cons name stype) cl-struct--type))
     (dolist (cspec constructors)
       (let ((cname (car cspec)) (ckind (cdr cspec)))
         (if (eq ckind 'kw)
@@ -2429,22 +2434,37 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
         (setq ros (cdr ros))
         (setq j (1+ j))))
     `(progn ,@(reverse forms) ',name)))
-;; Generic struct-slot introspection. Slots are stored as bare symbols (no
-;; default) or `(NAME DEFAULT)' pairs; slot 0 of the vector is the type tag.
+;; Generic struct-slot introspection (cl-macs.el).  Slots are stored as bare
+;; symbols (no default) or `(NAME DEFAULT . OPTS)' specs; CL-STRUCT--BASE is the
+;; index of the first one.  An unknown STRUCT-TYPE is `cl--struct-get-class''s
+;; "%S is not a struct name" error.
+(defun cl-struct--slots-of (struct-type)
+  (let ((e (assq struct-type cl-struct--slots)))
+    (unless e (error "%S is not a struct name" struct-type))
+    (cdr e)))
+(defun cl-struct-sequence-type (struct-type)
+  "Return the sequence used to build STRUCT-TYPE: `vector', `list', or nil."
+  (cl-struct--slots-of struct-type)
+  (cdr (assq struct-type cl-struct--type)))
 (defun cl-struct-slot-offset (struct-type slot-name)
-  (let ((slots (cdr (assq struct-type cl-struct--slots)))
+  (let ((slots (cl-struct--slots-of struct-type))
         (i (or (cdr (assq struct-type cl-struct--base)) 1))
         (idx nil))
     (dolist (s slots)
       (when (eq (if (consp s) (car s) s) slot-name) (setq idx i))
       (setq i (1+ i)))
-    (or idx (error "Invalid slot name: %S, %S" struct-type slot-name))))
+    (or idx (signal 'cl-struct-unknown-slot (list struct-type slot-name)))))
 (defun cl-struct-slot-value (struct-type slot-name inst)
   (aref inst (cl-struct-slot-offset struct-type slot-name)))
+;; A record's info starts with the bare `(cl-tag-slot)' entry; a `:named'
+;; `:type'd struct carries the tag as a real slot, `(cl-tag-slot nil)'; an
+;; unnamed one has no tag entry at all.
 (defun cl-struct-slot-info (struct-type)
-  (cons '(cl-tag-slot)
-        (mapcar (lambda (s) (if (consp s) s (list s nil)))
-                (cdr (assq struct-type cl-struct--slots)))))
+  (let ((slots (mapcar (lambda (s) (if (consp s) s (list s nil)))
+                       (cl-struct--slots-of struct-type))))
+    (cond ((null (cdr (assq struct-type cl-struct--type))) (cons '(cl-tag-slot) slots))
+          ((eq (cdr (assq struct-type cl-struct--base)) 1) (cons '(cl-tag-slot nil) slots))
+          (t slots))))
 (defmacro and-let* (bindings &rest body)
   ;; Like when-let* but with no body returns the last bound value (SRFI-2).
   (if-let--chain bindings
@@ -3315,6 +3335,7 @@ function may, `gethash' on such a table included."
 (put 'quit 'error-conditions '(quit))
 (define-error 'minibuffer-quit "Quit" 'quit)
 (define-error 'args-out-of-range "Args out of range")
+(define-error 'cl-struct-unknown-slot "struct has no slot")
 (define-error 'arith-error "Arithmetic error")
 (define-error 'type-mismatch "Types do not match")
 (define-error 'wrong-type-argument "Wrong type argument")
