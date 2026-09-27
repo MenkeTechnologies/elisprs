@@ -6,6 +6,12 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **`cl-with-accessors` and `cl-struct-sequence-type` were void.** Both are
+  ported from Emacs 31.1 cl-macs.el; `cl-defstruct` now records its `:type`,
+  so `cl-struct-slot-info` omits the tag entry for an unnamed `:type`d struct
+  and shows `(cl-tag-slot nil)` for a `:named` one, an unknown slot signals
+  `cl-struct-unknown-slot`, and an unknown struct is
+  `"NAME is not a struct name"`.
 - **Backquote was expanded by the reader.** `` `X ``, `,X` and `,@X` now read
   as `` (\` X) ``, `(\, X)` and `(\,@ X)` and expand through a port of
   backquote.el, so nested backquotes keep their levels (cl-once-only's

@@ -5536,6 +5536,52 @@ the `cl-generic` / `cl-find-method` dispatch internals, `cl-print-object` /
 `string-*rectangle` helpers, `string-glyph-compose` / `-decompose`, and
 `string-make-unibyte` / `string-make-multibyte`.
 
+## Round 30 — `cl-with-accessors`, and struct introspection by struct type
+
+**Oracle: GNU Emacs 31.1.** Two names from round 29's void list, and the
+struct introspection functions next to them. Definitions ported from the 31.1
+`cl-macs.el`; expectations from `emacs -Q --batch` with `(require 'cl-lib)`.
+
+### R30-A. ✅ FIXED — `cl-with-accessors` was void
+
+Ported as cl-macs.el writes it: each `(NAME ACCESSOR)` binding becomes a
+`cl-symbol-macrolet` entry `(NAME (ACCESSOR INSTANCE))` over a single
+evaluation of INSTANCE (`cl-once-only`), so `setf`, `setq` and `cl-incf` on
+NAME write through the accessor.
+
+| form | Emacs 31.1 |
+|---|---|
+| `(cl-with-accessors ((a pt-x) (b pt-y)) p (setf a 10) (setq b (+ a b)) (list a b p))` | `(10 12 #s(pt 10 12))` |
+| `(cl-with-accessors ((h car) (tl cdr)) (progn (cl-incf n) c) (cl-incf h) (list h tl c n))` | `(2 (2) (2 2) 1)` |
+| `(cl-with-accessors () '(7) 3 4)` | `4` |
+| `(macroexpand '(cl-with-accessors ((1 car)) x y))` | `(error "Malformed ‘cl-with-accessors’ binding: (1 car)")` |
+
+### R30-B. ✅ FIXED — `cl-struct-sequence-type` was void, and slot info ignored `:type`
+
+`cl-defstruct` did not record its `:type`, so there was nothing to answer
+`cl-struct-sequence-type` from, and `cl-struct-slot-info` put `(cl-tag-slot)`
+first for every struct:
+
+| form | Emacs 31.1 | elisprs before |
+|---|---|---|
+| `(cl-struct-sequence-type 'a2)` on `(:type list)` | `list` | `void-function` |
+| `(cl-struct-slot-info 'a2)` on `(:type list)` | `((x nil))` | `((cl-tag-slot) (x nil))` |
+| `(cl-struct-slot-info 'a3)` on `(:type vector) :named` | `((cl-tag-slot nil) (x nil))` | `((cl-tag-slot) (x nil))` |
+| `(cl-struct-slot-offset 'a1 'q)` | `(cl-struct-unknown-slot a1 q)` | `(error "Invalid slot name: a1, q")` |
+| `(cl-struct-slot-info 'nosuch)` | `(error "nosuch is not a struct name")` | `((cl-tag-slot))` |
+
+The type is kept in `cl-struct--type` beside `cl-struct--base`; an unknown
+struct is `cl--struct-get-class`'s error in all three functions.
+Regression tests for both: `tests/parity_cl_macs_remaining_surface.rs`.
+
+### Still open after round 30
+
+Round 29's void list less `cl-with-accessors` and `cl-struct-sequence-type`
+(the sweep was not re-run this round). `string-make-unibyte` /
+`string-make-multibyte` stay void by design until strings carry a
+unibyte/multibyte flag: elisprs's `string-to-unibyte` and friends are
+identity functions today.
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the
