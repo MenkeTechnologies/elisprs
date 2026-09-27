@@ -130,3 +130,33 @@ fn float_limits_and_misc() {
         "\"a\nb\""
     );
 }
+
+#[test]
+fn with_accessors_binds_places_over_one_evaluation() {
+    // cl-macs.el: each NAME is a symbol macro for (ACCESSOR INSTANCE), so setf,
+    // setq and cl-incf write through; INSTANCE is evaluated once (cl-once-only).
+    assert_eq!(
+        eval(
+            "(progn (cl-defstruct pt x y) \
+              (let ((p (make-pt :x 1 :y 2))) \
+                (cl-with-accessors ((a pt-x) (b pt-y)) p \
+                  (setf a 10) (setq b (+ a b)) (list a b p))))"
+        ),
+        "(10 12 #s(pt 10 12))"
+    );
+    assert_eq!(
+        eval(
+            "(let ((c (list 1 2)) (n 0)) \
+              (cl-with-accessors ((h car) (tl cdr)) (progn (cl-incf n) c) \
+                (cl-incf h) (list h tl c n)))"
+        ),
+        "(2 (2) (2 2) 1)"
+    );
+    // An empty body is nil; no bindings is just the body.
+    assert_eq!(eval("(cl-with-accessors ((h car)) '(7))"), "nil");
+    assert_eq!(eval("(cl-with-accessors () '(7) 3 4)"), "4");
+    assert_eq!(
+        eval("(condition-case e (macroexpand '(cl-with-accessors ((1 car)) x y)) (error e))"),
+        "(error \"Malformed ‘cl-with-accessors’ binding: (1 car)\")"
+    );
+}
