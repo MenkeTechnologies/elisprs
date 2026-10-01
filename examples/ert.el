@@ -8,6 +8,9 @@
 ;; failed, so this file doubles as a CI regression gate.
 (message "== ERT demo ==")
 
+;; `signal' needs a defined error symbol (one with `error-conditions').
+(define-error 'my-error "My error")
+
 (ert-deftest my-math-test ()
   "Ensure basic addition works."
   (should (= (+ 1 2) 3))

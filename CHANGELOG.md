@@ -13,6 +13,11 @@ All notable changes to elisprs are documented here. The format follows
   rejected a reversed region. Newly defined: `move-to-column`,
   `insert-buffer-substring`, `compare-buffer-substrings`, sort.el, tabify.el,
   `keep-lines`/`flush-lines`, `current-word`, `point-min-marker` and more.
+- **The native JSON API is a port of json.c** (`json-parse-string`,
+  `json-parse-buffer`, `json-serialize`, `json-insert`): Emacs's error data,
+  surrogate pairs, argument checks and serializer type rules. **`signal`**
+  rejects a symbol without `error-conditions` as Emacs 31.1 does, and every
+  standard error condition is defined.
 - **`cl-with-accessors` and `cl-struct-sequence-type` were void.** Both are
   ported from Emacs 31.1 cl-macs.el; `cl-defstruct` now records its `:type`,
   so `cl-struct-slot-info` omits the tag entry for an unnamed `:type`d struct

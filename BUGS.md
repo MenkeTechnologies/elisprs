@@ -5677,6 +5677,42 @@ worked through. Regression tests: `tests/parity_sort_tabify_and_function_cells.r
   `function-alias-p`, `add-to-ordered-list`, `degrees-to-radians` /
   `radians-to-degrees`.
 
+### Round 32, second batch — json.c and `signal`
+
+Regression tests: `tests/parity_json_and_signal.rs`.
+
+| form | Emacs 31.1 | elisprs before |
+|---|---|---|
+| `(json-parse-string "[1,")` | `(json-end-of-file 1 nil 3)` | `(args-out-of-range "[1," 3)` |
+| `(json-parse-string "[1] x")` | `(json-trailing-content 1 nil 5)` | `[1]` |
+| `(json-parse-string "\"\\q\"")` | `(json-escape-sequence-error 1 nil 3)` | `"q"` |
+| `(json-parse-string "\"\\u00e9\\ud83d\\ude00\"")` | `"é😀"` | `"é"` (pair dropped) |
+| `(json-parse-string "1e400")` | `(json-number-out-of-range-error 1 nil 5)` | `1.0e+INF` |
+| `(json-parse-string "1" :object-type 'foo)` | `(error "One of hash-table, alist or plist should be specified" foo)` | `1` |
+| `(json-parse-buffer)` | reads from point | void-function |
+| `(json-serialize '((a . foo)))` | `(wrong-type-argument json-value-p foo)` | `"{\"a\":\"foo\"}"` |
+| `(json-serialize 1.0e+INF)` | `(error "JSON does not allow Inf or NaN" 1.0e+INF)` | `"1.0e+INF"` |
+| `(signal 'undefined '(1))` | `(error "Invalid error symbol" undefined)` | `(undefined 1)` |
+| `(signal nil '(error "x"))` | `(error "x")` | `(nil error "x")` |
+| `(signal "str" nil)` | `(wrong-type-argument symbolp "str")` | `(error)` |
+
+- **The native JSON API is json.c's** (src/json.rs), replacing a shim over
+  json.el: RFC 8259 grammar, `(SYMBOL LINE nil POSITION)` error data, surrogate
+  pairs, bignum integers, `json-parse-buffer`, `json-insert`,
+  `json-available-p`, and the serializer's alist/plist/hash-table rules
+  (first duplicate key wins, `consp`/`symbolp`/`listp` errors in json.c's order,
+  upper-case `\u00XX` escapes).
+- **`signal`** follows eval.c 31.1: a nil symbol takes `(car DATA)`, the symbol
+  must be a symbol with `error-conditions`, otherwise `Invalid error symbol`.
+  Every condition `emacs -Q` seeds is now defined (`json-*`, `cl-no-method`,
+  `domain-error`, `singularity-error`, `underflow-error`, `user-search-failed`,
+  `ert-test-failed`, ...), and `cl-no-applicable-method`/`cl-no-next-method`
+  inherit `cl-no-method`. Two tests that signalled an undefined `my-err`
+  (`tests/eval.rs`, `tests/builtins.rs`) now `define-error` it first.
+- Still open: `json-serialize` returns a multibyte string; Emacs returns a
+  unibyte UTF-8 one (`"é"` prints as `"\303\251"`). elisprs strings carry no
+  unibyte flag.
+
 ### Still open after round 32
 
 - `capitalize`/`upcase` of a propertized string shares the property plist with

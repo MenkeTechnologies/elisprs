@@ -16,6 +16,7 @@ pub mod dap;
 pub mod freevars;
 pub mod host;
 pub mod intercepts;
+pub mod json;
 pub mod lsp;
 pub mod prelude;
 pub mod reader;

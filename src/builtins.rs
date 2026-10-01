@@ -465,7 +465,7 @@ fn ge(h: &mut ElispHost, a: &[Value]) -> R {
 // `eq` is object identity. Fixnums and interned symbols/heap handles compare by
 // value, but two distinct float *objects* are never `eq` (matching Emacs:
 // `(eq 1.0 1.0)` => nil). `eql` adds by-value float comparison on top of `eq`.
-fn el_eq(h: &ElispHost, a: &Value, b: &Value) -> bool {
+pub(crate) fn el_eq(h: &ElispHost, a: &Value, b: &Value) -> bool {
     if is_nil(a) && is_nil(b) {
         return true;
     }
@@ -2420,12 +2420,62 @@ fn user_error_fn(h: &mut ElispHost, a: &[Value]) -> R {
     h.set_pending_error(&full, obj);
     Err(full)
 }
+/// `(get SYM PROP)` read from Rust. Symbol plists live in the prelude's
+/// `symbol-plist--table` (an `eq` table keyed by the symbol), so this is the
+/// same lookup the prelude's `get` does, without a round trip through elisp.
+fn symbol_get(h: &mut ElispHost, sym: &Value, prop: &str) -> Value {
+    let table_sym = h.intern("symbol-plist--table");
+    let Ok(table) = h.get_dynamic_value(&table_sym) else {
+        return Value::Undef;
+    };
+    let plist = gethash(h, &[sym.clone(), table]).unwrap_or(Value::Undef);
+    let prop = h.intern(prop);
+    h.plist_get_eq(&plist, &prop)
+}
+/// `(signal ERROR-SYMBOL DATA)` — eval.c `Fsignal` / `signal_or_quit`, 31.1.
+///
+/// A nil ERROR-SYMBOL takes the symbol from `(car DATA)` (and the rest as
+/// DATA); a nil or non-cons DATA makes it `error`. The symbol must be a symbol
+/// (`wrong-type-argument symbolp`) and must have `error-conditions`, or the
+/// signal becomes `(error "Invalid error symbol" SYM)`; a non-list conditions
+/// property is `wrong-type-argument listp`.
 fn signal_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    // Error object: (ERROR-SYMBOL . DATA) — preserve the actual data list.
-    let sym = h.sym_name(&a[0]).unwrap_or_else(|| "error".to_string());
-    let display = h.print(a.get(1).unwrap_or(&Value::Undef), true);
-    let symv = h.intern(&sym);
-    let data = a.get(1).cloned().unwrap_or(Value::Undef);
+    let (mut symv, mut data) = (a[0].clone(), a[1].clone());
+    if is_nil(&symv) {
+        match h.obj(&data) {
+            Some(Obj::Cons(car, cdr)) => {
+                let (car, cdr) = (car.clone(), cdr.clone());
+                symv = car;
+                data = cdr;
+            }
+            _ => symv = h.intern("error"),
+        }
+    }
+    let is_symbol =
+        matches!(symv, Value::Bool(true)) || matches!(h.obj(&symv), Some(Obj::Symbol(_)));
+    if !is_symbol {
+        return Err(format!(
+            "wrong-type-argument: symbolp {}",
+            h.print(&symv, true)
+        ));
+    }
+    let conditions = symbol_get(h, &symv, "error-conditions");
+    if is_nil(&conditions) {
+        let msg = h.new_string("Invalid error symbol");
+        let err = h.intern("error");
+        let obj = h.list_from(vec![err, msg, symv.clone()]);
+        let text = format!("error: Invalid error symbol: {}", h.print(&symv, true));
+        h.set_pending_error(&text, obj);
+        return Err(text);
+    }
+    if !matches!(h.obj(&conditions), Some(Obj::Cons(..))) {
+        return Err(format!(
+            "wrong-type-argument: listp {}",
+            h.print(&conditions, true)
+        ));
+    }
+    let sym = h.sym_name(&symv).unwrap_or_else(|| "error".to_string());
+    let display = h.print(&data, true);
     let obj = h.cons(symv, data);
     let msg = format!("{sym}: {display}");
     h.set_pending_error(&msg, obj);
@@ -3268,7 +3318,7 @@ fn hash_into(h: &ElispHost, test: u8, v: &Value, depth: u32, st: &mut impl std::
     }
 }
 
-fn ht_ref<'a>(h: &'a ElispHost, v: &Value) -> Result<&'a ElHashTable, String> {
+pub(crate) fn ht_ref<'a>(h: &'a ElispHost, v: &Value) -> Result<&'a ElHashTable, String> {
     match h.obj(v) {
         Some(Obj::HashTable(t)) => Ok(t),
         _ => Err(format!(
@@ -9615,6 +9665,17 @@ pub fn install(h: &mut ElispHost) {
     s("fset", 2, Some(2), fset);
     s("fboundp", 1, Some(1), fboundp);
     s("fmakunbound", 1, Some(1), fmakunbound);
+    // json.c
+    s("json-parse-string", 1, None, crate::json::json_parse_string);
+    s("json-parse-buffer", 0, None, crate::json::json_parse_buffer);
+    s("json-serialize", 1, None, crate::json::json_serialize);
+    s("json-insert", 1, None, crate::json::json_insert);
+    s(
+        "json-available-p",
+        0,
+        Some(0),
+        crate::json::json_available_p,
+    );
     s("indirect-function", 1, Some(2), indirect_function);
     // The higher-order primitives run in `host::call_function`, which intercepts
     // them by name *before* any function-cell lookup so they never execute

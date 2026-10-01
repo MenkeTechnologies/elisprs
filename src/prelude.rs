@@ -3317,14 +3317,23 @@ function may, `gethash' on such a table included."
 ;; `record'/`make-record' are `Obj::Record' primitives (see builtins.rs); a record
 ;; is a distinct type from a vector, with the type symbol in slot 0.
 (defun define-error (name message &optional parent)
-  ;; Register NAME as an error condition: its conditions are NAME plus PARENT's.
-  (let* ((parent (or parent 'error))
-         (parents (if (listp parent) parent (list parent)))
-         (conds (cons name (apply (function append)
-                                  (mapcar (lambda (p) (get p 'error-conditions)) parents)))))
-    (put name 'error-conditions conds)
-    (put name 'error-message message)
-    name))
+  "Define NAME as a new error signal (subr.el).
+PARENT is either a signal or a list of signals from which it inherits.
+Defaults to `error'.  The conditions are de-duplicated, so two parents that
+share `error' list it once."
+  (unless parent (setq parent 'error))
+  (let ((conditions
+         (if (consp parent)
+             (apply #'append
+                    (mapcar (lambda (parent)
+                              (cons parent
+                                    (or (get parent 'error-conditions)
+                                        (error "Unknown signal `%s'" parent))))
+                            parent))
+           (cons parent (get parent 'error-conditions)))))
+    (put name 'error-conditions
+         (delete-dups (copy-sequence (cons name conditions))))
+    (when message (put name 'error-message message))))
 ;; Seed the standard error symbols (so `error-message-string' / `get' match Emacs).
 (define-error 'error "error" nil)
 (put 'error 'error-conditions '(error))
@@ -3379,6 +3388,34 @@ function may, `gethash' on such a table included."
 (define-error 'setting-constant "Attempt to set a constant symbol")
 (define-error 'recursion-error "Excessive recursive calling error")
 (define-error 'excessive-lisp-nesting "Lisp nesting exceeds `max-lisp-eval-depth'" 'recursion-error)
+;; The remaining standard error symbols `emacs -Q' seeds (data.c, eval.c,
+;; json.c, search.c, ...), messages and parents as Emacs 31.1 reports them.
+;; `signal' refuses a symbol with no `error-conditions', so every condition
+;; a builtin or library raises must be registered.
+(define-error 'excessive-variable-binding "Variable binding depth exceeds max-specpdl-size" 'recursion-error)
+(define-error 'domain-error "Arithmetic domain error" 'arith-error)
+(define-error 'singularity-error "Arithmetic singularity error" 'domain-error)
+(define-error 'underflow-error "Arithmetic underflow error" 'range-error)
+(define-error 'cyclic-function-indirection "Symbol's chain of function indirections contains a loop")
+(define-error 'inhibited-interaction "User interaction while inhibited")
+(define-error 'invalid-arity "Invalid function arity")
+(define-error 'malformed-keyword-arg-list "Keyword lacks a corresponding value")
+(define-error 'mark-inactive "The mark is not active now")
+(define-error 'protected-field "Attempt to modify a protected field")
+(define-error 'trapping-constant "Attempt to trap writes to a constant symbol")
+(define-error 'user-search-failed "Search failed" '(user-error search-failed))
+;; search.c seeds this list literally; `define-error' would put `error' second.
+(put 'user-search-failed 'error-conditions '(user-search-failed user-error search-failed error))
+(define-error 'json-error "generic JSON error")
+(define-error 'json-parse-error "could not parse JSON stream" 'json-error)
+(define-error 'json-end-of-file "end of JSON stream" 'json-parse-error)
+(define-error 'json-trailing-content "trailing content after JSON stream" 'json-parse-error)
+(define-error 'json-escape-sequence-error "invalid escape sequence" 'json-parse-error)
+(define-error 'json-invalid-surrogate-error "invalid surrogate pair" 'json-error)
+(define-error 'json-number-out-of-range-error "number out of range" 'json-error)
+(define-error 'json-object-too-deep "object cyclic or Lisp evaluation too deep" 'json-error)
+(define-error 'json-out-of-memory "not enough memory for creating JSON object" 'json-error)
+(define-error 'json-utf8-decode-error "invalid utf-8 encoding" 'json-error)
 ;; eval.c's recursion guard. Reached before the native stack is, so runaway
 ;; recursion signals `(excessive-lisp-nesting DEPTH)' — which `condition-case'
 ;; can catch — instead of aborting the process on a stack overflow.
@@ -3838,18 +3875,8 @@ The argument may be a character or string.  The result has the same type."
      ((json--lookahead s i "null") (cons json-null (+ i 4)))
      (t (error "json-read: unexpected character")))))
 (defun json-read-from-string (s) (car (json--read s 0)))
-;; Native JSON API (Emacs 27+): keyword args, hash-table/string-key defaults,
-;; :null / :false objects — built on the json.el machinery via dynamic binding.
-(defun json-parse-string (string &rest args)
-  (let ((json-object-type (or (plist-get args :object-type) 'hash-table))
-        (json-array-type (or (plist-get args :array-type) 'vector))
-        (json-null (if (plist-member args :null-object) (plist-get args :null-object) :null))
-        (json-false (if (plist-member args :false-object) (plist-get args :false-object) :false)))
-    (json-read-from-string string)))
-(defun json-serialize (object &rest args)
-  (let ((json-null (if (plist-member args :null-object) (plist-get args :null-object) :null))
-        (json-false (if (plist-member args :false-object) (plist-get args :false-object) :false)))
-    (json-encode object)))
+;; The native JSON API (`json-parse-string', `json-parse-buffer',
+;; `json-serialize', `json-insert') is json.c's, in Rust: src/json.rs.
 ;;; ---- file-name path manipulation (pure, no filesystem) ----
 (defun file-name--last (f ch)
   (let ((i (length f)) (res nil))
@@ -5463,8 +5490,11 @@ reports and the one a hash table's slots are observable in."
 (defvar cl--generic-table nil)
 (defvar cl--cnm-args nil)
 (defvar cl--cnm-next nil)
-(define-error 'cl-no-applicable-method "No applicable method")
-(define-error 'cl-no-next-method "No next method")
+;; cl-generic.el: the three method-lookup failures share `cl-no-method'.
+(define-error 'cl-no-method "No method")
+(define-error 'cl-no-next-method "No next method" 'cl-no-method)
+(define-error 'cl-no-primary-method "No primary method" 'cl-no-method)
+(define-error 'cl-no-applicable-method "No applicable method" 'cl-no-method)
 (defun cl--spec-match (sp arg)
   (cond ((eq sp t) t)
         ((and (consp sp) (eq (car sp) 'eql)) (eql arg (car (cdr sp))))
@@ -12375,6 +12405,8 @@ No problems result if this variable is not bound.
 ;; expected). `ert-run-tests-batch-and-exit` errors out on any unexpected one.
 
 (defvar ert--tests nil)   ; alist of (name . expected-result), :passed | :failed
+(define-error 'ert-test-failed "Test failed")
+(define-error 'ert-test-skipped "Test skipped")
 
 ;; should-failure explanation: for an assertion `(PRED ARG...)`, each ARG is
 ;; evaluated once and its value reported next to the form on failure — the way

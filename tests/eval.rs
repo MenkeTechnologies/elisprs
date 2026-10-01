@@ -1494,7 +1494,12 @@ fn emacs_parity_error_object_data() {
         "(wrong-type-argument integerp 5)"
     );
     assert_eq!(
-        eval("(condition-case e (signal 'my-err '(1 2 3)) (my-err (caddr e)))"),
+        // `signal' requires an error symbol with `error-conditions' (Emacs 31.1:
+        // otherwise `(error "Invalid error symbol" my-err)'), so define it first.
+        eval(
+            "(progn (define-error 'my-err \"My error\") \
+             (condition-case e (signal 'my-err '(1 2 3)) (my-err (caddr e))))"
+        ),
         "2"
     );
     // error builds (error "MESSAGE").

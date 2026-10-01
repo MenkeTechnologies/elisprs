@@ -192,10 +192,19 @@ fn error_and_signal_are_catchable() {
         eval("(condition-case e (error \"boom %d\" 7) (error (cadr e)))"),
         "\"boom 7\""
     );
-    // signal dispatches to the matching condition handler by symbol.
+    // signal dispatches to the matching condition handler by symbol. The symbol
+    // must be a defined error (Emacs 31.1 signals `(error "Invalid error
+    // symbol" my-err)' for one without `error-conditions').
     assert_eq!(
-        eval("(condition-case nil (signal 'my-err '(1 2)) (my-err 'caught))"),
+        eval(
+            "(progn (define-error 'my-err \"My error\") \
+             (condition-case nil (signal 'my-err '(1 2)) (my-err 'caught)))"
+        ),
         "caught"
+    );
+    assert_eq!(
+        eval("(condition-case e (signal 'r32-undefined '(1 2)) (error e))"),
+        "(error \"Invalid error symbol\" r32-undefined)"
     );
     // user-error is catchable as a plain error too.
     assert_eq!(
