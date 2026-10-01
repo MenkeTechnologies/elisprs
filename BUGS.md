@@ -5645,6 +5645,11 @@ everything outside the documented `make-hash-table` / `split-string` /
 `end-of-file` 30→31 drift is fixed below, and the round-31 void list was
 worked through. Regression tests: `tests/parity_sort_tabify_and_function_cells.rs`.
 
+After both batches the same seeds report 15/7/17/8 (seed 101: 19 → 8), and seeds
+202/303/404/505/606/707 went from 13/12/12/12/23/8 to 13/11/12/12/21/8. Every
+remaining hit is the documented 30→31 drift except one `capitalize` plist-sharing
+form (open, below).
+
 | form | Emacs 31.1 | elisprs before |
 |---|---|---|
 | `(last CYCLE)` | the cell `(nthcdr (1- (safe-length CYCLE)))` | hang |
