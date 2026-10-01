@@ -2064,6 +2064,17 @@ fn fset(h: &mut ElispHost, a: &[Value]) -> R {
     h.note_subr_alias(&a[0], &a[1]);
     Ok(a[1].clone())
 }
+/// `(fmakunbound SYMBOL)` — data.c `Ffmakunbound`: empty SYMBOL's function cell
+/// and return SYMBOL. `nil` and `t` are refused with `setting-constant`; a
+/// keyword is not (only its value cell is constant).
+fn fmakunbound(h: &mut ElispHost, a: &[Value]) -> R {
+    if is_nil(&a[0]) || matches!(a[0], Value::Bool(true)) {
+        let name = if is_nil(&a[0]) { "nil" } else { "t" };
+        return Err(format!("setting-constant: {name}"));
+    }
+    h.set_function_value(&a[0], Value::Undef)?;
+    Ok(a[0].clone())
+}
 /// `(fboundp SYMBOL)` — non-nil if SYMBOL has a function definition.
 fn fboundp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(
@@ -5374,6 +5385,14 @@ fn oclosure_copy_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(functionp OBJECT)` — non-nil if OBJECT can be called as a function (a subr,
 /// a non-macro closure, or a symbol whose function cell resolves to one).
 fn functionp(h: &mut ElispHost, a: &[Value]) -> R {
+    // eval.c `FUNCTIONP`: a SUBR object is a function only when its `max_args`
+    // is not `UNEVALLED`, so `(functionp (symbol-function 'if))` is nil even
+    // though the subr object itself resolves.
+    if let Some(Obj::Subr { name, .. }) = h.obj(&a[0]) {
+        if SPECIAL_FORMS.iter().any(|(sf, _)| *sf == name.as_str()) {
+            return Ok(Value::Bool(false));
+        }
+    }
     let ok = match h.resolve_function(&a[0]) {
         Ok(Resolved::Subr { .. }) => true,
         Ok(Resolved::Closure { is_macro, .. }) => !is_macro,
@@ -9595,6 +9614,7 @@ pub fn install(h: &mut ElispHost) {
     s("url-unhex-string", 1, Some(2), url_unhex_string);
     s("fset", 2, Some(2), fset);
     s("fboundp", 1, Some(1), fboundp);
+    s("fmakunbound", 1, Some(1), fmakunbound);
     s("indirect-function", 1, Some(2), indirect_function);
     // The higher-order primitives run in `host::call_function`, which intercepts
     // them by name *before* any function-cell lookup so they never execute

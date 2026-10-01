@@ -6,6 +6,13 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Round 32 parity vs Emacs 31.1** (see BUGS.md): `last` on a circular list
+  hung; `fset` to nil left the symbol `fboundp`, and `fmakunbound` was void;
+  `functionp` accepted a special-form subr object; empty vectors were distinct
+  objects and empty vectors/strings got `print-circle` labels; `how-many`
+  rejected a reversed region. Newly defined: `move-to-column`,
+  `insert-buffer-substring`, `compare-buffer-substrings`, sort.el, tabify.el,
+  `keep-lines`/`flush-lines`, `current-word`, `point-min-marker` and more.
 - **`cl-with-accessors` and `cl-struct-sequence-type` were void.** Both are
   ported from Emacs 31.1 cl-macs.el; `cl-defstruct` now records its `:type`,
   so `cl-struct-slot-info` omits the tag entry for an unnamed `:type`d struct

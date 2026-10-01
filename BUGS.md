@@ -5637,6 +5637,56 @@ Regression tests: `tests/parity_search_limits_and_whitespace.rs`.
   `flush-lines`/`keep-lines`, `tabify`/`untabify`, `encode-coding-string`.
 - `(match-data)` after a buffer search returns integers; Emacs returns markers.
 
+## Round 32 — the function cell, `last` on a cycle, the shared empty vector, and sort/tabify/line-filter commands
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch`, `lexical-binding` t). Seeds
+1/7/31/101 of the 500-form fuzz corpus reported 15/7/17/19 diverging forms;
+everything outside the documented `make-hash-table` / `split-string` /
+`end-of-file` 30→31 drift is fixed below, and the round-31 void list was
+worked through. Regression tests: `tests/parity_sort_tabify_and_function_cells.rs`.
+
+| form | Emacs 31.1 | elisprs before |
+|---|---|---|
+| `(last CYCLE)` | the cell `(nthcdr (1- (safe-length CYCLE)))` | hang |
+| `(progn (defun f () 1) (fset 'f nil) (fboundp 'f))` | `nil` | `t` |
+| `(fmakunbound 'f)` | `f` | void-function |
+| `(functionp (symbol-function 'if))` | `nil` | `t` |
+| `(eq (vector) [])` | `t` | `nil` |
+| `(let ((print-circle t) (v (vector))) (prin1-to-string (list v v)))` | `"([] [])"` | `"(#1=[] #1#)"` |
+| the same with `(make-string 0 ?a)` | `"(\"\" \"\")"` | `"(#1=\"\" #1#)"` |
+| `(how-many "a" 9 1)` | counts 1..9 | `(error "Invalid search bound (wrong side of point)")` |
+
+- **`last`** walked `cdr` until it stopped being a cons; subr.el's
+  `(nthcdr (1- (safe-length list)) list)` terminates on a cycle.
+- **A nil definition is an empty function cell** (data.c `Ffboundp` is
+  `!NILP (function)`), so `fset` to nil unbinds, and `fmakunbound` is defined
+  (`setting-constant` for `nil`/`t`, keywords allowed).
+- **`functionp`** of a special-form subr object is nil (eval.c `FUNCTIONP`:
+  `max_args != UNEVALLED`); the symbol case was already right.
+- **Every empty vector is one object** (alloc.c `zero_vector`), like the empty
+  string already was, and neither is a `print-circle` label candidate.
+- **`how-many`** is the replace.el port: RSTART/REND ordered, `search-upper-case`.
+- **Newly defined**, ported from the 31.1 sources (C ones against their
+  editfns.c/indent.c contracts): `move-to-column` (so `indent-line-to`),
+  `insert-buffer-substring`(`-no-properties`), `compare-buffer-substrings`,
+  `point-min-marker`/`point-max-marker`, `point-at-bol`/`point-at-eol`,
+  `current-word`, sort.el (`sort-subr`, `sort-lines`, `sort-fields`,
+  `sort-numeric-fields`, `sort-regexp-fields`, `reverse-region`,
+  `delete-duplicate-lines`), tabify.el (`tabify`, `untabify`), replace.el
+  (`keep-lines`, `flush-lines`, `count-matches`), `isearch-no-upper-case-p`,
+  `function-alias-p`, `add-to-ordered-list`, `degrees-to-radians` /
+  `radians-to-degrees`.
+
+### Still open after round 32
+
+- `capitalize`/`upcase` of a propertized string shares the property plist with
+  the source; Emacs copies it, so `print-circle` labels differ when the plist
+  is reachable from both.
+- Void: `thing-at-point` and friends, `transpose-regions`,
+  `encode-coding-string`/`decode-coding-string`, `get-byte`,
+  `remove-list-of-text-properties`, variable watchers.
+- `(match-data)` after a buffer search returns integers; Emacs returns markers.
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the

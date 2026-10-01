@@ -1038,6 +1038,11 @@ pub struct ElispHost {
     /// and is never serialized as user heap. Nothing can mutate it: `aset` on a
     /// zero-length string is `args-out-of-range` and `clear-string` is a no-op.
     pub(crate) empty_string: Value,
+    /// The one shared empty vector. alloc.c `zero_vector` is allocated once and
+    /// every zero-length vector IS that object, so `(eq (vector) [])` is `t`.
+    /// Same placement and immutability argument as `empty_string`: `aset` on it
+    /// is `args-out-of-range` and `fillarray` touches nothing.
+    pub(crate) empty_vector: Value,
     /// OClosure metadata, keyed by the closure object's arena handle. An OClosure
     /// (`oclosure.el`) is an ordinary [`Obj::Closure`] that also carries a *type*
     /// symbol and an ordered list of *slot* symbol handles. The slot *values* are
@@ -1260,6 +1265,7 @@ impl ElispHost {
             closure_free: HashMap::new(),
             compiler_macros: std::collections::HashSet::new(),
             empty_string: Value::Undef, // fixed below, once the arena exists
+            empty_vector: Value::Undef,
             oclosure_meta: HashMap::new(),
             intercepts: Vec::new(),
             subr_aliased: std::collections::HashSet::new(),
@@ -1276,6 +1282,7 @@ impl ElispHost {
         // allocated in the built-in prefix so its handle is stable across a
         // cache hit and it is never serialized as user heap.
         h.empty_string = h.alloc(Obj::Str(Arc::new(String::new())));
+        h.empty_vector = h.alloc(Obj::Vector(Vec::new()));
         let scratch = h.alloc(Obj::Buffer(0));
         h.buffers[0].self_obj = scratch;
         // The other two buffers a bare `emacs -Q --batch` starts with, in the
@@ -1319,6 +1326,13 @@ impl ElispHost {
 
     // ── arena / interning ──
     pub fn alloc(&mut self, obj: Obj) -> Value {
+        // Every zero-length vector is `zero_vector` (see `empty_vector`). The
+        // first allocation, during construction, is the singleton itself.
+        if let Obj::Vector(items) = &obj {
+            if items.is_empty() && !matches!(self.empty_vector, Value::Undef) {
+                return self.empty_vector.clone();
+            }
+        }
         let id = self.arena.len() as u32;
         self.arena.push(obj);
         Value::Obj(id)
@@ -2167,8 +2181,11 @@ impl ElispHost {
                 ))
             }
         };
+        // A nil definition IS the empty cell: data.c `Ffboundp` is
+        // `!NILP (XSYMBOL (symbol)->u.s.function)`, so `(fset 'f nil)` and
+        // `fmakunbound` leave F unbound rather than bound to nil.
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
-            s.function = Some(def);
+            s.function = if el_truthy(&def) { Some(def) } else { None };
         }
         Ok(())
     }
@@ -3423,6 +3440,12 @@ impl ElispHost {
                         }
                         Some(kids)
                     }
+                    // A zero-length string or vector is never labelled: Emacs
+                    // shares one `zero_vector` / empty string, and prints
+                    // `(let ((v (vector))) (list v v))` as `([] [])`, not
+                    // `(#1=[] #1#)` (measured, 31.1; same for `""`).
+                    Some(Obj::Vector(items)) if items.is_empty() => None,
+                    Some(Obj::Str(a)) if a.is_empty() => None,
                     Some(Obj::Vector(items)) | Some(Obj::Record(items)) => Some(items.clone()),
                     // print.c:1431-1436 — "A string may have text properties,
                     // which can be circular": the children are the plists of the

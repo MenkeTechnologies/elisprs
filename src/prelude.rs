@@ -153,9 +153,10 @@ pub const PRELUDE: &str = r#"
    ;; A non-list has no cons cells to take: Emacs returns it unchanged --
    ;; (last t) and (last t 0) are both t.
    ((not (consp l)) l)
-   ((or (null n) (= n 1))
-    (while (consp (cdr l)) (setq l (cdr l)))
-    l)
+   ;; subr.el: `(nthcdr (1- (safe-length list)) list)'. Walking `cdr' until
+   ;; it stops being a cons never terminated on a circular list; `safe-length'
+   ;; does, so `(last CYCLE)' answers the same cell Emacs does.
+   ((null n) (nthcdr (1- (safe-length l)) l))
    ;; `safe-length', not `length': an improper list has no `length' (it signals
    ;; `wrong-type-argument listp TAIL'), so `(last (cons "z" 1.5) 7)' errored
    ;; where Emacs answers the whole improper list, `("z" . 1.5)'. The two agree
@@ -4528,15 +4529,42 @@ removed, and one that spans the range is split in two -- which is why this needs
           (replace-match replacement t)
           (setq matches (1+ matches)))
         (and (not (zerop matches)) matches)))))
-(defun how-many (regexp &optional start end)
-  ;; Count non-overlapping matches of REGEXP from START (or point) to END.
+;; replace.el `how-many'. RSTART/REND are ordered (a reversed pair counts the
+;; same region), and `search-upper-case' turns case folding off for a REGEXP
+;; with an upper-case letter. `isearch-no-upper-case-p' and `search-upper-case'
+;; are defined with `keep-lines' further down; they are only called at run time.
+(defun how-many (regexp &optional rstart rend interactive)
+  "Return the number of matches for REGEXP following point (or in RSTART..REND)."
   (save-excursion
-    (when start (goto-char start))
-    (let ((count 0) (limit (or end (point-max))))
-      (while (re-search-forward regexp limit t)
-        (when (= (match-beginning 0) (match-end 0))
-          (if (>= (point) limit) (goto-char (1+ limit)) (forward-char 1)))
+    (if rstart
+        (if rend
+            (progn
+              (goto-char (min rstart rend))
+              (setq rend (max rstart rend)))
+          (goto-char rstart)
+          (setq rend (point-max)))
+      (if (and interactive (use-region-p))
+          (setq rstart (region-beginning)
+                rend (region-end))
+        (setq rstart (point)
+              rend (point-max)))
+      (goto-char rstart))
+    (let ((count 0)
+          (case-fold-search
+           (if (and case-fold-search search-upper-case)
+               (isearch-no-upper-case-p regexp t)
+             case-fold-search)))
+      (while (and (< (point) rend)
+                  (re-search-forward regexp rend t))
+        ;; Ensure forward progress on zero-length matches like "^$".
+        (when (and (= (match-beginning 0) (match-end 0))
+                   (not (eobp)))
+          (forward-char 1))
         (setq count (1+ count)))
+      (when interactive (message (ngettext "%d occurrence"
+                                           "%d occurrences"
+                                           count)
+                                 count))
       count)))
 ;;; ---- misc small subr.el helpers ----
 (defun ngettext (singular plural n) (if (= n 1) singular plural))
@@ -9927,6 +9955,625 @@ If N is negative, delete newlines as well, leaving -N spaces."
     (string-replace
      "\n" "'\n'"
      (replace-regexp-in-string "[^-0-9a-zA-Z_./\n]" "\\\\\\&" argument))))
+
+;; ── round 32: buffer primitives and commands that were void ──
+;; The C ones are written against their editfns.c / indent.c contracts; the
+;; Lisp ones are ports of the 31.1 sources (simple.el, sort.el, tabify.el,
+;; replace.el, subr.el, float-sup.el).
+(defalias 'point-at-eol #'line-end-position)
+(defalias 'point-at-bol #'line-beginning-position)
+(defun point-min-marker ()
+  "Return a marker to the minimum permissible value of point in this buffer."
+  (copy-marker (point-min)))
+(defun point-max-marker ()
+  "Return a marker to the maximum permissible value of point in this buffer."
+  (copy-marker (point-max)))
+(defconst degrees-to-radians (/ float-pi 180.0)
+  "Degrees to radian conversion constant.")
+(defconst radians-to-degrees (/ 180.0 float-pi)
+  "Radian to degree conversion constant.")
+(defmacro degrees-to-radians (x)
+  "Convert X from degrees to radians."
+  (list '* degrees-to-radians x))
+(defmacro radians-to-degrees (x)
+  "Convert X from radians to degrees."
+  (list '* radians-to-degrees x))
+(defun function-alias-p (func &optional _noerror)
+  "Return nil if FUNC is not a function alias.
+If FUNC is a function alias, return the function alias chain."
+  (let ((chain nil))
+    (while (and (symbolp func)
+                (setq func (symbol-function func))
+                (symbolp func))
+      (push func chain))
+    (nreverse chain)))
+(defun add-to-ordered-list (list-var element &optional order)
+  "Add ELEMENT to the value of LIST-VAR if it isn't there yet, keeping the
+list ordered by the numbers recorded in LIST-VAR's `list-order' property."
+  (let ((ordering (get list-var 'list-order)))
+    (unless ordering
+      (put list-var 'list-order
+           (setq ordering (make-hash-table :weakness 'key :test 'eq))))
+    (when order
+      (puthash element (and (numberp order) order) ordering))
+    (unless (memq element (symbol-value list-var))
+      (set list-var (cons element (symbol-value list-var))))
+    (set list-var (sort (symbol-value list-var)
+                        (lambda (a b)
+                          (let ((oa (gethash a ordering))
+                                (ob (gethash b ordering)))
+                            (if (and oa ob)
+                                (< oa ob)
+                              oa)))))))
+(defun insert-buffer-substring (buffer &optional start end)
+  "Insert before point a substring of the contents of BUFFER.
+editfns.c `Finsert_buffer_substring': START and END default to BUFFER's
+accessible portion, are swapped when reversed, and must lie inside it."
+  (let ((buf (get-buffer buffer)))
+    (unless buf
+      (if (stringp buffer)
+          (error "No buffer named %s" buffer)
+        (error "Invalid buffer")))
+    (unless (buffer-live-p buf) (error "Selecting deleted buffer"))
+    (insert (with-current-buffer buf
+              (let ((b (if start (if (markerp start) (marker-position start) start)
+                         (point-min)))
+                    (e (if end (if (markerp end) (marker-position end) end)
+                         (point-max))))
+                (unless (integerp b)
+                  (signal 'wrong-type-argument (list 'integer-or-marker-p start)))
+                (unless (integerp e)
+                  (signal 'wrong-type-argument (list 'integer-or-marker-p end)))
+                (when (> b e) (setq b (prog1 e (setq e b))))
+                (unless (and (<= (point-min) b) (<= e (point-max)))
+                  (signal 'args-out-of-range (list start end)))
+                (buffer-substring b e))))
+    nil))
+(defun insert-buffer-substring-no-properties (buffer &optional start end)
+  "Insert before point a substring of BUFFER, without text properties."
+  (let ((opoint (point)))
+    (insert-buffer-substring buffer start end)
+    (let ((inhibit-read-only t))
+      (set-text-properties opoint (point) nil))))
+(defun compare-buffer-substrings (buffer1 start1 end1 buffer2 start2 end2)
+  "Compare two substrings of two buffers; return result as number.
+editfns.c: -N if the first is less after N-1 equal characters, N if greater,
+0 if equal; `case-fold-search' non-nil folds case."
+  (let ((text (lambda (buffer start end)
+                (with-current-buffer (if buffer (or (get-buffer buffer)
+                                                    (error "No buffer named %s" buffer))
+                                       (current-buffer))
+                  (let ((b (or start (point-min))) (e (or end (point-max))))
+                    (when (> b e) (setq b (prog1 e (setq e b))))
+                    (unless (and (<= (point-min) b) (<= e (point-max)))
+                      (signal 'args-out-of-range (list start end)))
+                    (buffer-substring-no-properties b e))))))
+    (let ((r (compare-strings (funcall text buffer1 start1 end1) nil nil
+                              (funcall text buffer2 start2 end2) nil nil
+                              case-fold-search)))
+      (if (eq r t) 0 r))))
+(defun current-word (&optional strict really-word)
+  "Return the word at or near point, as a string, without text properties."
+  (save-excursion
+    (let* ((oldpoint (point)) (start (point)) (end (point))
+           (syntaxes (if really-word "w" "w_"))
+           (not-syntaxes (concat "^" syntaxes)))
+      (skip-syntax-backward syntaxes) (setq start (point))
+      (goto-char oldpoint)
+      (skip-syntax-forward syntaxes) (setq end (point))
+      (when (and (eq start oldpoint) (eq end oldpoint)
+                 ;; Point is neither within nor adjacent to a word.
+                 (not strict))
+        ;; Look for preceding word in same line.
+        (skip-syntax-backward not-syntaxes (line-beginning-position))
+        (if (bolp)
+            ;; No preceding word in same line.
+            ;; Look for following word in same line.
+            (progn
+              (skip-syntax-forward not-syntaxes (line-end-position))
+              (setq start (point))
+              (skip-syntax-forward syntaxes)
+              (setq end (point)))
+          (setq end (point))
+          (skip-syntax-backward syntaxes)
+          (setq start (point))))
+      ;; If we found something nonempty, return it as a string.
+      (unless (= start end)
+        (buffer-substring-no-properties start end)))))
+(defun move-to-column (column &optional force)
+  "Move point to column COLUMN in the current line; return the column reached.
+indent.c `Fmove_to_column': scanning stops at the first column >= COLUMN or at
+the end of the line. With FORCE non-nil a tab that the goal falls inside is
+split into spaces; with FORCE t a short line is indented out to COLUMN."
+  (unless (natnump column)
+    (signal 'wrong-type-argument (list 'wholenump column)))
+  (beginning-of-line)
+  (let ((col 0) (prev-col 0) (prev-pos (point)) (end (line-end-position)))
+    (while (and (< col column) (< (point) end))
+      (setq prev-col col prev-pos (point))
+      (forward-char 1)
+      (setq col (current-column)))
+    ;; A tab made us overshoot: put spaces in front of it up to the goal,
+    ;; delete it, and re-indent the rest of its span from there.
+    (when (and force (> col column)
+               (eq (char-after prev-pos) ?\t) (< prev-col column))
+      (goto-char prev-pos)
+      (insert-char ?\s (- column prev-col) t)
+      (delete-region (point) (1+ (point)))
+      (let ((goal-pt (point)))
+        (indent-to col)
+        (goto-char goal-pt))
+      (setq col column))
+    ;; The line ends prematurely: add space to the end.
+    (when (and (< col column) (eq force t))
+      (indent-to (setq col column)))
+    col))
+(defun indent-line-to (column)
+  "Indent current line to COLUMN."
+  (beginning-of-line 1)
+  (skip-chars-forward " \t")
+  (let ((cur-col (current-column)))
+    (cond ((< cur-col column)
+           (if (>= (- column (* (/ cur-col tab-width) tab-width)) tab-width)
+               (delete-region (point)
+                              (progn (skip-chars-backward " ") (point))))
+           (indent-to column))
+          ((> cur-col column) ; too far right (after tab?)
+           (delete-region (progn (move-to-column column t) (point))
+                          ;; The `move-to-column' call may replace
+                          ;; tabs with spaces, so we can't reuse the
+                          ;; previous start point.
+                          (progn (beginning-of-line 1)
+                                 (skip-chars-forward " \t")
+                                 (point)))))))
+
+;; tabify.el
+(defun untabify (start end &optional _arg)
+  "Convert all tabs in region to multiple spaces, preserving columns."
+  (let ((c (current-column)))
+    (save-excursion
+      (save-restriction
+        (narrow-to-region (point-min) end)
+        (goto-char start)
+        (while (search-forward "\t" nil t)      ; faster than re-search
+          (forward-char -1)
+          (let ((tab-beg (point))
+                (indent-tabs-mode nil)
+                column)
+            (skip-chars-forward "\t")
+            (setq column (current-column))
+            (delete-region tab-beg (point))
+            (indent-to column)))))
+    (move-to-column c)))
+(defvar tabify-regexp " [ \t]+"
+  "Regexp matching whitespace that tabify should consider.")
+(defun tabify (start end &optional _arg)
+  "Convert multiple spaces in region to tabs when possible."
+  (save-excursion
+    (save-restriction
+      ;; Include the beginning of the line in the narrowing
+      ;; since otherwise it will throw off current-column.
+      (goto-char start)
+      (beginning-of-line)
+      (narrow-to-region (point) end)
+      (goto-char start)
+      (let ((indent-tabs-mode t))
+        (while (re-search-forward tabify-regexp nil t)
+          (let ((end-col (current-column))
+                (beg-col (save-excursion (goto-char (match-beginning 0))
+                                         (skip-chars-forward "\t")
+                                         (current-column))))
+            (if (= (/ end-col tab-width) (/ beg-col tab-width))
+                nil
+              (delete-region (match-beginning 0) (point))
+              (indent-to end-col))))))))
+
+;; replace.el: `keep-lines', `flush-lines', `how-many' (`count-matches').
+;; The INTERACTIVE argument only adds the region default and a message.
+(defcustom search-upper-case 'not-yanks
+  "If non-nil, upper case chars disable case fold searching."
+  :type '(choice (const :tag "off" nil) (const not-yanks) (other :tag "on" t)))
+(defun isearch-no-upper-case-p (string regexp-flag)
+  "Return t if there are no upper case chars in STRING."
+  (let (quote-flag (i 0) (len (length string)) found)
+    (while (and (not found) (< i len))
+      (let ((char (aref string i)))
+        (if (and regexp-flag (eq char ?\\))
+            (setq quote-flag (not quote-flag))
+          (if (and (not quote-flag) (not (eq char (downcase char))))
+              (setq found t))
+          (setq quote-flag nil)))
+      (setq i (1+ i)))
+    (not (or found
+             (and regexp-flag (string-match "\\[:\\(upp\\|low\\)er:]" string)
+                  (condition-case err
+                      (progn
+                        (string-match (substring string 0 (match-beginning 0))
+                                      "")
+                        nil)
+                    (invalid-regexp
+                     (equal "Unmatched [ or [^" (cadr err)))))))))
+(defun keep-lines (regexp &optional rstart rend interactive)
+  "Delete all lines except those containing matches for REGEXP."
+  (if rstart
+      (progn
+        (goto-char (min rstart rend))
+        (setq rend
+              (progn
+                (save-excursion
+                  (goto-char (max rstart rend))
+                  (unless (or (bolp) (eobp))
+                    (forward-line 0))
+                  (point-marker)))))
+    (if (and interactive (use-region-p))
+        (setq rstart (region-beginning)
+              rend (progn
+                     (goto-char (region-end))
+                     (unless (or (bolp) (eobp))
+                       (forward-line 0))
+                     (point-marker)))
+      (setq rstart (point)
+            rend (point-max-marker)))
+    (goto-char rstart))
+  (save-excursion
+    (or (bolp) (forward-line 1))
+    (let ((start (point))
+          (case-fold-search
+           (if (and case-fold-search search-upper-case)
+               (isearch-no-upper-case-p regexp t)
+             case-fold-search)))
+      (while (< (point) rend)
+        ;; Start is first char not preserved by previous match.
+        (if (not (re-search-forward regexp rend 'move))
+            (delete-region start rend)
+          (let ((end (save-excursion (goto-char (match-beginning 0))
+                                     (forward-line 0)
+                                     (point))))
+            ;; Now end is first char preserved by the new match.
+            (if (< start end)
+                (delete-region start end))))
+        (setq start (save-excursion (forward-line 1) (point)))
+        ;; If the match was empty, avoid matching again at same place.
+        (and (< (point) rend)
+             (= (match-beginning 0) (match-end 0))
+             (forward-char 1)))))
+  (set-marker rend nil)
+  nil)
+(defun flush-lines (regexp &optional rstart rend interactive)
+  "Delete lines containing matches for REGEXP; return the number deleted."
+  (if rstart
+      (progn
+        (goto-char (min rstart rend))
+        (setq rend (copy-marker (max rstart rend))))
+    (if (and interactive (use-region-p))
+        (setq rstart (region-beginning)
+              rend (copy-marker (region-end)))
+      (setq rstart (point)
+            rend (point-max-marker)))
+    (goto-char rstart))
+  (let ((count 0)
+        (case-fold-search
+         (if (and case-fold-search search-upper-case)
+             (isearch-no-upper-case-p regexp t)
+           case-fold-search)))
+    (save-excursion
+      (while (and (< (point) rend)
+                  (re-search-forward regexp rend t))
+        (delete-region (save-excursion (goto-char (match-beginning 0))
+                                       (forward-line 0)
+                                       (point))
+                       (progn (forward-line 1) (point)))
+        (setq count (1+ count))))
+    (set-marker rend nil)
+    (when interactive (message (ngettext "Deleted %d matching line"
+                                         "Deleted %d matching lines"
+                                         count)
+                               count))
+    count))
+(defalias 'count-matches 'how-many)
+
+;; sort.el. `sort-reorder-buffer' copies through a temporary buffer exactly as
+;; sort.el does; elisprs buffers carry no multibyte flag and no modified flag,
+;; so `set-buffer-multibyte' and `with-buffer-unmodified-if-unchanged' have
+;; nothing to preserve and are left out.
+(defcustom sort-fold-case nil
+  "Non-nil if the buffer sort functions should ignore case."
+  :type 'boolean)
+(defun sort-subr (reverse nextrecfun endrecfun
+                          &optional startkeyfun endkeyfun predicate)
+  "General text sorting routine to divide buffer into records and sort them."
+  (save-excursion
+    (let* ((sort-lists (sort-build-lists nextrecfun endrecfun
+                                         startkeyfun endkeyfun))
+           (old (reverse sort-lists))
+           (case-fold-search sort-fold-case))
+      (if (null sort-lists)
+          ()
+        (or reverse (setq sort-lists (nreverse sort-lists)))
+        (setq sort-lists
+              (sort sort-lists
+                    (cond (predicate
+                           (lambda (a b) (funcall predicate (car a) (car b))))
+                          ((numberp (car (car sort-lists)))
+                           'car-less-than-car)
+                          ((consp (car (car sort-lists)))
+                           (lambda (a b)
+                             (> 0 (compare-buffer-substrings
+                                   nil (car (car a)) (cdr (car a))
+                                   nil (car (car b)) (cdr (car b))))))
+                          (t
+                           (lambda (a b) (string< (car a) (car b)))))))
+        (if reverse (setq sort-lists (nreverse sort-lists)))
+        (sort-reorder-buffer sort-lists old))))
+  nil)
+(defun sort-build-lists (nextrecfun endrecfun startkeyfun endkeyfun)
+  (let ((sort-lists ())
+        (start-rec nil)
+        done key)
+    (while (not (eobp))
+      (setq start-rec (point))          ;save record start
+      (setq done nil)
+      ;; Get key value, or move to start of key.
+      (setq key (catch 'key
+                  (or (and startkeyfun (funcall startkeyfun))
+                      ;; If key was not returned as value,
+                      ;; move to end of key and get key from the buffer.
+                      (let ((start (point)))
+                        (funcall (or endkeyfun
+                                     (prog1 endrecfun (setq done t))))
+                        (cons start (point))))))
+      ;; Move to end of this record (start of next one, or end of buffer).
+      (cond ((prog1 done (setq done nil)))
+            (endrecfun (funcall endrecfun))
+            (nextrecfun (funcall nextrecfun) (setq done t)))
+      (if key (push
+               ;; consing optimization in case in which key is same as record.
+               (if (and (consp key)
+                        (equal (car key) start-rec)
+                        (equal (cdr key) (point)))
+                   (cons key key)
+                 (cons key (cons start-rec (point))))
+               sort-lists))
+      (and (not done) nextrecfun (funcall nextrecfun)))
+    sort-lists))
+(defun sort-reorder-buffer (sort-lists old)
+  (let ((last (point-min))
+        (min (point-min)) (max (point-max))
+        (old-buffer (current-buffer))
+        temp-buffer)
+    (with-temp-buffer
+      (setq temp-buffer (current-buffer))
+      ;; Copy the sorted text into the temporary buffer.
+      (while sort-lists
+        (goto-char (point-max))
+        (insert-buffer-substring old-buffer
+                                 last
+                                 (nth 1 (car old)))
+        (goto-char (point-max))
+        (insert-buffer-substring old-buffer
+                                 (nth 1 (car sort-lists))
+                                 (cdr (cdr (car sort-lists))))
+        (setq last (cdr (cdr (car old)))
+              sort-lists (cdr sort-lists)
+              old (cdr old)))
+      (goto-char (point-max))
+      (insert-buffer-substring old-buffer last max)
+      ;; Copy the reordered text from the temporary buffer
+      ;; to the buffer we sorted (OLD-BUFFER).
+      (set-buffer old-buffer)
+      (let ((inhibit-quit t))
+        ;; Leave the last character of the region so markers at its end stay.
+        (delete-region min (1- max))
+        ;; Now replace the one remaining old character with the sorted text.
+        (goto-char (point-min))
+        (insert-buffer-substring temp-buffer)
+        (delete-region max (1+ max))))))
+(defvar inhibit-field-text-motion nil)
+(defun sort-lines (reverse beg end)
+  "Sort lines in region alphabetically; REVERSE non-nil means descending order."
+  (save-excursion
+    (save-restriction
+      (narrow-to-region beg end)
+      (goto-char (point-min))
+      (let ((inhibit-field-text-motion t))
+        (sort-subr reverse 'forward-line 'end-of-line)))))
+(defvar sort-numeric-base 10
+  "The default base used by `sort-numeric-fields'.")
+(defvar sort-fields-syntax-table nil)
+(if sort-fields-syntax-table nil
+  (let ((table (make-syntax-table))
+        (i 0))
+    (while (< i 256)
+      (modify-syntax-entry i "w" table)
+      (setq i (1+ i)))
+    (modify-syntax-entry ?\s " " table)
+    (modify-syntax-entry ?\t " " table)
+    (modify-syntax-entry ?\n " " table)
+    (modify-syntax-entry ?\. "_" table) ; for floating pt. numbers. -wsr
+    (setq sort-fields-syntax-table table)))
+(defun sort-numeric-fields (field beg end)
+  "Sort lines in region numerically by the FIELDth field of each line."
+  (let ((inhibit-field-text-motion t))
+    (sort-fields-1
+     field beg end
+     (lambda ()
+       ;; Don't try to parse blank lines (they'll be sorted at the start).
+       (if (looking-at "[\t ]*$")
+           0
+         (sort-skip-fields field)
+         (let* ((case-fold-search t)
+                (base
+                 (if (looking-at "\\(0x\\)[0-9a-f]\\|\\(0\\)[0-7]")
+                     (cond ((match-beginning 1)
+                            (goto-char (match-end 1))
+                            16)
+                           ((match-beginning 2)
+                            (goto-char (match-end 2))
+                            8)
+                           (t nil)))))
+           (string-to-number (buffer-substring (point)
+                                               (save-excursion
+                                                 (forward-sexp 1)
+                                                 (point)))
+                             (or base sort-numeric-base)))))
+     nil)))
+(defun sort-fields (field beg end)
+  "Sort lines in region lexicographically by the FIELDth field of each line."
+  (let ((inhibit-field-text-motion t))
+    (sort-fields-1 field beg end
+                   (lambda ()
+                     (sort-skip-fields field)
+                     nil)
+                   (lambda () (skip-chars-forward "^ \t\n")))))
+(defun sort-skip-fields (n)
+  (if (> n 0)
+      ;; Skip across N - 1 fields.
+      (let ((i (1- n)))
+        (while (> i 0)
+          (skip-chars-forward " \t")
+          (skip-chars-forward "^ \t\n")
+          (setq i (1- i)))
+        (skip-chars-forward " \t")
+        (if (eolp)
+            (error "Line has too few fields: %s"
+                   (buffer-substring
+                    (line-beginning-position)
+                    (line-end-position)))))
+    (end-of-line)
+    ;; Skip back across - N - 1 fields.
+    (let ((i (1- (- n))))
+      (while (> i 0)
+        (skip-chars-backward " \t")
+        (skip-chars-backward "^ \t\n")
+        (setq i (1- i)))
+      (skip-chars-backward " \t"))
+    (if (bolp)
+        (error "Line has too few fields: %s"
+               (buffer-substring
+                (line-beginning-position)
+                (line-end-position))))
+    ;; Position at the front of the field even if moving backwards.
+    (skip-chars-backward "^ \t\n")))
+(defun sort-fields-1 (field beg end startkeyfun endkeyfun)
+  (let ((tbl (syntax-table)))
+    (if (zerop field) (setq field 1))
+    (unwind-protect
+        (save-excursion
+          (save-restriction
+            (narrow-to-region beg end)
+            (goto-char (point-min))
+            (set-syntax-table sort-fields-syntax-table)
+            (sort-subr nil
+                       'forward-line 'end-of-line
+                       startkeyfun endkeyfun)))
+      (set-syntax-table tbl))))
+(defvar sort-regexp-fields-regexp)
+(defvar sort-regexp-record-end)
+(defun sort-regexp-fields (reverse record-regexp key-regexp beg end)
+  "Sort the text in the region lexicographically by REGEXP-defined records/keys."
+  (cond ((or (equal key-regexp "") (equal key-regexp "\\&"))
+         (setq key-regexp 0))
+        ((string-match "\\`\\\\[1-9]\\'" key-regexp)
+         (setq key-regexp (- (aref key-regexp 1) ?0))))
+  (save-excursion
+    (save-restriction
+      (narrow-to-region beg end)
+      (goto-char (point-min))
+      (let (sort-regexp-record-end
+            (sort-regexp-fields-regexp record-regexp))
+        (re-search-forward sort-regexp-fields-regexp nil t)
+        (setq sort-regexp-record-end (point))
+        (goto-char (match-beginning 0))
+        (sort-subr reverse
+                   'sort-regexp-fields-next-record
+                   (lambda ()
+                     (goto-char sort-regexp-record-end))
+                   (lambda ()
+                     (let ((n 0))
+                       (cond ((numberp key-regexp)
+                              (setq n key-regexp))
+                             ((re-search-forward
+                               key-regexp sort-regexp-record-end t)
+                              (setq n 0))
+                             (t (throw 'key nil)))
+                       (condition-case ()
+                           (cons (match-beginning n)
+                                 (match-end n))
+                         ;; if there was no such register
+                         (error (throw 'key nil))))))))))
+(defun sort-regexp-fields-next-record ()
+  (let ((oldpos (point)))
+    (and (re-search-forward sort-regexp-fields-regexp nil 'move)
+         (setq sort-regexp-record-end (match-end 0))
+         (if (= sort-regexp-record-end oldpos)
+             (progn
+               (forward-char 1)
+               (re-search-forward sort-regexp-fields-regexp nil 'move)
+               (setq sort-regexp-record-end (match-end 0)))
+           t)
+         (goto-char (match-beginning 0)))))
+(defun reverse-region (beg end)
+  "Reverse the order of lines in a region."
+  (if (> beg end)
+      (let (mid) (setq mid end end beg beg mid)))
+  (save-excursion
+    ;; Put beg at the start of a line and end and the end of one --
+    ;; the largest possible region which fits this criteria.
+    (goto-char beg)
+    (or (bolp) (forward-line 1))
+    (setq beg (point))
+    (goto-char end)
+    (or (and (eolp) (not (bolp))) (progn (forward-line -1) (end-of-line)))
+    (setq end (point-marker))
+    (when (<= end beg)
+      (user-error "There are no full lines in the region"))
+    (let (ll (do t))
+      (while do
+        (goto-char beg)
+        (setq ll (cons (buffer-substring (point) (progn (end-of-line) (point)))
+                       ll))
+        (setq do (/= (point) end))
+        (delete-region beg (if do (1+ (point)) (point))))
+      (while (cdr ll)
+        (insert (car ll) "\n")
+        (setq ll (cdr ll)))
+      (insert (car ll)))))
+(defun delete-duplicate-lines (beg end &optional reverse adjacent keep-blanks
+                               interactive)
+  "Delete all but one copy of any identical lines in the region; return count."
+  (let ((lines (unless adjacent (make-hash-table :test 'equal)))
+        line prev-line first-line
+        (count 0)
+        (beg (copy-marker beg))
+        (end (copy-marker end)))
+    (save-excursion
+      (goto-char (if reverse end beg))
+      (if (and reverse (bolp)) (forward-char -1))
+      (while (if reverse
+                 (not first-line)
+               (and (< (point) end) (not (eobp))))
+        (setq first-line (and reverse (or (<= (point) beg) (bobp))))
+        (setq line (buffer-substring-no-properties
+                    (line-beginning-position) (line-end-position)))
+        (if (and keep-blanks (string= "" line))
+            (forward-line 1)
+          (if (if adjacent (equal line prev-line) (gethash line lines))
+              (progn
+                (delete-region (progn (forward-line 0) (point))
+                               (progn (forward-line 1) (point)))
+                (if reverse (forward-line -1))
+                (setq count (1+ count)))
+            (if adjacent (setq prev-line line) (puthash line t lines))
+            (forward-line (if reverse -1 1))))))
+    (set-marker beg nil)
+    (set-marker end nil)
+    (when interactive
+      (message "Deleted %d %sduplicate line%s%s"
+               count
+               (if adjacent "adjacent " "")
+               (if (= count 1) "" "s")
+               (if reverse " backward" "")))
+    count))
 
 (defun forward-comment (count)
   "Move forward across up to COUNT comments.  If COUNT is negative, move backward.
