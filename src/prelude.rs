@@ -832,6 +832,8 @@ pub const PRELUDE: &str = r#"
 ;; that the Rust printer — which reads the symbol's dynamic value cell — never sees,
 ;; so shared structure printed unlabelled and a circular list had nothing to stop it.
 (defvar print-circle nil)
+;; print.c `print-gensym': non-nil prints an uninterned symbol as `#:NAME'.
+(defvar print-gensym nil)
 ;; print.c `standard-output': where a print primitive given a nil PRINTCHARFUN
 ;; sends its output. t is stdout in batch; a buffer, marker or function is
 ;; honoured exactly as when passed as PRINTCHARFUN.
@@ -4488,6 +4490,44 @@ removed, and one that spans the range is split in two -- which is why this needs
   nil)
 (defun count-words (start end)
   (length (split-string (buffer-substring start end) "[^[:alnum:]]+" t)))
+;; subr.el `replace-string-in-region' / `replace-regexp-in-region': replace in
+;; START..END (default point..point-max) with case-fold-search nil, returning the
+;; count or nil. The region is a narrowing, so START > END is swapped (Emacs answers
+;; nil, not "wrong side of point") and an out-of-range START signals
+;; `narrow-to-region''s `(args-out-of-range START END)'.
+(defun replace-string-in-region (string replacement &optional start end)
+  (if start
+      (when (< start (point-min)) (error "Start before start of buffer"))
+    (setq start (point)))
+  (if end
+      (when (> end (point-max)) (error "End after end of buffer"))
+    (setq end (point-max)))
+  (save-excursion
+    (goto-char start)
+    (save-restriction
+      (narrow-to-region start end)
+      (let ((matches 0) (case-fold-search nil))
+        (while (search-forward string nil t)
+          (delete-region (match-beginning 0) (match-end 0))
+          (insert replacement)
+          (setq matches (1+ matches)))
+        (and (not (zerop matches)) matches)))))
+(defun replace-regexp-in-region (regexp replacement &optional start end)
+  (if start
+      (when (< start (point-min)) (error "Start before start of buffer"))
+    (setq start (point)))
+  (if end
+      (when (> end (point-max)) (error "End after end of buffer"))
+    (setq end (point-max)))
+  (save-excursion
+    (goto-char start)
+    (save-restriction
+      (narrow-to-region start end)
+      (let ((matches 0) (case-fold-search nil))
+        (while (re-search-forward regexp nil t)
+          (replace-match replacement t)
+          (setq matches (1+ matches)))
+        (and (not (zerop matches)) matches)))))
 (defun how-many (regexp &optional start end)
   ;; Count non-overlapping matches of REGEXP from START (or point) to END.
   (save-excursion
@@ -5529,9 +5569,16 @@ reports and the one a hash table's slots are observable in."
   (if string
       (list 'if form nil (cons 'error (cons string args)))
     (list 'if form nil (list 'signal (list 'quote 'cl-assertion-failed) (list 'list (list 'quote form))))))
-(defmacro cl-check-type (form type &rest _)
-  (list 'if (list 'cl-typep form (list 'quote type)) nil
-        (list 'signal (list 'quote 'wrong-type-argument) (list 'list (list 'quote type) form))))
+;; cl-macs.el: the signal DATA is (STRING-or-TYPE VALUE FORM), FORM evaluated once.
+;; (`macroexp-let2' is defined further down, after this body is compiled, so its
+;; expansion is spelled out.)
+(defmacro cl-check-type (form type &optional string)
+  (let* ((temp (if (macroexp-copyable-p form) form (make-symbol "temp")))
+         (body `(progn (or (cl-typep ,temp ',type)
+                           (signal 'wrong-type-argument
+                                   (list ,(or string `',type) ,temp ',form)))
+                       nil)))
+    (if (eq temp form) body `(let ((,temp ,form)) ,body))))
 (defmacro cl-etypecase (expr &rest clauses)
   `(cl-typecase ,expr ,@clauses (t (error "cl-etypecase failed"))))
 (defmacro cl-ecase (expr &rest clauses)
@@ -9726,6 +9773,160 @@ the prefix syntax flag (p)."
           (setq pos (1- pos))))
       (goto-char opoint)
       nil)))
+
+;; ── indentation and whitespace commands (indent.c, simple.el) ──
+(defvar indent-tabs-mode t)
+(defvar delete-trailing-lines t)
+(defun current-indentation ()
+  "Column of the first non-space, non-tab character on the current line."
+  (save-excursion
+    (beginning-of-line)
+    (skip-chars-forward " \t")
+    (current-column)))
+(defun back-to-indentation ()
+  "Move point to the first non-whitespace character on this line."
+  (beginning-of-line 1)
+  (skip-syntax-forward " " (line-end-position))
+  (backward-prefix-chars))
+(defun indent-to (column &optional minimum)
+  "Indent from point with tabs and spaces until COLUMN is reached.
+indent.c `Findent_to': at least MINIMUM columns are inserted; tabs are used up
+to the last tab stop at or before COLUMN when `indent-tabs-mode' is non-nil.
+Returns the column reached."
+  (unless (fixnump column) (signal 'wrong-type-argument (list 'fixnump column)))
+  (if minimum
+      (unless (fixnump minimum) (signal 'wrong-type-argument (list 'fixnump minimum)))
+    (setq minimum 0))
+  (let* ((fromcol (current-column))
+         (mincol (max (+ fromcol minimum) column)))
+    (unless (= fromcol mincol)
+      (when indent-tabs-mode
+        (let ((n (- (/ mincol tab-width) (/ fromcol tab-width))))
+          (when (> n 0)
+            (insert-and-inherit (make-string n ?\t))
+            (setq fromcol (* (/ mincol tab-width) tab-width)))))
+      (insert-and-inherit (make-string (- mincol fromcol) ?\s)))
+    mincol))
+(defun delete-horizontal-space (&optional backward-only)
+  "Delete all spaces and tabs around point.
+If BACKWARD-ONLY is non-nil, delete them only before point."
+  (let ((orig-pos (point)))
+    (delete-region
+     (if backward-only
+         orig-pos
+       (progn (skip-chars-forward " \t") (point)))
+     (progn (skip-chars-backward " \t") (point)))))
+(defun delete-trailing-whitespace (&optional start end)
+  "Delete trailing whitespace between START and END (default: whole buffer).
+With no END, also delete trailing empty lines at the end of the buffer when
+`delete-trailing-lines' is non-nil. Returns nil."
+  (save-match-data
+    (save-excursion
+      (let ((end-marker (and end (copy-marker end))))
+        (goto-char (or start (point-min)))
+        (with-syntax-table (make-syntax-table (syntax-table))
+          ;; Don't delete formfeeds, even if they are considered whitespace.
+          (modify-syntax-entry ?\f "_")
+          (while (re-search-forward "\\s-$" end-marker t)
+            (skip-syntax-backward "-" (line-beginning-position))
+            (delete-region (point) (match-end 0))))
+        (if end
+            (set-marker end-marker nil)
+          (and delete-trailing-lines
+               (= (goto-char (point-max)) (1+ (buffer-size)))
+               (<= (skip-chars-backward "\n") -2)
+               (delete-region (1+ (point)) (point-max)))))))
+  nil)
+;; simple.el whitespace commands. elisprs has no `field' text properties, so
+;; simple.el's `(constrain-to-field nil ORIG-POS)' calls — which only differ
+;; from point inside a field — are spelled as point.
+(defvar fill-prefix nil)
+(defvar deactivate-mark nil)
+(defun fixup-whitespace ()
+  "Fixup white space between objects around point.
+Leave one space or none, according to the context."
+  (save-excursion
+    (delete-horizontal-space)
+    (if (or (looking-at "^\\|$\\|\\s)")
+            (save-excursion (forward-char -1)
+                            (looking-at "$\\|\\s(\\|\\s'")))
+        nil
+      (insert ?\s))))
+(defun delete-indentation (&optional arg beg end)
+  "Join this line to previous and fix up whitespace at join.
+With ARG, join the current line to the following line. When BEG and END are
+non-nil, join all lines in the region they define."
+  (setq deactivate-mark t)
+  (if (and beg (not arg))
+      (and (goto-char beg)
+           (> end (line-end-position))
+           (goto-char end))
+    (setq beg (1- (line-beginning-position (and arg 2))))
+    (when arg (forward-line)))
+  (let ((prefix (and (> (length fill-prefix) 0)
+                     (regexp-quote fill-prefix))))
+    (while (and (> (line-beginning-position) beg)
+                (forward-line 0)
+                (= (preceding-char) ?\n))
+      (delete-char -1)
+      (if (and prefix (looking-at prefix))
+          (replace-match "" t t))
+      (fixup-whitespace))))
+(defalias 'join-line #'delete-indentation)
+(defun delete-blank-lines ()
+  "On blank line, delete all surrounding blank lines, leaving just one.
+On isolated blank line, delete that one.
+On nonblank line, delete any immediately following blank lines."
+  (let (thisblank singleblank)
+    (save-excursion
+      (beginning-of-line)
+      (setq thisblank (looking-at "[ \t]*$"))
+      (setq singleblank
+            (and thisblank
+                 (not (looking-at "[ \t]*\n[ \t]*$"))
+                 (or (bobp)
+                     (progn (forward-line -1)
+                            (not (looking-at "[ \t]*$")))))))
+    (if thisblank
+        (progn
+          (beginning-of-line)
+          (if singleblank (forward-line 1))
+          (delete-region (point)
+                         (if (re-search-backward "[^ \t\n]" nil t)
+                             (progn (forward-line 1) (point))
+                           (point-min)))))
+    (if (not (and thisblank singleblank))
+        (save-excursion
+          (end-of-line)
+          (forward-line 1)
+          (delete-region (point)
+                         (if (re-search-forward "[^ \t\n]" nil t)
+                             (progn (beginning-of-line) (point))
+                           (point-max)))))
+    (if (looking-at "^[ \t]*\n\\'")
+        (delete-region (point) (point-max)))))
+(defun just-one-space (&optional n)
+  "Delete all spaces and tabs around point, leaving one space (or N spaces).
+If N is negative, delete newlines as well, leaving -N spaces."
+  (let ((skip-characters (if (and n (< n 0)) " \t\n\r" " \t"))
+        (num             (abs (or n 1))))
+    (skip-chars-backward skip-characters)
+    (let* ((num   (- num (skip-chars-forward " " (+ num (point)))))
+           (mid   (point))
+           (end   (progn
+                    (skip-chars-forward skip-characters)
+                    (point))))
+      (delete-region mid end)
+      (insert (make-string num ?\s)))))
+;; subr.el `shell-quote-argument', POSIX branch: the ms-dos and windows-nt
+;; branches are for `system-type's elisprs never runs as.
+(defun shell-quote-argument (argument &optional _posix)
+  "Quote ARGUMENT for passing as argument to an inferior POSIX shell."
+  (if (equal argument "")
+      "''"
+    (string-replace
+     "\n" "'\n'"
+     (replace-regexp-in-string "[^-0-9a-zA-Z_./\n]" "\\\\\\&" argument))))
 
 (defun forward-comment (count)
   "Move forward across up to COUNT comments.  If COUNT is negative, move backward.

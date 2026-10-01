@@ -354,8 +354,9 @@ impl Reader {
                             self.pos += 1;
                             32
                         }
-                        // A literal newline after `\` is elided (line continuation).
-                        '\n' => {
+                        // `\<newline>` (line continuation) and `\ ` are both elided
+                        // in a string literal (lread.c read_string_literal).
+                        '\n' | ' ' => {
                             self.pos += 1;
                             continue;
                         }

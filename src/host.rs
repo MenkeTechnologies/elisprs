@@ -988,6 +988,10 @@ pub struct ElispHost {
     /// the `PRINT_CIRCLE` depth ceiling live inside `if (NILP (Vprint_circle))`, so
     /// with the label table on a 250-deep nest prints instead of signalling.
     pub(crate) print_circle_on: Cell<bool>,
+    /// `Vprint_gensym` sampled once at the top of a `print` call: an uninterned
+    /// symbol prints with a `#:` prefix and, under `print-circle`, becomes a
+    /// label candidate (print.c `PRINT_CIRCLE_CANDIDATE_P`).
+    pub(crate) print_gensym_on: Cell<bool>,
     /// The global buffer registry. Index 0 is the default buffer (`*scratch*`).
     /// Slots are never removed — `kill-buffer` marks a buffer dead (`name: None`)
     /// so its index (and any live buffer object referencing it) stays valid.
@@ -1232,6 +1236,7 @@ impl ElispHost {
             print_next_label: Cell::new(1),
             print_being: RefCell::new(Vec::new()),
             print_circle_on: Cell::new(false),
+            print_gensym_on: Cell::new(false),
             buffers: vec![EditBuffer {
                 overlays: Vec::new(),
                 name: Some("*scratch*".to_string()),
@@ -1882,12 +1887,22 @@ impl ElispHost {
         }
         Ok(base.clone())
     }
+    /// Assign a variable reference (`setq`): a lexical binding shadows both the
+    /// buffer-local and the global cell.
     pub fn set_value(&mut self, v: &Value, val: Value) -> Result<(), String> {
+        self.set_value_in(v, val, true)
+    }
+    /// The `set` primitive: data.c `Fset` goes through `set_internal`, which
+    /// never sees a lexical binding — `(let ((x 1)) (set 'x 2) x)` is 1 and
+    /// leaves the global `x` at 2.
+    pub fn set_dynamic_value(&mut self, v: &Value, val: Value) -> Result<(), String> {
+        self.set_value_in(v, val, false)
+    }
+    fn set_value_in(&mut self, v: &Value, val: Value, lexical: bool) -> Result<(), String> {
         self.check_settable(v)?;
         let id0 = self.sym_handle(v).ok_or("set: not a symbol")?;
         let id = self.indirect_var(id0);
-        // A lexical binding shadows both the buffer-local and global cells.
-        if self.lex.as_ref().is_some_and(|s| s.set(id, &val)) {
+        if lexical && self.lex.as_ref().is_some_and(|s| s.set(id, &val)) {
             return Ok(());
         }
         // Write the current buffer's local slot if it already has one, or if the
@@ -2018,13 +2033,24 @@ impl ElispHost {
         }
         Ok(())
     }
+    /// Read a variable reference. Precedence: lexical binding, then the current
+    /// buffer's local binding, then the global (default) value cell.
     pub fn get_value(&self, v: &Value) -> Result<Value, String> {
+        self.get_value_in(v, true)
+    }
+    /// The dynamic value only — what data.c `Fsymbol_value` and `Fboundp` read.
+    /// A lexical binding is invisible to them: under `lexical-binding` t,
+    /// `(let ((x 1)) (boundp 'x))` is nil.
+    pub fn get_dynamic_value(&self, v: &Value) -> Result<Value, String> {
+        self.get_value_in(v, false)
+    }
+    fn get_value_in(&self, v: &Value, lexical: bool) -> Result<Value, String> {
         if let Some(id0) = self.sym_handle(v) {
             let id = self.indirect_var(id0);
-            // Precedence: lexical binding, then the current buffer's local
-            // binding, then the global (default) value cell.
-            if let Some(val) = self.lex.as_ref().and_then(|s| s.lookup(id)) {
-                return Ok(val);
+            if lexical {
+                if let Some(val) = self.lex.as_ref().and_then(|s| s.lookup(id)) {
+                    return Ok(val);
+                }
             }
             if let Some(slot) = self.buffers[self.cur_buf_idx()].locals.get(&id) {
                 return slot.clone().ok_or_else(|| {
@@ -3336,6 +3362,7 @@ impl ElispHost {
         // `print-circle` is opt-in: only then does the printer pay for the
         // reference-counting pre-pass that finds the objects needing `#N=` labels.
         self.print_circle_on.set(self.print_flag("print-circle"));
+        self.print_gensym_on.set(self.print_flag("print-gensym"));
         if self.print_circle_on.get() {
             self.print_next_label.set(1);
             self.print_preprocess(v);
@@ -3450,6 +3477,14 @@ impl ElispHost {
                             kids.push(val.clone());
                         }
                         Some(kids)
+                    }
+                    // `(! NILP (Vprint_gensym) && SYMBOLP (obj) && !SYMBOL_INTERNED_P
+                    // (obj))`: a shared gensym gets a label, so `(list s s)` prints
+                    // `(#1=#:x #1#)`. A leaf — it has no children to descend into.
+                    Some(Obj::Symbol(_))
+                        if self.print_gensym_on.get() && !self.interned_in_standard_obarray(id) =>
+                    {
+                        Some(Vec::new())
                     }
                     _ => None,
                 };
@@ -3687,6 +3722,17 @@ impl ElispHost {
                 Some(Obj::Str(s)) => self.print_body(&Value::Str(Arc::clone(s)), readable, depth),
                 Some(Obj::Symbol(s)) => {
                     if readable {
+                        // print.c: `if (escapeflag && print_gensym &&
+                        // !SYMBOL_INTERNED_IN_INITIAL_OBARRAY_P (obj))` prints `#:`
+                        // and then the name — with no `##` for an empty one.
+                        if self.print_gensym_on.get() && !self.interned_in_standard_obarray(*id) {
+                            let name = if s.name.is_empty() {
+                                String::new()
+                            } else {
+                                print_symbol_readable(&s.name)
+                            };
+                            return format!("#:{name}");
+                        }
                         print_symbol_readable(&s.name)
                     } else {
                         s.name.clone()

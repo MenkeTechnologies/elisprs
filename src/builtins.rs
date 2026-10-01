@@ -2026,7 +2026,7 @@ fn make_symbol_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 fn set_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    h.set_value(&a[0], a[1].clone())?;
+    h.set_dynamic_value(&a[0], a[1].clone())?;
     Ok(a[1].clone())
 }
 /// `(keywordp OBJECT)` — OBJECT is a symbol interned in the standard obarray
@@ -2049,7 +2049,7 @@ fn symbol_value(h: &mut ElispHost, a: &[Value]) -> R {
     if h.is_keyword(&a[0]) {
         return Ok(a[0].clone());
     }
-    h.get_value(&a[0])
+    h.get_dynamic_value(&a[0])
 }
 /// `(makunbound SYMBOL)` — clear SYMBOL's value cell, returning SYMBOL.
 fn makunbound(h: &mut ElispHost, a: &[Value]) -> R {
@@ -2113,7 +2113,8 @@ fn indirect_variable(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(boundp SYMBOL)` — non-nil if SYMBOL currently has a value.
 fn boundp(h: &mut ElispHost, a: &[Value]) -> R {
     // nil and t are always bound; otherwise the value cell must resolve.
-    let bound = is_nil(&a[0]) || matches!(a[0], Value::Bool(true)) || h.get_value(&a[0]).is_ok();
+    let bound =
+        is_nil(&a[0]) || matches!(a[0], Value::Bool(true)) || h.get_dynamic_value(&a[0]).is_ok();
     Ok(nil_or(bound))
 }
 
@@ -8229,10 +8230,16 @@ fn propertize_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(out)
 }
 fn delete_region(h: &mut ElispHost, a: &[Value]) -> R {
-    let len = h.cur_buf().text.len() as i64;
-    let s = as_int(h, &a[0])?.clamp(1, len + 1);
-    let e = as_int(h, &a[1])?.clamp(1, len + 1);
+    // `validate_region`, as in `buffer-substring`: a bound outside the accessible
+    // portion signals `(args-out-of-range BUFFER START END)` — clamping it
+    // silently deleted what was there instead.
+    let s = as_int_or_marker(h, &a[0], "integer-or-marker-p")?;
+    let e = as_int_or_marker(h, &a[1], "integer-or-marker-p")?;
     let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+    let buf = h.cur_buf_ref();
+    if lo < buf.begv as i64 || hi > buf.zv as i64 {
+        return Err(args_out_of_range_in_buffer(h, s, e));
+    }
     h.cur_delete(lo as usize, hi as usize);
     Ok(Value::Undef)
 }
@@ -8374,7 +8381,10 @@ fn forward_line(h: &mut ElispHost, a: &[Value]) -> R {
     let len = buf.zv - 1;
     let mut p = buf.point;
     let mut short = 0i64;
-    if n >= 0 {
+    // cmds.c `Fforward_line`: COUNT <= 0 searches backward (so `(forward-line 0)`
+    // goes to the beginning of the line) and the shortage comes back NEGATED —
+    // `(forward-line -1)` on the first line is -1, not 1.
+    if n > 0 {
         let mut moved = 0;
         while moved < n {
             let mut q = p;
@@ -8404,7 +8414,7 @@ fn forward_line(h: &mut ElispHost, a: &[Value]) -> R {
         }
     }
     buf.point = p;
-    Ok(Value::Int(short))
+    Ok(Value::Int(if n > 0 { short } else { -short }))
 }
 
 // ── buffer search (sets buffer-position match data) ──
@@ -8467,12 +8477,7 @@ fn search_with_count(
                     // end that is depends on the direction actually searched,
                     // and a negative COUNT reverses the command's own.
                     let going_forward = forward == (count > 0);
-                    let len = h.cur_buf().text.len();
-                    let limit = match a.get(1) {
-                        Some(v) if !is_nil(v) => (as_int(h, v)?.max(1) as usize).min(len + 1),
-                        _ if going_forward => len + 1,
-                        _ => 1,
-                    };
+                    let limit = search_limit(h, a, going_forward)?;
                     h.cur_buf().point = limit;
                 }
                 return Ok(Value::Undef);
@@ -8493,13 +8498,35 @@ fn re_search_forward(h: &mut ElispHost, a: &[Value]) -> R {
 fn re_search_backward(h: &mut ElispHost, a: &[Value]) -> R {
     search_with_count(h, a, false, re_search_backward_once, re_search_forward_once)
 }
+/// search.c `search_command`'s limit: BOUND nil is ZV going forward and BEGV
+/// going backward; a BOUND on the wrong side of point is an error, and one past
+/// the accessible portion is clamped to it. Returns the 1-based limit.
+///
+/// Defaulting to the whole buffer instead let every search in a narrowed buffer
+/// find text outside the narrowing — `replace-regexp-in-region` (which narrows
+/// to its region) then edited past its END.
+fn search_limit(h: &mut ElispHost, a: &[Value], forward: bool) -> Result<usize, String> {
+    let (begv, zv, pt) = {
+        let b = h.cur_buf_ref();
+        (b.begv as i64, b.zv as i64, b.point as i64)
+    };
+    let lim = match a.get(1) {
+        Some(v) if !is_nil(v) => {
+            let lim = as_int_or_marker(h, v, "integer-or-marker-p")?;
+            if if forward { lim < pt } else { lim > pt } {
+                return Err("error: Invalid search bound (wrong side of point)".to_string());
+            }
+            lim.clamp(begv, zv)
+        }
+        _ if forward => zv,
+        _ => begv,
+    };
+    Ok(lim as usize)
+}
 fn search_forward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
     let needle: Vec<char> = as_string(h, &a[0])?.chars().collect();
     let len = h.cur_buf().text.len();
-    let bound = match a.get(1) {
-        Some(v) if !is_nil(v) => (as_int(h, v)?.max(0) as usize).min(len + 1),
-        _ => len + 1,
-    };
+    let bound = search_limit(h, a, true)?;
     let start = h.cur_buf().point - 1;
     let nlen = needle.len();
     let found = {
@@ -8534,17 +8561,25 @@ fn search_forward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, St
 fn re_search_forward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
     let pat = as_string(h, &a[0])?;
     let re = compile_cf(h, &pat, case_fold_search(h))?;
-    let bound = match a.get(1) {
-        Some(v) if !is_nil(v) => Some(as_int(h, v)?.max(0) as usize),
-        _ => None,
-    };
+    let bound = search_limit(h, a, true)?;
     let text: String = h.cur_buf().text.iter().collect();
     let start_char = h.cur_buf().point - 1;
-    let m = run_match(&re, &text, start_char).filter(|spans| {
-        spans[0]
-            .map(|(_, e)| bound.is_none_or(|b| e < b))
-            .unwrap_or(false)
-    });
+    // The regexp sees only the accessible portion — regex-emacs.c is handed
+    // BEGV..ZV, so `\``/`^` match at BEGV and `\'`/`$` at ZV — while BOUND only
+    // caps where the match may end.
+    let (begv0, zv0) = {
+        let b = h.cur_buf_ref();
+        (b.begv - 1, b.zv - 1)
+    };
+    let subject: String = h.cur_buf_ref().text[begv0..zv0].iter().collect();
+    let m = run_match(&re, &subject, start_char - begv0)
+        .map(|spans| {
+            spans
+                .into_iter()
+                .map(|s| s.map(|(b, e)| (b + begv0, e + begv0)))
+                .collect::<Vec<_>>()
+        })
+        .filter(|spans| spans[0].map(|(_, e)| e < bound).unwrap_or(false));
     let _ = &pat;
     match m {
         Some(spans0) => {
@@ -9148,10 +9183,7 @@ fn current_column(h: &mut ElispHost, _a: &[Value]) -> R {
 }
 fn search_backward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
     let needle: Vec<char> = as_string(h, &a[0])?.chars().collect();
-    let bound = match a.get(1) {
-        Some(v) if !is_nil(v) => (as_int(h, v)?.max(1) as usize) - 1,
-        _ => 0,
-    };
+    let bound = search_limit(h, a, false)? - 1;
     let point = h.cur_buf().point;
     let nlen = needle.len();
     let found = {
@@ -9159,7 +9191,8 @@ fn search_backward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, S
         let mut res = None;
         if nlen == 0 {
             res = Some(point - 1);
-        } else if point > nlen {
+        } else if point > nlen && point - 1 - nlen >= bound {
+            // Starts run from the last one that ends at point down to BOUND.
             let mut i = point - 1 - nlen; // max start so match ends at point-1
             loop {
                 if hay[i..i + nlen] == needle[..] {
@@ -9208,10 +9241,7 @@ fn re_search_backward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>
     let re = compile_cf(h, &pat, case_fold_search(h))?;
     // BOUND: the match may not START before it (`search_backward` reads it the
     // same way for a literal search).
-    let bound = match a.get(1) {
-        Some(v) if !is_nil(v) => (as_int(h, v)?.max(1) as usize) - 1,
-        _ => 0,
-    };
+    let bound = search_limit(h, a, false)? - 1;
     let full: String = h.cur_buf().text.iter().collect();
     let point_char = h.cur_buf().point - 1;
     // Truncating at point is what bounds the match END; char offsets in the
@@ -9242,46 +9272,119 @@ fn re_search_backward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>
         None => Ok(None),
     }
 }
-fn parse_char_set(spec: &str) -> (bool, Vec<(char, char)>) {
-    let chars: Vec<char> = spec.chars().collect();
-    let mut i = 0;
-    let neg = chars.first() == Some(&'^');
-    if neg {
-        i = 1;
-    }
-    let mut ranges = Vec::new();
-    while i < chars.len() {
-        if i + 2 < chars.len() && chars[i + 1] == '-' {
-            ranges.push((chars[i], chars[i + 2]));
-            i += 3;
-        } else {
-            ranges.push((chars[i], chars[i]));
+/// One member of a `skip-chars-forward` set: an inclusive character range, or
+/// an ISO C class (`[:alpha:]`), tested through the regexp engine's class
+/// translation so the two agree character for character.
+enum SkipItem {
+    Range(char, char),
+    Class(Rc<CompiledRe>),
+}
+/// A parsed `skip-chars-forward`/`-backward` set (syntax.c `skip_chars`).
+struct SkipSet {
+    negate: bool,
+    items: Vec<SkipItem>,
+}
+impl SkipSet {
+    /// syntax.c `skip_chars`'s parse: a leading `^` negates; `[:NAME:]` is a
+    /// character class (an unknown NAME is an error, a malformed one is plain
+    /// characters); `\` quotes the next character; `A-B` is a range only when a
+    /// character follows the `-`, and an inverted range is empty.
+    fn parse(h: &ElispHost, spec: &str) -> Result<SkipSet, String> {
+        let chars: Vec<char> = spec.chars().collect();
+        let negate = chars.first() == Some(&'^');
+        let mut i = usize::from(negate);
+        let mut items = Vec::new();
+        while i < chars.len() {
+            let mut c = chars[i];
             i += 1;
+            if c == '[' && chars.get(i) == Some(&':') {
+                let beg = i + 1;
+                let mut end = beg;
+                while end + 1 < chars.len()
+                    && !(chars[end] as u32 >= 0o200
+                        || chars[end] as u32 <= 0o40
+                        || (chars[end] == ':' && chars[end + 1] == ']'))
+                {
+                    end += 1;
+                }
+                if end > beg && chars.get(end) == Some(&':') && chars.get(end + 1) == Some(&']') {
+                    let name: String = chars[beg..end].iter().collect();
+                    if !crate::regexp::is_class_name(&name) {
+                        return Err("error: Invalid ISO C character class".to_string());
+                    }
+                    items.push(SkipItem::Class(compile_cf(
+                        h,
+                        &format!("[[:{name}:]]"),
+                        false,
+                    )?));
+                    i = end + 2;
+                    continue;
+                }
+            }
+            if c == '\\' {
+                match chars.get(i) {
+                    Some(&q) => {
+                        c = q;
+                        i += 1;
+                    }
+                    None => break,
+                }
+            }
+            if i + 1 < chars.len() && chars[i] == '-' {
+                let mut c2 = chars[i + 1];
+                i += 2;
+                if c2 == '\\' && i < chars.len() {
+                    c2 = chars[i];
+                    i += 1;
+                }
+                if c <= c2 {
+                    items.push(SkipItem::Range(c, c2));
+                }
+            } else {
+                items.push(SkipItem::Range(c, c));
+            }
+        }
+        Ok(SkipSet { negate, items })
+    }
+    fn contains(&self, c: char) -> bool {
+        let hit = self.items.iter().any(|item| match item {
+            SkipItem::Range(a, b) => (*a..=*b).contains(&c),
+            SkipItem::Class(re) => re.is_match(c.encode_utf8(&mut [0; 4])).unwrap_or(false),
+        });
+        hit != self.negate
+    }
+}
+/// syntax.c `skip_chars`: LIM nil is ZV (forward) / BEGV (backward), and any
+/// LIM is clamped to the accessible portion — so a narrowing bounds the scan
+/// and point already past LIM does not move. Returns the distance moved.
+fn skip_chars(h: &mut ElispHost, a: &[Value], forward: bool) -> R {
+    let set = SkipSet::parse(h, &as_string(h, &a[0])?)?;
+    let lim = match a.get(1) {
+        Some(v) if !is_nil(v) => Some(as_int_or_marker(h, v, "integer-or-marker-p")?),
+        _ => None,
+    };
+    let buf = h.cur_buf();
+    let (begv, zv) = (buf.begv as i64, buf.zv as i64);
+    let lim = lim
+        .unwrap_or(if forward { zv } else { begv })
+        .clamp(begv, zv) as usize;
+    let start = buf.point;
+    if forward {
+        while buf.point < lim && set.contains(buf.text[buf.point - 1]) {
+            buf.point += 1;
+        }
+    } else {
+        while buf.point > lim && set.contains(buf.text[buf.point - 2]) {
+            buf.point -= 1;
         }
     }
-    (neg, ranges)
-}
-fn in_char_set(c: char, ranges: &[(char, char)], neg: bool) -> bool {
-    let m = ranges.iter().any(|&(a, b)| c >= a && c <= b);
-    m != neg
+    Ok(Value::Int(buf.point as i64 - start as i64))
 }
 fn skip_chars_forward(h: &mut ElispHost, a: &[Value]) -> R {
-    let (neg, ranges) = parse_char_set(&as_string(h, &a[0])?);
-    let buf = h.cur_buf();
-    let start = buf.point;
-    while buf.point <= buf.text.len() && in_char_set(buf.text[buf.point - 1], &ranges, neg) {
-        buf.point += 1;
-    }
-    Ok(Value::Int((buf.point - start) as i64))
+    skip_chars(h, a, true)
 }
 fn skip_chars_backward(h: &mut ElispHost, a: &[Value]) -> R {
-    let (neg, ranges) = parse_char_set(&as_string(h, &a[0])?);
-    let buf = h.cur_buf();
-    let start = buf.point;
-    while buf.point > 1 && in_char_set(buf.text[buf.point - 2], &ranges, neg) {
-        buf.point -= 1;
-    }
-    Ok(Value::Int(buf.point as i64 - start as i64))
+    skip_chars(h, a, false)
 }
 fn forward_word(h: &mut ElispHost, a: &[Value]) -> R {
     // Word = run of alphanumerics (no syntax tables).

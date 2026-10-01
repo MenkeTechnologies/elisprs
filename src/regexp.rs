@@ -257,6 +257,12 @@ const CLASS_NAMES: [&str; 17] = [
     "xdigit",
 ];
 
+/// Whether NAME is one of [`CLASS_NAMES`] — shared with `skip-chars-forward`,
+/// whose `[:NAME:]` accepts exactly the regexp engine's classes.
+pub(crate) fn is_class_name(name: &str) -> bool {
+    CLASS_NAMES.contains(&name)
+}
+
 fn translate_escape(
     it: &mut std::iter::Peekable<std::str::Chars>,
     out: &mut String,

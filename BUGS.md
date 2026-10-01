@@ -5582,6 +5582,61 @@ Round 29's void list less `cl-with-accessors` and `cl-struct-sequence-type`
 unibyte/multibyte flag: elisprs's `string-to-unibyte` and friends are
 identity functions today.
 
+## Round 31 — search limits, `skip-chars`, the dynamic-only primitives, and the whitespace commands
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch`, `lexical-binding` t). A seed-1
+500-form fuzz corpus reported only `make-hash-table` / `split-string` oracle
+drift, so this round came from hand-written probes of everyday forms.
+Regression tests: `tests/parity_search_limits_and_whitespace.rs`.
+
+| form | Emacs 31.1 | elisprs before |
+|---|---|---|
+| `(narrow-to-region 1 4) (goto-char 1) (list (search-forward "c" nil t) (search-forward "a" nil t))` on `"abcabc"` | `(4 nil)` | `(4 5)` |
+| `(re-search-forward "c\\'" nil t)` in the same narrowing | `4` | `7` |
+| `(re-search-forward "\\`a" nil t)` at BEGV of `(narrow-to-region 4 7)` | `5` | `nil` |
+| `(search-forward "a" 1)` with point at 4 | `(error "Invalid search bound (wrong side of point)")` | `(search-failed "a")` |
+| `(search-forward "x" 0 t)` | the same error | Rust panic (`usize` underflow) |
+| `(skip-chars-forward " " 3)` from 2 in `"a    b"` | `1` | `4` (LIM ignored) |
+| `(skip-chars-forward "[:alpha:]")` on `"ab12"` | `2` | `1` (`[:alpha:]` read as literal characters) |
+| `(forward-line 0)` mid-line | point at bol | point unmoved |
+| `(forward-line -1)` on the first line | `-1` | `1` |
+| `(let ((x 1)) (set 'x 2) x)` | `1` | `2` |
+| `(let ((x 1)) (boundp 'x))` | `nil` | `t` |
+| `(let ((print-gensym t)) (prin1-to-string (make-symbol "x")))` | `"#:x"` | `"x"` |
+| `"a\ b"` (reader) | `"ab"` | `"a b"` |
+| `(with-temp-buffer (delete-region 1 5))` | `(args-out-of-range #<buffer> 1 5)` | `nil` (clamped) |
+| `(cl-check-type 1 string)` | `(wrong-type-argument string 1 1)` | `(wrong-type-argument string 1)` |
+
+- **Searches ignored the narrowing.** search.c `search_command` defaults BOUND
+  to ZV/BEGV, clamps an explicit one into the accessible portion and rejects one
+  on the wrong side of point; the regexp engine is handed only BEGV..ZV, so the
+  buffer anchors sit at the narrowing. All four searches (and NOERROR's
+  move-to-limit) now share one `search_limit`.
+- **`skip-chars-forward`/`-backward`** are a port of syntax.c `skip_chars`'s set
+  parser (`^`, `[:class:]` through the regexp engine's classes, `\` quoting,
+  ranges only between two characters, inverted range empty, unknown class an
+  error) and its LIM clamping.
+- **`set`/`symbol-value`/`boundp`** read and write the dynamic value only
+  (data.c `Fset`/`Fsymbol_value`/`Fboundp`); variable references keep the
+  lexical-first lookup.
+- **`print-gensym`**: `#:` prefix for symbols not in the initial obarray, and a
+  shared one is a `print-circle` label candidate.
+- **Newly defined**, ported from the 31.1 lisp sources: `replace-regexp-in-region`,
+  `replace-string-in-region`, `current-indentation`, `back-to-indentation`,
+  `indent-to`, `delete-horizontal-space`, `delete-trailing-whitespace`,
+  `fixup-whitespace`, `delete-indentation` / `join-line`, `delete-blank-lines`,
+  `just-one-space`, `shell-quote-argument` (POSIX branch).
+
+### Still open after round 31
+
+- `print-gensym` + `print-circle` labels a symbol interned in a *private*
+  obarray (`(intern "x" (obarray-make))`); Emacs does not (`SYMBOL_INTERNED_P`).
+  The host does not track membership in private obarrays.
+- Void: `move-to-column` (so `indent-line-to`), `current-word`,
+  `thing-at-point`, `sort-lines`, `reverse-region`, `transpose-regions`,
+  `flush-lines`/`keep-lines`, `tabify`/`untabify`, `encode-coding-string`.
+- `(match-data)` after a buffer search returns integers; Emacs returns markers.
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the
