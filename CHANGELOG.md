@@ -22,6 +22,20 @@ All notable changes to elisprs are documented here. The format follows
   `sexp-at-point`, ...), `forward-symbol`, `forward-whitespace`,
   `buffer-narrowed-p`, `search-forward-regexp`, `barf-if-buffer-read-only`,
   `delete-and-extract-region`, `remove-list-of-text-properties`.
+- **Lisp timestamps are exact** (src/timefns.rs, a port of timefns.c): every
+  time value decodes to a `(TICKS . HZ)` rational, so `time-add`,
+  `time-subtract`, `time-less-p`, `time-equal-p` and `time-convert` no longer
+  round through floats and answer in the form Emacs picks; `float-time` rounds
+  once, correctly; `decode-time` with FORM t and `encode-time` keep sub-second
+  resolution. Newly defined from time-date.el: `seconds-to-time`,
+  `days-to-time`, `time-since`, `date-leap-year-p`, `time-to-days`,
+  `time-to-day-in-year`, `date-days-in-month`, `date-ordinal-to-time`.
+- **`(eval '(progn ...))` compiled the whole body before running it**, so a
+  `cl-defstruct` or `defmacro` early in it was not in effect for the forms
+  after it; each subform is now expanded when it is reached, as in
+  `eval_sub`. Also: `cl-ecase`/`cl-etypecase` failure messages, `cl-copy-list`
+  on a dotted list, `cl-no-applicable-method`'s arguments, and files.el's
+  `file-relative-name` (`../` climbing) and `file-name-sans-versions`.
 - **Round 32 parity vs Emacs 31.1** (see BUGS.md): `last` on a circular list
   hung; `fset` to nil left the symbol `fboundp`, and `fmakunbound` was void;
   `functionp` accepted a special-form subr object; empty vectors were distinct

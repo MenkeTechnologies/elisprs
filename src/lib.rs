@@ -23,6 +23,7 @@ pub mod reader;
 pub mod regexp;
 pub mod rust_ffi;
 pub mod tiers;
+pub mod timefns;
 
 pub use fusevm::Value;
 pub use host::{reset_host, run_chunk, with_host};

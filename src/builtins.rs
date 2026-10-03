@@ -4939,7 +4939,7 @@ fn atan_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// overflows `2^n` to infinity for very negative `n` and returns 0.0, whereas
 /// Emacs (via C `ldexp`) yields the smallest subnormal (e.g. `(ldexp 1.0 -1074)`
 /// => 5e-324). The staged scaling keeps every intermediate in range.
-fn scalbn(x: f64, mut n: i64) -> f64 {
+pub(crate) fn scalbn(x: f64, mut n: i64) -> f64 {
     let two_1023 = 2f64.powi(1023);
     let two_m1022 = f64::MIN_POSITIVE; // 2^-1022
     let two_53 = (1u64 << 53) as f64; // 2^53
@@ -6933,27 +6933,7 @@ fn random_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// integer/float of seconds, a `(TICKS . HZ)` pair, or a `(HIGH LOW [USEC ...])`
 /// legacy list.
 fn time_arg_secs(h: &ElispHost, v: Option<&Value>) -> Result<f64, String> {
-    match v {
-        None => Ok(now_secs()),
-        Some(t) if is_nil(t) => Ok(now_secs()),
-        Some(Value::Int(n)) => Ok(*n as f64),
-        Some(Value::Float(f)) => Ok(*f),
-        Some(t) => {
-            // (TICKS . HZ): a cons whose cdr is a number.
-            if let Some(Obj::Cons(car, Value::Int(hz))) = h.obj(t) {
-                if *hz != 0 {
-                    return Ok(as_num(h, car)?.1 / (*hz as f64));
-                }
-            }
-            // (HIGH LOW [USEC [PSEC]]).
-            let parts = h.list_vec(t).ok_or("invalid time value")?;
-            let get = |i: usize| parts.get(i).and_then(|v| as_num(h, v).ok()).map(|x| x.1);
-            let high = get(0).unwrap_or(0.0);
-            let low = get(1).unwrap_or(0.0);
-            let usec = get(2).unwrap_or(0.0);
-            Ok(high * 65536.0 + low + usec / 1.0e6)
-        }
-    }
+    crate::timefns::float_seconds(h, v)
 }
 
 /// Decompose epoch seconds into a `struct tm` for the given ZONE (nil = local,
@@ -7361,16 +7341,36 @@ fn current_time_string(h: &mut ElispHost, a: &[Value]) -> R {
 // `tm_gmtoff` is `c_long`; `i64::from` is needed on 32-bit but a no-op here.
 #[allow(clippy::useless_conversion)]
 fn decode_time(h: &mut ElispHost, a: &[Value]) -> R {
-    let secs = time_arg_secs(h, a.first())?;
+    // timefns.c `Fdecode_time`: FORM t keeps TIME's resolution in the seconds
+    // element, `(TICKS . HZ)`; any other FORM decodes whole seconds only.
+    let exact = if matches!(a.get(2), Some(Value::Bool(true))) {
+        Some(crate::timefns::decode(h, a.first(), false)?)
+    } else {
+        None
+    };
+    let secs = match &exact {
+        Some(t) => crate::timefns::floor_seconds(t)?,
+        None => crate::timefns::seconds_argument(h, a.first())?,
+    };
     let local = check_time_zone(h, a.get(1))?;
-    let tm = time_decompose(secs, a.get(1), local);
+    let tm = time_decompose(secs as f64, a.get(1), local);
     let dst = match tm.tm_isdst {
         0 => Value::Undef,
         n if n > 0 => Value::Bool(true),
         _ => Value::Int(-1),
     };
+    let sec = match exact {
+        Some(t) if t.hz != BigInt::from(1) => {
+            use num_integer::Integer;
+            let ticks = t.ticks.mod_floor(&t.hz) + &t.hz * BigInt::from(tm.tm_sec);
+            let ticks = h.make_integer(ticks);
+            let hz = h.make_integer(t.hz);
+            h.cons(ticks, hz)
+        }
+        _ => Value::Int(tm.tm_sec as i64),
+    };
     Ok(h.list_from(vec![
-        Value::Int(tm.tm_sec as i64),
+        sec,
         Value::Int(tm.tm_min as i64),
         Value::Int(tm.tm_hour as i64),
         Value::Int(tm.tm_mday as i64),
@@ -7382,45 +7382,95 @@ fn decode_time(h: &mut ElispHost, a: &[Value]) -> R {
     ]))
 }
 
+/// timefns.c `Fencode_time`. The seconds element is any time value, so a
+/// sub-second one comes back as `(TICKS . HZ)` at its own resolution; whole
+/// seconds come back as `(HI LO)`.
 fn encode_time(h: &mut ElispHost, a: &[Value]) -> R {
-    // Two conventions: (encode-time DECODED-LIST) where the list is
-    // (SEC MIN HOUR DAY MON YEAR [DOW] [DST] [ZONE]); or the spread form
-    // (encode-time SEC MIN HOUR DAY MON YEAR &optional ZONE).
-    let single_list = a.len() == 1 && h.list_vec(&a[0]).is_some();
-    let (parts, zone) = if single_list {
-        let p = h.list_vec(&a[0]).unwrap();
-        let z = p.get(8).cloned();
-        (p, z)
+    let mut isdst: libc::c_int = -1;
+    let (fields, zone): (Vec<Value>, Value) = if a.len() == 1 {
+        let mut fields = Vec::with_capacity(6);
+        let mut tail = a[0].clone();
+        for _ in 0..6 {
+            let Some(Obj::Cons(car, cdr)) = h.obj(&tail) else {
+                return Err(h.signal_wrong_type("consp", &tail));
+            };
+            fields.push(car.clone());
+            tail = cdr.clone();
+        }
+        let mut zone = Value::Undef;
+        if !is_nil(&tail) {
+            let Some(Obj::Cons(_, rest)) = h.obj(&tail) else {
+                return Err(h.signal_wrong_type("consp", &tail));
+            };
+            let rest = rest.clone();
+            let Some(Obj::Cons(dstflag, rest2)) = h.obj(&rest) else {
+                return Err(h.signal_wrong_type("consp", &rest));
+            };
+            let (dstflag, rest2) = (dstflag.clone(), rest2.clone());
+            let Some(Obj::Cons(z, _)) = h.obj(&rest2) else {
+                return Err(h.signal_wrong_type("consp", &rest2));
+            };
+            zone = z.clone();
+            let is_symbol = is_nil(&dstflag)
+                || matches!(dstflag, Value::Bool(true))
+                || h.sym_name(&dstflag).is_some();
+            let zone_fixnum_or_cons =
+                matches!(zone, Value::Int(_)) || matches!(h.obj(&zone), Some(Obj::Cons(..)));
+            if is_symbol && !zone_fixnum_or_cons {
+                isdst = libc::c_int::from(!is_nil(&dstflag));
+            }
+        }
+        (fields, zone)
+    } else if a.len() < 6 {
+        let f = h.intern("encode-time");
+        let n = h.list_from(vec![f, Value::Int(a.len() as i64)]);
+        let sym = h.intern("wrong-number-of-arguments");
+        let obj = h.cons(sym, n);
+        let msg = format!("wrong-number-of-arguments: encode-time {}", a.len());
+        h.set_pending_error(&msg, obj);
+        return Err(msg);
     } else {
-        (a.to_vec(), a.get(6).cloned())
+        let zone = if a.len() > 6 {
+            a[a.len() - 1].clone()
+        } else {
+            Value::Undef
+        };
+        (a[..6].to_vec(), zone)
     };
-    let g = |i: usize| {
-        parts
-            .get(i)
-            .and_then(|v| as_num(h, v).ok())
-            .map(|x| x.0)
-            .unwrap_or(0)
+    let t = crate::timefns::decode(h, Some(&fields[0]), false)?;
+    let (sec, subsec) = {
+        use num_integer::Integer;
+        t.ticks.div_mod_floor(&t.hz)
     };
+    // `check_tm_member`: each field a fixnum whose offset value fits an int.
+    let member = |h: &mut ElispHost, v: &Value, offset: i64| -> Result<libc::c_int, String> {
+        let Value::Int(n) = v else {
+            return Err(h.signal_wrong_type("fixnump", v));
+        };
+        libc::c_int::try_from(n - offset).map_err(|_| crate::timefns::overflow())
+    };
+    let sec_v = h.make_integer(sec);
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    tm.tm_sec = g(0) as libc::c_int;
-    tm.tm_min = g(1) as libc::c_int;
-    tm.tm_hour = g(2) as libc::c_int;
-    tm.tm_mday = g(3) as libc::c_int;
-    tm.tm_mon = (g(4) - 1) as libc::c_int;
-    tm.tm_year = (g(5) - 1900) as libc::c_int;
-    tm.tm_isdst = -1;
-    let secs: i64 = match zone.as_ref() {
-        None | Some(Value::Undef) | Some(Value::Bool(false)) => unsafe {
-            libc::mktime(&mut tm) as i64
-        },
-        // Components are stated in a fixed offset east of UTC: read as UTC, then back out the offset.
-        Some(Value::Int(off)) => unsafe { libc::timegm(&mut tm) as i64 - *off },
+    tm.tm_sec = member(h, &sec_v, 0)?;
+    tm.tm_min = member(h, &fields[1], 0)?;
+    tm.tm_hour = member(h, &fields[2], 0)?;
+    tm.tm_mday = member(h, &fields[3], 0)?;
+    tm.tm_mon = member(h, &fields[4], 1)?;
+    tm.tm_year = member(h, &fields[5], 1900)?;
+    tm.tm_isdst = isdst;
+    let local = check_time_zone(h, Some(&zone))?;
+    let value: i64 = match &zone {
+        Value::Int(off) => unsafe { libc::timegm(&mut tm) as i64 - *off },
+        _ if local || is_nil(&zone) => unsafe { libc::mktime(&mut tm) as i64 },
         _ => unsafe { libc::timegm(&mut tm) as i64 },
     };
-    Ok(h.list_from(vec![
-        Value::Int(secs.div_euclid(65536)),
-        Value::Int(secs.rem_euclid(65536)),
-    ]))
+    if t.hz == BigInt::from(1) {
+        return Ok(h.list_from(vec![Value::Int(value >> 16), Value::Int(value & 0xffff)]));
+    }
+    let ticks = BigInt::from(value) * &t.hz + subsec;
+    let ticks = h.make_integer(ticks);
+    let hz = h.make_integer(t.hz);
+    Ok(h.cons(ticks, hz))
 }
 
 // ── environment / working directory ──
@@ -10086,6 +10136,7 @@ pub fn install(h: &mut ElispHost) {
     s("current-time-string", 0, Some(2), current_time_string);
     s("decode-time", 0, Some(3), decode_time);
     s("encode-time", 1, None, encode_time);
+    s("time--decode", 1, Some(1), crate::timefns::time_decode_fn);
     // strings
     s("substring", 1, Some(3), substring);
     s(

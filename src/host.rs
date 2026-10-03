@@ -6162,6 +6162,24 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 if matches!(form, Value::Bool(true)) {
                     return Ok(form.clone());
                 }
+                // eval.c `eval_sub` interprets a `progn` one subform at a time,
+                // expanding each only when it is reached, so a `cl-defstruct`,
+                // `defmacro` or `gv-define-setter` earlier in the body is in
+                // effect for the forms after it. Compiling the whole form first
+                // expanded `(setf (S-x p) v)` before S existed.
+                let progn_body = with_host(|h| {
+                    h.list_vec(form)
+                        .filter(|v| !v.is_empty() && h.sym_name(&v[0]).as_deref() == Some("progn"))
+                });
+                if let Some(body) = progn_body {
+                    let mut last = Value::Undef;
+                    for sub in &body[1..] {
+                        let mut sub_args = vec![sub.clone()];
+                        sub_args.extend(args.get(1).cloned());
+                        last = call_function(f, &sub_args)?;
+                    }
+                    return Ok(last);
+                }
                 let expanded = macroexpand_all_for_eval(form)?;
                 let chunk = with_host(|h| crate::compiler::compile_top(h, &expanded))?;
                 // FORM is evaluated in the lexical environment given by LEXICAL —

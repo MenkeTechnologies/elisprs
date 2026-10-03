@@ -542,7 +542,12 @@ pub const PRELUDE: &str = r#"
 (defun cl-notevery (pred seq &rest rest) (not (apply (function cl-every) pred seq rest)))
 ;; cl- list utilities.
 (defun cl-list-length (l) (length l))
-(defun cl-copy-list (l) (copy-sequence l))
+(defun cl-copy-list (list)
+  (if (consp list)
+      (let ((res nil))
+        (while (consp list) (setq res (cons (car list) res) list (cdr list)))
+        (prog1 (nreverse res) (setcdr res list)))
+    (car list)))
 (defun cl-revappend (l tail) (append (reverse l) tail))
 (defun cl-nreconc (l tail) (nconc (nreverse l) tail))
 (defmacro cl-nth-value (n form) (list 'nth n form))
@@ -4089,11 +4094,40 @@ of `load-path'."
     (let ((res (concat (if abs "/" "") (mapconcat (function identity) (nreverse out) "/"))))
       (when (and trail (not (string-suffix-p "/" res))) (setq res (concat res "/")))
       (if (string= res "") (if abs "/" ".") res))))
-(defun file-relative-name (filename &optional dir)
-  ;; Common-prefix relativization (no `../' climb when FILENAME isn't under DIR).
-  (let ((d (file-name-as-directory (expand-file-name (or dir default-directory))))
-        (f (expand-file-name filename)))
-    (if (string-prefix-p d f) (substring f (length d)) f)))
+;; files.el (Emacs 31.1). No file name handlers or remote files here, and no
+;; DOS drive letters; case folding follows minibuffer.el's default for
+;; `read-file-name-completion-ignore-case', which is what files.el consults.
+(defvar read-file-name-completion-ignore-case
+  (if (memq system-type '(ms-dos windows-nt darwin cygwin)) t nil))
+(defvar file-name-version-regexp
+  "\\(?:~\\|\\.~[-[:alnum:]:#@^._]+\\(?:~[[:digit:]]+\\)?~\\)")
+(defun file-name-sans-versions (name &optional keep-backup-version)
+  (substring name 0
+             (unless keep-backup-version
+               (string-match (concat file-name-version-regexp "\\'")
+                             name))))
+(defun file-relative-name (filename &optional directory)
+  (save-match-data
+    (setq directory
+          (file-name-as-directory (expand-file-name (or directory
+                                                        default-directory))))
+    (setq filename (expand-file-name filename))
+    (let ((fold-case read-file-name-completion-ignore-case)
+          (ancestor ".")
+          (filename-dir (file-name-as-directory filename)))
+      (while (not
+              (or (string-prefix-p directory filename-dir fold-case)
+                  (string-prefix-p directory filename fold-case)))
+        (setq directory (file-name-directory (substring directory 0 -1))
+              ancestor (if (equal ancestor ".")
+                           ".."
+                         (concat "../" ancestor))))
+      (if (string-prefix-p directory filename fold-case)
+          (let ((rest (substring filename (length directory))))
+            (if (and (equal ancestor ".") (not (equal rest "")))
+                rest
+              (concat (file-name-as-directory ancestor) rest)))
+        ancestor))))
 (defun abbreviate-file-name (filename)
   (let ((home (getenv "HOME")))
     (if (and home (string-prefix-p (file-name-as-directory home) filename))
@@ -5245,38 +5279,144 @@ If all LST elements are zeros or LST is nil, return zero."
   (declare (side-effect-free t))
   (version-list-= (version-to-list v1) (version-to-list v2)))
 ;; format-seconds: ported from time-date.el. %y/%d/%h/%m/%s units (upper-case adds
-;; ---- time arithmetic (seconds-based) ----
-;; elisprs represents time values as plain seconds (integer or float) — a valid
-;; Emacs time value. (Emacs's high-precision ticks/list forms for fractional
-;; results aren't reproduced, but float-time/time-less-p etc. interoperate.)
-(defun time-to-seconds (time) (float-time time))
-(defun time--norm (s) (if (= s (truncate s)) (truncate s) s))
-(defun time-add (a b) (time--norm (+ (float-time a) (float-time b))))
-(defun time-subtract (a b) (time--norm (- (float-time a) (float-time b))))
-(defun time-less-p (a b) (< (float-time a) (float-time b)))
-(defun time-equal-p (a b) (= (float-time a) (float-time b)))
+;; ---- Lisp timestamps: a port of timefns.c (Emacs 31.1) ----
+;; Every time value decodes to an exact (TICKS . HZ) pair (bignum arithmetic,
+;; no floats), so sums, differences and comparisons are exact and come back in
+;; the form timefns.c picks: an integer when HZ is 1, (TICKS . HZ) when either
+;; input was in that form or HZ does not divide a trillion, otherwise the
+;; (HI LO US PS) list `current-time-list' asks for.
+(defvar current-time-list t)
+(defun time--gcd (a b)
+  (setq a (abs a) b (abs b))
+  (while (/= b 0) (setq b (prog1 (% a b) (setq a b))))
+  a)
+;; `time--decode' (src/timefns.rs) is decode_lisp_time: TIME as exact (TICKS . HZ).
+;; ticks_hz_list4: floor to picoseconds, then split.
+(defun time--list4 (ticks hz)
+  (let* ((x (floor (* ticks 1000000000000) hz))
+         (s (floor x 1000000000000))
+         (fullps (mod x 1000000000000)))
+    (list (ash s -16) (logand s 65535) (/ fullps 1000000) (% fullps 1000000))))
+;; ticks_hz_hz_ticks: floor (TICKS * HZ / T.HZ), validating HZ.
+(defun time--hz-ticks (th hz)
+  (unless (and (integerp hz) (> hz 0))
+    (signal 'error (list "Invalid time frequency" hz)))
+  (floor (* (car th) hz) (cdr th)))
+(defun time--trillion-factor (hz)
+  (and (fixnump hz) (= 0 (% 1000000000000 hz))))
+;; time_arith.
+(defun time--arith (a b subtract)
+  (let ((ta (time--decode a)) (tb (time--decode b)) ticks hz)
+    (if (eql (cdr ta) (cdr tb))
+        (setq hz (cdr ta)
+              ticks (if subtract (- (car ta) (car tb)) (+ (car ta) (car tb))))
+      (let* ((da (cdr ta)) (db (cdr tb))
+             (hzmin (min da db))
+             (g (time--gcd da db))
+             (fa (/ da g)) (fb (/ db g))
+             (ihz (* fa db))
+             (iticks (if subtract
+                         (- (* fb (car ta)) (* fa (car tb)))
+                       (+ (* fb (car ta)) (* fa (car tb)))))
+             (ig (time--gcd iticks ihz)))
+        (when (> ig 1)
+          (setq iticks (/ iticks ig) ihz (/ ihz ig))
+          (when (< ihz hzmin)
+            (let ((rescale (ceiling hzmin ihz)))
+              (setq iticks (* iticks rescale) ihz (* ihz rescale)))))
+        (setq ticks iticks hz ihz)))
+    (cond ((eql hz 1) ticks)
+          ((or (not current-time-list)
+               (and (consp a) (not (consp (cdr a))))
+               (and (consp b) (not (consp (cdr b))))
+               (not (time--trillion-factor hz)))
+           (cons ticks hz))
+          (t (time--list4 ticks hz)))))
+(defun time-add (a b) (time--arith a b nil))
+(defun time-subtract (a b)
+  (if (eq a b)
+      (if current-time-list (list 0 0 0 0) (cons 0 1000000000))
+    (time--arith a b t)))
+;; time_cmp, including its fast paths that compare without validating.
+(defun time--cmp (a b)
+  (if (eq a b)
+      0
+    (let ((x a) (y b))
+      (when (and (consp a) (consp b) (eql (cdr a) (cdr b)))
+        (setq x (car a) y (car b)))
+      (if (and (fixnump x) (fixnump y))
+          (- x y)
+        (let ((ta (time--decode a)) (tb (time--decode b)))
+          (- (* (car ta) (cdr tb)) (* (car tb) (cdr ta))))))))
+(defun time-less-p (a b) (< (time--cmp a b) 0))
+(defun time-equal-p (a b)
+  (and (eq (null a) (null b)) (= (time--cmp a b) 0)))
 (defun time-convert (time &optional form)
-  ;; FORM t asks for the highest-resolution (TICKS . HZ) pair.  Ported from
-  ;; timefns.c `time_convert' / `decode_float_time': an integer stays (N . 1);
-  ;; a float f is decomposed exactly as emacs does — scale = DBL_MANT_DIG-1-ilogb(f)
-  ;; (ilogb(f) = (cdr (frexp f)) - 1, so scale = 53 - (cdr (frexp f))), giving
-  ;; ticks = f*2^scale (an exact integer) over hz = 2^scale.  Zero maps to (0 . 1).
-  ;; A numeric FORM is an explicit HZ.
-  (cond ((eq form 'integer) (truncate (float-time time)))
-        ((eq form 'list) (let ((s (truncate (float-time time))))
-                           (list (ash s -16) (logand s #xffff))))
-        ((eq form t)
-         (if (integerp time)
-             (cons time 1)
-           (let ((f (float-time time)))
-             (if (= f 0.0)
-                 (cons 0 1)
-               (let* ((scale (- 53 (cdr (frexp f))))
-                      (hz (expt 2 scale)))
-                 (cons (round (* f hz)) hz))))))
-        ((integerp form)
-         (cons (round (* (float-time time) form)) form))
-        (t (time--norm (float-time time)))))
+  (let ((th (time--decode time)))
+    (setq form (cond (form form) (current-time-list 'list) (t t)))
+    (cond ((eq form 'list) (time--list4 (car th) (cdr th)))
+          ((eq form 'integer)
+           (if (integerp time) time (floor (car th) (cdr th))))
+          (t
+           (when (eq form t) (setq form (cdr th)))
+           (if (and (consp time) (eq form (cdr time)))
+               time
+             (cons (time--hz-ticks th form) form))))))
+;; time-date.el (Emacs 31.1).
+(fset 'time-to-seconds #'float-time)
+(defun seconds-to-time (seconds) (time-convert seconds 'list))
+(defun days-to-time (days)
+  (let ((time (time-convert (* 86400 days) 'list)))
+    (if (and (integerp days) (consp (cdr time)))
+        (setcdr (cdr time) nil))
+    time))
+(defun time-since (time)
+  (when (stringp time)
+    (setq time (date-to-time time)))
+  (time-subtract nil time))
+(fset 'subtract-time #'time-subtract)
+(defun date-leap-year-p (year)
+  (or (and (zerop (% year 4))
+           (not (zerop (% year 100))))
+      (zerop (% year 400))))
+(defun time-date--day-in-year (tim)
+  (let* ((month (nth 4 tim))
+         (day (nth 3 tim))
+         (year (nth 5 tim))
+         (day-of-year (+ day (* 31 (1- month)))))
+    (when (> month 2)
+      (setq day-of-year (- day-of-year (/ (+ 23 (* 4 month)) 10)))
+      (when (date-leap-year-p year)
+        (setq day-of-year (1+ day-of-year))))
+    day-of-year))
+(defun time-to-day-in-year (time)
+  (time-date--day-in-year (decode-time time)))
+(defun time-to-days (time)
+  (let* ((tim (decode-time time))
+         (year (nth 5 tim)))
+    (+ (time-date--day-in-year tim)
+       (* 365 (1- year))
+       (/ (1- year) 4)
+       (- (/ (1- year) 100))
+       (/ (1- year) 400))))
+(defun time-to-number-of-days (time)
+  (/ (float-time time) (* 60 60 24)))
+(defun date-days-in-month (year month)
+  (unless (and (numberp month) (<= 1 month 12))
+    (error "Month %s is invalid" month))
+  (if (= month 2)
+      (if (date-leap-year-p year)
+          29
+        28)
+    (if (memq month '(1 3 5 7 8 10 12))
+        31
+      30)))
+(defun date-ordinal-to-time (year ordinal)
+  (let ((month 1))
+    (while (> ordinal (date-days-in-month year month))
+      (setq ordinal (- ordinal (date-days-in-month year month))
+            month (1+ month)))
+    (list nil nil nil ordinal month year nil nil nil)))
 (defun current-time-zone (&optional time zone)
   ;; (OFFSET NAME). The local zone's offset comes from decode-time's zone field;
   ;; the abbreviated NAME is unavailable here, so it is nil.
@@ -6076,7 +6216,7 @@ reports and the one a hash table's slots are observable in."
           (primaries (cl--sortq app nil t))
           (afters (cl--sortq app :after nil)))
       (if (and (null primaries) (null arounds))
-          (signal 'cl-no-applicable-method (list name))
+          (signal 'cl-no-applicable-method (cons name args))
         (let ((core (lambda (a)
                       (dolist (b befores) (apply b a))
                       (let ((result (cl--chain primaries nil a)))
@@ -6162,10 +6302,26 @@ reports and the one a hash table's slots are observable in."
                                    (list ,(or string `',type) ,temp ',form)))
                        nil)))
     (if (eq temp form) body `(let ((,temp ,form)) ,body))))
+;; cl-macs.el (Emacs 31.1): the `cl--ecase-error-flag' clause reports the value
+;; and the keys `cl-case' collected -- a list KEYLIST is prepended whole, an
+;; atom pushed, and the result reversed -- or the types in clause order.
+(defun cl--ecase-keys (clauses)
+  (let ((head-list nil))
+    (dolist (c clauses)
+      (cond ((memq (car c) '(t otherwise)))
+            ((listp (car c)) (setq head-list (append (car c) head-list)))
+            (t (push (car c) head-list))))
+    (reverse head-list)))
 (defmacro cl-etypecase (expr &rest clauses)
-  `(cl-typecase ,expr ,@clauses (t (error "cl-etypecase failed"))))
+  (let ((temp (make-symbol "temp")))
+    `(let ((,temp ,expr))
+       (cl-typecase ,temp ,@clauses
+         (t (error "cl-etypecase failed: %s, %s" ,temp ',(mapcar #'car clauses)))))))
 (defmacro cl-ecase (expr &rest clauses)
-  `(cl-case ,expr ,@clauses (t (error "cl-ecase failed"))))
+  (let ((temp (make-symbol "temp")))
+    `(let ((,temp ,expr))
+       (cl-case ,temp ,@clauses
+         (t (error "cl-ecase failed: %s, %s" ,temp ',(cl--ecase-keys clauses)))))))
 ;; (cl-do ((VAR INIT [STEP])...) (END RESULT...) BODY...): like CL `do', with
 ;; the steps computed from the previous iteration's values (parallel assignment).
 (defmacro cl-do (specs endclause &rest body)
