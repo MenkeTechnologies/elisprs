@@ -404,14 +404,14 @@ pub const SUBRS: &[Entry] = &[
     Entry {
         name: "decode-time",
         kind: Kind::Function,
-        sig: "(decode-time &optional TIME ZONE)",
-        doc: "Decompose TIME into (SEC MIN HOUR DAY MON YEAR DOW DST UTCOFF).",
+        sig: "(decode-time &optional TIME ZONE FORM)",
+        doc: "Decompose TIME into (SEC MIN HOUR DAY MON YEAR DOW DST UTCOFF). With FORM t, SEC keeps TIME's resolution as (TICKS . HZ).",
     },
     Entry {
         name: "encode-time",
         kind: Kind::Function,
         sig: "(encode-time TIME) or (encode-time SEC MIN HOUR DAY MON YEAR &optional ZONE)",
-        doc: "Inverse of decode-time: turn decoded components into a (HIGH LOW) time value.",
+        doc: "Inverse of decode-time: turn decoded components into a time value — (HIGH LOW) for whole seconds, (TICKS . HZ) when SECOND carries sub-second resolution.",
     },
     Entry {
         name: "vector",

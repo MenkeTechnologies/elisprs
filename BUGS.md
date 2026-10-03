@@ -5728,6 +5728,118 @@ Regression tests: `tests/parity_json_and_signal.rs`.
   `remove-list-of-text-properties`, variable watchers.
 - `(match-data)` after a buffer search returns integers; Emacs returns markers.
 
+## Round 33 — literal search case folding, the kill ring, exact timestamps, syntax-table boundaries, closure slots
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch`, `lexical-binding` t). The
+500-form fuzz corpus was already at the oracle-drift floor before this round —
+seeds 1/7/31/101/808/909/1111/2222 reported 15/7/17/8/10/14/6/15 diverging
+forms, every one of them `make-hash-table`/`split-string` 30→31 drift — so the
+round came from five hand-written probe corpora of everyday forms the fuzz
+grammar never generates (stdlib strings/seq/cl-lib, buffers/time/structs/EIEIO,
+the kill ring, thingatpt, regexps/hash tables/numbers). Before → after, same
+corpora:
+
+| corpus | forms | before | after |
+|---|---|---|---|
+| p1 strings / seq / cl-lib / files / pcase | 338 | 6 | 1 |
+| p2 buffers / time / structs / EIEIO / printer / reader | 182 | 36 | 15 |
+| p3 kill ring / transpose / read-only (written mid-round) | 36 | 6 | 0 |
+| p4 thingatpt / text-property returns (written mid-round) | 28 | 7 | 0 |
+| p5 regexps / hash tables / numbers / format (written mid-round) | 165 | 6 | 3 |
+
+The fuzz seeds are unchanged at 15/7/17/8/10/14/6/15, all drift. Regression
+tests: `tests/parity_kill_ring_and_word_motion.rs`,
+`tests/parity_timestamps_and_eval_progn.rs`,
+`tests/parity_boundaries_closure_slots_and_docs.rs`.
+
+| form | Emacs 31.1 | elisprs before |
+|---|---|---|
+| `(search-forward "hello")` over `"Hello"` | `6` | `(search-failed "hello")` |
+| `(downcase-word -1)` after `HELLO` | `"hello world"` | `"HELLO world"` (`forward-word -1` did nothing) |
+| `(insert "x")` with `buffer-read-only` t | `(buffer-read-only #<buffer>)` | inserted |
+| `(delete-char 2)` one before ZV | `(end-of-buffer)` | deleted one |
+| `(add-text-properties 0 2 '(a 2) s)` changing a value | `t` | `nil` |
+| `(list s (upcase s))` under `print-circle`, S propertized | no labels | `#1=(a 1)` shared plist |
+| `(kill-word 1)`, `(yank)`, `thing-at-point`, `forward-symbol`, `buffer-narrowed-p` | defined | void |
+| `(time-add 0.1 0.2)` | `(10808639105689191 . 36028797018963968)` | `0.30000000000000004` |
+| `(float-time '(1 2 3 4))` | `65538.00000300001` | `65538.000003` |
+| `(decode-time 1.5 t t)` | `((6755399441055744 . 4503599627370496) 0 0 ...)` | `(1 0 0 ...)` |
+| `(encode-time '((3 . 2) 0 0 1 1 1970 nil nil t))` | `(3 . 2)` | `(0 0)` |
+| `(eval '(progn (cl-defstruct s x) (setf (s-x p) 9)) t)` | sets | `(gv-invalid-place (s-x p))` |
+| `(cl-ecase 9 ((1 2) 'a) (3 'b))` | `(error "cl-ecase failed: 9, (2 1 3)")` | `(error "cl-ecase failed")` |
+| `(file-relative-name "/a/b/c" "/a/d")` | `"../b/c"` | `"/a/b/c"` |
+| `(string-match "\\_<foo\\_>" "a foo-bar foo")` | `10` | `2` |
+| `(lambda (a) "doc" (interactive "p") a)` | `#[(a) (a) (t) nil "doc" "p"]` | `#[(a) ("doc" nil a) (t)]` |
+| `(setq t 1)` | `(setting-constant t)` | compile-time `"expected a symbol"` (uncatchable) |
+| `(let ((float-output-format "%.2f")) (prin1-to-string 1.2345))` | `"1.23"` | `"1.2345"` |
+
+- **Literal searches fold case.** search.c `search_buffer_non_re` compares
+  through the case canon table when `case-fold-search` is set; only the regexp
+  searches did.
+- **`forward-word` is syntax.c `scan_words`**: word syntax from the current
+  table, negative counts, the accessible portion as the limit, `t` only when
+  every word was found. casefiddle.c's word commands were already right on top
+  of it once it moved backwards.
+- **The kill ring** is simple.el's: `kill-new`, `kill-append`, `current-kill`,
+  `kill-region` (read-only aware), `copy-region-as-kill`, `kill-ring-save`,
+  `kill-line` (the real one, with its `end-of-buffer` signal and `kill-whole-line`),
+  `kill-word`, `backward-kill-word`, `yank` (`insert-for-yank`,
+  `yank-excluded-properties`), `push-mark`, `add-to-history`; plus
+  `transpose-chars`/`-words`/`-lines` through `transpose-subr`. With no command
+  loop `last-command` stays nil, so consecutive kills never append — as in
+  `emacs --batch`.
+- **`buffer-read-only`** is enforced at every non-empty buffer change (insdel.c
+  `prepare_to_modify_buffer`), lifted by `inhibit-read-only`.
+- **Copied text no longer shares plists.** intervals.c `copy_properties` copies
+  each interval's plist whenever text moves into a new string or between a
+  buffer and a string; every carrier here (`concat`, `substring`, the case
+  functions, `insert`, `buffer-string`, `buffer-substring`) does now. This
+  closes round 32's open `capitalize` plist-sharing item.
+- **Timestamps are exact** (src/timefns.rs): `decode_lisp_time` to `(TICKS . HZ)`
+  with bignums, `frac_to_double` rounding once, `time_arith`'s gcd/rescale and
+  result-form rules, `time_cmp`'s unvalidated fast paths, `time-convert`'s
+  `ticks_hz_list4`, `Fdecode_time` FORM t and `Fencode_time`'s sub-second
+  seconds. time-date.el's helpers are defined.
+- **`eval` of a `progn` runs each subform before expanding the next**, as
+  `eval_sub` does, so a definition early in the body is visible later in it.
+  (A `let` body is still compiled whole — see below.)
+- **Boundaries** `\<` `\>` `\_<` `\_>` `\b` `\B` are lookarounds over the syntax
+  table's word / symbol classes, and the subject's ends always count for `\b`
+  (regex-emacs.c `wordbound`). `replace-regexp-in-string` is the 31.1 one
+  (`match-data--translate`), and `looking-at` matches against BEGV..ZV.
+- **Closure slots**: eval.c `make-interpreted-closure` puts the docstring in
+  slot 4 and the interactive spec in slot 5; elisprs printed them as body forms
+  and `interactive` (a macro expanding to nil) erased the spec. `aref`/`length`
+  read the slots, and `documentation` / `documentation-property` /
+  `function-documentation` / `defvar`'s `variable-documentation` are ported.
+- Also: `float-output-format` (print.c `float_to_string`), `(setq NONSYMBOL …)`
+  at run time, the bool-vector set operations and `count-consecutive`,
+  `cl-copy-list` on a dotted list, `cl-no-applicable-method`'s arguments,
+  files.el `file-relative-name` / `file-name-sans-versions`,
+  `remove-list-of-text-properties`, `delete-and-extract-region`.
+
+### Still open after round 33
+
+- **EIEIO is absent**: `defclass`, `make-instance`, `oref`/`oset`,
+  `slot-value`, class-dispatched `cl-defmethod` (6 p2 forms).
+- A `let` (or any non-`progn`) body is compiled before it runs, so a
+  `cl-defstruct`/`defmacro` inside it is not in effect for the forms after it
+  in the same body; Emacs's interpreter expands lazily.
+- `parse-time-string` / `date-to-time` / `days-between` (parse-time.el) are void.
+- No unibyte strings: `string-as-unibyte`, `encode-coding-string`,
+  `decode-coding-string`, `string-limit` with CODING-SYSTEM, `aset` of a
+  non-ASCII char into a unibyte string, and `json-serialize`'s result.
+- `\<` between two word characters of different scripts (`"a日"`) is a word
+  start in Emacs (`word_boundary_p` via `char-script-table`); not modelled, and
+  `forward-word` has the same gap.
+- `define-inline` (inline.el), `?\N{NAME}` (needs the Unicode name table),
+  the internal layout `make-char-table` prints, `sxhash-equal`'s actual values,
+  and two closures from one scope sharing their `(t)` env cons under
+  `print-circle`.
+- `delete-char`'s KILLFLAG is ignored; `documentation` of a primitive is nil
+  (there is no etc/DOC).
+- `print-gensym` + private obarrays and `(match-data)` markers, from round 31.
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the
