@@ -651,6 +651,9 @@ pub(crate) fn json_serialize(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(json-insert OBJECT &rest ARGS)` — insert the serialization at point.
 pub(crate) fn json_insert(h: &mut ElispHost, a: &[Value]) -> R {
     let s = serialize(h, a)?;
+    if !s.is_empty() {
+        h.barf_if_read_only()?;
+    }
     h.cur_insert(s.chars().collect(), true);
     Ok(Value::Undef)
 }

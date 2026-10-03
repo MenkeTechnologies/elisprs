@@ -7882,11 +7882,15 @@ fn insert_fn(h: &mut ElispHost, a: &[Value]) -> R {
     for v in a {
         let start = h.cur_buf_ref().point; // 1-based insertion position
         let chars = insert_chars(h, v)?;
+        if !chars.is_empty() {
+            h.barf_if_read_only()?;
+        }
         let n = chars.len();
         h.cur_insert(chars, true);
         // A propertized string carries its text properties into the buffer.
         if let Some(arc) = h.str_arc(v) {
             if let Some(plists) = h.string_props_vec(&arc) {
+                let plists = h.copy_plist_runs(plists);
                 for (i, pl) in plists.into_iter().enumerate().take(n) {
                     if !is_nil(&pl) {
                         h.buffer_set_plist_at(start - 1 + i, pl);
@@ -7901,6 +7905,9 @@ fn insert_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// insertion point past the new text (the `insert-before-markers` primitive).
 fn insert_before_markers_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let chunks = insert_chars(h, &a[0])?;
+    if !chunks.is_empty() {
+        h.barf_if_read_only()?;
+    }
     h.cur_insert_before_markers(chunks);
     Ok(Value::Undef)
 }
@@ -7923,6 +7930,7 @@ fn buffer_string(h: &mut ElispHost, _a: &[Value]) -> R {
         })
         .collect();
     if plists.iter().any(|p| !is_nil(p)) {
+        let plists = h.copy_plist_runs(plists);
         h.string_set_props_vec(&arc, plists);
     }
     Ok(out)
@@ -7952,6 +7960,9 @@ fn goto_char(h: &mut ElispHost, a: &[Value]) -> R {
 fn erase_buffer(h: &mut ElispHost, _a: &[Value]) -> R {
     // Delete the whole buffer (ignoring narrowing) and remove the restriction.
     let len = h.cur_buf().text.len();
+    if len > 0 {
+        h.barf_if_read_only()?;
+    }
     h.cur_delete(1, len + 1);
     h.widen();
     h.cur_buf().point = 1;
@@ -8016,6 +8027,7 @@ fn buffer_substring_core(h: &mut ElispHost, a: &[Value], with_props: bool) -> R 
             })
             .collect();
         if plists.iter().any(|p| !is_nil(p)) {
+            let plists = h.copy_plist_runs(plists);
             h.string_set_props_vec(&arc, plists);
         }
     }
@@ -8205,11 +8217,22 @@ fn set_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let plist = a[2].clone();
     let obj = prop_object(h, a.get(3))?;
     let (lo, hi) = prop_range(&obj, start, end, h);
+    // textprop.c `set_text_properties`: an object with no intervals at all and
+    // nil PROPERTIES returns nil without touching anything; otherwise t.
+    let has_props = |h: &ElispHost| match &obj {
+        PropObj::Str(s) => h
+            .string_props_vec(s)
+            .is_some_and(|v| v.iter().any(|p| !is_nil(p))),
+        PropObj::Buf(bi) => h.buffers[*bi].props.iter().any(|p| !is_nil(p)),
+    };
+    if is_nil(&plist) && !has_props(h) {
+        return Ok(Value::Undef);
+    }
     match obj {
         PropObj::Str(s) => h.string_set_props(&s, lo, hi, &plist),
         PropObj::Buf(bi) => with_buffer(h, bi, |h| h.buffer_set_props(lo, hi, &plist)),
     }
-    Ok(Value::Undef)
+    Ok(Value::Bool(true))
 }
 /// Apply each `(prop val)` pair of PROPS via `f` (for add/remove).
 fn each_prop_pair(h: &ElispHost, props: &Value) -> Vec<(Value, Value)> {
@@ -8228,12 +8251,55 @@ fn each_prop_pair(h: &ElispHost, props: &Value) -> Vec<(Value, Value)> {
     }
     out
 }
+/// The value PROP has in PLIST (`eq` keys), or `None` when PROP is absent —
+/// a present nil value is `Some`.
+fn plist_lookup(h: &ElispHost, plist: &Value, prop: &Value) -> Option<Value> {
+    let mut cur = plist.clone();
+    while let Some(Obj::Cons(k, d)) = h.obj(&cur) {
+        let (k, d) = (k.clone(), d.clone());
+        let Some(Obj::Cons(v, rest)) = h.obj(&d) else {
+            return None;
+        };
+        if h.values_eq(&k, prop) {
+            return Some(v.clone());
+        }
+        cur = rest.clone();
+    }
+    None
+}
+/// Whether any character in `[lo, hi)` of OBJ would change: textprop.c
+/// `add_properties` (PROP absent or not `eq` to its new value) when ADD,
+/// `remove_properties` (PROP present at all) otherwise. Their callers
+/// return t exactly when this holds.
+fn props_would_change(
+    h: &ElispHost,
+    obj: &PropObj,
+    lo: usize,
+    hi: usize,
+    pairs: &[(Value, Value)],
+    add: bool,
+) -> bool {
+    (lo..hi).any(|i| {
+        let plist = match obj {
+            PropObj::Str(s) => h.string_plist_at(s, i),
+            PropObj::Buf(bi) => h.buffer_plist_at_idx(*bi, i),
+        };
+        pairs
+            .iter()
+            .any(|(prop, val)| match plist_lookup(h, &plist, prop) {
+                Some(old) => !add || !h.values_eq(&old, val),
+                None => add,
+            })
+    })
+}
 fn add_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let start = as_int(h, &a[0])?;
     let end = as_int(h, &a[1])?;
     let obj = prop_object(h, a.get(3))?;
     let (lo, hi) = prop_range(&obj, start, end, h);
-    for (prop, val) in each_prop_pair(h, &a[2]) {
+    let pairs = each_prop_pair(h, &a[2]);
+    let changed = props_would_change(h, &obj, lo, hi, &pairs, true);
+    for (prop, val) in pairs {
         match &obj {
             PropObj::Str(s) => h.string_put_prop(s, lo, hi, &prop, &val),
             PropObj::Buf(bi) => {
@@ -8242,14 +8308,16 @@ fn add_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
             }
         }
     }
-    Ok(Value::Undef)
+    Ok(Value::Bool(changed))
 }
 fn remove_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let start = as_int(h, &a[0])?;
     let end = as_int(h, &a[1])?;
     let obj = prop_object(h, a.get(3))?;
     let (lo, hi) = prop_range(&obj, start, end, h);
-    for (prop, _) in each_prop_pair(h, &a[2]) {
+    let pairs = each_prop_pair(h, &a[2]);
+    let changed = props_would_change(h, &obj, lo, hi, &pairs, false);
+    for (prop, _) in pairs {
         match &obj {
             PropObj::Str(s) => h.string_remove_prop(s, lo, hi, &prop),
             PropObj::Buf(bi) => {
@@ -8258,7 +8326,7 @@ fn remove_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
             }
         }
     }
-    Ok(Value::Undef)
+    Ok(Value::Bool(changed))
 }
 /// `(elisprs--carry-text-properties SRC DST)` — DST with SRC's per-character
 /// text properties, when the two are the same length.
@@ -8308,6 +8376,9 @@ fn delete_region(h: &mut ElispHost, a: &[Value]) -> R {
     let buf = h.cur_buf_ref();
     if lo < buf.begv as i64 || hi > buf.zv as i64 {
         return Err(args_out_of_range_in_buffer(h, s, e));
+    }
+    if lo < hi {
+        h.barf_if_read_only()?;
     }
     h.cur_delete(lo as usize, hi as usize);
     Ok(Value::Undef)
@@ -8592,8 +8663,29 @@ fn search_limit(h: &mut ElispHost, a: &[Value], forward: bool) -> Result<usize, 
     };
     Ok(lim as usize)
 }
+/// search.c `search_buffer_non_re` compares through the buffer's case canon
+/// table when `case-fold-search` is non-nil (`TRANSLATE (c, trt, ...)`); the
+/// standard canon table maps every character to its lower-case form.
+fn chars_match(hay: &[char], needle: &[char], fold: bool) -> bool {
+    if !fold {
+        return hay == needle;
+    }
+    hay.iter()
+        .zip(needle)
+        .all(|(&x, &y)| canon_char(x) == canon_char(y))
+}
+/// One character through the standard case canon table: its one-to-one
+/// lower-case mapping, or itself when there is none.
+pub(crate) fn canon_char(c: char) -> char {
+    let mut l = c.to_lowercase();
+    match (l.next(), l.next()) {
+        (Some(d), None) => d,
+        _ => c,
+    }
+}
 fn search_forward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
     let needle: Vec<char> = as_string(h, &a[0])?.chars().collect();
+    let fold = case_fold_search(h);
     let len = h.cur_buf().text.len();
     let bound = search_limit(h, a, true)?;
     let start = h.cur_buf().point - 1;
@@ -8604,7 +8696,7 @@ fn search_forward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, St
         let mut i = start;
         // match must end at or before bound-1 (0-based) => i+nlen <= bound-1
         while i + nlen <= (bound - 1).max(start) || (nlen == 0 && i == start) {
-            if i + nlen <= len && hay[i..i + nlen] == needle[..] {
+            if i + nlen <= len && chars_match(&hay[i..i + nlen], &needle, fold) {
                 res = Some(i);
                 break;
             }
@@ -8820,6 +8912,7 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
         adapt_replacement_case(&matched, rep)
     };
     let rep_chars: Vec<char> = rep.chars().collect();
+    h.barf_if_read_only()?;
     // Delete the matched span, then insert the replacement at its start (point is
     // left after the replacement, matching Emacs and adjusting markers/narrowing).
     h.cur_buf().point = b;
@@ -9186,18 +9279,32 @@ fn char_before(h: &mut ElispHost, a: &[Value]) -> R {
         Value::Undef
     })
 }
+/// cmds.c `Fdelete_char`: N characters past either end of the accessible
+/// portion signal `beginning-of-buffer`/`end-of-buffer` instead of deleting
+/// what is there. (KILLFLAG, which routes through `kill-forward-chars`, is
+/// not honoured: a subr cannot call back into Lisp here.)
 fn delete_char(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = as_int(h, &a[0])?;
-    let point = h.cur_buf().point;
-    let zv = h.cur_buf().zv;
-    let begv = h.cur_buf().begv;
-    if n >= 0 {
-        let end = (point + n as usize).min(zv);
-        h.cur_delete(point, end);
+    let n = as_fixnum_named(h, &a[0], "fixnump")?;
+    let (point, begv, zv) = {
+        let b = h.cur_buf_ref();
+        (b.point as i64, b.begv as i64, b.zv as i64)
+    };
+    let pos = point + n;
+    let (lo, hi) = if n < 0 {
+        if pos < begv {
+            return Err("beginning-of-buffer".to_string());
+        }
+        (pos, point)
     } else {
-        let start = (point as i64 + n).max(begv as i64) as usize;
-        h.cur_delete(start, point);
+        if pos > zv {
+            return Err("end-of-buffer".to_string());
+        }
+        (point, pos)
+    };
+    if lo < hi {
+        h.barf_if_read_only()?;
     }
+    h.cur_delete(lo as usize, hi as usize);
     Ok(Value::Undef)
 }
 fn insert_char(h: &mut ElispHost, a: &[Value]) -> R {
@@ -9206,6 +9313,9 @@ fn insert_char(h: &mut ElispHost, a: &[Value]) -> R {
         Some(v) if !is_nil(v) => as_int(h, v)?.max(0) as usize,
         _ => 1,
     };
+    if count > 0 {
+        h.barf_if_read_only()?;
+    }
     h.cur_insert(vec![c; count], true);
     Ok(Value::Undef)
 }
@@ -9252,6 +9362,7 @@ fn current_column(h: &mut ElispHost, _a: &[Value]) -> R {
 }
 fn search_backward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
     let needle: Vec<char> = as_string(h, &a[0])?.chars().collect();
+    let fold = case_fold_search(h);
     let bound = search_limit(h, a, false)? - 1;
     let point = h.cur_buf().point;
     let nlen = needle.len();
@@ -9264,7 +9375,7 @@ fn search_backward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, S
             // Starts run from the last one that ends at point down to BOUND.
             let mut i = point - 1 - nlen; // max start so match ends at point-1
             loop {
-                if hay[i..i + nlen] == needle[..] {
+                if chars_match(&hay[i..i + nlen], &needle, fold) {
                     res = Some(i);
                     break;
                 }
@@ -9455,39 +9566,76 @@ fn skip_chars_forward(h: &mut ElispHost, a: &[Value]) -> R {
 fn skip_chars_backward(h: &mut ElispHost, a: &[Value]) -> R {
     skip_chars(h, a, false)
 }
+/// syntax.c `scan_words`: the position COUNT words from FROM (1-based), or
+/// `None` when the accessible portion ends first. A word is a run of
+/// word-syntax characters in the current syntax table. (`word_boundary_p`'s
+/// script split inside a run is not modelled.)
+fn scan_words(h: &mut ElispHost, mut from: usize, mut count: i64) -> Option<usize> {
+    let (begv, zv) = {
+        let b = h.cur_buf_ref();
+        (b.begv, b.zv)
+    };
+    let at = |h: &mut ElispHost, pos: usize| -> bool {
+        let c = h.cur_buf_ref().text[pos - 1];
+        h.syntax_class_of(c) == 'w'
+    };
+    while count > 0 {
+        loop {
+            if from == zv {
+                return None;
+            }
+            let word = at(h, from);
+            from += 1;
+            if word {
+                break;
+            }
+        }
+        while from != zv && at(h, from) {
+            from += 1;
+        }
+        count -= 1;
+    }
+    while count < 0 {
+        loop {
+            if from == begv {
+                return None;
+            }
+            let word = at(h, from - 1);
+            from -= 1;
+            if word {
+                break;
+            }
+        }
+        while from != begv && at(h, from - 1) {
+            from -= 1;
+        }
+        count += 1;
+    }
+    Some(from)
+}
+/// syntax.c `Fforward_word`: move to `scan_words`'s answer, or to the edge of
+/// the accessible portion when it ran out; t only when all ARG words were found.
 fn forward_word(h: &mut ElispHost, a: &[Value]) -> R {
-    // Word = run of alphanumerics (no syntax tables).
     let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(h, v)?,
+        Some(v) if !is_nil(v) => as_fixnum_named(h, v, "fixnump")?,
         _ => 1,
     };
-    let buf = h.cur_buf();
-    let len = buf.text.len();
-    for _ in 0..n {
-        while buf.point <= len && !buf.text[buf.point - 1].is_alphanumeric() {
-            buf.point += 1;
-        }
-        while buf.point <= len && buf.text[buf.point - 1].is_alphanumeric() {
-            buf.point += 1;
-        }
-    }
-    Ok(Value::Bool(true))
+    let pt = h.cur_buf_ref().point;
+    let found = scan_words(h, pt, n);
+    let (begv, zv) = {
+        let b = h.cur_buf_ref();
+        (b.begv, b.zv)
+    };
+    h.cur_buf().point = found.unwrap_or(if n > 0 { zv } else { begv });
+    Ok(Value::Bool(found.is_some()))
 }
+/// simple.el `backward-word`: `(forward-word (- (or arg 1)))`.
 fn backward_word(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(h, v)?,
+        Some(v) if !is_nil(v) => as_fixnum_named(h, v, "fixnump")?,
         _ => 1,
     };
-    let buf = h.cur_buf();
-    for _ in 0..n {
-        while buf.point > 1 && !buf.text[buf.point - 2].is_alphanumeric() {
-            buf.point -= 1;
-        }
-        while buf.point > 1 && buf.text[buf.point - 2].is_alphanumeric() {
-            buf.point -= 1;
-        }
-    }
-    Ok(Value::Bool(true))
+    forward_word(h, &[Value::Int(-n)])
 }
 
 /// Install the primitive subr set.

@@ -6,6 +6,22 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Round 33 parity vs Emacs 31.1** (see BUGS.md): `search-forward` /
+  `search-backward` ignored `case-fold-search`; `forward-word` was not
+  syntax.c `scan_words` (negative counts did nothing, the narrowing and the
+  return value were wrong, so `upcase-word -1` was a no-op); a
+  `buffer-read-only` buffer accepted every edit; `delete-char` clamped instead
+  of signalling `end-of-buffer`; `add-`/`remove-`/`set-text-properties`
+  always answered nil; copied text shared its property plists with the source.
+  Newly defined, ported from the 31.1 sources: the kill ring (`kill-new`,
+  `kill-append`, `current-kill`, `kill-region`, `copy-region-as-kill`,
+  `kill-ring-save`, `kill-word`, `backward-kill-word`, `yank`, `push-mark`,
+  `add-to-history`), simple.el's `kill-line` and `transpose-chars` /
+  `-words` / `-lines`, the thingatpt.el core (`thing-at-point`,
+  `bounds-of-thing-at-point`, `symbol-at-point`, `number-at-point`,
+  `sexp-at-point`, ...), `forward-symbol`, `forward-whitespace`,
+  `buffer-narrowed-p`, `search-forward-regexp`, `barf-if-buffer-read-only`,
+  `delete-and-extract-region`, `remove-list-of-text-properties`.
 - **Round 32 parity vs Emacs 31.1** (see BUGS.md): `last` on a circular list
   hung; `fset` to nil left the symbol `fboundp`, and `fmakunbound` was void;
   `functionp` accepted a special-form subr object; empty vectors were distinct

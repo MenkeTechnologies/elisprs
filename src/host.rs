@@ -4499,6 +4499,28 @@ impl ElispHost {
             adj_del(&mut od.end, from, to);
         }
     }
+    /// buffer.c `Fbarf_if_buffer_read_only`, as insdel.c
+    /// `prepare_to_modify_buffer_1` calls it before every change: a non-nil
+    /// `buffer-read-only` with `inhibit-read-only` nil signals
+    /// `(buffer-read-only BUFFER)`. Callers check only when the change is
+    /// non-empty, because Emacs returns before preparing an empty one.
+    pub fn barf_if_read_only(&mut self) -> Result<(), String> {
+        let set = |h: &Self, name: &str| {
+            h.find_symbol(name)
+                .and_then(|s| h.get_value(&s).ok())
+                .is_some_and(|v| el_truthy(&v))
+        };
+        if !set(self, "buffer-read-only") || set(self, "inhibit-read-only") {
+            return Ok(());
+        }
+        let buf = self.current_buffer();
+        let msg = format!("buffer-read-only: {}", self.print(&buf, true));
+        let sym = self.intern("buffer-read-only");
+        let data = self.list_from(vec![buf]);
+        let obj = self.cons(sym, data);
+        self.set_pending_error(&msg, obj);
+        Err(msg)
+    }
     /// Insert `chars` at point in the current buffer. `leave_after` puts point
     /// after the inserted text (the `insert` default); otherwise point is left at
     /// the start (`insert-file-contents`). Markers are adjusted per Emacs rules.
@@ -4823,6 +4845,25 @@ impl ElispHost {
         self.string_props_vec(s)
             .unwrap_or_else(|| vec![Value::Undef; s.chars().count()])
     }
+    /// intervals.c `copy_properties`: text copied into a new string or between
+    /// a buffer and a string takes a fresh copy (`Fcopy_sequence`) of each
+    /// interval's plist, so the result never shares a plist with its source. A
+    /// run of characters holding the same plist is one interval and shares one
+    /// copy.
+    pub fn copy_plist_runs(&mut self, plists: Vec<Value>) -> Vec<Value> {
+        let mut out: Vec<Value> = Vec::with_capacity(plists.len());
+        for (i, p) in plists.iter().enumerate() {
+            if !el_truthy(p) {
+                out.push(Value::Undef);
+            } else if i > 0 && self.values_eq(&plists[i - 1], p) {
+                out.push(out[i - 1].clone());
+            } else {
+                let items = self.list_vec(p).unwrap_or_default();
+                out.push(self.list_from(items));
+            }
+        }
+        out
+    }
     /// Carry text properties onto a freshly-built string.
     ///
     /// `pieces` names, for each run of the result in order, the source string it
@@ -4854,6 +4895,7 @@ impl ElispHost {
             }
         }
         if any {
+            let vec = self.copy_plist_runs(vec);
             self.string_set_props_vec(out, vec);
         }
     }
@@ -5022,6 +5064,22 @@ impl ElispHost {
         }
     }
 
+    /// `SYNTAX (c)` in the current syntax table, as its designator character.
+    pub fn syntax_class_of(&self, c: char) -> char {
+        self.syntax_class_in(&self.current_syntax_table(), c as u32)
+    }
+
+    /// `SYNTAX (c)` in TABLE; an entry that is not a `(CODE . MATCH)` cons is
+    /// class 0 (whitespace).
+    fn syntax_class_in(&self, table: &Value, c: u32) -> char {
+        let v = self.char_table_ref(table, c);
+        let code = match self.obj(&v) {
+            Some(Obj::Cons(Value::Int(n), _)) => (*n as u64 & 0xFFFF) as usize,
+            _ => 0,
+        };
+        *Self::SYNTAX_CODE_SPEC.get(code).unwrap_or(&b' ') as char
+    }
+
     /// Every character range whose syntax class in the current table is `class`
     /// (a `modify-syntax-entry` designator: `w`, `_`, `.`, `<`, `>`, …).
     ///
@@ -5049,14 +5107,7 @@ impl ElispHost {
         breaks.sort_unstable();
         breaks.dedup();
 
-        let class_at = |c: u32| -> char {
-            let v = self.char_table_ref(&table, c);
-            let code = match self.obj(&v) {
-                Some(Obj::Cons(Value::Int(n), _)) => (*n as u64 & 0xFFFF) as usize,
-                _ => 0,
-            };
-            *Self::SYNTAX_CODE_SPEC.get(code).unwrap_or(&b' ') as char
-        };
+        let class_at = |c: u32| self.syntax_class_in(&table, c);
 
         let mut out: Vec<(u32, u32)> = Vec::new();
         for (i, &lo) in breaks.iter().enumerate() {
