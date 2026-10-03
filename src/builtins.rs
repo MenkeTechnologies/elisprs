@@ -862,6 +862,10 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
     if is_nil(&a[0]) {
         return Ok(Value::Int(0));
     }
+    // A closure is a pseudovector of 3, 5 or 6 slots.
+    if let Some(slots) = h.closure_slots(&a[0]) {
+        return Ok(Value::Int(slots.len() as i64));
+    }
     if let Some(s) = h.str_text(&a[0]) {
         return Ok(Value::Int(s.chars().count() as i64));
     }
@@ -1513,6 +1517,76 @@ fn bool_vector_subsetp(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(nil_or(ba.iter().zip(&bb).all(|(&x, &y)| !x || y)))
 }
+/// data.c `bool_vector_binop_driver` for the four set operations: the result
+/// goes into C when given (C must match A and B in length) and is returned
+/// only if C changed, otherwise into a fresh bool vector.
+fn bool_vector_binop(h: &mut ElispHost, a: &[Value], op: fn(bool, bool) -> bool) -> R {
+    let ba = as_bool_vector(h, &a[0])?;
+    let bb = as_bool_vector(h, &a[1])?;
+    let dest = a.get(2).filter(|v| !is_nil(v)).cloned();
+    let wrong_length = |extra: Option<usize>| match extra {
+        Some(n) => format!("wrong-length-argument: {} {} {n}", ba.len(), bb.len()),
+        None => format!("wrong-length-argument: {} {}", ba.len(), bb.len()),
+    };
+    if bb.len() != ba.len() {
+        let extra = match &dest {
+            Some(d) => Some(as_bool_vector(h, d)?.len()),
+            None => None,
+        };
+        return Err(wrong_length(extra));
+    }
+    let out: Vec<bool> = ba.iter().zip(&bb).map(|(&x, &y)| op(x, y)).collect();
+    let Some(dest) = dest else {
+        return Ok(h.alloc(Obj::BoolVector(out)));
+    };
+    let bd = as_bool_vector(h, &dest)?;
+    if bd.len() != ba.len() {
+        return Err(wrong_length(Some(bd.len())));
+    }
+    if bd == out {
+        return Ok(Value::Undef);
+    }
+    if let Value::Obj(id) = &dest {
+        if let Some(Obj::BoolVector(bits)) = h.arena.get_mut(*id as usize) {
+            *bits = out;
+        }
+    }
+    Ok(dest)
+}
+fn bool_vector_exclusive_or(h: &mut ElispHost, a: &[Value]) -> R {
+    bool_vector_binop(h, a, |x, y| x ^ y)
+}
+fn bool_vector_union(h: &mut ElispHost, a: &[Value]) -> R {
+    bool_vector_binop(h, a, |x, y| x | y)
+}
+fn bool_vector_intersection(h: &mut ElispHost, a: &[Value]) -> R {
+    bool_vector_binop(h, a, |x, y| x & y)
+}
+fn bool_vector_set_difference(h: &mut ElispHost, a: &[Value]) -> R {
+    bool_vector_binop(h, a, |x, y| x & !y)
+}
+/// data.c `Fbool_vector_count_consecutive`: how many elements of A from I on
+/// equal B; I may be one past the end.
+fn bool_vector_count_consecutive(h: &mut ElispHost, a: &[Value]) -> R {
+    let ba = as_bool_vector(h, &a[0])?;
+    let i = match &a[2] {
+        Value::Int(n) if *n >= 0 => *n as usize,
+        v => return Err(h.signal_wrong_type("wholenump", v)),
+    };
+    if i > ba.len() {
+        let (v, n) = (a[0].clone(), a[2].clone());
+        let data = h.list_from(vec![v, n]);
+        let sym = h.intern("args-out-of-range");
+        let obj = h.cons(sym, data);
+        let msg = format!("args-out-of-range: {}", h.print(&obj, true));
+        h.set_pending_error(&msg, obj);
+        return Err(msg);
+    }
+    let b = !is_nil(&a[1]);
+    Ok(Value::Int(
+        ba[i..].iter().take_while(|&&x| x == b).count() as i64
+    ))
+}
 /// `(bool-vector-not A &optional B)` — store the complement of A into B (or a new
 /// bool-vector) and return it. B, if given, must have A's length.
 fn bool_vector_not(h: &mut ElispHost, a: &[Value]) -> R {
@@ -1602,6 +1676,12 @@ fn aref(h: &mut ElispHost, a: &[Value]) -> R {
     // args-out-of-range.
     let oor = |h: &ElispHost| format!("args-out-of-range: {} {idx}", h.print(&a[0], true));
     let get = |len: usize| -> Option<usize> { usize::try_from(idx).ok().filter(|i| *i < len) };
+    // An interpreted closure is a pseudovector: `aref` reads its slots.
+    if let Some(slots) = h.closure_slots(&a[0]) {
+        return get(slots.len())
+            .map(|i| slots[i].clone())
+            .ok_or_else(|| oor(h));
+    }
     match h.obj(&a[0]) {
         Some(Obj::Vector(items)) | Some(Obj::Record(items)) => get(items.len())
             .map(|i| items[i].clone())
@@ -8806,7 +8886,20 @@ fn looking_at(h: &mut ElispHost, a: &[Value]) -> R {
     let re = compile_cf(h, &as_string(h, &a[0])?, case_fold_search(h))?;
     let text: String = h.cur_buf().text.iter().collect();
     let start_char = h.cur_buf().point - 1;
-    match run_match(&re, &text, start_char) {
+    // search.c `looking_at_1` hands the matcher BEGV..ZV, as a search does, so
+    // the anchors and `\b` see the narrowing's edges.
+    let (begv0, zv0) = {
+        let b = h.cur_buf_ref();
+        (b.begv - 1, b.zv - 1)
+    };
+    let subject: String = h.cur_buf_ref().text[begv0..zv0].iter().collect();
+    let spans = run_match(&re, &subject, start_char - begv0).map(|spans| {
+        spans
+            .into_iter()
+            .map(|s| s.map(|(b, e)| (b + begv0, e + begv0)))
+            .collect::<Vec<_>>()
+    });
+    match spans {
         Some(spans0) if spans0[0].map(|(b, _)| b == start_char).unwrap_or(false) => {
             set_buf_match(h, &spans0, text);
             Ok(Value::Bool(true))
@@ -8871,6 +8964,19 @@ fn no_such_subexp(h: &mut ElispHost, subexp: usize) -> String {
     msg
 }
 
+/// search.c `Fmatch_data__translate`: add N to every recorded position,
+/// flooring each at 0. `replace-regexp-in-string` uses it to aim the match
+/// data at the matched substring instead of matching REGEXP a second time.
+fn match_data_translate(h: &mut ElispHost, a: &[Value]) -> R {
+    let n = as_fixnum_named(h, &a[0], "fixnump")?;
+    if let Some(md) = h.match_data.as_mut() {
+        for (b, e) in md.spans.iter_mut().flatten() {
+            *b = (*b as i64 + n).max(0) as usize;
+            *e = (*e as i64 + n).max(0) as usize;
+        }
+    }
+    Ok(Value::Undef)
+}
 fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
     let newtext = as_string(h, &a[0])?;
     let fixedcase = !matches!(
@@ -9782,6 +9888,31 @@ pub fn install(h: &mut ElispHost) {
     );
     s("bool-vector-subsetp", 2, Some(2), bool_vector_subsetp);
     s("bool-vector-not", 1, Some(2), bool_vector_not);
+    s(
+        "bool-vector-exclusive-or",
+        2,
+        Some(3),
+        bool_vector_exclusive_or,
+    );
+    s("bool-vector-union", 2, Some(3), bool_vector_union);
+    s(
+        "bool-vector-intersection",
+        2,
+        Some(3),
+        bool_vector_intersection,
+    );
+    s(
+        "bool-vector-set-difference",
+        2,
+        Some(3),
+        bool_vector_set_difference,
+    );
+    s(
+        "bool-vector-count-consecutive",
+        3,
+        Some(3),
+        bool_vector_count_consecutive,
+    );
     s("elt", 2, Some(2), elt_fn);
     s("aref", 2, Some(2), aref);
     s("aset", 3, Some(3), aset);
@@ -10164,6 +10295,7 @@ pub fn install(h: &mut ElispHost) {
     s("match-string", 1, Some(2), match_string);
     s("match-data", 0, Some(3), match_data_fn);
     s("set-match-data", 1, Some(2), set_match_data);
+    s("match-data--translate", 1, Some(1), match_data_translate);
     s("regexp-quote", 1, Some(1), regexp_quote);
     // `replace-regexp-in-string` is Lisp in Emacs (subr.el) and Lisp here — see
     // the prelude, which mirrors that definition.

@@ -392,6 +392,34 @@ fn translate_escape(
         // Anchors.
         '`' => out.push_str(r"\A"),
         '\'' => out.push_str(r"\z"),
+        // Word and symbol boundaries. regex-emacs.c decides them by SYNTAX:
+        // `\<` / `\>` need a word constituent after / before and none on the
+        // other side, `\_<` / `\_>` the same with "word or symbol
+        // constituent", and `\b` / `\B` are (not) at either, where the start and
+        // end of the subject always count as a boundary. The
+        // crate's `\b` uses Unicode `\w`, which counts `_` as a word character
+        // and knows nothing of symbol constituents, so `\_<foo\_>` matched
+        // inside `foo-bar`. With a syntax table the boundaries become
+        // lookarounds over the table's own classes.
+        '<' | '>' | 'b' | 'B' if syn.available() => {
+            let w = char_class(&syn.ranges('w'), false);
+            out.push_str(&match e {
+                '<' => format!("(?={w})(?<!{w})"),
+                '>' => format!("(?<={w})(?!{w})"),
+                'b' => format!(r"(?:\A|\z|(?<={w})(?!{w})|(?<!{w})(?={w}))"),
+                _ => format!(r"(?!\A)(?!\z)(?:(?<={w})(?={w})|(?<!{w})(?!{w}))"),
+            });
+        }
+        '_' if syn.available() && matches!(it.peek(), Some('<') | Some('>')) => {
+            let mut ranges = syn.ranges('w');
+            ranges.extend(syn.ranges('_'));
+            let s = char_class(&ranges, false);
+            out.push_str(&if it.next() == Some('<') {
+                format!("(?={s})(?<!{s})")
+            } else {
+                format!("(?<={s})(?!{s})")
+            });
+        }
         '<' | '>' => out.push_str(r"\b"),
         '_' => {
             // Symbol boundaries `\_<` / `\_>` — approximate with a word boundary.

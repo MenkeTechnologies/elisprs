@@ -239,6 +239,10 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
         }
         Some("lambda") => compile_lambda(h, b, &elems, false)?,
         Some("progn") => compile_progn(h, b, &elems[1..])?,
+        // eval.c `Finteractive`: nil, its arguments never evaluated.
+        Some("interactive") => {
+            b.emit(Op::LoadUndef, 0);
+        }
         Some("prog1") => compile_prog1(h, b, &elems[1..])?,
         Some("if") => compile_if(h, b, &elems[1..])?,
         Some("when") => compile_when(h, b, &elems[1..], true)?,
@@ -736,6 +740,22 @@ fn compile_defvar(
     let name = elems.get(1).cloned().ok_or("defvar: missing name")?;
     // defvar/defconst declare a dynamically-scoped (special) variable.
     h.set_special(&name);
+    // eval.c `internal--define-uninitialized-variable`: a docstring goes on
+    // the symbol's `variable-documentation` property, unevaluated.
+    if let Some(doc) = elems
+        .get(3)
+        .filter(|d| !matches!(d, Value::Undef | Value::Bool(false)))
+    {
+        let put = h.intern("put");
+        let quote = h.intern("quote");
+        let prop = h.intern("variable-documentation");
+        let qname = h.list_from(vec![quote.clone(), name.clone()]);
+        let qprop = h.list_from(vec![quote.clone(), prop]);
+        let qdoc = h.list_from(vec![quote, doc.clone()]);
+        let form = h.list_from(vec![put, qname, qprop, qdoc]);
+        compile_form(h, b, &form)?;
+        b.emit(Op::Pop, 0);
+    }
     if let Some(init) = elems.get(2) {
         load_const(b, name.clone());
         compile_form(h, b, init)?;
@@ -966,10 +986,10 @@ fn compile_setq(h: &mut ElispHost, b: &mut ChunkBuilder, parts: &[Value]) -> Res
     }
     let mut i = 0;
     while i + 1 < parts.len() {
+        // eval.c `Fsetq` evaluates the value first and leaves the target to
+        // `Fset`, so `(setq nil 1)` is `setting-constant` and `(setq 1 2)` is
+        // `(wrong-type-argument symbolp 1)` -- both at run time.
         let sym = parts[i].clone();
-        if !matches!(h.obj(&sym), Some(Obj::Symbol(_))) {
-            return Err("setq: expected a symbol".to_string());
-        }
         load_const(b, sym);
         compile_form(h, b, &parts[i + 1])?;
         b.emit(Op::Extended(ops::SETVAR, 0), 0);

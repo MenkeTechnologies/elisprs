@@ -1103,6 +1103,44 @@ pub struct ClosureSrc {
     pub body: Vec<Value>,
 }
 
+/// A closure's source body split the way eval.c `Ffunction` splits a lambda
+/// before `make-interpreted-closure` stores it: a leading string is the
+/// docstring unless it is the only form, an `(interactive ...)` form after
+/// that is the interactive spec, and an empty remainder becomes `(nil)`.
+pub struct ClosureSlots {
+    pub body: Vec<Value>,
+    pub doc: Option<Value>,
+    pub iform: Option<Value>,
+}
+
+impl ClosureSrc {
+    pub fn slots(&self, h: &ElispHost) -> ClosureSlots {
+        let mut body: &[Value] = &self.body;
+        let mut doc = None;
+        if body.len() > 1 && h.is_string(&body[0]) {
+            doc = Some(body[0].clone());
+            body = &body[1..];
+        }
+        let mut iform = None;
+        if let Some(first) = body.first() {
+            let is_interactive = match h.obj(first) {
+                Some(Obj::Cons(head, _)) => h.sym_name(head).as_deref() == Some("interactive"),
+                _ => false,
+            };
+            if is_interactive {
+                iform = Some(first.clone());
+                body = &body[1..];
+            }
+        }
+        let body = if body.is_empty() {
+            vec![Value::Undef]
+        } else {
+            body.to_vec()
+        };
+        ClosureSlots { body, doc, iform }
+    }
+}
+
 /// The cells of a symbol that the *running* file may mutate, snapshotted before
 /// it runs so a cached heap image can roll them back (the cached chunks replay
 /// every one of them on a hit). `special` is absent on purpose: the compiler sets
@@ -1914,7 +1952,10 @@ impl ElispHost {
     }
     fn set_value_in(&mut self, v: &Value, val: Value, lexical: bool) -> Result<(), String> {
         self.check_settable(v)?;
-        let id0 = self.sym_handle(v).ok_or("set: not a symbol")?;
+        // data.c `set_internal`: `CHECK_SYMBOL (symbol)`.
+        let Some(id0) = self.sym_handle(v) else {
+            return Err(self.signal_wrong_type("symbolp", v));
+        };
         let id = self.indirect_var(id0);
         if lexical && self.lex.as_ref().is_some_and(|s| s.set(id, &val)) {
             return Ok(());
@@ -2643,6 +2684,52 @@ impl ElispHost {
             }
             _ => None,
         }
+    }
+
+    /// The slots of an interpreted closure as eval.c `make-interpreted-closure`
+    /// lays them out: ARGS, BODY, ENV, nil, DOCSTRING, INTERACTIVE-SPEC, cut
+    /// after the last one present (3, 5 or 6 slots). `None` when V is not a
+    /// closure.
+    pub fn closure_slots(&mut self, v: &Value) -> Option<Vec<Value>> {
+        let (dynamic, src, env) = match self.obj(v) {
+            Some(Obj::Closure {
+                dynamic, src, env, ..
+            }) => (*dynamic, src.clone(), env.clone()),
+            _ => return None,
+        };
+        let slots = src.slots(self);
+        let body = self.list_from(slots.body);
+        let env = if dynamic {
+            Value::Undef
+        } else {
+            let mut cells = Vec::new();
+            let mut cur = env;
+            while let Some(scope) = cur {
+                let name = Value::Obj(scope.sym_handle());
+                cells.push(self.cons(name, scope.value()));
+                cur = scope.parent_lex();
+            }
+            if cells.is_empty() {
+                cells.push(Value::Bool(true));
+            }
+            self.list_from(cells)
+        };
+        let mut out = vec![src.arglist.clone(), body, env];
+        if slots.doc.is_some() || slots.iform.is_some() {
+            out.push(Value::Undef);
+            out.push(slots.doc.unwrap_or(Value::Undef));
+        }
+        if let Some(iform) = slots.iform {
+            let spec = self.list_vec(&iform).unwrap_or_default();
+            let value = if spec.len() <= 2 {
+                spec.get(1).cloned().unwrap_or(Value::Undef)
+            } else {
+                let modes = self.list_from(spec[2..].to_vec());
+                self.alloc(Obj::Vector(vec![spec[1].clone(), modes]))
+            };
+            out.push(value);
+        }
+        Some(out)
     }
 
     /// Clone a closure's captured env (for slot access), or `None`.
@@ -3592,6 +3679,46 @@ impl ElispHost {
     }
 
     /// True if a printer flag dynamic var (e.g. `print-escape-newlines`) is non-nil.
+    /// print.c `float_to_string` for a finite F: `float-output-format`, when it
+    /// is a string Emacs accepts (`%.` then at most `DBL_DIG` digits, zero only
+    /// for `f`, then one of `e` `f` `g`), and the shortest round-trip form
+    /// otherwise. A result that would not read back as a float gets `.0`, except
+    /// under `%.0f`.
+    fn float_to_string(&self, f: f64) -> String {
+        let spec = self
+            .obarray
+            .get("float-output-format")
+            .and_then(|id| match self.arena.get(*id as usize) {
+                Some(Obj::Symbol(s)) => s.value.clone(),
+                _ => None,
+            })
+            .and_then(|v| self.str_text(&v).map(str::to_string));
+        let Some((prec, conv)) = spec.as_deref().and_then(parse_float_output_format) else {
+            return format_float(f);
+        };
+        let s = match conv {
+            'f' => format!("{f:.prec$}", prec = prec.unwrap_or(0)),
+            'e' => {
+                let e_form = format!("{:.*e}", prec.unwrap_or(0), f);
+                let (mantissa, exp) = e_form.rsplit_once('e').unwrap_or((&e_form, "0"));
+                let exp: i32 = exp.parse().unwrap_or(0);
+                let sign = if exp < 0 { '-' } else { '+' };
+                format!("{mantissa}e{sign}{:02}", exp.abs())
+            }
+            _ => format_g(f, prec.unwrap_or(0)),
+        };
+        if prec == Some(0) {
+            return s;
+        }
+        // The first character that is not a digit or `-` must be a `.` with a
+        // digit after it, or an exponent.
+        match s.find(|c: char| !c.is_ascii_digit() && c != '-') {
+            None => format!("{s}.0"),
+            Some(i) if i + 1 == s.len() && s.ends_with('.') => format!("{s}0"),
+            _ => s,
+        }
+    }
+
     fn print_flag(&self, name: &str) -> bool {
         self.print_flag_or(name, false)
     }
@@ -3704,7 +3831,7 @@ impl ElispHost {
                 } else if f.is_infinite() {
                     if *f < 0.0 { "-1.0e+INF" } else { "1.0e+INF" }.to_string()
                 } else {
-                    format_float(*f)
+                    self.float_to_string(*f)
                 }
             }
             Value::Str(s) => {
@@ -3879,7 +4006,11 @@ impl ElispHost {
                     // and prints `nil` there — `(eval '(let ((x 1)) (lambda (y) x))
                     // nil)` is `#[(y) (x) nil]`, never `#[(y) (x) (t)]`.
                     let arglist = self.print_inner(&src.arglist, readable, depth + 1);
-                    let body: Vec<String> = src
+                    // eval.c `make-interpreted-closure`: the docstring and the
+                    // interactive spec are slots 4 and 5, not body forms, and
+                    // the vector is only as long as the last one present.
+                    let slots = src.slots(self);
+                    let body: Vec<String> = slots
                         .body
                         .iter()
                         .map(|f| self.print_inner(f, readable, depth + 1))
@@ -3889,7 +4020,36 @@ impl ElispHost {
                     } else {
                         self.captured_alist(env, readable, depth + 1)
                     };
-                    let closure = format!("#[{arglist} ({}) {captures}]", body.join(" "));
+                    let mut extra = String::new();
+                    if slots.doc.is_some() || slots.iform.is_some() {
+                        let doc = slots.doc.clone().unwrap_or(Value::Undef);
+                        extra = format!(" nil {}", self.print_inner(&doc, readable, depth + 1));
+                    }
+                    if let Some(iform) = &slots.iform {
+                        // `ifcdr = CDR (iform)`: one element is the spec itself,
+                        // more become the vector [SPEC MODES].
+                        let spec = self.list_vec(iform).unwrap_or_default();
+                        let shown = match spec.len() {
+                            0..=2 => {
+                                let v = spec.get(1).cloned().unwrap_or(Value::Undef);
+                                self.print_inner(&v, readable, depth + 1)
+                            }
+                            _ => {
+                                let modes: Vec<String> = spec[2..]
+                                    .iter()
+                                    .map(|m| self.print_inner(m, readable, depth + 1))
+                                    .collect();
+                                format!(
+                                    "[{} ({})]",
+                                    self.print_inner(&spec[1], readable, depth + 1),
+                                    modes.join(" ")
+                                )
+                            }
+                        };
+                        extra.push(' ');
+                        extra.push_str(&shown);
+                    }
+                    let closure = format!("#[{arglist} ({}) {captures}{extra}]", body.join(" "));
                     if *is_macro {
                         format!("(macro . {closure})")
                     } else {
@@ -5489,6 +5649,29 @@ impl ElispHost {
             Some(self.list_from(forms))
         }
     }
+}
+
+/// The `(PRECISION, CONVERSION)` of a `float-output-format` that print.c's
+/// `float_to_string` accepts, or `None` for one it ignores. PRECISION is
+/// `None` when no digits follow the `.`.
+fn parse_float_output_format(spec: &str) -> Option<(Option<usize>, char)> {
+    let rest = spec.strip_prefix("%.")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let conv_rest = &rest[digits.len()..];
+    let mut it = conv_rest.chars();
+    let conv = it.next()?;
+    if !matches!(conv, 'e' | 'f' | 'g') || it.next().is_some() {
+        return None;
+    }
+    if digits.is_empty() {
+        return Some((None, conv));
+    }
+    // `DBL_DIG < width` loses on the first digit past 15.
+    let prec: usize = digits.parse().ok().filter(|&p| p <= 15)?;
+    if prec == 0 && conv != 'f' {
+        return None;
+    }
+    Some((Some(prec), conv))
 }
 
 /// Print a finite float the way Emacs does: the shortest round-tripping form,

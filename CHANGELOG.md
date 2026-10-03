@@ -36,6 +36,19 @@ All notable changes to elisprs are documented here. The format follows
   `eval_sub`. Also: `cl-ecase`/`cl-etypecase` failure messages, `cl-copy-list`
   on a dotted list, `cl-no-applicable-method`'s arguments, and files.el's
   `file-relative-name` (`../` climbing) and `file-name-sans-versions`.
+- **Word and symbol boundaries follow the syntax table.** `\<`, `\>`, `\_<`,
+  `\_>`, `\b` and `\B` were the regex crate's Unicode `\b`, so `\_<foo\_>`
+  matched inside `foo-bar` and `\b` never matched at the ends of the subject.
+  `replace-regexp-in-string` is Emacs 31's (`match-data--translate`, now
+  defined), and `looking-at` sees only the accessible portion.
+- **An interpreted closure keeps its docstring and interactive spec in slots
+  4 and 5** (`#[(x) (x) (t) nil "Doc."]`), readable with `aref`/`length`;
+  `interactive` is a special form rather than a macro that erased the spec.
+  `documentation`, `documentation-property` and `function-documentation` are
+  defined, and `defvar`/`defconst` record `variable-documentation`.
+- `float-output-format` is honoured by the printer; `(setq 1 2)` / `(setq t 1)`
+  signal at run time like `Fsetq`; `bool-vector-union`, `-intersection`,
+  `-exclusive-or`, `-set-difference` and `-count-consecutive` are defined.
 - **Round 32 parity vs Emacs 31.1** (see BUGS.md): `last` on a circular list
   hung; `fset` to nil left the symbol `fboundp`, and `fmakunbound` was void;
   `functionp` accepted a special-form subr object; empty vectors were distinct

@@ -834,6 +834,7 @@ pub const PRELUDE: &str = r#"
 (defvar print-escape-newlines nil)
 (defvar print-escape-control-characters nil)
 (defvar print-quoted t)
+(defvar float-output-format nil)
 ;; Without this `defvar' a `(let ((print-circle t)) …)' binds a LEXICAL `print-circle'
 ;; that the Rust printer — which reads the symbol's dynamic value cell — never sees,
 ;; so shared structure printed unlabelled and a circular list had nothing to stop it.
@@ -1588,9 +1589,11 @@ The argument may be a character or string.  The result has the same type."
   ;; compile error wins: (string-trim "" "\\(" "[") => (invalid-regexp
   ;; "Unmatched [ or [^").
   (string-trim-left (string-trim-right s trim-right) trim-left))
-;; Port of subr.el's Lisp definition (the Emacs-29 shape, which re-matches
-;; REGEXP against the matched substring instead of Emacs 30's internal
-;; `match-data--translate`). Everything observable falls out of the original:
+;; Port of subr.el's Lisp definition (Emacs 31.1): `match-data--translate'
+;; aims the match data at the matched substring. Re-matching REGEXP against the
+;; substring lost the context a match can depend on -- `\\B' matched between
+;; "a" and "b" fails on the one-character substring. Everything observable
+;; falls out of the original:
 ;; `(length string)` rejects a non-sequence up front (`sequencep`), a nil
 ;; STRING flows through to `(substring nil 0 0)` (`arrayp nil`), REGEXP is only
 ;; type-checked/compiled when the loop runs (l > 0), REP may be a function and
@@ -1609,10 +1612,9 @@ The argument may be a character or string.  The result has the same type."
         (when (= me mb) (setq me (min l (1+ mb))))
         ;; Generate a replacement for the matched substring.
         ;; Operate on only the substring to minimize string consing.
-        ;; Set up match data for the substring for replacement;
-        ;; presumably this is likely to be faster than munging the
-        ;; match data directly in Lisp.
-        (string-match regexp (setq str (substring string mb me)))
+        ;; Translate the match data so that it applies to the matched substring.
+        (match-data--translate (- mb))
+        (setq str (substring string mb me))
         (setq matches
               (cons (replace-match (if (stringp rep)
                                        rep
@@ -9224,11 +9226,10 @@ The third argument DOC is a documentation string for the widget."
 ;; are placeholders sufficient for `define-derived-mode' to expand and load; they
 ;; do not model syntax/abbrev semantics.
 
-;; `interactive' is only meaningful as the first body form of a command; when a
-;; command is called from Lisp (as in batch), it is a no-op. Modeling it as a
-;; macro that expands to nil drops its (unevaluated) interactive spec at compile
-;; time, matching the non-interactive runtime behavior.
-(defmacro interactive (&rest _) nil)
+;; `interactive' is a special form the compiler lowers to nil (eval.c
+;; `Finteractive' returns nil without evaluating its arguments); keeping it a
+;; form rather than a macro leaves the spec in the closure, where
+;; `make-interpreted-closure' stores it.
 
 ;; `current-buffer'/`set-buffer'/`get-buffer-create' and the rest of the buffer
 ;; registry are C-level primitives (see builtins.rs). Buffers are not associated
@@ -14867,6 +14868,45 @@ and if a matching region is found, place point at the start of the region."
 (defun cl-fresh-line (&optional stream)
   "Output a newline unless already at the beginning of a line."
   (terpri stream 'ensure))
+;; doc.c `documentation' / `documentation-property' and simple.el's
+;; `function-documentation' (Emacs 31.1). There is no etc/DOC file, so a
+;; primitive's docstring is nil.
+(defun documentation-property (symbol prop &optional raw)
+  (let ((tem (get symbol prop)))
+    (if (and (null tem) (eq prop 'variable-documentation)
+             (not (eq symbol (indirect-variable symbol))))
+        (documentation-property (indirect-variable symbol) prop raw)
+      (when (eql tem 0) (setq tem nil))
+      (unless (stringp tem) (setq tem (eval tem nil)))
+      (if (and (null raw) (stringp tem)) (substitute-command-keys tem) tem))))
+(defun function-documentation (function)
+  (cond
+   ((closurep function)
+    (when (> (length function) 4)
+      (let ((doc (aref function 4)))
+        (when (or (stringp doc) (fixnump doc) (fixnump (cdr-safe doc))) doc))))
+   ((or (stringp function) (vectorp function)) "Keyboard macro.")
+   ((eq (car-safe function) 'keymap)
+    "Prefix command (definition is a keymap associating keystrokes with commands).")
+   ((memq (car-safe function) '(lambda autoload))
+    (let ((doc (car (cdr (cdr function)))))
+      (when (or (stringp doc) (fixnump doc) (fixnump (cdr-safe doc))) doc)))
+   ((symbolp function)
+    (let ((f (indirect-function function)))
+      (if f (function-documentation f)
+        (signal 'void-function (list function)))))
+   ((eq (car-safe function) 'macro) (function-documentation (cdr function)))
+   ((subrp function) nil)
+   (t (signal 'invalid-function (list function)))))
+(defun documentation (function &optional raw)
+  (if (and (symbolp function) (get function 'function-documentation))
+      (documentation-property function 'function-documentation raw)
+    (let ((fun (indirect-function function)))
+      (unless fun (signal 'void-function (list function)))
+      (when (eq (car-safe fun) 'macro) (setq fun (cdr fun)))
+      (let ((doc (function-documentation fun)))
+        (if (eql doc 0) (setq doc nil))
+        (if raw doc (substitute-command-keys doc))))))
 "#;
 
 /// Faithful port of emacs-lisp/nadvice.el (Emacs 30.2) — the modern light-weight
