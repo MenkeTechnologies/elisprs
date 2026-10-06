@@ -1244,6 +1244,9 @@ pub struct MatchData {
     /// True if the last match was a buffer search: spans are 1-based buffer
     /// positions and `match-string` reads from `subject` accordingly.
     pub from_buffer: bool,
+    /// The buffer slot a buffer match was made in (`last_thing_searched`), which
+    /// `match-data` hands back as markers into it, or appends under INTEGERS.
+    pub buffer: Option<usize>,
 }
 
 impl Default for ElispHost {

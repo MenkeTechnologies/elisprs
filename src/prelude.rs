@@ -1256,7 +1256,7 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 (defmacro save-match-data (&rest body)
   `(let ((--save-match-- (match-data)))
      (unwind-protect (progn ,@body)
-       (set-match-data --save-match--))))
+       (set-match-data --save-match-- t))))
 
 ;;; ====================================================================
 ;;; Standard library — subr / subr-x / seq / cl-lib written in elisp on
@@ -4574,9 +4574,6 @@ removed, and one that spans the range is split in two -- which is why this needs
           (when (consp tail)
             (setcdr tail nil))))
       (set history-var history))))
-(defun delete-and-extract-region (start end)
-  (let ((lo (min start end)) (hi (max start end)))
-    (prog1 (buffer-substring lo hi) (delete-region lo hi))))
 (defun remove-list-of-text-properties (start end list-of-properties &optional object)
   (remove-text-properties start end
                           (mapcan (lambda (p) (list p nil)) list-of-properties)
@@ -10517,36 +10514,11 @@ the prefix syntax flag (p)."
 ;; ── indentation and whitespace commands (indent.c, simple.el) ──
 (defvar indent-tabs-mode t)
 (defvar delete-trailing-lines t)
-(defun current-indentation ()
-  "Column of the first non-space, non-tab character on the current line."
-  (save-excursion
-    (beginning-of-line)
-    (skip-chars-forward " \t")
-    (current-column)))
 (defun back-to-indentation ()
   "Move point to the first non-whitespace character on this line."
   (beginning-of-line 1)
   (skip-syntax-forward " " (line-end-position))
   (backward-prefix-chars))
-(defun indent-to (column &optional minimum)
-  "Indent from point with tabs and spaces until COLUMN is reached.
-indent.c `Findent_to': at least MINIMUM columns are inserted; tabs are used up
-to the last tab stop at or before COLUMN when `indent-tabs-mode' is non-nil.
-Returns the column reached."
-  (unless (fixnump column) (signal 'wrong-type-argument (list 'fixnump column)))
-  (if minimum
-      (unless (fixnump minimum) (signal 'wrong-type-argument (list 'fixnump minimum)))
-    (setq minimum 0))
-  (let* ((fromcol (current-column))
-         (mincol (max (+ fromcol minimum) column)))
-    (unless (= fromcol mincol)
-      (when indent-tabs-mode
-        (let ((n (- (/ mincol tab-width) (/ fromcol tab-width))))
-          (when (> n 0)
-            (insert-and-inherit (make-string n ?\t))
-            (setq fromcol (* (/ mincol tab-width) tab-width)))))
-      (insert-and-inherit (make-string (- mincol fromcol) ?\s)))
-    mincol))
 (defun delete-horizontal-space (&optional backward-only)
   "Delete all spaces and tabs around point.
 If BACKWARD-ONLY is non-nil, delete them only before point."
@@ -10674,12 +10646,6 @@ If N is negative, delete newlines as well, leaving -N spaces."
 ;; replace.el, subr.el, float-sup.el).
 (defalias 'point-at-eol #'line-end-position)
 (defalias 'point-at-bol #'line-beginning-position)
-(defun point-min-marker ()
-  "Return a marker to the minimum permissible value of point in this buffer."
-  (copy-marker (point-min)))
-(defun point-max-marker ()
-  "Return a marker to the maximum permissible value of point in this buffer."
-  (copy-marker (point-max)))
 (defconst degrees-to-radians (/ float-pi 180.0)
   "Degrees to radian conversion constant.")
 (defconst radians-to-degrees (/ 180.0 float-pi)
@@ -10717,30 +10683,6 @@ list ordered by the numbers recorded in LIST-VAR's `list-order' property."
                             (if (and oa ob)
                                 (< oa ob)
                               oa)))))))
-(defun insert-buffer-substring (buffer &optional start end)
-  "Insert before point a substring of the contents of BUFFER.
-editfns.c `Finsert_buffer_substring': START and END default to BUFFER's
-accessible portion, are swapped when reversed, and must lie inside it."
-  (let ((buf (get-buffer buffer)))
-    (unless buf
-      (if (stringp buffer)
-          (error "No buffer named %s" buffer)
-        (error "Invalid buffer")))
-    (unless (buffer-live-p buf) (error "Selecting deleted buffer"))
-    (insert (with-current-buffer buf
-              (let ((b (if start (if (markerp start) (marker-position start) start)
-                         (point-min)))
-                    (e (if end (if (markerp end) (marker-position end) end)
-                         (point-max))))
-                (unless (integerp b)
-                  (signal 'wrong-type-argument (list 'integer-or-marker-p start)))
-                (unless (integerp e)
-                  (signal 'wrong-type-argument (list 'integer-or-marker-p end)))
-                (when (> b e) (setq b (prog1 e (setq e b))))
-                (unless (and (<= (point-min) b) (<= e (point-max)))
-                  (signal 'args-out-of-range (list start end)))
-                (buffer-substring b e))))
-    nil))
 (defun insert-buffer-substring-no-properties (buffer &optional start end)
   "Insert before point a substring of BUFFER, without text properties."
   (let ((opoint (point)))
@@ -10792,34 +10734,6 @@ editfns.c: -N if the first is less after N-1 equal characters, N if greater,
       ;; If we found something nonempty, return it as a string.
       (unless (= start end)
         (buffer-substring-no-properties start end)))))
-(defun move-to-column (column &optional force)
-  "Move point to column COLUMN in the current line; return the column reached.
-indent.c `Fmove_to_column': scanning stops at the first column >= COLUMN or at
-the end of the line. With FORCE non-nil a tab that the goal falls inside is
-split into spaces; with FORCE t a short line is indented out to COLUMN."
-  (unless (natnump column)
-    (signal 'wrong-type-argument (list 'wholenump column)))
-  (beginning-of-line)
-  (let ((col 0) (prev-col 0) (prev-pos (point)) (end (line-end-position)))
-    (while (and (< col column) (< (point) end))
-      (setq prev-col col prev-pos (point))
-      (forward-char 1)
-      (setq col (current-column)))
-    ;; A tab made us overshoot: put spaces in front of it up to the goal,
-    ;; delete it, and re-indent the rest of its span from there.
-    (when (and force (> col column)
-               (eq (char-after prev-pos) ?\t) (< prev-col column))
-      (goto-char prev-pos)
-      (insert-char ?\s (- column prev-col) t)
-      (delete-region (point) (1+ (point)))
-      (let ((goal-pt (point)))
-        (indent-to col)
-        (goto-char goal-pt))
-      (setq col column))
-    ;; The line ends prematurely: add space to the end.
-    (when (and (< col column) (eq force t))
-      (indent-to (setq col column)))
-    col))
 (defun indent-line-to (column)
   "Indent current line to COLUMN."
   (beginning-of-line 1)

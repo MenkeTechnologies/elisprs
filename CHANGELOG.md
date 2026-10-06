@@ -6,6 +6,18 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Round 34 parity vs Emacs 31.1** (see BUGS.md): `match-data` after a
+  buffer search answers markers into the searched buffer, appends the buffer
+  under INTEGERS, and honours REUSE and RESEAT; `set-match-data` takes markers
+  and a trailing buffer, and `save-match-data` reseats. `forward-line`,
+  `pos-bol`/`pos-eol`, `line-beginning-position`/`line-end-position` and
+  `beginning-of-line`/`end-of-line` are ports of `find_newline`, `bol`, `eol`
+  and `Fforward_line` (N outside the fixnum range included). Region arguments
+  go through `validate_region` / `fix_position`; search BOUND is checked
+  against the search direction before COUNT 0 returns; `current-column` uses
+  `tab-width` and `char-width`; `current-indentation`, `indent-to`,
+  `move-to-column`, `insert-buffer-substring`, `point-min-marker`,
+  `point-max-marker` and `delete-and-extract-region` are subrs, as in Emacs.
 - **Round 33 parity vs Emacs 31.1** (see BUGS.md): `search-forward` /
   `search-backward` ignored `case-fold-search`; `forward-word` was not
   syntax.c `scan_words` (negative counts did nothing, the narrowing and the
@@ -277,6 +289,7 @@ All notable changes to elisprs are documented here. The format follows
   the whole parity surface.
 
 ### Added
+
 - **Strings are mutable objects.** `aset` on a string signalled
   `(wrong-type-argument arrayp "ab")`; `store-substring` and `clear-string` were
   void; `fillarray` refused anything but a vector. A string is now an arena

@@ -5838,7 +5838,89 @@ tests: `tests/parity_kill_ring_and_word_motion.rs`,
   `print-circle`.
 - `delete-char`'s KILLFLAG is ignored; `documentation` of a primitive is nil
   (there is no etc/DOC).
-- `print-gensym` + private obarrays and `(match-data)` markers, from round 31.
+- `print-gensym` + private obarrays, from round 31. (`(match-data)` markers:
+  fixed in round 34.)
+
+## Round 34 — match-data markers, `find_newline` line motion, `validate_region`, and the indent.c subrs
+
+**Oracle: GNU Emacs 31.1.** This round finishes a buffer-motion WIP that ran
+alongside rounds 31–33. Those rounds had already landed the restriction-aware
+searches, `skip_chars`, `scan_words`, the read-only checks and Lisp versions
+of the indentation commands; what remained, measured against 31.1 by
+`tests/parity_buffer_motion_and_search.rs` (every expectation regenerated
+from `emacs -Q --batch`), is below. The C sources read are `search.c`,
+`cmds.c`, `editfns.c`, `buffer.c`, `indent.c` and `syntax.c`.
+
+### R34-A. ✅ FIXED — `match-data` after a buffer search answered integers
+
+`Fmatch_data` answers MARKERS into the searched buffer when the last match was
+a buffer search, and with INTEGERS non-nil APPENDS that buffer. REUSE and
+RESEAT were ignored. `set-match-data` accepted only integers, so restoring a
+marker list lost the match; it now takes markers, a trailing buffer and
+RESEAT, and a nil start skips its end as `Fset_match_data` does.
+`save-match-data` passes RESEAT `t`, as subr.el's does.
+
+```text
+(with-temp-buffer (insert "foo bar") (goto-char 1) (re-search-forward "fo")
+  (let (r) (save-match-data (re-search-forward "bar") (push (match-beginning 0) r))
+       (push (match-data) r) r))
+emacs:   ((#<marker in no buffer> #<marker in no buffer>) 5)
+before:  ((1 3) 5)
+```
+
+### R34-B. ✅ FIXED — line positions were not `bol` / `eol`
+
+`pos-bol`, `pos-eol`, `line-beginning-position`, `line-end-position`,
+`beginning-of-line`, `end-of-line` and `forward-line` are ports of
+`find_newline`, `scan_newline_from_point`, `bol`, `eol` and `Fforward_line`.
+A count of 0 or less scans back `1 - N` newlines, and a bignum N is clipped
+the way `bol`/`eol` clip it rather than rejected.
+
+```text
+(with-temp-buffer (insert "a\nb") (goto-char 1)
+  (list (pos-bol 2) (pos-eol 2) (line-end-position 0) (line-beginning-position 0)
+        (line-end-position -1) (pos-bol 5) (pos-eol 5)))
+emacs:   (3 4 1 1 1 4 4)
+before:  (3 4 2 1 2 4 4)
+```
+
+### R34-C. ✅ FIXED — region and BOUND arguments
+
+`delete-region`, `delete-and-extract-region` and `insert-buffer-substring` go
+through `validate_region` / `fix_position`, so an out-of-range bignum is
+`(args-out-of-range BUFFER START END)` rather than `integer-or-marker-p`. The
+search commands check BOUND against the direction `search_command` computes
+before COUNT 0 returns point: `(search-forward "c" 5 t 0)` from 1 signals
+`Invalid search bound (wrong side of point)` (a COUNT of 0 searches
+backward for the check) where elisprs answered 1. A literal search is the
+`regexp-quote`d regexp search, sharing its case folding and its restriction.
+
+### R34-D. ✅ FIXED — columns
+
+`current-column` counted every character as one column with a fixed tab width
+of 8; it is `scan_for_column` with `tab-width` (`SANE_TAB_WIDTH`) and
+`char-width`, so `中文a` ends at column 5.
+
+### R34-E. ✅ FIXED — indent.c and editfns.c functions are subrs
+
+`current-indentation`, `indent-to`, `move-to-column` (indent.c),
+`insert-buffer-substring`, `point-min-marker`, `point-max-marker` and
+`delete-and-extract-region` (editfns.c) were prelude defuns, so `subrp` was nil
+and their argument checks were Lisp's. They are ports of the C functions;
+the prelude definitions are gone. `backward-word` negates through `-`, so a
+non-number ARG is `number-or-marker-p`, as simple.el's.
+
+### Still open after round 34
+
+- **A bounded regexp search whose leftmost match crosses BOUND.** Emacs stops
+  the matcher at BOUND while its assertions still see the text beyond it;
+  fancy-regex has no stop position, so elisprs matches against the text cut at
+  BOUND, where an end assertion at BOUND is true that Emacs evaluates as false.
+- **`match-string` without STRING after a `string-match`** reads the matched
+  string; Emacs's reads the CURRENT BUFFER. The prelude's `format-spec` relies
+  on the elisprs behaviour.
+- `word_boundary_p`'s script split (`abcαβγ` is two words in Emacs) needs
+  `char-script-table`.
 
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 

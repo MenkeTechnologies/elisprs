@@ -119,7 +119,7 @@ elisp --version
 | IO/format | `format message princ prin1 prin1-to-string print terpri write-char` (PRINTCHARFUN is honoured as in print.c: a buffer inserts at its point, a marker at itself, a function is called per character, nil defers to `standard-output`; `with-output-to-string` binds `standard-output` to a buffer, and `terpri`'s ENSURE tests `bolp`) |
 | Functional | `funcall apply mapcar mapc sort identity` |
 | Regexp | `string-match string-match-p match-beginning match-end match-string match-data set-match-data replace-regexp-in-string regexp-quote regexp-opt regexp-opt-charset regexp-opt-depth looking-at looking-back re-search-forward re-search-backward` (+ `save-match-data`; `regexp-opt` and `rx` reproduce Emacs's *output*, not just its language) |
-| Markers | `make-marker point-marker copy-marker set-marker move-marker marker-position marker-buffer markerp marker-insertion-type set-marker-insertion-type` |
+| Markers | `make-marker point-marker point-min-marker point-max-marker copy-marker set-marker move-marker marker-position marker-buffer markerp marker-insertion-type set-marker-insertion-type` |
 | Text properties | `propertize put-text-property get-text-property set-text-properties add-text-properties remove-text-properties text-properties-at next-single-property-change next-property-change previous-single-property-change get-char-property` |
 
 `defun`/`defmacro`/`lambda` support `&optional` and `&rest`; macros expand and re-evaluate; `condition-case` matches the `error` umbrella and specific error symbols.

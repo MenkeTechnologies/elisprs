@@ -4378,6 +4378,7 @@ fn string_match(h: &mut ElispHost, a: &[Value]) -> R {
                 subject,
                 spans,
                 from_buffer: false,
+                buffer: None,
             });
             Ok(Value::Int(begin))
         }
@@ -4454,62 +4455,148 @@ fn match_string(h: &mut ElispHost, a: &[Value]) -> R {
     }
 }
 
-/// `(match-data)` — the last match's positions as a flat list
-/// `(beg0 end0 beg1 end1 …)`, with `nil nil` for groups that did not match.
-/// Pairs with `set-match-data` to save/restore around inner searches.
-fn match_data_fn(h: &mut ElispHost, _a: &[Value]) -> R {
-    let mut spans = match &h.match_data {
-        Some(md) => md.spans.clone(),
-        None => return Ok(Value::Undef),
-    };
-    // Emacs reports only up to the last group that matched: an optional trailing
-    // group that did not participate contributes no `nil nil` pair at all.
-    while spans.len() > 1 && spans.last().is_some_and(|s| s.is_none()) {
-        spans.pop();
+/// Port of `Fmatch_data` (search.c): `(match-data &optional INTEGERS REUSE RESEAT)`.
+///
+/// A match made in a buffer is reported as MARKERS into that buffer (markers
+/// pointing nowhere once it is killed), unless INTEGERS is non-nil, in which
+/// case the positions are integers and the buffer itself is appended. Only up
+/// to the last group that matched is reported. A cons REUSE receives the
+/// values in place — surplus cells are set to nil, a shortfall is consed on —
+/// and is the value; RESEAT first detaches the markers REUSE holds.
+fn match_data_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let integers = a.first().is_some_and(|v| !is_nil(v));
+    let reuse = a.get(1).cloned().unwrap_or(Value::Undef);
+    if a.get(2).is_some_and(|v| !is_nil(v)) {
+        let mut tail = reuse.clone();
+        while let Some(Obj::Cons(car, cdr)) = h.obj(&tail).cloned() {
+            if h.is_marker(&car) {
+                h.set_marker_to(&car, None, 0)?;
+                setcar(h, &[tail.clone(), Value::Undef])?;
+            }
+            tail = cdr;
+        }
     }
-    let mut items = Vec::with_capacity(spans.len() * 2);
-    for span in spans {
-        match span {
+    let Some(md) = h.match_data.clone() else {
+        return Ok(Value::Undef);
+    };
+    let live = md.buffer.filter(|&bi| h.buffers[bi].name.is_some());
+    let mut data = Vec::with_capacity(md.spans.len() * 2 + 1);
+    let mut len = 0;
+    for span in &md.spans {
+        match *span {
             Some((b, e)) => {
-                items.push(Value::Int(b as i64));
-                items.push(Value::Int(e as i64));
+                if md.buffer.is_none() || integers {
+                    data.push(Value::Int(b as i64));
+                    data.push(Value::Int(e as i64));
+                } else {
+                    data.push(h.alloc_marker(live, if live.is_some() { b } else { 0 }, false));
+                    data.push(h.alloc_marker(live, if live.is_some() { e } else { 0 }, false));
+                }
+                len = data.len();
             }
             None => {
-                items.push(Value::Undef);
-                items.push(Value::Undef);
+                data.push(Value::Undef);
+                data.push(Value::Undef);
             }
         }
     }
-    Ok(h.list_from(items))
+    data.truncate(len);
+    if let (Some(bi), true) = (md.buffer, integers) {
+        data.push(h.buffer_object(bi));
+    }
+    if !matches!(h.obj(&reuse), Some(Obj::Cons(..))) {
+        return Ok(h.list_from(data));
+    }
+    let mut items = data.into_iter();
+    let mut tail = reuse.clone();
+    let mut prev = tail.clone();
+    while let Some(Obj::Cons(_, cdr)) = h.obj(&tail).cloned() {
+        setcar(h, &[tail.clone(), items.next().unwrap_or(Value::Undef)])?;
+        prev = tail;
+        tail = cdr;
+    }
+    let rest: Vec<Value> = items.collect();
+    if !rest.is_empty() {
+        let rest = h.list_from(rest);
+        setcdr(h, &[prev, rest])?;
+    }
+    Ok(reuse)
 }
 
-/// `(set-match-data LIST)` — restore match positions from a `match-data` list.
-/// Integer positions carry no subject, so a later `match-string` must be given
-/// its STRING argument (matching Emacs's behaviour for integer match data).
+/// Port of `Fset_match_data` (search.c): `(set-match-data LIST &optional RESEAT)`.
+///
+/// LIST is what `match-data` produces: integer or marker pairs, nil pairs for
+/// groups that did not match, optionally ending in a buffer. A marker or a
+/// trailing buffer makes the data a buffer match in that buffer; a marker
+/// pointing nowhere reads as 0. RESEAT detaches each marker once read.
 fn set_match_data(h: &mut ElispHost, a: &[Value]) -> R {
-    if is_nil(&a[0]) {
+    let list = a[0].clone();
+    if !is_nil(&list) && !matches!(h.obj(&list), Some(Obj::Cons(..))) {
+        return Err(h.signal_wrong_type("listp", &list));
+    }
+    let reseat = a.get(1).is_some_and(|v| !is_nil(v));
+    let flat = h.list_vec(&list).unwrap_or_default();
+    let pairs = flat.len() / 2;
+    let mut buffer: Option<usize> = None;
+    let mut spans: Vec<Option<(usize, usize)>> = Vec::with_capacity(pairs);
+    let pos = |h: &mut ElispHost, v: &Value, buffer: &mut Option<usize>| -> Result<i64, String> {
+        if h.is_marker(v) {
+            let p = match h.marker_buffer(v) {
+                Some(bv) => {
+                    if let Some(Obj::Buffer(bi)) = h.obj(&bv) {
+                        *buffer = Some(*bi);
+                    }
+                    h.marker_position(v).unwrap_or(0) as i64
+                }
+                None => 0,
+            };
+            if reseat {
+                h.set_marker_to(v, None, 0)?;
+            }
+            return Ok(p);
+        }
+        as_int_or_marker(h, v, "integer-or-marker-p")
+    };
+    let mut i = 0;
+    while i < flat.len() {
+        if let Some(Obj::Buffer(bi)) = h.obj(&flat[i]) {
+            buffer = Some(*bi);
+            break;
+        }
+        if spans.len() >= pairs {
+            break;
+        }
+        if is_nil(&flat[i]) {
+            // A nil start skips its (unread) end as well.
+            spans.push(None);
+            i += 2;
+            continue;
+        }
+        let from = pos(h, &flat[i], &mut buffer)?;
+        let Some(end_v) = flat.get(i + 1).cloned() else {
+            break;
+        };
+        let to = pos(h, &end_v, &mut buffer)?;
+        spans.push(Some((from.max(0) as usize, to.max(0) as usize)));
+        i += 2;
+    }
+    while spans.last().is_some_and(|s| s.is_none()) {
+        spans.pop();
+    }
+    if spans.is_empty() {
         h.match_data = None;
         return Ok(Value::Undef);
     }
-    let flat = h.list_vec(&a[0]).ok_or("set-match-data: not a list")?;
     let subject = h
         .match_data
         .as_ref()
         .map(|m| m.subject.clone())
         .unwrap_or_default();
-    let mut spans = Vec::with_capacity(flat.len() / 2);
-    for pair in flat.chunks(2) {
-        match (pair.first(), pair.get(1)) {
-            (Some(Value::Int(b)), Some(Value::Int(e))) => {
-                spans.push(Some((*b.max(&0) as usize, *e.max(&0) as usize)))
-            }
-            _ => spans.push(None),
-        }
-    }
     h.match_data = Some(MatchData {
         subject,
         spans,
-        from_buffer: false,
+        from_buffer: buffer.is_some(),
+        buffer,
     });
     Ok(Value::Undef)
 }
@@ -7896,20 +7983,21 @@ fn region_end(h: &mut ElispHost, _a: &[Value]) -> R {
 /// given rather than the swapped order. Clamping instead silently narrowed to
 /// something the caller did not ask for.
 fn narrow_to_region(h: &mut ElispHost, a: &[Value]) -> R {
-    let beg = as_int(h, &a[0])?;
-    let end = as_int(h, &a[1])?;
-    let (lo, hi) = if beg <= end { (beg, end) } else { (end, beg) };
+    let (lo, hi) = narrow_bounds(h, &a[0], &a[1])?;
+    h.narrow(lo, hi);
+    Ok(Value::Undef)
+}
+/// `Fnarrow_to_region`'s argument check: positions in either order, inside the
+/// WHOLE buffer (`BEG`..`Z`, not the current restriction), or
+/// `(args-out-of-range START END)` naming the arguments as given.
+fn narrow_bounds(h: &mut ElispHost, b: &Value, e: &Value) -> Result<(usize, usize), String> {
+    let (s0, e0) = (fix_position(h, b)?, fix_position(h, e)?);
+    let (lo, hi) = if e0 < s0 { (e0, s0) } else { (s0, e0) };
     let z = h.cur_buf_ref().text.len() as i64 + 1;
     if lo < 1 || hi > z {
-        let sym = h.intern("args-out-of-range");
-        let data = h.list_from(vec![Value::Int(beg), Value::Int(end)]);
-        let obj = h.cons(sym, data);
-        let msg = format!("args-out-of-range: {beg} {end}");
-        h.set_pending_error(&msg, obj);
-        return Err(msg);
+        return Err(args_out_of_range_values(h, vec![b.clone(), e.clone()]));
     }
-    h.narrow(lo as usize, hi as usize);
-    Ok(Value::Undef)
+    Ok((lo as usize, hi as usize))
 }
 fn widen_fn(h: &mut ElispHost, _a: &[Value]) -> R {
     h.widen();
@@ -8173,6 +8261,62 @@ fn buffer_substring_no_properties(h: &mut ElispHost, a: &[Value]) -> R {
 // ── markers ──────────────────────────────────────────────────────────────
 fn make_marker(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(h.alloc_marker(None, 0, false))
+}
+/// Port of `Finsert_buffer_substring` (editfns.c): insert BUFFER's text from
+/// START to END (default its accessible region), with its text properties,
+/// before point in the current buffer.
+fn insert_buffer_substring(h: &mut ElispHost, a: &[Value]) -> R {
+    let Some(bi) = h.get_buffer(&a[0])? else {
+        return Err(h.nsberror(&a[0]));
+    };
+    if h.buffers[bi].name.is_none() {
+        return Err("error: Selecting deleted buffer".to_string());
+    }
+    let (begv, zv) = (h.buffers[bi].begv as i64, h.buffers[bi].zv as i64);
+    let b = match a.get(1) {
+        Some(v) if !is_nil(v) => fix_position(h, v)?,
+        _ => begv,
+    };
+    let e = match a.get(2) {
+        Some(v) if !is_nil(v) => fix_position(h, v)?,
+        _ => zv,
+    };
+    let (lo, hi) = if b > e { (e, b) } else { (b, e) };
+    if !(begv <= lo && hi <= zv) {
+        let data = vec![
+            a.get(1).cloned().unwrap_or(Value::Undef),
+            a.get(2).cloned().unwrap_or(Value::Undef),
+        ];
+        return Err(args_out_of_range_values(h, data));
+    }
+    let cur = h.current;
+    h.current = bi;
+    let text = buffer_substring_core(h, &[Value::Int(lo), Value::Int(hi)], true);
+    h.current = cur;
+    insert_fn(h, &[text?])?;
+    Ok(Value::Undef)
+}
+/// `(point-min-marker)` / `(point-max-marker)`: a marker at the edge of the
+/// accessible region.
+fn point_min_marker(h: &mut ElispHost, _a: &[Value]) -> R {
+    let (bi, p) = (h.current, h.cur_buf_ref().begv);
+    Ok(h.alloc_marker(Some(bi), p, false))
+}
+fn point_max_marker(h: &mut ElispHost, _a: &[Value]) -> R {
+    let (bi, p) = (h.current, h.cur_buf_ref().zv);
+    Ok(h.alloc_marker(Some(bi), p, false))
+}
+/// Port of `Fdelete_and_extract_region` (editfns.c): delete START..END and
+/// answer the deleted text, text properties included.
+fn delete_and_extract_region(h: &mut ElispHost, a: &[Value]) -> R {
+    let (lo, hi) = validate_region(h, &a[0], &a[1])?;
+    if lo == hi {
+        return Ok(h.new_string(String::new()));
+    }
+    let text = buffer_substring_core(h, &[Value::Int(lo as i64), Value::Int(hi as i64)], true)?;
+    h.barf_if_read_only()?;
+    h.cur_delete(lo, hi);
+    Ok(text)
 }
 fn point_marker(h: &mut ElispHost, _a: &[Value]) -> R {
     let p = h.cur_buf_ref().point;
@@ -8496,21 +8640,48 @@ fn propertize_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(out)
 }
-fn delete_region(h: &mut ElispHost, a: &[Value]) -> R {
-    // `validate_region`, as in `buffer-substring`: a bound outside the accessible
-    // portion signals `(args-out-of-range BUFFER START END)` — clamping it
-    // silently deleted what was there instead.
-    let s = as_int_or_marker(h, &a[0], "integer-or-marker-p")?;
-    let e = as_int_or_marker(h, &a[1], "integer-or-marker-p")?;
-    let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
-    let buf = h.cur_buf_ref();
-    if lo < buf.begv as i64 || hi > buf.zv as i64 {
-        return Err(args_out_of_range_in_buffer(h, s, e));
+/// Port of `fix_position` (editfns.c): an integer or marker as a buffer
+/// position. A bignum is accepted and pinned to the fixnum range in its
+/// direction, so it reaches the caller's range check and is reported there as
+/// out of range rather than as the wrong type.
+fn fix_position(h: &mut ElispHost, v: &Value) -> Result<i64, String> {
+    if let Some(Obj::Bignum(b)) = h.obj(v) {
+        return Ok(if b.sign() == num_bigint::Sign::Minus {
+            -MOST_POSITIVE_FIXNUM - 1
+        } else {
+            MOST_POSITIVE_FIXNUM
+        });
     }
+    as_int_or_marker(h, v, "integer-or-marker-p")
+}
+/// Signal `(args-out-of-range ...DATA)` with DATA's objects as given.
+fn args_out_of_range_values(h: &mut ElispHost, data: Vec<Value>) -> String {
+    let sym = h.intern("args-out-of-range");
+    let rendered: Vec<String> = data.iter().map(|v| h.print(v, true)).collect();
+    let data = h.list_from(data);
+    let obj = h.cons(sym, data);
+    let msg = format!("args-out-of-range: {}", rendered.join(" "));
+    h.set_pending_error(&msg, obj);
+    msg
+}
+/// Port of `validate_region` (buffer.c): START and END in either order, both
+/// inside the accessible portion, or `(args-out-of-range BUFFER START END)`.
+fn validate_region(h: &mut ElispHost, b: &Value, e: &Value) -> Result<(usize, usize), String> {
+    let (s0, e0) = (fix_position(h, b)?, fix_position(h, e)?);
+    let (lo, hi) = if e0 < s0 { (e0, s0) } else { (s0, e0) };
+    let buf = h.cur_buf_ref();
+    if !(buf.begv as i64 <= lo && hi <= buf.zv as i64) {
+        let cur = h.current_buffer();
+        return Err(args_out_of_range_values(h, vec![cur, b.clone(), e.clone()]));
+    }
+    Ok((lo as usize, hi as usize))
+}
+fn delete_region(h: &mut ElispHost, a: &[Value]) -> R {
+    let (lo, hi) = validate_region(h, &a[0], &a[1])?;
     if lo < hi {
         h.barf_if_read_only()?;
     }
-    h.cur_delete(lo as usize, hi as usize);
+    h.cur_delete(lo, hi);
     Ok(Value::Undef)
 }
 fn insert_file_contents(h: &mut ElispHost, a: &[Value]) -> R {
@@ -8556,71 +8727,94 @@ fn backward_char(h: &mut ElispHost, a: &[Value]) -> R {
     };
     move_point_by(h, -n)
 }
-/// 1-based position of the beginning of POINT's line, not before `begv`.
-fn bol_of(t: &[char], point: usize, begv: usize) -> usize {
-    let mut p = point;
-    while p > begv && t[p - 2] != '\n' {
-        p -= 1;
-    }
-    p
-}
-/// 1-based position of the end of POINT's line (before the newline / at `zv`).
-fn eol_of(t: &[char], point: usize, zv: usize) -> usize {
-    let mut p = point;
-    while p < zv && t[p - 1] != '\n' {
-        p += 1;
-    }
-    p
-}
-fn beginning_of_line(h: &mut ElispHost, _a: &[Value]) -> R {
-    let buf = h.cur_buf();
-    buf.point = bol_of(&buf.text, buf.point, buf.begv);
-    Ok(Value::Undef)
-}
-fn end_of_line(h: &mut ElispHost, _a: &[Value]) -> R {
-    let buf = h.cur_buf();
-    buf.point = eol_of(&buf.text, buf.point, buf.zv);
-    Ok(Value::Undef)
-}
-/// 1-based start of the line N-1 lines forward (N<1 = backward) from POINT's line,
-/// bounded by the accessible region `[begv, zv]`.
-fn bol_after_lines(t: &[char], point: usize, n: i64, begv: usize, zv: usize) -> usize {
-    let mut p = bol_of(t, point, begv);
-    let mut k = n;
-    while k > 0 {
-        let e = eol_of(t, p, zv);
-        if e < zv {
-            p = e + 1;
-        } else {
-            p = e;
-            break;
+/// Port of `find_newline` (search.c) over the accessible region: scan from
+/// START towards the limit for COUNT newlines (backwards when COUNT < 0).
+///
+/// Answers the position just past the COUNT-th newline found — in either
+/// direction, `find_newline` lands AFTER the newline — or the limit (`zv`
+/// forwards, `begv` backwards) when there are fewer. The second value is the
+/// number found, negative when scanning backwards, like `*counted`.
+fn find_newline(t: &[char], start: usize, count: i64, begv: usize, zv: usize) -> (usize, i64) {
+    let mut p = start;
+    let mut found = 0i64;
+    if count > 0 {
+        while p < zv {
+            p += 1;
+            if t[p - 2] == '\n' {
+                found += 1;
+                if found == count {
+                    return (p, found);
+                }
+            }
         }
-        k -= 1;
+        (zv, found)
+    } else {
+        while p > begv {
+            if t[p - 2] == '\n' {
+                found += 1;
+                if found == -count {
+                    return (p, -found);
+                }
+            }
+            p -= 1;
+        }
+        (begv, -found)
     }
-    while k < 0 && p > begv {
-        p = bol_of(t, p - 1, begv);
-        k += 1;
+}
+/// Port of `scan_newline_from_point`: COUNT <= 0 scans back for `1 - COUNT`
+/// newlines, so 0 is the start of point's own line.
+fn scan_newline_from_point(buf: &crate::host::EditBuffer, count: i64) -> (usize, i64) {
+    let cnt = if count <= 0 { count - 1 } else { count };
+    find_newline(&buf.text, buf.point, cnt, buf.begv, buf.zv)
+}
+/// An optional line-count argument: nil is DEFAULT, a fixnum is taken as is, and
+/// a bignum stands for "more lines than any buffer has" in its direction, as
+/// `bol`/`eol` clip it to `BUF_BYTES_MAX`. Anything else is not an integer.
+fn line_count_arg(h: &ElispHost, a: &[Value], default: i64) -> Result<i64, String> {
+    const HUGE: i64 = i64::MAX / 4;
+    match a.first() {
+        None => Ok(default),
+        Some(v) if is_nil(v) => Ok(default),
+        Some(v) => match h.obj(v) {
+            Some(Obj::Bignum(b)) => Ok(if b.sign() == num_bigint::Sign::Minus {
+                -HUGE
+            } else {
+                HUGE
+            }),
+            _ => as_integer(h, v),
+        },
     }
-    p
+}
+/// Port of `bol` (editfns.c): the start of the line N - 1 lines from point's.
+fn bol_n(h: &mut ElispHost, a: &[Value]) -> Result<usize, String> {
+    let n = line_count_arg(h, a, 1)?;
+    Ok(scan_newline_from_point(h.cur_buf(), n.saturating_sub(1)).0)
+}
+/// Port of `eol` (editfns.c) via `find_before_next_newline`: the end of the
+/// line N - 1 lines from point's. A scan that found every newline it wanted
+/// stops ON the last one; a short scan stops at the limit.
+fn eol_n(h: &mut ElispHost, a: &[Value]) -> Result<usize, String> {
+    let n = line_count_arg(h, a, 1)?;
+    let cnt = n - (n <= 0) as i64;
+    let buf = h.cur_buf();
+    let (pos, counted) = find_newline(&buf.text, buf.point, cnt, buf.begv, buf.zv);
+    Ok(if counted == cnt { pos - 1 } else { pos })
+}
+fn beginning_of_line(h: &mut ElispHost, a: &[Value]) -> R {
+    let p = bol_n(h, a)?;
+    h.cur_buf().point = p;
+    Ok(Value::Undef)
+}
+fn end_of_line(h: &mut ElispHost, a: &[Value]) -> R {
+    let p = eol_n(h, a)?;
+    h.cur_buf().point = p;
+    Ok(Value::Undef)
 }
 fn line_beginning_position(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(h, v)?,
-        _ => 1,
-    };
-    let buf = h.cur_buf();
-    Ok(Value::Int(
-        bol_after_lines(&buf.text, buf.point, n - 1, buf.begv, buf.zv) as i64,
-    ))
+    Ok(Value::Int(bol_n(h, a)? as i64))
 }
 fn line_end_position(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(h, v)?,
-        _ => 1,
-    };
-    let buf = h.cur_buf();
-    let bol = bol_after_lines(&buf.text, buf.point, n - 1, buf.begv, buf.zv);
-    Ok(Value::Int(eol_of(&buf.text, bol, buf.zv) as i64))
+    Ok(Value::Int(eol_n(h, a)? as i64))
 }
 fn bolp(h: &mut ElispHost, _a: &[Value]) -> R {
     let buf = h.cur_buf();
@@ -8643,119 +8837,119 @@ fn eobp(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(nil_or(buf.point == buf.zv))
 }
 fn forward_line(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = match a.first() {
-        Some(v) if !is_nil(v) => as_int(h, v)?,
-        _ => 1,
-    };
+    // Port of `Fforward_line` (cmds.c).
+    let count = line_count_arg(h, a, 1)?;
     let buf = h.cur_buf();
-    let len = buf.zv - 1;
-    let mut p = buf.point;
-    let mut short = 0i64;
-    // cmds.c `Fforward_line`: COUNT <= 0 searches backward (so `(forward-line 0)`
-    // goes to the beginning of the line) and the shortage comes back NEGATED —
-    // `(forward-line -1)` on the first line is -1, not 1.
-    if n > 0 {
-        let mut moved = 0;
-        while moved < n {
-            let mut q = p;
-            while q <= len && buf.text[q - 1] != '\n' {
-                q += 1;
-            }
-            if q > len {
-                // No newline before eob: land at eob; the partial line counts as
-                // one not-fully-moved line unless we were already at bol/eob.
-                short = n - moved - if p <= len { 1 } else { 0 };
-                p = len + 1;
-                break;
-            }
-            p = q + 1;
-            moved += 1;
-        }
-    } else {
-        p = bol_of(&buf.text, p, buf.begv);
-        let mut moved = 0;
-        while moved < -n {
-            if p == buf.begv {
-                short = -n - moved;
-                break;
-            }
-            p = bol_of(&buf.text, p - 1, buf.begv);
-            moved += 1;
-        }
+    let opoint = buf.point;
+    let (pos, counted) = scan_newline_from_point(buf, count);
+    buf.point = pos;
+    let mut shortage = count - (count <= 0) as i64 - counted;
+    if shortage != 0 {
+        // A non-empty last line counts as a line moved across.
+        shortage -= if count <= 0 {
+            -1
+        } else {
+            (buf.begv < buf.zv && pos != opoint && buf.text[pos - 2] != '\n') as i64
+        };
     }
-    buf.point = p;
-    Ok(Value::Int(if n > 0 { short } else { -short }))
+    // A bignum N was scanned as a clipped COUNT; report against N itself.
+    match a.first().and_then(|v| h.obj(v)).and_then(|o| match o {
+        Obj::Bignum(b) => Some(b.clone()),
+        _ => None,
+    }) {
+        Some(n) => Ok(h.make_integer(n + (shortage - count))),
+        None => Ok(Value::Int(shortage)),
+    }
 }
 
 // ── buffer search (sets buffer-position match data) ──
-fn set_buf_match(h: &mut ElispHost, spans0: &[Option<(usize, usize)>], text: String) {
+/// Record SPANS (0-based buffer offsets) as a match in the current buffer, which
+/// becomes `last_thing_searched`.
+fn set_buf_match(h: &mut ElispHost, spans0: &[Option<(usize, usize)>]) {
     let spans = spans0
         .iter()
         .map(|o| o.map(|(b, e)| (b + 1, e + 1)))
         .collect();
     h.match_data = Some(MatchData {
-        subject: text,
+        subject: String::new(),
         spans,
         from_buffer: true,
+        buffer: Some(h.current),
     });
 }
-/// The four search commands, driven COUNT times.
+/// The four search commands, driven COUNT times — a port of `search_command`
+/// (search.c).
 ///
 /// COUNT is not a decoration: `(search-forward "a" nil t 2)` finds the SECOND
 /// occurrence, COUNT 0 searches not at all and answers point, and a NEGATIVE
 /// COUNT searches the other way — `search-forward` with -1 is a backward
-/// search. Ignoring it made every one of those answer the first match instead.
+/// search.
 ///
-/// Failure is per Emacs's `search_command`: with NOERROR nil it signals; with
-/// NOERROR `t` it answers nil and leaves point WHERE IT WAS, which matters
-/// because a partial run has already moved it; with any other non-nil NOERROR
-/// it answers nil and moves point to the limit.
+/// BOUND must lie on the side of point the search goes (`Invalid search
+/// bound`), and is then clipped to the accessible region; the search never
+/// looks outside that region, narrowed or not.
+///
+/// Failure is per `search_command`: with NOERROR nil it signals; with NOERROR
+/// `t` it answers nil and leaves point WHERE IT WAS; with any other non-nil
+/// NOERROR it answers nil and moves point to the limit.
 fn search_with_count(
     h: &mut ElispHost,
     a: &[Value],
     forward: bool,
-    fwd: fn(&mut ElispHost, &[Value]) -> Result<Option<i64>, String>,
-    bwd: fn(&mut ElispHost, &[Value]) -> Result<Option<i64>, String>,
+    fwd: SearchStep,
+    bwd: SearchStep,
 ) -> R {
     let noerror = a.get(2).cloned().unwrap_or(Value::Undef);
     let count = match a.get(3) {
-        Some(v) if !is_nil(v) => as_int(h, v)?,
+        Some(v) if !is_nil(v) => as_fixnum_named(h, v, "fixnump")?,
         _ => 1,
     };
-    let entry = h.cur_buf().point;
-    if count == 0 {
-        return Ok(Value::Int(entry as i64));
-    }
-    let (step, reps) = if count > 0 {
-        (fwd, count)
-    } else {
-        (bwd, -count)
+    let n = if forward { count } else { -count };
+    let pat = as_string(h, &a[0])?;
+    let (point, begv, zv) = {
+        let b = h.cur_buf_ref();
+        (b.point, b.begv, b.zv)
     };
+    let lim = match a.get(1) {
+        Some(v) if !is_nil(v) => {
+            let lim = fix_position(h, v)?;
+            if if n > 0 {
+                lim < point as i64
+            } else {
+                lim > point as i64
+            } {
+                return Err("error: Invalid search bound (wrong side of point)".to_string());
+            }
+            lim.clamp(begv as i64, zv as i64) as usize
+        }
+        _ if n > 0 => zv,
+        _ => begv,
+    };
+    if n == 0 {
+        return Ok(Value::Int(point as i64));
+    }
+    let step = if count > 0 { fwd } else { bwd };
     let mut last = None;
-    for _ in 0..reps {
-        match step(h, a)? {
+    for _ in 0..count.unsigned_abs() {
+        match step(h, &pat, lim)? {
             Some(p) => last = Some(p),
             None => {
+                h.cur_buf().point = point;
                 if is_nil(&noerror) {
-                    h.cur_buf().point = entry;
-                    return Err(format!("search-failed: {}", as_string(h, &a[0])?));
+                    return Err(format!("search-failed: {pat}"));
                 }
-                if matches!(noerror, Value::Bool(true)) {
-                    h.cur_buf().point = entry;
-                } else {
-                    // Any other non-nil NOERROR moves point to the limit — which
-                    // end that is depends on the direction actually searched,
-                    // and a negative COUNT reverses the command's own.
-                    let going_forward = forward == (count > 0);
-                    let limit = search_limit(h, a, going_forward)?;
-                    h.cur_buf().point = limit;
+                if !matches!(noerror, Value::Bool(true)) {
+                    h.cur_buf().point = lim;
                 }
                 return Ok(Value::Undef);
             }
         }
     }
-    Ok(Value::Int(last.unwrap_or(entry as i64)))
+    Ok(Value::Int(last.unwrap_or(point as i64)))
 }
+/// One search from point to LIM: answers the new point, having moved there
+/// and recorded the match, or `None` without touching either.
+type SearchStep = fn(&mut ElispHost, &str, usize) -> Result<Option<i64>, String>;
 fn search_forward(h: &mut ElispHost, a: &[Value]) -> R {
     search_with_count(h, a, true, search_forward_once, search_backward_once)
 }
@@ -8768,143 +8962,138 @@ fn re_search_forward(h: &mut ElispHost, a: &[Value]) -> R {
 fn re_search_backward(h: &mut ElispHost, a: &[Value]) -> R {
     search_with_count(h, a, false, re_search_backward_once, re_search_forward_once)
 }
-/// search.c `search_command`'s limit: BOUND nil is ZV going forward and BEGV
-/// going backward; a BOUND on the wrong side of point is an error, and one past
-/// the accessible portion is clamped to it. Returns the 1-based limit.
+/// A literal search is a regexp search for the quoted string: Emacs folds case
+/// in both through the same `case-fold-search` translation.
+fn literal_regexp(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '.' | '*' | '+' | '?' | '[' | '^' | '$' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+fn search_forward_once(h: &mut ElispHost, s: &str, lim: usize) -> Result<Option<i64>, String> {
+    re_search_forward_once(h, &literal_regexp(s), lim)
+}
+fn search_backward_once(h: &mut ElispHost, s: &str, lim: usize) -> Result<Option<i64>, String> {
+    re_search_backward_once(h, &literal_regexp(s), lim)
+}
+/// The current buffer's accessible portion as a string, with the 0-based
+/// buffer offset of its first character. Every buffer regexp operation runs
+/// on this, never on the whole text: Emacs hands `re_search_2` exactly the
+/// region `BEGV`..`ZV`, so `\`` and `^` match at `BEGV`, `\'` and `$` at
+/// `ZV`, and nothing outside the restriction can match.
+fn accessible_text(h: &ElispHost) -> (String, usize) {
+    let b = h.cur_buf_ref();
+    (b.text[b.begv - 1..b.zv - 1].iter().collect(), b.begv - 1)
+}
+/// A match of RE starting exactly at char S of TEXT whose end is at most
+/// STOP — `re_match_2_internal` with STOP as `stop`.
 ///
-/// Defaulting to the whole buffer instead let every search in a narrowed buffer
-/// find text outside the narrowing — `replace-regexp-in-region` (which narrows
-/// to its region) then edited past its END.
-fn search_limit(h: &mut ElispHost, a: &[Value], forward: bool) -> Result<usize, String> {
-    let (begv, zv, pt) = {
-        let b = h.cur_buf_ref();
-        (b.begv as i64, b.zv as i64, b.point as i64)
+/// fancy-regex has no stop position, so this is two attempts. Matched against
+/// the whole text, a match that already ends by STOP is the one Emacs finds:
+/// a stop only prunes paths, so it cannot change which path succeeds first
+/// when the first success never reaches it. Only when that match runs past
+/// STOP is the text cut there — and then an end-of-text assertion (`\'`,
+/// `$`, `\b`) right at STOP sees an end Emacs would not.
+fn match_within(
+    re: &CompiledRe,
+    text: &str,
+    s: usize,
+    stop: usize,
+    anchored: bool,
+) -> Option<Spans> {
+    let ok = |spans: &Spans| match spans[0] {
+        Some((b, e)) => (!anchored || b == s) && e <= stop,
+        None => false,
     };
-    let lim = match a.get(1) {
-        Some(v) if !is_nil(v) => {
-            let lim = as_int_or_marker(h, v, "integer-or-marker-p")?;
-            if if forward { lim < pt } else { lim > pt } {
-                return Err("error: Invalid search bound (wrong side of point)".to_string());
-            }
-            lim.clamp(begv, zv)
-        }
-        _ if forward => zv,
-        _ => begv,
+    let m = run_match(re, text, s)?;
+    if ok(&m) {
+        return Some(m);
+    }
+    let first = m[0]?.0;
+    if anchored && first != s || first > stop {
+        return None;
+    }
+    let cut = &text[..byte_of_char(text, stop)];
+    run_match(re, cut, s).filter(ok)
+}
+type Spans = Vec<Option<(usize, usize)>>;
+/// Record SPANS (offsets into the accessible text starting at buffer offset
+/// OFF) as the current buffer's match data, and answer them rebased.
+fn record_buf_match(h: &mut ElispHost, spans: Spans, off: usize) -> Spans {
+    let spans: Spans = spans
+        .into_iter()
+        .map(|o| o.map(|(b, e)| (b + off, e + off)))
+        .collect();
+    set_buf_match(h, &spans);
+    spans
+}
+fn re_search_forward_once(h: &mut ElispHost, pat: &str, lim: usize) -> Result<Option<i64>, String> {
+    let re = compile_cf(h, pat, case_fold_search(h))?;
+    let (text, off) = accessible_text(h);
+    let p = h.cur_buf_ref().point - 1 - off;
+    let Some(m) = match_within(&re, &text, p, lim - 1 - off, false) else {
+        return Ok(None);
     };
-    Ok(lim as usize)
+    let spans = record_buf_match(h, m, off);
+    let end = spans[0].map_or(p + off, |(_, e)| e) + 1;
+    h.cur_buf().point = end;
+    Ok(Some(end as i64))
 }
-/// search.c `search_buffer_non_re` compares through the buffer's case canon
-/// table when `case-fold-search` is non-nil (`TRANSLATE (c, trt, ...)`); the
-/// standard canon table maps every character to its lower-case form.
-fn chars_match(hay: &[char], needle: &[char], fold: bool) -> bool {
-    if !fold {
-        return hay == needle;
-    }
-    hay.iter()
-        .zip(needle)
-        .all(|(&x, &y)| canon_char(x) == canon_char(y))
-}
-/// One character through the standard case canon table: its one-to-one
-/// lower-case mapping, or itself when there is none.
-pub(crate) fn canon_char(c: char) -> char {
-    let mut l = c.to_lowercase();
-    match (l.next(), l.next()) {
-        (Some(d), None) => d,
-        _ => c,
-    }
-}
-fn search_forward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
-    let needle: Vec<char> = as_string(h, &a[0])?.chars().collect();
-    let fold = case_fold_search(h);
-    let len = h.cur_buf().text.len();
-    let bound = search_limit(h, a, true)?;
-    let start = h.cur_buf().point - 1;
-    let nlen = needle.len();
-    let found = {
-        let hay = &h.cur_buf().text;
-        let mut res = None;
-        let mut i = start;
-        // match must end at or before bound-1 (0-based) => i+nlen <= bound-1
-        while i + nlen <= (bound - 1).max(start) || (nlen == 0 && i == start) {
-            if i + nlen <= len && chars_match(&hay[i..i + nlen], &needle, fold) {
-                res = Some(i);
-                break;
-            }
-            if nlen == 0 {
-                res = Some(i);
-                break;
-            }
-            i += 1;
+/// `(re-search-backward REGEXP &optional BOUND NOERROR COUNT)`.
+///
+/// A backward search is not "the last forward match before point". Emacs tries
+/// START positions from point downwards and takes the FIRST that matches, and
+/// it stops the match at the position the search started from — so for `a+` in
+/// `"aaa"` with point at 4 the answer is a one-character match at 3, not the
+/// three-character match at 1 that a forward scan finds first:
+///
+/// ```text
+/// (with-temp-buffer (insert "aaa") (goto-char 4)
+///   (list (re-search-backward "a+" nil t) (match-beginning 0) (match-end 0)))
+///   => (3 3 4)
+/// (with-temp-buffer (insert "aaa") (goto-char 3) …)   => (2 2 3)
+/// ```
+///
+/// The second line is the end bound: at start 2 an unbounded `a+` would reach
+/// 4, past where the search began. Collecting non-overlapping forward matches
+/// instead answered 1 for the first and nil for the second, and ignored BOUND
+/// entirely.
+fn re_search_backward_once(
+    h: &mut ElispHost,
+    pat: &str,
+    lim: usize,
+) -> Result<Option<i64>, String> {
+    let re = compile_cf(h, pat, case_fold_search(h))?;
+    let (text, off) = accessible_text(h);
+    let p = h.cur_buf_ref().point - 1 - off;
+    let lower = lim - 1 - off;
+    let mut s = p + 1;
+    while s > lower {
+        s -= 1;
+        if let Some(m) = match_within(&re, &text, s, p, true) {
+            let spans = record_buf_match(h, m, off);
+            let begin = spans[0].map_or(s + off, |(b, _)| b) + 1;
+            h.cur_buf().point = begin;
+            return Ok(Some(begin as i64));
         }
-        res
-    };
-    match found {
-        Some(i) => {
-            let end = i + nlen;
-            let text: String = h.cur_buf().text.iter().collect();
-            h.cur_buf().point = end + 1;
-            set_buf_match(h, &[Some((i, end))], text);
-            Ok(Some((end + 1) as i64))
-        }
-        None => Ok(None),
     }
-}
-fn re_search_forward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
-    let pat = as_string(h, &a[0])?;
-    let re = compile_cf(h, &pat, case_fold_search(h))?;
-    let bound = search_limit(h, a, true)?;
-    let text: String = h.cur_buf().text.iter().collect();
-    let start_char = h.cur_buf().point - 1;
-    // The regexp sees only the accessible portion — regex-emacs.c is handed
-    // BEGV..ZV, so `\``/`^` match at BEGV and `\'`/`$` at ZV — while BOUND only
-    // caps where the match may end.
-    let (begv0, zv0) = {
-        let b = h.cur_buf_ref();
-        (b.begv - 1, b.zv - 1)
-    };
-    let subject: String = h.cur_buf_ref().text[begv0..zv0].iter().collect();
-    let m = run_match(&re, &subject, start_char - begv0)
-        .map(|spans| {
-            spans
-                .into_iter()
-                .map(|s| s.map(|(b, e)| (b + begv0, e + begv0)))
-                .collect::<Vec<_>>()
-        })
-        .filter(|spans| spans[0].map(|(_, e)| e < bound).unwrap_or(false));
-    let _ = &pat;
-    match m {
-        Some(spans0) => {
-            let endc = spans0[0].unwrap().1;
-            h.cur_buf().point = endc + 1;
-            set_buf_match(h, &spans0, text);
-            Ok(Some((endc + 1) as i64))
-        }
-        None => Ok(None),
-    }
+    Ok(None)
 }
 fn looking_at(h: &mut ElispHost, a: &[Value]) -> R {
     let re = compile_cf(h, &as_string(h, &a[0])?, case_fold_search(h))?;
-    let text: String = h.cur_buf().text.iter().collect();
-    let start_char = h.cur_buf().point - 1;
-    // search.c `looking_at_1` hands the matcher BEGV..ZV, as a search does, so
-    // the anchors and `\b` see the narrowing's edges.
-    let (begv0, zv0) = {
-        let b = h.cur_buf_ref();
-        (b.begv - 1, b.zv - 1)
-    };
-    let subject: String = h.cur_buf_ref().text[begv0..zv0].iter().collect();
-    let spans = run_match(&re, &subject, start_char - begv0).map(|spans| {
-        spans
-            .into_iter()
-            .map(|s| s.map(|(b, e)| (b + begv0, e + begv0)))
-            .collect::<Vec<_>>()
-    });
-    match spans {
-        Some(spans0) if spans0[0].map(|(b, _)| b == start_char).unwrap_or(false) => {
-            set_buf_match(h, &spans0, text);
+    let (text, off) = accessible_text(h);
+    let p = h.cur_buf_ref().point - 1 - off;
+    let stop = text.chars().count();
+    match match_within(&re, &text, p, stop, true) {
+        Some(m) => {
+            record_buf_match(h, m, off);
             Ok(Value::Bool(true))
         }
-        _ => Ok(Value::Undef),
+        None => Ok(Value::Undef),
     }
 }
 fn looking_at_p(h: &mut ElispHost, a: &[Value]) -> R {
@@ -9476,12 +9665,10 @@ fn insert_char(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Undef)
 }
 fn count_lines(h: &mut ElispHost, a: &[Value]) -> R {
-    let len = h.cur_buf_ref().text.len() as i64;
-    let s = as_int(h, &a[0])?.clamp(1, len + 1);
-    let e = as_int(h, &a[1])?.clamp(1, len + 1);
+    // simple.el narrows to START..END first, so the bounds are narrow-to-region's.
+    let (lo, hi) = narrow_bounds(h, &a[0], &a[1])?;
     let buf = h.cur_buf();
-    let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
-    let region = &buf.text[(lo - 1) as usize..(hi - 1) as usize];
+    let region = &buf.text[lo - 1..hi - 1];
     let nl = region.iter().filter(|&&c| c == '\n').count();
     // Count the final partial line (region non-empty and not ending in newline).
     let extra = if !region.is_empty() && region[region.len() - 1] != '\n' {
@@ -9502,111 +9689,128 @@ fn line_number_at_pos(h: &mut ElispHost, a: &[Value]) -> R {
     let n = buf.text[..upto].iter().filter(|&&c| c == '\n').count();
     Ok(Value::Int(n as i64 + 1))
 }
+/// `SANE_TAB_WIDTH` (buffer.h): `tab-width` when it is an integer in
+/// 1..=1000, else 8.
+fn sane_tab_width(h: &ElispHost) -> i64 {
+    match h
+        .find_symbol("tab-width")
+        .and_then(|s| h.get_value(&s).ok())
+    {
+        Some(Value::Int(n)) if (1..=1000).contains(&n) => n,
+        _ => 8,
+    }
+}
+/// The columns character C advances from column COL: a tab to the next tab
+/// stop, anything else its `char-width`.
+fn advance_column(c: char, col: i64, tab_width: i64) -> i64 {
+    if c == '\t' {
+        (col / tab_width + 1) * tab_width
+    } else {
+        col + char_display_width(c as u32) as i64
+    }
+}
+/// Port of `scan_for_column` (indent.c) without display properties or
+/// invisibility: walk from the start of point's line towards END, stopping at a
+/// newline or once column GOAL is reached. Answers `(pos, col, prev_pos,
+/// prev_col)`, the `prev_` pair naming the last character stepped over.
+fn scan_for_column(h: &ElispHost, end: usize, goal: i64) -> (usize, i64, usize, i64) {
+    let tab_width = sane_tab_width(h);
+    let buf = h.cur_buf_ref();
+    let mut pos = find_newline(&buf.text, buf.point, -1, buf.begv, buf.zv).0;
+    let (mut col, mut prev_pos, mut prev_col) = (0i64, pos, 0i64);
+    while pos < end {
+        if col >= goal {
+            break;
+        }
+        let c = buf.text[pos - 1];
+        if c == '\n' {
+            break;
+        }
+        prev_pos = pos;
+        prev_col = col;
+        col = advance_column(c, col, tab_width);
+        pos += 1;
+    }
+    (pos, col, prev_pos, prev_col)
+}
+/// `(current-column)`: the display column of point.
 fn current_column(h: &mut ElispHost, _a: &[Value]) -> R {
-    let buf = h.cur_buf();
-    // Expand tabs to the next multiple of tab-width (8) like Emacs.
-    let bol = bol_of(&buf.text, buf.point, buf.begv);
-    let mut col = 0usize;
-    for i in bol..buf.point {
-        if buf.text[i - 1] == '\t' {
-            col = (col / 8 + 1) * 8;
-        } else {
-            col += 1;
-        }
-    }
-    Ok(Value::Int(col as i64))
+    let point = h.cur_buf_ref().point;
+    Ok(Value::Int(scan_for_column(h, point, i64::MAX).1))
 }
-fn search_backward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
-    let needle: Vec<char> = as_string(h, &a[0])?.chars().collect();
-    let fold = case_fold_search(h);
-    let bound = search_limit(h, a, false)? - 1;
-    let point = h.cur_buf().point;
-    let nlen = needle.len();
-    let found = {
-        let hay = &h.cur_buf().text;
-        let mut res = None;
-        if nlen == 0 {
-            res = Some(point - 1);
-        } else if point > nlen && point - 1 - nlen >= bound {
-            // Starts run from the last one that ends at point down to BOUND.
-            let mut i = point - 1 - nlen; // max start so match ends at point-1
-            loop {
-                if chars_match(&hay[i..i + nlen], &needle, fold) {
-                    res = Some(i);
-                    break;
-                }
-                if i <= bound {
-                    break;
-                }
-                i -= 1;
-            }
-        }
-        res
+/// Port of `Fcurrent_indentation` / `position_indentation` (indent.c): the
+/// column of the first character on point's line that is not a space or tab.
+fn current_indentation(h: &mut ElispHost, _a: &[Value]) -> R {
+    let tab_width = sane_tab_width(h);
+    let buf = h.cur_buf_ref();
+    let mut pos = find_newline(&buf.text, buf.point, -1, buf.begv, buf.zv).0;
+    let mut col = 0i64;
+    while pos < buf.zv && matches!(buf.text[pos - 1], ' ' | '\t') {
+        col = advance_column(buf.text[pos - 1], col, tab_width);
+        pos += 1;
+    }
+    Ok(Value::Int(col))
+}
+/// Port of `Findent_to` (indent.c): pad from point's column to COLUMN (and at
+/// least MINIMUM columns), with tabs where `indent-tabs-mode` allows, and
+/// answer the column reached.
+fn indent_to(h: &mut ElispHost, a: &[Value]) -> R {
+    let column = as_fixnum_named(h, &a[0], "fixnump")?;
+    let minimum = match a.get(1) {
+        Some(v) if !is_nil(v) => as_fixnum_named(h, v, "fixnump")?,
+        _ => 0,
     };
-    match found {
-        Some(i) => {
-            let text: String = h.cur_buf().text.iter().collect();
-            h.cur_buf().point = i + 1;
-            set_buf_match(h, &[Some((i, i + nlen))], text);
-            Ok(Some((i + 1) as i64))
-        }
-        None => Ok(None),
+    let tab_width = sane_tab_width(h);
+    let point = h.cur_buf_ref().point;
+    let mut fromcol = scan_for_column(h, point, i64::MAX).1;
+    let mincol = (fromcol + minimum).max(column);
+    if fromcol == mincol {
+        return Ok(Value::Int(mincol));
     }
+    h.barf_if_read_only()?;
+    let tabs_mode = h
+        .find_symbol("indent-tabs-mode")
+        .and_then(|s| h.get_value(&s).ok())
+        .is_some_and(|v| !is_nil(&v));
+    if tabs_mode {
+        let n = mincol / tab_width - fromcol / tab_width;
+        if n != 0 {
+            h.cur_insert(vec!['\t'; n.max(0) as usize], true);
+            fromcol = (mincol / tab_width) * tab_width;
+        }
+    }
+    h.cur_insert(vec![' '; (mincol - fromcol).max(0) as usize], true);
+    Ok(Value::Int(mincol))
 }
-/// `(re-search-backward REGEXP &optional BOUND NOERROR COUNT)`.
-///
-/// A backward search is not "the last forward match before point". Emacs tries
-/// START positions from point downwards and takes the FIRST that matches, and
-/// it stops the match at the position the search started from — so for `a+` in
-/// `"aaa"` with point at 4 the answer is a one-character match at 3, not the
-/// three-character match at 1 that a forward scan finds first:
-///
-/// ```text
-/// (with-temp-buffer (insert "aaa") (goto-char 4)
-///   (list (re-search-backward "a+" nil t) (match-beginning 0) (match-end 0)))
-///   => (3 3 4)
-/// (with-temp-buffer (insert "aaa") (goto-char 3) …)   => (2 2 3)
-/// ```
-///
-/// The second line is the end bound: at start 2 an unbounded `a+` would reach
-/// 4, past where the search began. Collecting non-overlapping forward matches
-/// instead answered 1 for the first and nil for the second, and ignored BOUND
-/// entirely.
-fn re_search_backward_once(h: &mut ElispHost, a: &[Value]) -> Result<Option<i64>, String> {
-    let pat = as_string(h, &a[0])?;
-    let re = compile_cf(h, &pat, case_fold_search(h))?;
-    // BOUND: the match may not START before it (`search_backward` reads it the
-    // same way for a literal search).
-    let bound = search_limit(h, a, false)? - 1;
-    let full: String = h.cur_buf().text.iter().collect();
-    let point_char = h.cur_buf().point - 1;
-    // Truncating at point is what bounds the match END; char offsets in the
-    // prefix are the same as in the whole text, so the spans need no rebasing.
-    let cut = byte_of_char(&full, point_char);
-    let text = full[..cut].to_string();
-    let mut found: Option<Vec<Option<(usize, usize)>>> = None;
-    let mut s = point_char + 1;
-    while s > bound {
-        s -= 1;
-        if let Some(spans) = run_match(&re, &text, s) {
-            // `run_match` finds the LEFTMOST match at or after `s`; only one
-            // that begins exactly at `s` is a match starting there.
-            if spans[0].map(|(b, _)| b) == Some(s) {
-                found = Some(spans);
-                break;
-            }
+/// Port of `Fmove_to_column` (indent.c): move to COLUMN on the current line,
+/// or as close as the line allows. FORCE non-nil splits a tab that straddles
+/// COLUMN into spaces; FORCE `t` also pads a line too short to reach it.
+fn move_to_column(h: &mut ElispHost, a: &[Value]) -> R {
+    let goal = match &a[0] {
+        Value::Int(n) if *n >= 0 => *n,
+        other => return Err(h.signal_wrong_type("wholenump", other)),
+    };
+    let force = a.get(1).cloned().unwrap_or(Value::Undef);
+    let zv = h.cur_buf_ref().zv;
+    let (pos, mut col, prev_pos, prev_col) = scan_for_column(h, zv, goal);
+    h.cur_buf().point = pos;
+    if !is_nil(&force) && col > goal {
+        let c = h.cur_buf_ref().text[prev_pos - 1];
+        if c == '\t' && prev_col < goal && prev_pos < pos {
+            h.cur_buf().point = prev_pos;
+            h.cur_insert(vec![' '; (goal - prev_col) as usize], true);
+            let at = h.cur_buf_ref().point;
+            h.cur_delete(at, at + 1);
+            indent_to(h, &[Value::Int(col)])?;
+            h.cur_buf().point = at;
+            col = goal;
         }
     }
-    let _ = &pat;
-    match found {
-        Some(spans0) => {
-            let bc = spans0[0].unwrap().0;
-            h.cur_buf().point = bc + 1;
-            set_buf_match(h, &spans0, full);
-            Ok(Some((bc + 1) as i64))
-        }
-        None => Ok(None),
+    if col < goal && matches!(force, Value::Bool(true)) {
+        col = goal;
+        indent_to(h, &[Value::Int(col)])?;
     }
+    Ok(Value::Int(col))
 }
 /// One member of a `skip-chars-forward` set: an inclusive character range, or
 /// an ISO C class (`[:alpha:]`), tested through the regexp engine's class
@@ -9722,76 +9926,86 @@ fn skip_chars_forward(h: &mut ElispHost, a: &[Value]) -> R {
 fn skip_chars_backward(h: &mut ElispHost, a: &[Value]) -> R {
     skip_chars(h, a, false)
 }
-/// syntax.c `scan_words`: the position COUNT words from FROM (1-based), or
-/// `None` when the accessible portion ends first. A word is a run of
-/// word-syntax characters in the current syntax table. (`word_boundary_p`'s
-/// script split inside a run is not modelled.)
-fn scan_words(h: &mut ElispHost, mut from: usize, mut count: i64) -> Option<usize> {
-    let (begv, zv) = {
-        let b = h.cur_buf_ref();
-        (b.begv, b.zv)
+/// Port of `scan_words` (syntax.c): the position COUNT words from FROM, or
+/// `None` when the accessible region ends first.
+///
+/// A word is a run of word-syntax characters in the buffer's syntax table
+/// (plus escape / char-quote characters under `words-include-escapes`).
+/// Not ported: `word_boundary_p`'s script and category split, so a run that
+/// changes script mid-word (`abcαβγ`) is one word here and two in Emacs; and
+/// `find-word-boundary-function-table`.
+fn scan_words(h: &ElispHost, from: usize, mut count: i64) -> Option<usize> {
+    let escapes = h
+        .find_symbol("words-include-escapes")
+        .and_then(|s| h.get_value(&s).ok())
+        .is_some_and(|v| !is_nil(&v));
+    let buf = h.cur_buf_ref();
+    let is_word = |c: char| {
+        let code = h.syntax_class_of(c);
+        code == 'w' || (escapes && (code == '\\' || code == '/'))
     };
-    let at = |h: &mut ElispHost, pos: usize| -> bool {
-        let c = h.cur_buf_ref().text[pos - 1];
-        h.syntax_class_of(c) == 'w'
-    };
+    let mut from = from;
     while count > 0 {
         loop {
-            if from == zv {
+            if from == buf.zv {
                 return None;
             }
-            let word = at(h, from);
             from += 1;
-            if word {
+            if is_word(buf.text[from - 2]) {
                 break;
             }
         }
-        while from != zv && at(h, from) {
+        while from < buf.zv && is_word(buf.text[from - 1]) {
             from += 1;
         }
         count -= 1;
     }
     while count < 0 {
         loop {
-            if from == begv {
+            if from == buf.begv {
                 return None;
             }
-            let word = at(h, from - 1);
             from -= 1;
-            if word {
+            if is_word(buf.text[from - 1]) {
                 break;
             }
         }
-        while from != begv && at(h, from - 1) {
+        while from > buf.begv && is_word(buf.text[from - 2]) {
             from -= 1;
         }
         count += 1;
     }
     Some(from)
 }
-/// syntax.c `Fforward_word`: move to `scan_words`'s answer, or to the edge of
-/// the accessible portion when it ran out; t only when all ARG words were found.
+/// Port of `Fforward_word` (syntax.c): move over ARG words; on running out of
+/// buffer, stop at the limit and answer nil.
 fn forward_word(h: &mut ElispHost, a: &[Value]) -> R {
     let n = match a.first() {
         Some(v) if !is_nil(v) => as_fixnum_named(h, v, "fixnump")?,
         _ => 1,
     };
-    let pt = h.cur_buf_ref().point;
-    let found = scan_words(h, pt, n);
-    let (begv, zv) = {
-        let b = h.cur_buf_ref();
-        (b.begv, b.zv)
-    };
-    h.cur_buf().point = found.unwrap_or(if n > 0 { zv } else { begv });
-    Ok(Value::Bool(found.is_some()))
+    let found = scan_words(h, h.cur_buf_ref().point, n);
+    let buf = h.cur_buf();
+    buf.point = found.unwrap_or(if n > 0 { buf.zv } else { buf.begv });
+    Ok(nil_or(found.is_some()))
 }
-/// simple.el `backward-word`: `(forward-word (- (or arg 1)))`.
+/// `backward-word` (simple.el): `(forward-word (- (or arg 1)))`.
 fn backward_word(h: &mut ElispHost, a: &[Value]) -> R {
-    let n = match a.first() {
-        Some(v) if !is_nil(v) => as_fixnum_named(h, v, "fixnump")?,
-        _ => 1,
+    let arg = match a.first() {
+        Some(v) if !is_nil(v) => v.clone(),
+        _ => Value::Int(1),
     };
-    forward_word(h, &[Value::Int(-n)])
+    let neg = match arg {
+        Value::Int(n) => Value::Int(-n),
+        Value::Float(f) => Value::Float(-f),
+        other => {
+            return Err(format!(
+                "wrong-type-argument: number-or-marker-p {}",
+                h.print(&other, true)
+            ))
+        }
+    };
+    forward_word(h, &[neg])
 }
 
 /// Install the primitive subr set.
@@ -10148,6 +10362,20 @@ pub fn install(h: &mut ElispHost) {
     s("use-local-map", 1, Some(1), use_local_map_fn);
     s("current-local-map", 0, Some(0), current_local_map_fn);
     s("insert", 0, None, insert_fn);
+    s(
+        "insert-buffer-substring",
+        1,
+        Some(3),
+        insert_buffer_substring,
+    );
+    s("point-min-marker", 0, Some(0), point_min_marker);
+    s("point-max-marker", 0, Some(0), point_max_marker);
+    s(
+        "delete-and-extract-region",
+        2,
+        Some(2),
+        delete_and_extract_region,
+    );
     s("buffer-string", 0, Some(0), buffer_string);
     s("buffer-size", 0, Some(1), buffer_size);
     s("point", 0, Some(0), point_fn);
@@ -10251,9 +10479,12 @@ pub fn install(h: &mut ElispHost) {
     s("char-before", 0, Some(1), char_before);
     s("delete-char", 1, Some(2), delete_char);
     s("insert-char", 1, Some(3), insert_char);
-    s("count-lines", 2, Some(2), count_lines);
+    s("count-lines", 2, Some(3), count_lines);
     s("line-number-at-pos", 0, Some(2), line_number_at_pos);
     s("current-column", 0, Some(0), current_column);
+    s("current-indentation", 0, Some(0), current_indentation);
+    s("indent-to", 1, Some(2), indent_to);
+    s("move-to-column", 1, Some(2), move_to_column);
     s("search-backward", 1, Some(4), search_backward);
     s("re-search-backward", 1, Some(4), re_search_backward);
     s("skip-chars-forward", 1, Some(2), skip_chars_forward);
