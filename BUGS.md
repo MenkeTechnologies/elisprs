@@ -5833,7 +5833,8 @@ tests: `tests/parity_kill_ring_and_word_motion.rs`,
   start in Emacs (`word_boundary_p` via `char-script-table`); not modelled, and
   `forward-word` has the same gap.
 - `define-inline` (inline.el), `?\N{NAME}` (needs the Unicode name table),
-  the internal layout `make-char-table` prints, `sxhash-equal`'s actual values,
+  the internal layout `make-char-table` prints, `sxhash-equal`'s actual values
+  (fixed in round 35 for everything but address-hashed objects such as symbols),
   and two closures from one scope sharing their `(t)` env cons under
   `print-circle`.
 - `delete-char`'s KILLFLAG is ignored; `documentation` of a primitive is nil
