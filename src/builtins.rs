@@ -6864,13 +6864,46 @@ fn default_toplevel_value(h: &mut ElispHost, a: &[Value]) -> R {
     h.raw_global_value(&a[0])
 }
 /// `(read STRING)` — read the first Lisp form from STRING.
+/// `(read &optional STREAM)` (lread.c `Fread`). A string is read from its
+/// start. A buffer is read from ITS point (current or not) up to its `ZV`, and
+/// its point is left just past the object; a marker is read from its position
+/// in its buffer, and the marker is advanced instead.
 fn read_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let s = as_string(h, &a[0])?;
-    let forms = crate::reader::read_all(h, &s)?;
-    forms
-        .into_iter()
-        .next()
-        .ok_or_else(|| "end-of-file".to_string())
+    let stream = a.first().cloned().unwrap_or(Value::Undef);
+    let (bi, marker) = match h.obj(&stream) {
+        Some(Obj::Buffer(idx)) => (*idx, None),
+        Some(Obj::Marker(m)) => match m.borrow().buffer {
+            Some(idx) => (idx, Some(m.clone())),
+            None => return Err("error: Marker does not point anywhere".to_string()),
+        },
+        _ => {
+            let s = as_string(h, &stream)?;
+            let forms = crate::reader::read_all(h, &s)?;
+            return forms
+                .into_iter()
+                .next()
+                .ok_or_else(|| "end-of-file".to_string());
+        }
+    };
+    let (start, text) = {
+        let b = &h.buffers[bi];
+        let start = marker.as_ref().map_or(b.point, |m| m.borrow().pos);
+        let start = start.clamp(b.begv, b.zv);
+        (start, b.text[start - 1..b.zv - 1].iter().collect::<String>())
+    };
+    // Running out of text consumes all of it: point (or the marker) is at
+    // `ZV` when `end-of-file` is signalled.
+    let r = crate::reader::read_one(h, &text, 0);
+    let end = match &r {
+        Ok((_, end)) => start + end,
+        Err(e) if e == "end-of-file" => start + text.chars().count(),
+        Err(_) => start,
+    };
+    match marker {
+        Some(m) => m.borrow_mut().pos = end,
+        None => h.buffers[bi].point = end,
+    }
+    r.map(|(form, _)| form)
 }
 /// `(read-from-string STRING &optional START END)` — read the first object from
 /// STRING (from char index START), returning `(OBJECT . END-INDEX)`.
@@ -7076,24 +7109,53 @@ pub(crate) fn rng_next() -> u64 {
         x
     })
 }
-/// `(random &optional LIMIT)`. With a positive integer LIMIT, return an integer in
-/// [0, LIMIT); with t, reseed and return a random integer; otherwise a random
-/// fixnum (may be negative).
+/// A random fixnum over the whole fixnum range, as `get_random_fixnum`'s
+/// unbounded case: 62 random bits, sign-extended.
+fn random_fixnum() -> i64 {
+    ((rng_next() << 2) as i64) >> 2
+}
+/// Port of `Frandom` (fns.c). LIMIT t reseeds from the clock and a string
+/// reseeds from its contents; either way, as for any other non-integer LIMIT,
+/// the answer is a random fixnum, negative ones included. An integer LIMIT —
+/// a bignum too — must be positive (`(args-out-of-range LIMIT)`) and bounds
+/// the answer to [0, LIMIT).
 fn random_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    match a.first() {
-        Some(Value::Bool(true)) => {
-            RNG_STATE.with(|s| s.set(rng_seed()));
-            Ok(Value::Int((rng_next() >> 1) as i64))
-        }
-        Some(v) if !is_nil(v) => {
-            let n = as_int(h, v)?;
-            if n <= 0 {
-                return Err("args-out-of-range: random limit must be positive".to_string());
+    let limit = a.first().cloned().unwrap_or(Value::Undef);
+    match &limit {
+        Value::Bool(true) => RNG_STATE.with(|s| s.set(rng_seed())),
+        Value::Int(n) => {
+            if *n <= 0 {
+                return Err(args_out_of_range_values(h, vec![limit.clone()]));
             }
-            Ok(Value::Int((rng_next() % n as u64) as i64))
+            return Ok(Value::Int((rng_next() % *n as u64) as i64));
         }
-        _ => Ok(Value::Int((rng_next() >> 1) as i64)),
+        _ => {
+            if let Some(Obj::Bignum(b)) = h.obj(&limit) {
+                let b = b.clone();
+                if b.sign() != num_bigint::Sign::Plus {
+                    return Err(args_out_of_range_values(h, vec![limit.clone()]));
+                }
+                // 64 bits past LIMIT's width keep the modulo bias negligible.
+                let words = b.bits() / 64 + 2;
+                let mut r = BigInt::from(0u8);
+                for _ in 0..words {
+                    r = (r << 64) + BigInt::from(rng_next());
+                }
+                return Ok(h.make_integer(r % b));
+            }
+            if h.is_string(&limit) {
+                let s = as_string(h, &limit)?;
+                // `seed_random`: the same string always restarts the same sequence.
+                let seed = s
+                    .bytes()
+                    .fold(0xcbf2_9ce4_8422_2325u64, |acc, c| {
+                        (acc ^ c as u64).wrapping_mul(0x0100_0000_01b3)
+                    });
+                RNG_STATE.with(|st| st.set(seed | 1));
+            }
+        }
     }
+    Ok(Value::Int(random_fixnum()))
 }
 
 /// Convert an elisp TIME value to epoch seconds (float). Accepts nil (= now), an
@@ -7251,6 +7313,21 @@ fn fmt_time_string(fmt: &str, tm: &libc::tm, secs: f64) -> String {
         if i >= chars.len() {
             break;
         }
+        // nstrftime: `:`, `::` and `:::` are valid only just before `z`;
+        // anything else is a bad format, copied through literally.
+        let mut colons = 0;
+        while i + colons < chars.len() && chars[i + colons] == ':' {
+            colons += 1;
+        }
+        if colons > 0 {
+            if colons > 3 || chars.get(i + colons) != Some(&'z') {
+                let start = chars[..i].iter().rposition(|&c| c == '%').unwrap_or(0);
+                out.extend(&chars[start..i + colons]);
+                i += colons;
+                continue;
+            }
+            i += colons;
+        }
         let d = chars[i];
         i += 1;
         // Numeric field with default width/pad, honoring flags.
@@ -7331,12 +7408,7 @@ fn fmt_time_string(fmt: &str, tm: &libc::tm, secs: f64) -> String {
                     out.push_str(&cs.to_string_lossy());
                 }
             }
-            'z' => {
-                let off = tm.tm_gmtoff;
-                let sign = if off < 0 { '-' } else { '+' };
-                let a = off.unsigned_abs();
-                out.push_str(&format!("{sign}{:02}{:02}", a / 3600, (a % 3600) / 60));
-            }
+            'z' => out.push_str(&tz_offset(tm.tm_gmtoff, colons, flag, user_w)),
             'F' => out.push_str(&fmt_time_string("%Y-%m-%d", tm, secs)),
             'T' => out.push_str(&fmt_time_string("%H:%M:%S", tm, secs)),
             'R' => out.push_str(&fmt_time_string("%H:%M", tm, secs)),
@@ -7398,6 +7470,57 @@ fn fmt_time_string(fmt: &str, tm: &libc::tm, secs: f64) -> String {
     out
 }
 
+/// nstrftime's `%z` family (`do_z_conversion` / `do_tz_offset`): OFF seconds
+/// east of UTC as `+hhmm` (no colons), `+hh:mm` (`%:z`), `+hh:mm:ss` (`%::z`),
+/// or for `%:::z` the shortest of `+hh`, `+hh:mm`, `+hh:mm:ss` that is exact.
+///
+/// The sign always prints; the digits are zero-padded to the conversion's own
+/// width (5, 6, 9 or 3 counting the sign) or a user WIDTH. The `-` flag drops
+/// the padding (`%-:z` is `+1:00`), and `_` pads with spaces BEFORE the sign.
+fn tz_offset(off: i64, colons: usize, flag: Option<char>, width: Option<usize>) -> String {
+    let a = off.unsigned_abs();
+    let (hh, mm, ss) = (a / 3600, (a % 3600) / 60, a % 60);
+    let (digits, colon_mask, value) = match colons {
+        0 => (5, 0, hh * 100 + mm),
+        3 if ss == 0 && mm == 0 => (3, 0, hh),
+        1 => (6, 0o4, hh * 100 + mm),
+        3 if ss == 0 => (6, 0o4, hh * 100 + mm),
+        _ => (9, 0o24, hh * 10000 + mm * 100 + ss),
+    };
+    // `do_number_body`: digits from the right, a colon wherever the mask says,
+    // until both the value and the mask run out.
+    let (mut v, mut mask, mut num) = (value, colon_mask, Vec::new());
+    loop {
+        if mask & 1 == 1 {
+            num.push(':');
+        }
+        mask >>= 1;
+        num.push(char::from(b'0' + (v % 10) as u8));
+        v /= 10;
+        if v == 0 && mask == 0 {
+            break;
+        }
+    }
+    num.reverse();
+    let sign = if off < 0 { '-' } else { '+' };
+    // `do_number_sign_and_padding`.
+    let width = width.unwrap_or(digits);
+    let pad = width.saturating_sub(1 + num.len());
+    let mut out = String::new();
+    match flag {
+        Some('-') => out.push(sign),
+        Some('_') => {
+            out.push_str(&" ".repeat(pad));
+            out.push(sign);
+        }
+        _ => {
+            out.push(sign);
+            out.push_str(&"0".repeat(pad));
+        }
+    }
+    out.extend(num);
+    out
+}
 /// The ISO 8601 week-based year and week number for `tm`.
 ///
 /// A week runs Monday to Sunday and belongs to the year containing its
@@ -10626,7 +10749,7 @@ pub fn install(h: &mut ElispHost) {
     s("decode-char", 2, Some(2), decode_char);
     s("emacs-pid", 0, Some(0), emacs_pid);
     s("load-average", 0, Some(1), load_average);
-    s("read", 1, Some(1), read_fn);
+    s("read", 0, Some(1), read_fn);
     s("read-from-string", 1, Some(3), read_from_string);
     s("compare-strings", 6, Some(7), compare_strings);
     // Emacs 28 alias for split-string with identical semantics (direct forwarder).

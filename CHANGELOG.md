@@ -18,6 +18,11 @@ All notable changes to elisprs are documented here. The format follows
   `tab-width` and `char-width`; `current-indentation`, `indent-to`,
   `move-to-column`, `insert-buffer-substring`, `point-min-marker`,
   `point-max-marker` and `delete-and-extract-region` are subrs, as in Emacs.
+  `random` follows `Frandom` (bignum and non-integer LIMITs, `(args-out-of-range
+  LIMIT)`); `read` takes a buffer or marker STREAM; `%:z`, `%::z`, `%:::z` and
+  `%z`'s flags and width follow nstrftime; `print-escape-multibyte` and
+  `octalout`'s three-digit rule are honoured; startup no longer writes
+  `void-function: put` to stderr.
 - **Round 33 parity vs Emacs 31.1** (see BUGS.md): `search-forward` /
   `search-backward` ignored `case-fold-search`; `forward-word` was not
   syntax.c `scan_words` (negative counts did nothing, the narrowing and the

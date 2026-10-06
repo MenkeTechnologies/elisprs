@@ -5910,6 +5910,52 @@ and their argument checks were Lisp's. They are ports of the C functions;
 the prelude definitions are gone. `backward-word` negates through `-`, so a
 non-number ARG is `number-or-marker-p`, as simple.el's.
 
+### R34-F. ✅ FIXED — `random` was not `Frandom`
+
+A non-positive LIMIT signalled `(args-out-of-range "random limit must be
+positive")`; Emacs's data is `(args-out-of-range LIMIT)`. A bignum LIMIT, a
+float, a symbol or a string was `(wrong-type-argument integerp X)`; `Frandom`
+bounds by a positive bignum, reseeds from a string's contents, and otherwise
+answers a random fixnum over the whole fixnum range (negative ones included).
+
+### R34-G. ✅ FIXED — `read` accepted only a string
+
+`(read BUFFER)` reads from that buffer's point (current or not) to its `ZV`
+and leaves point after the object; `(read MARKER)` reads from the marker and
+advances it; running out of text leaves point at `ZV`. `read`'s STREAM is now
+optional as in `Fread`. Still open: a function STREAM, and STREAM nil / t
+(`standard-input`, the minibuffer in batch).
+
+### R34-H. ✅ FIXED — `format-time-string`'s `%z` family
+
+`%:z`, `%::z` and `%:::z` printed literally. They and `%z` are now
+nstrftime's `do_z_conversion` / `do_tz_offset`: the sign always prints, the
+digits are zero-padded to the conversion's width or a field width, `-` drops
+the padding and `_` pads with spaces before the sign; `%::::z` and a colon
+before anything but `z` are copied through.
+
+```text
+(format-time-string "%:z|%:::z|%-:z|%_z" 0 3600)
+emacs:   "+01:00|+01|+1:00| +100"
+before:  "%:z|%:::z|%:z|+0100"
+```
+
+### R34-I. ✅ FIXED — string escapes under `prin1`
+
+`print-escape-multibyte` was ignored; print.c writes each non-ASCII character
+as `\xXXXX` and puts `\ ` before a following hex digit. Under
+`print-escape-control-characters`, `octalout` widens an escape to three digits
+when the next character is an octal digit: `(string 1 ?5)` prints `"\0015"`,
+which elisprs printed as `"\15"` (a different string when read back).
+
+### R34-J. ✅ FIXED — every run wrote two lines to stderr
+
+`command-line-args` and `command-line-args-left` were `defvar`ed with a
+docstring before the prelude defines `put`, so recording
+`variable-documentation` failed and every `elisp` invocation printed
+`elisprs: prelude form failed: void-function: put` twice. They are now defined
+after `put`.
+
 ### Still open after round 34
 
 - **A bounded regexp search whose leftmost match crosses BOUND.** Emacs stops

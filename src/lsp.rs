@@ -929,7 +929,7 @@ pub const SUBRS: &[Entry] = &[
         name: "random",
         kind: Kind::Function,
         sig: "(random &optional LIMIT)",
-        doc: "Pseudo-random integer; if LIMIT is a positive integer, in the range [0, LIMIT).",
+        doc: "Pseudo-random integer; if LIMIT is a positive integer (a bignum too), in the range [0, LIMIT). A non-positive integer LIMIT signals args-out-of-range; t reseeds from the clock and a string reseeds from its contents; otherwise any fixnum.",
     },
     Entry {
         name: "string-to-number",
@@ -1078,8 +1078,8 @@ pub const SUBRS: &[Entry] = &[
     Entry {
         name: "read",
         kind: Kind::Function,
-        sig: "(read STRING)",
-        doc: "Read and return one Lisp object from STRING.",
+        sig: "(read &optional STREAM)",
+        doc: "Read and return one Lisp object from STREAM: a string (from its start), a buffer (from its point, which moves past the object) or a marker (from its position, which advances).",
     },
     Entry {
         name: "read-from-string",

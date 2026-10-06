@@ -3681,7 +3681,6 @@ impl ElispHost {
         }
     }
 
-    /// True if a printer flag dynamic var (e.g. `print-escape-newlines`) is non-nil.
     /// print.c `float_to_string` for a finite F: `float-output-format`, when it
     /// is a string Emacs accepts (`%.` then at most `DBL_DIG` digits, zero only
     /// for `f`, then one of `e` `f` `g`), and the shortest round-trip form
@@ -3722,6 +3721,59 @@ impl ElispHost {
         }
     }
 
+    /// The body of a string under `prin1`, a port of print.c's string loop.
+    ///
+    /// `"` and `\` are backslashed; `print-escape-newlines` writes newline and
+    /// formfeed as `\n` / `\f`; `print-escape-control-characters` writes the
+    /// other control characters through `octalout`; and
+    /// `print-escape-multibyte` writes every non-ASCII character as `\xXXXX`
+    /// (at least four hex digits), following it with `\ ` when the next
+    /// character is a hex digit that would otherwise extend the escape.
+    fn escape_string_body(&self, s: &str) -> String {
+        let esc_newlines = self.print_flag("print-escape-newlines");
+        let esc_control = self.print_flag("print-escape-control-characters");
+        let esc_multibyte = self.print_flag("print-escape-multibyte");
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(s.len() + 2);
+        let mut need_nonhex = false;
+        for (i, &c) in chars.iter().enumerate() {
+            if esc_multibyte && !c.is_ascii() {
+                out.push_str(&format!("\\x{:04x}", c as u32));
+                need_nonhex = true;
+                continue;
+            }
+            if need_nonhex && c.is_ascii_hexdigit() {
+                out.push_str("\\ ");
+            }
+            need_nonhex = false;
+            match c {
+                '\n' if esc_newlines => out.push_str("\\n"),
+                '\u{c}' if esc_newlines => out.push_str("\\f"),
+                '"' | '\\' => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                c if esc_control && c.is_ascii_control() => {
+                    // `octalout`: three digits when C needs them or when the
+                    // next character is an octal digit, else as few as fit.
+                    let next_octal = chars.get(i + 1).is_some_and(|n| ('0'..='7').contains(n));
+                    let c = c as u32;
+                    let digits = if c > 0o77 || next_octal {
+                        3
+                    } else if c > 0o7 {
+                        2
+                    } else {
+                        1
+                    };
+                    out.push_str(&format!("\\{c:0digits$o}"));
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// True if a printer flag dynamic var (e.g. `print-escape-newlines`) is non-nil.
     fn print_flag(&self, name: &str) -> bool {
         self.print_flag_or(name, false)
     }
@@ -3851,25 +3903,7 @@ impl ElispHost {
             }
             Value::Str(s) => {
                 if readable {
-                    let mut t = s.replace('\\', "\\\\").replace('"', "\\\"");
-                    // print-escape-newlines: render newline/formfeed as \n / \f.
-                    if self.print_flag("print-escape-newlines") {
-                        t = t.replace('\n', "\\n").replace('\u{c}', "\\f");
-                    }
-                    // print-escape-control-characters: every remaining control
-                    // character prints as a backslash + *octal* escape (Emacs
-                    // `print_object`), so a tab reads back as `\11`.
-                    if self.print_flag("print-escape-control-characters") {
-                        let mut esc = String::with_capacity(t.len());
-                        for c in t.chars() {
-                            if (c as u32) < 0x20 || c as u32 == 0x7f {
-                                esc.push_str(&format!("\\{:o}", c as u32));
-                            } else {
-                                esc.push(c);
-                            }
-                        }
-                        t = esc;
-                    }
+                    let t = self.escape_string_body(s);
                     // A propertized string prints as `#("text" START END (plist) …)`.
                     let intervals = self.string_prop_intervals(s, depth);
                     if intervals.is_empty() {

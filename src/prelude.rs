@@ -89,20 +89,6 @@ pub const PRELUDE: &str = r#"
 ;; No GUI and non-interactive batch execution, matching `emacs -Q --batch'.
 (defvar window-system nil)
 (defvar noninteractive t)
-;; The command line.  `elisp FILE a b c' models `emacs -l FILE a b c', where
-;; `command-line-args' is the whole invocation and `command-line-args-left' is
-;; what follows the script.  Both are (re)set per run by the entry point, since
-;; the bytecode cache would otherwise replay the *previous* run's arguments; the
-;; values here are the `emacs --eval' answers (nil args-left), which is what
-;; `elisp -e' models.  `argv' is an alias, not a copy -- startup.el does
-;; `(defvaralias 'argv 'command-line-args-left)', so `(setq argv ...)' is visible
-;; through both names.
-(defvar command-line-args nil
-  "List of command line arguments, as they were given to this process.")
-(defvar command-line-args-left nil
-  "List of command line arguments not yet processed.")
-(defvaralias 'argv 'command-line-args-left
-  "List of command line arguments not yet processed.")
 ;; `temporary-file-directory' is defined below, right after
 ;; `file-name-as-directory', which its initializer depends on.
 
@@ -833,6 +819,7 @@ pub const PRELUDE: &str = r#"
 (defvar print-level nil)
 (defvar print-escape-newlines nil)
 (defvar print-escape-control-characters nil)
+(defvar print-escape-multibyte nil)
 (defvar print-quoted t)
 (defvar float-output-format nil)
 ;; Without this `defvar' a `(let ((print-circle t)) …)' binds a LEXICAL `print-circle'
@@ -3281,6 +3268,21 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 (defun get (sym prop)
   (symbol-plist--check sym)
   (plist-get (gethash sym symbol-plist--table) prop))
+;; The command line, defined after `put' because a `defvar' docstring is
+;; stored with it.  `elisp FILE a b c' models `emacs -l FILE a b c', where
+;; `command-line-args' is the whole invocation and `command-line-args-left' is
+;; what follows the script.  Both are (re)set per run by the entry point, since
+;; the bytecode cache would otherwise replay the *previous* run's arguments; the
+;; values here are the `emacs --eval' answers (nil args-left), which is what
+;; `elisp -e' models.  `argv' is an alias, not a copy -- startup.el does
+;; `(defvaralias 'argv 'command-line-args-left)', so `(setq argv ...)' is visible
+;; through both names.
+(defvar command-line-args nil
+  "List of command line arguments, as they were given to this process.")
+(defvar command-line-args-left nil
+  "List of command line arguments not yet processed.")
+(defvaralias 'argv 'command-line-args-left
+  "List of command line arguments not yet processed.")
 ;; backquote.el marks the two unquote symbols as reader constructs.
 (put '\, 'reader-construct t)
 (put '\,@ 'reader-construct t)

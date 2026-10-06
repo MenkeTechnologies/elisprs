@@ -562,7 +562,7 @@
         <h3><a class="doc-anchor" href="#doc-random">#</a> <code>random</code></h3>
         <pre><code class="lang-elisp">(random &amp;optional LIMIT)
 </code></pre>
-        <p>Pseudo-random integer; if LIMIT is a positive integer, in the range [0, LIMIT).</p>
+        <p>Pseudo-random integer; if LIMIT is a positive integer (a bignum too), in the range [0, LIMIT). A non-positive integer LIMIT signals args-out-of-range; t reseeds from the clock and a string reseeds from its contents; otherwise any fixnum.</p>
       </article>
       <article class="doc-entry" id="doc-string-to-number">
         <h3><a class="doc-anchor" href="#doc-string-to-number">#</a> <code>string-to-number</code></h3>
@@ -1126,9 +1126,9 @@
       </article>
       <article class="doc-entry" id="doc-read">
         <h3><a class="doc-anchor" href="#doc-read">#</a> <code>read</code></h3>
-        <pre><code class="lang-elisp">(read STRING)
+        <pre><code class="lang-elisp">(read &amp;optional STREAM)
 </code></pre>
-        <p>Read and return one Lisp object from STRING.</p>
+        <p>Read and return one Lisp object from STREAM: a string (from its start), a buffer (from its point, which moves past the object) or a marker (from its position, which advances).</p>
       </article>
       <article class="doc-entry" id="doc-read-from-string">
         <h3><a class="doc-anchor" href="#doc-read-from-string">#</a> <code>read-from-string</code></h3>
