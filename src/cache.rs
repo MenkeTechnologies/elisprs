@@ -459,6 +459,8 @@ pub struct CachedScript {
     pub oclosure_meta: Vec<(u32, u32, Vec<u32>)>,
     pub introspection_cells: Vec<(u32, fusevm::Value)>,
     pub builtin_cells: Vec<Option<crate::host::SymbolBaseline>>,
+    /// How many of `heap`'s objects are the shared post-prelude base.
+    pub base_len: usize,
 }
 
 /// `schema_key` must match the key the entry was written under (see `schema_key`).
@@ -500,6 +502,7 @@ pub fn get(path: &str, mtime_ns: i64, schema_key: &str) -> Option<CachedScript> 
     // The full image is the shard's shared base followed by this file's tail —
     // the same `Vec<SerObj>` v12 stored per entry, reassembled.
     let mut heap: Vec<SerObj> = bincode::deserialize(&shard.base.heap).ok()?;
+    let base_len = heap.len();
     let tail: Vec<SerObj> = bincode::deserialize(&entry.heap_tail).ok()?;
     heap.extend(tail);
     let oclosure_meta: Vec<(u32, u32, Vec<u32>)> =
@@ -514,6 +517,7 @@ pub fn get(path: &str, mtime_ns: i64, schema_key: &str) -> Option<CachedScript> 
         oclosure_meta,
         introspection_cells,
         builtin_cells,
+        base_len,
     })
 }
 

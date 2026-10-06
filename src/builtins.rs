@@ -5550,7 +5550,9 @@ fn recordp(h: &mut ElispHost, a: &[Value]) -> R {
 
 /// `(closurep OBJECT)` — t if OBJECT is a closure.
 fn closurep_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(h.is_closure(&a[0])))
+    // A macro is the cons `(macro . FN)` in Emacs, so `CLOSUREP` is false for it.
+    let macro_cell = matches!(h.obj(&a[0]), Some(Obj::Closure { is_macro: true, .. }));
+    Ok(nil_or(h.is_closure(&a[0]) && !macro_cell))
 }
 
 /// `(oclosure--fix-type TYPE SLOTS MUTABLES CLOSURE)` — mark CLOSURE as an
@@ -5635,6 +5637,29 @@ fn functionp(h: &mut ElispHost, a: &[Value]) -> R {
     if let Some(Obj::Subr { name, .. }) = h.obj(&a[0]) {
         if SPECIAL_FORMS.iter().any(|(sf, _)| *sf == name.as_str()) {
             return Ok(Value::Bool(false));
+        }
+    }
+    // A list is a function when its car is `lambda`, and a symbol whose
+    // indirect definition is an `autoload` is one unless TYPE (the fifth
+    // element) is non-nil — a macro or keymap autoload.
+    if h.indirect_lambda_list(&a[0]).is_some() {
+        return Ok(Value::Bool(true));
+    }
+    let mut cur = a[0].clone();
+    for _ in 0..64 {
+        match h.obj(&cur) {
+            Some(Obj::Symbol(s)) => match &s.function {
+                Some(def) => cur = def.clone(),
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    if let Some(items) = h.list_vec(&cur) {
+        if items.first().and_then(|c| h.sym_name(c)).as_deref() == Some("autoload")
+            && matches!(h.obj(&a[0]), Some(Obj::Symbol(_)))
+        {
+            return Ok(nil_or(!items.get(4).is_some_and(crate::host::el_truthy)));
         }
     }
     let ok = match h.resolve_function(&a[0]) {
@@ -7828,6 +7853,40 @@ fn func_arity(h: &mut ElispHost, a: &[Value]) -> R {
             let many = h.intern("many");
             return Ok(h.cons(Value::Int(*min), many));
         }
+    }
+    // eval.c `lambda_arity` for a `(lambda ARGLIST . BODY)` list.
+    if let Some(fun) = h.indirect_lambda_list(&a[0]) {
+        let arglist = match h.obj(&fun) {
+            Some(Obj::Cons(_, rest)) => match h.obj(rest) {
+                Some(Obj::Cons(args, _)) => args.clone(),
+                _ => return Err(h.signal_invalid_function(&fun)),
+            },
+            _ => return Err(h.signal_invalid_function(&fun)),
+        };
+        let (mut min, mut max, mut optional) = (0i64, 0i64, false);
+        let mut cur = arglist;
+        while let Some(Obj::Cons(next, rest)) = h.obj(&cur) {
+            let (next, rest) = (next.clone(), rest.clone());
+            match h.sym_name(&next).as_deref() {
+                None => return Err(h.signal_invalid_function(&fun)),
+                Some("&rest") => {
+                    let many = h.intern("many");
+                    return Ok(h.cons(Value::Int(min), many));
+                }
+                Some("&optional") => optional = true,
+                Some(_) => {
+                    if !optional {
+                        min += 1;
+                    }
+                    max += 1;
+                }
+            }
+            cur = rest;
+        }
+        if !matches!(cur, Value::Undef | Value::Bool(false)) {
+            return Err(h.signal_invalid_function(&fun));
+        }
+        return Ok(h.cons(Value::Int(min), Value::Int(max)));
     }
     let (min, max) = {
         match h.resolve_function(&a[0])? {

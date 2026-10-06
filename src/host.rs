@@ -889,6 +889,10 @@ pub struct ElispHost {
     /// Arena length right after `install` (the builtin objects). Everything at or
     /// above this index is user/prelude data — the portion serialized for AOT.
     builtin_count: usize,
+    /// Arena length right after the prelude loaded (0 before). A closure below
+    /// this line models Emacs's preloaded, byte-compiled Lisp, whose arity
+    /// errors name the `(MANDATORY . NONREST)` template rather than the function.
+    prelude_end: usize,
     /// Dynamic-binding save stack. Each `let`/param binding of a special variable
     /// pushes one entry; `unbind_to` pops and restores.
     specstack: Vec<SpecEntry>,
@@ -1300,6 +1304,7 @@ impl ElispHost {
             arena: Vec::new(),
             obarray: HashMap::new(),
             builtin_count: 0,
+            prelude_end: 0,
             specstack: Vec::new(),
             lex: None,
             dynamic_binding: false,
@@ -2966,6 +2971,13 @@ impl ElispHost {
     pub fn builtin_count(&self) -> usize {
         self.builtin_count
     }
+    pub fn set_prelude_end(&mut self, end: usize) {
+        self.prelude_end = end;
+    }
+    /// Whether `v` is an object the prelude created (see `prelude_end`).
+    pub fn is_prelude_object(&self, v: &Value) -> bool {
+        matches!(v, Value::Obj(id) if (*id as usize) >= self.builtin_count && (*id as usize) < self.prelude_end)
+    }
     /// The captured lexical environment as Emacs prints it in a closure: an alist
     /// of the captured bindings, newest first, or `(t)` when nothing is captured
     /// (`t` is Emacs's marker that the closure is lexically bound).
@@ -3446,6 +3458,21 @@ impl ElispHost {
 
     /// Resolve a function designator (symbol → function cell, following aliases;
     /// or a literal closure/subr object).
+    /// Follow `f` through symbol function cells; `Some(list)` when it ends at a
+    /// cons whose car is `lambda` (eval.c `funcall_general`'s `Qlambda` case).
+    pub fn indirect_lambda_list(&self, f: &Value) -> Option<Value> {
+        let mut cur = f.clone();
+        for _ in 0..64 {
+            match self.obj(&cur) {
+                Some(Obj::Symbol(s)) => cur = s.function.clone()?,
+                Some(Obj::Cons(car, _)) => {
+                    return (self.sym_name(car).as_deref() == Some("lambda")).then_some(cur);
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
     pub fn resolve_function(&self, f: &Value) -> Result<Resolved, String> {
         let mut cur = f.clone();
         for _ in 0..64 {
@@ -5541,6 +5568,61 @@ impl ElispHost {
     /// formals, which is why `error`, whose `&rest` makes `func-arity` say
     /// `(1 . many)`, still reports `(1 . 1)`. See `lisp_level_arity` for why
     /// elisprs has to know which of its subrs Emacs implements this way.
+    /// `funcall_lambda` / `exec_byte_code` for a macro's expander: a user macro is
+    /// an interpreted closure, named itself (the cdr of `(macro . FN)`); a prelude
+    /// macro stands for byte-compiled Lisp and reports `(MANDATORY . NONREST)`,
+    /// as `(macroexpand '(push 1))` does in Emacs: `(2 . 2) 1`.
+    pub fn signal_macro_wrong_nargs(
+        &mut self,
+        macro_obj: &Value,
+        params: &Params,
+        argc: usize,
+    ) -> String {
+        let prelude = self.is_prelude_object(macro_obj);
+        // A macro closure prints as `(macro . FN)`; the datum is FN.
+        let fun = match self.obj(macro_obj) {
+            Some(Obj::Closure {
+                params,
+                body,
+                env,
+                dynamic,
+                src,
+                ..
+            }) => {
+                let c = Obj::Closure {
+                    params: params.clone(),
+                    body: body.clone(),
+                    is_macro: false,
+                    env: env.clone(),
+                    dynamic: *dynamic,
+                    src: src.clone(),
+                };
+                if prelude {
+                    macro_obj.clone()
+                } else {
+                    self.alloc(c)
+                }
+            }
+            _ => macro_obj.clone(),
+        };
+        let subject = if prelude {
+            let mandatory = params.required.len() as i64;
+            let nonrest = mandatory + params.optional.len() as i64;
+            self.cons(Value::Int(mandatory), Value::Int(nonrest))
+        } else {
+            fun
+        };
+        let sym = self.intern("wrong-number-of-arguments");
+        let data = self.list_from(vec![subject.clone(), Value::Int(argc as i64)]);
+        let msg = format!(
+            "wrong-number-of-arguments: {} {argc}",
+            self.print(&subject, true)
+        );
+        let obj = self.cons(sym, data);
+        self.set_pending_error(&msg, obj);
+        msg
+    }
+
     pub fn signal_wrong_nargs(&mut self, callee: &Value, argc: usize) -> String {
         let sym = self.intern("wrong-number-of-arguments");
         let count = Value::Int(argc as i64);
@@ -6614,6 +6696,12 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
     let resolved = match with_host(|h| h.resolve_function(f)) {
         Ok(r) => r,
         Err(e) => {
+            // eval.c `funcall_general`: a list whose car is `lambda` is called by
+            // `funcall_lambda` with an empty lexical environment, i.e. under
+            // dynamic binding — `(funcall '(lambda (x) x) 4)` is 4.
+            if let Some(fun) = with_host(|h| h.indirect_lambda_list(f)) {
+                return call_lambda_list(&fun, args);
+            }
             // Inline Rust FFI fallback: a `rust { ... }` exported function is
             // callable by bareword when no elisp function shadows it. A user
             // `defun` still wins — it resolves above; only a `void-function` miss
@@ -6679,6 +6767,33 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             run_closure(&params, &body, env, dynamic, args)
         }
     }
+}
+
+/// eval.c `funcall_lambda` for a `(lambda ARGLIST . BODY)` list: `eval` of
+/// `(function FUN)` under dynamic binding builds the closure Emacs interprets
+/// the list as. The list itself is what an arity error names, and a list whose
+/// cdr is not a cons is `invalid-function`.
+fn call_lambda_list(fun: &Value, args: &[Value]) -> Result<Value, String> {
+    let (eval_sym, form, well_formed) = with_host(|h| {
+        let well_formed = matches!(h.obj(fun), Some(Obj::Cons(_, rest)) if matches!(h.obj(rest), Some(Obj::Cons(..))));
+        let fsym = h.intern("function");
+        (
+            h.intern("eval"),
+            h.list_from(vec![fsym, fun.clone()]),
+            well_formed,
+        )
+    });
+    if !well_formed {
+        return Err(with_host(|h| h.signal_invalid_function(fun)));
+    }
+    let closure = call_function(&eval_sym, &[form, Value::Undef])?;
+    if let Ok(Resolved::Closure { params, .. }) = with_host(|h| h.resolve_function(&closure)) {
+        let max = params.required.len() + params.optional.len();
+        if args.len() < params.required.len() || (params.rest.is_none() && args.len() > max) {
+            return Err(with_host(|h| h.signal_wrong_nargs(fun, args.len())));
+        }
+    }
+    call_function(&closure, args)
 }
 
 /// The inline-Rust FFI fallback, kept OUT of [`call_function`]'s frame.
@@ -6952,13 +7067,22 @@ pub fn macroexpand_1(form: &Value) -> Result<Option<Value>, String> {
                 is_macro: true,
                 env,
                 dynamic,
-                ..
-            }) => Some((params, body, env, dynamic, elems[1..].to_vec())),
+                object,
+            }) => Some((params, body, env, dynamic, object, elems[1..].to_vec())),
             _ => None,
         }
     });
     match info {
-        Some((params, body, env, dynamic, args)) => {
+        Some((params, body, env, dynamic, object, args)) => {
+            // `funcall_lambda`'s arity check names the expander itself: an
+            // uncaught `(m 1)` for `(defmacro m (a b) a)` is
+            // `(wrong-number-of-arguments #[(a b) (a) (t)] 1)`.
+            let max = params.required.len() + params.optional.len();
+            if args.len() < params.required.len() || (params.rest.is_none() && args.len() > max) {
+                return Err(with_host(|h| {
+                    h.signal_macro_wrong_nargs(&object, &params, args.len())
+                }));
+            }
             Ok(Some(run_closure(&params, &body, env, dynamic, &args)?))
         }
         None => Ok(None),

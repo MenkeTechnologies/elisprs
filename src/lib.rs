@@ -194,6 +194,10 @@ fn load_prelude() {
         let counter = h.intern("gensym-counter");
         let _ = h.set_raw_global(&counter, Value::Int(0));
     });
+    host::with_host(|h| {
+        let end = h.arena_len();
+        h.set_prelude_end(end);
+    });
     host::set_prelude_compiling(false);
     host::save_prelude_snapshot();
 }
@@ -395,13 +399,16 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
             oclosure_meta,
             introspection_cells,
             builtin_cells,
+            base_len,
         } = cached;
         if debug {
             eprintln!("elisprs: cache HIT  {path} ({} chunks)", chunks.len());
         }
         host::reset_host();
         host::with_host(|h| {
+            let end = h.builtin_count() + base_len;
             h.import_heap_image(heap);
+            h.set_prelude_end(end);
             // The OClosure table is built when the prelude runs, which this hit
             // skips — restore it or every prelude OClosure comes back as a plain
             // closure.

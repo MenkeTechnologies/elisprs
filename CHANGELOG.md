@@ -6,6 +6,16 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Round 35 parity vs Emacs 31.1** (see BUGS.md): `cl-typep` is the body of
+  cl-macs.el's `define-inline` (`real`, `character`, `base-char`,
+  `extended-char`, bounds, `Unknown type` / `Bad type spec`); `cl-deftype`
+  computes the atomic predicate and defaults omitted arguments to `*`;
+  `cl-coerce` is cl-extra.el's; `seq-let` / `seq-setq` are `pcase-let` /
+  `pcase-setq` over the `seq` pattern (nested lists, `&rest`); `pcase-setq` is
+  pcase.el's; a macro called with the wrong argument count names its expander
+  (or `(MANDATORY . NONREST)` for preloaded macros); `(lambda ...)` lists are
+  callable, `functionp` and have a `func-arity`; `commandp` and
+  `interactive-form` are ported (`commandp` was a stub).
 - **Round 34 parity vs Emacs 31.1** (see BUGS.md): `match-data` after a
   buffer search answers markers into the searched buffer, appends the buffer
   under INTEGERS, and honours REUSE and RESEAT; `set-match-data` takes markers

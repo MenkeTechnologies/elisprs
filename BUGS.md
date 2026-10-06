@@ -6027,6 +6027,118 @@ into `?` in both.
   values differ; both depend on the C library and the object layout.
 - `\cg` and the other category escapes are unsupported in regexps.
 
+## Round 35 — `cl-typep`, `seq-let`/`pcase-setq`, macro arity, lambda lists, `commandp`
+
+**Oracle: GNU Emacs 31.1.** Found by probing areas the fuzzer's generator does
+not reach; every expectation in
+`tests/parity_types_lambda_lists_and_commands.rs` is `emacs -Q --batch` output.
+Sources read: `cl-macs.el`, `cl-preloaded.el`, `cl-extra.el`, `seq.el`,
+`pcase.el`, `eval.c` and `data.c` (31.1).
+
+### R35-A. ✅ FIXED — `cl-typep` was not cl-macs.el's
+
+The prelude's `cl-typep` mangled every unknown atom into `TYPEp`, so `real`,
+`base-char` and `extended-char` were `void-function realp` (and so was
+`(cl-typecase x (real ...))`); bounds applied to `(fixnum ...)`,
+`(signed-byte ...)` and `(real ...)` heads Emacs rejects; `(integer (5) *)`
+signalled `number-or-marker-p`; `(foo)` answered nil. It is now the function
+body of the `define-inline`: `cl-deftype-satisfies` first, then a
+`cl-deftype-handler`, the `(integer|float|number MIN MAX)` bounds (MIN and MAX
+are the first two arguments, as the compiled `(or `(,min ,max)
+pcase--dontcare)` leaves them), `not`/`and`/`or`/`eql`/`member`/`satisfies`,
+`TYPEp`/`TYPE-p`/`TYPE`, and `Unknown type` / `Bad type spec`.
+`cl-defstruct` registers its predicate as `cl-deftype-satisfies`.
+
+```text
+(list (cl-typep 1.0 'real) (cl-typep 0 '(integer 1)) (cl-typep 5 '(integer 0 10 20)))
+emacs:   (t nil t)
+before:  (void-function realp)
+```
+
+### R35-B. ✅ FIXED — `cl-deftype` and the derived types
+
+`cl-deftype` only stored a handler. It is cl-macs.el's: the expander defaults
+omitted `&optional`/`&key` arguments to `*`, a call with no arguments computes
+the atomic predicate (`(satisfies F)` is F itself, a required argument means
+none), `(declare (parents ...))` is consumed, and `cl--define-derived-type`
+records both properties. `natnum`, `keyword`, `command`, `character`,
+`base-char`, `extended-char` and `real` are defined as in cl-preloaded.el /
+cl-macs.el. Not modelled: the derived-type class object `cl-defmethod` would
+dispatch on.
+
+### R35-C. ✅ FIXED — `cl-coerce`
+
+`(cl-coerce "a" 'character)` answered `"a"` and any unknown TYPE returned the
+object. It is cl-extra.el's: identity when the object already has the type
+(`eq`), `bool-vector`, characters from one-character strings and symbols,
+`(cl-typep x type)`, else `Can't coerce`.
+
+### R35-D. ✅ FIXED — `seq-let`, `seq-setq` and the `seq` pattern
+
+`seq-let` bound with `elt`, so a nested argument list was `binding name must
+be a symbol` and `seq-setq` answered the last element. Both are now seq.el's
+`pcase-let` / `pcase-setq` over `seq--make-pcase-patterns`, and the `seq`
+pcase pattern is `(and (pred seqp) (app (seq--elt-safe _ I) P)...)`, which
+gives it `&rest`. pcase's `app` follows `pcase--funcall`: `_` in a call form
+stands for the value, and `(not F)` negates.
+
+```text
+(let (a b c) (list (seq-setq (a (b c)) '(1 (2 3))) a b c))
+emacs:   (1 1 2 3)
+before:  (wrong-type-argument symbolp (b c))
+```
+
+### R35-E. ✅ FIXED — `pcase-setq`
+
+pcase.el's: `(pcase-setq PAT VAL)` with a trivial pattern is `(setq PAT VAL)`,
+further pairs become a `progn` of single `pcase-setq`s, an odd count of extra
+arguments is `(wrong-number-of-arguments pcase-setq N)`, and the value is the
+last assignment. `(pcase-setq a)` is now the macro's own arity error.
+
+### R35-F. ✅ FIXED — macro arity errors
+
+A macro called with the wrong number of arguments signalled
+`(error "wrong-number-of-arguments")`. `funcall_lambda` names the expander:
+`(wrong-number-of-arguments #[(a b) (a) (t)] 1)` for a user `defmacro`, and
+the byte-code template `(MANDATORY . NONREST)` for the preloaded macros
+(`(macroexpand '(push 1))` is `(2 . 2) 1`). The host records where the
+prelude's objects end (also on a cache hit) to tell the two apart.
+
+### R35-G. ✅ FIXED — `(lambda ...)` lists are functions
+
+`(funcall '(lambda (x) x) 4)`, `apply` and `mapcar` of a quoted lambda, and a
+function cell holding a lambda list signalled `invalid-function`. eval.c's
+`funcall_general` calls such a list with an empty lexical environment, i.e.
+under dynamic binding; arity errors name the list and `(lambda)` is
+`invalid-function`. `functionp` is `FUNCTIONP` (a lambda list is a function;
+an autoload is one unless its TYPE is non-nil) and `func-arity` handles lambda
+lists through `lambda_arity`.
+
+### R35-H. ✅ FIXED — `commandp` and `interactive-form`
+
+`commandp` was a stub answering nil and `interactive-form` was void. They are
+eval.c's `Fcommandp` and data.c's `Finteractive_form` for closures (the
+interactive slot), lambda lists (`(interactive ...)` in the body), strings and
+vectors (keyboard macros), autoloads (the INTERACTIVE element) and the
+`interactive-form` symbol property. `closurep` is nil for a macro, whose cell
+is a cons in Emacs.
+
+### Still open after round 35
+
+- Subrs carry no interactive spec, so `(commandp 'forward-char)` is nil
+  (Emacs: t); `interactive-form` of an autoload does not load it; the OClosure
+  `oclosure-interactive-form` delegation is not modelled.
+- A macro's function cell is a closure object, not the cons `(macro . FN)`:
+  `(car-safe (symbol-function 'push))` is nil where Emacs answers `macro`.
+- `(when)` / `(unless)` with no arguments are compiler intrinsics and answer nil;
+  Emacs signals `(wrong-number-of-arguments (1 . 1) 0)`. `(macroexpand
+  '(lambda ...))` answers the form itself; Emacs expands it to `#'(lambda ...)`.
+- elisprs expands a top-level form completely before running it, so a macro
+  error inside `condition-case` escapes it; Emacs falls back to lazy expansion
+  after an eager-expansion failure and the handler catches it.
+- `(cl-typep 5 '(real 1 (6)))` signals `Bad type spec: (satisfies . FN)` on
+  both, but FN prints as an interpreted closure here and as byte code in Emacs.
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the

@@ -498,7 +498,49 @@ pub const PRELUDE: &str = r#"
     (let ((key (cl--getkey keys :key nil)))
       (if key (sort seq (lambda (a b) (funcall pred (funcall key a) (funcall key b))))
         (sort seq pred)))))
-(defun commandp (_obj &optional _) nil)
+;; data.c `Finteractive_form' and eval.c `Fcommandp'.  A macro's function cell
+;; is `(macro . FN)' in Emacs, a cons whose car is not `lambda', so neither
+;; treats one as a command.  Not modelled: subr interactive specs (no subr
+;; here records an `intspec'), loading an autoload to read its form, and the
+;; OClosure `oclosure-interactive-form' delegation.
+(defun interactive-form (cmd)
+  (let ((fun (indirect-function cmd)) (found nil) (spec nil))
+    (when fun
+      (setq fun cmd)
+      (while (and (not found) (symbolp fun))
+        (let ((tmp (get fun 'interactive-form)))
+          (if tmp
+              (setq found t spec tmp)
+            (setq fun (symbol-function fun)))))
+      (cond
+       (found spec)
+       ((and (closurep fun) (> (length fun) 5))
+        (let ((form (aref fun 5)))
+          (list 'interactive (if (vectorp form) (aref form 0) form))))
+       ((eq (car-safe fun) 'lambda)
+        (let ((spec (assq 'interactive (cdr (cdr fun)))))
+          (if (null (cdr (cdr spec)))
+              spec
+            (list 'interactive (car (cdr spec))))))))))
+(defun commandp (function &optional for-call-interactively)
+  (let ((fun (indirect-function function)))
+    (cond
+     ((null fun) nil)
+     ((subrp fun) nil)
+     ((closurep fun) (> (length fun) 5))
+     ((or (stringp fun) (vectorp fun)) (null for-call-interactively))
+     ((not (consp fun)) nil)
+     ((eq (car fun) 'autoload)
+      (if (car (cdr (cdr (cdr fun)))) t
+        (setq fun function)
+        (while (symbolp fun)
+          (when (get fun 'interactive-form)
+            (error "Found an 'interactive-form' property!"))
+          (setq fun (symbol-function fun)))
+        nil))
+     ((eq (car fun) 'lambda)
+      (and (assq 'interactive (cdr-safe (cdr fun))) t))
+     (t nil))))
 (defun plistp (l)
   (let ((n 0)) (while (consp l) (setq n (1+ n)) (setq l (cdr l))) (and (null l) (= 0 (% n 2)))))
 ;; Port of cl-some/cl-every from cl-extra.el: with extra SEQs (or a non-list
@@ -1370,13 +1412,20 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
       (abs a))))
 (defun cl-parse-integer (string &rest keys)
   (string-to-number (string-trim string) (or (plist-get keys :radix) 10)))
-(defun cl-coerce (object type)
-  (cond ((eq type 'list) (append object nil))
-        ((memq type '(vector array simple-vector)) (vconcat object))
-        ((eq type 'string) (concat object))
-        ((eq type 'float) (float object))
-        ((eq type 'character) object)
-        (t object)))
+;; cl-extra.el `cl-coerce'.
+(defun cl-coerce (x type)
+  (cond ((eq type 'list) (if (listp x) x (append x nil)))
+        ((eq type 'vector) (if (vectorp x) x (vconcat x)))
+        ((eq type 'bool-vector)
+         (if (bool-vector-p x) x (apply #'bool-vector (cl-coerce x 'list))))
+        ((eq type 'string) (if (stringp x) x (concat x)))
+        ((eq type 'array) (if (arrayp x) x (vconcat x)))
+        ((and (eq type 'character) (stringp x) (= (length x) 1)) (aref x 0))
+        ((and (eq type 'character) (symbolp x))
+         (cl-coerce (symbol-name x) type))
+        ((eq type 'float) (float x))
+        ((cl-typep x type) x)
+        (t (error "Can't coerce %s to type %s" x type))))
 (defvar cl--gensym-counter 0)
 ;; cl-macs.el: a string PREFIX replaces "G", an integer PREFIX is the number
 ;; itself (the counter is left alone), anything else is ignored.
@@ -2368,6 +2417,8 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
     ;; `(:type list)' instance carries nothing to recognize it by, so
     ;; `(fboundp 'NAME-p)' is nil in Emacs and must be here too.
     (when named
+      ;; cl-macs.el registers the predicate as the atomic type's test.
+      (setq forms (cons `(define-symbol-prop ',name 'cl-deftype-satisfies ',(intern pred)) forms))
       (setq forms
             (cons (cond
                    ((eq stype 'list)
@@ -6109,54 +6160,126 @@ reports and the one a hash table's slots are observable in."
                (while ,test ,@(reverse pre) ,@(reverse body) ,@(reverse steps)))
              ,result))))))
 
-;; The predicate symbol for a `cl-typecase' type name (integer->integerp, etc.).
+;; cl-macs.el `cl-deftype': the expander is `(cl-function (lambda (&cl-defs
+;; ('*) ,@ARGLIST) ...))', so an omitted &optional or &key argument defaults to
+;; `*'; calling it with no arguments at definition time computes the atomic
+;; type's specifier, and a `wrong-number-of-arguments' there means NAME has no
+;; atomic form (no predicate). A `(declare (parents ...))' is consumed.
+(defun cl--deftype-defaulted-arglist (arglist)
+  (let ((res nil) (kind nil))
+    (while (consp arglist)
+      (let ((a (car arglist)))
+        (cond ((memq a '(&optional &key &rest &body &aux)) (setq kind a))
+              ((and (memq kind '(&optional &key)) (symbolp a) (not (eq a '&allow-other-keys)))
+               (setq a (list a ''*))))
+        (setq res (cons a res)))
+      (setq arglist (cdr arglist)))
+    (nconc (nreverse res) arglist)))
+(defun cl--deftype-arity (arglist)
+  ;; (MIN . MAX) of a cl lambda list, MAX nil when &rest/&body/&key takes any.
+  (let ((min 0) (max 0) (kind nil))
+    (while (consp arglist)
+      (let ((a (car arglist)))
+        (cond ((memq a '(&optional &key &rest &body &aux &allow-other-keys))
+               (setq kind a)
+               (when (memq a '(&rest &body &key)) (setq max nil)))
+              ((null kind) (setq min (1+ min)) (and max (setq max (1+ max))))
+              ((eq kind '&optional) (and max (setq max (1+ max))))))
+      (setq arglist (cdr arglist)))
+    (when arglist (setq max nil))
+    (cons min max)))
 (defmacro cl-deftype (name arglist &rest body)
-  ;; Register a type alias: NAME (with ARGLIST) expands to the type spec BODY
-  ;; returns, consulted by cl-typep.
-  (list 'progn
-        (list 'put (list 'quote name) (list 'quote 'cl-deftype-handler)
-              (cons 'lambda (cons arglist body)))
-        (list 'quote name)))
-(defun cl--type-bound (n lo hi)
-  ;; Range check for (TYPE LO HI); bound `*'/nil/absent means unbounded.
-  (and (or (null lo) (eq lo '*) (>= n lo))
-       (or (null hi) (eq hi '*) (<= n hi))))
-(defun cl-typep (obj type)
-  ;; Simple type names plus compound specifiers: (integer LO HI), (or …),
-  ;; (and …), (not T), (member …), (eql V), (satisfies PRED).
-  (cond
-   ((eq type t) t)
-   ((eq type nil) nil)
-   ((consp type)
-    (let ((head (car type)) (args (cdr type)))
-      (cond
-       ((eq head 'or) (let ((r nil)) (dolist (tp args) (when (cl-typep obj tp) (setq r t))) r))
-       ((eq head 'and) (let ((r t)) (dolist (tp args) (unless (cl-typep obj tp) (setq r nil))) r))
-       ((eq head 'not) (not (cl-typep obj (car args))))
-       ((eq head 'member) (and (memql obj args) t))
-       ((eq head 'eql) (eql obj (car args)))
-       ((eq head 'satisfies) (and (funcall (car args) obj) t))
-       ((memq head '(integer fixnum bignum signed-byte unsigned-byte))
-        (and (integerp obj) (cl--type-bound obj (car args) (car (cdr args)))))
-       ((eq head 'float) (and (floatp obj) (cl--type-bound obj (car args) (car (cdr args)))))
-       ((memq head '(number real)) (and (numberp obj) (cl--type-bound obj (car args) (car (cdr args)))))
-       ;; A cl-deftype alias applied to arguments.
-       ((and (symbolp head) (get head 'cl-deftype-handler))
-        (cl-typep obj (apply (get head 'cl-deftype-handler) args)))
-       (t nil))))
-   ;; A cl-deftype alias used bare.
-   ((and (symbolp type) (get type 'cl-deftype-handler))
-    (cl-typep obj (funcall (get type 'cl-deftype-handler))))
-   (t (funcall (cl-typecase--pred type) obj))))
-(defun cl-typecase--pred (type)
-  (cond ((eq type 'list) 'listp)
-        ((eq type 'null) 'null)
-        ((eq type 'atom) 'atom)
-        ((eq type 'number) 'numberp)
-        ;; Builtins use TYPEp; cl-defstruct types use the hyphenated TYPE-p.
-        (t (let ((p (intern (concat (symbol-name type) "p")))
-                 (sp (intern (concat (symbol-name type) "-p"))))
-             (if (and (not (fboundp p)) (fboundp sp)) sp p)))))
+  (let ((decls nil) (forms body) (parents nil))
+    (while (and forms
+                (or (and (stringp (car forms)) (cdr forms))
+                    (memq (car-safe (car forms)) '(:documentation declare interactive cl-declare))))
+      (setq decls (cons (car forms) decls) forms (cdr forms)))
+    (setq decls (nreverse decls))
+    (let ((declares (assq 'declare decls)))
+      (when declares
+        (let ((parent-decl (assq 'parents (cdr declares))))
+          (when parent-decl
+            (setq parents (cdr parent-decl))
+            (setcdr declares (delq parent-decl (copy-sequence (cdr declares))))
+            (when (equal declares '(declare))
+              (setq decls (delq declares decls)))))))
+    (let* ((arity (cl--deftype-arity arglist))
+           (args (make-symbol "args"))
+           (expander
+            `(lambda (&rest ,args)
+               ,@(and (stringp (car decls)) (list (car decls)))
+               (let ((n (length ,args)))
+                 (when (or (< n ,(car arity)) ,(and (cdr arity) `(> n ,(cdr arity))))
+                   (signal 'wrong-number-of-arguments (list ',arity n))))
+               (cl-destructuring-bind ,(cl--deftype-defaulted-arglist arglist) ,args
+                 ,@forms)))
+           (specifier
+            (condition-case nil
+                (funcall (eval expander t))
+              (wrong-number-of-arguments
+               (and parents arglist
+                    (error "Type %S with parents may be not atomic: %S"
+                           name arglist)))))
+           (predicate
+            (cond ((and (eq (car-safe specifier) 'satisfies)
+                        (consp (cdr specifier)) (null (cdr (cdr specifier))))
+                   `#',(car (cdr specifier)))
+                  ((null specifier) nil)
+                  (t `(lambda (x) (ignore x) (cl-typep x ',specifier))))))
+      `(eval-and-compile
+         (cl--define-derived-type ',name ,expander ,predicate ',parents)))))
+;; cl-preloaded.el `cl--define-derived-type', without the derived-type class
+;; object (method dispatch on derived types is not modelled).
+(defun cl--define-derived-type (name expander predicate &optional _parents)
+  (define-symbol-prop name 'cl-deftype-handler expander)
+  (when predicate
+    (define-symbol-prop name 'cl-deftype-satisfies predicate)))
+;; cl-macs.el `cl-typep' (a `define-inline'), as its function body runs.
+(defun cl-typep (val type)
+  "Return t if VAL is of type TYPE, nil otherwise."
+  (let ((satisfies (cond ((and type (symbolp type)) (get type 'cl-deftype-satisfies))
+                         ((and (consp type) (null (cdr type)))
+                          (get (car type) 'cl-deftype-satisfies)))))
+    (cond
+     (satisfies (funcall satisfies val))
+     ((and (consp type) (get (car type) 'cl-deftype-handler))
+      (cl-typep val (apply (get (car type) 'cl-deftype-handler) (cdr type))))
+     ((and (consp type) (memq (car type) '(integer float number)))
+      ;; The compiled `(or `(,min ,max) pcase--dontcare)' keeps whatever the
+      ;; failed list match bound: MIN is the first argument, MAX the second.
+      (let* ((bounds (cdr type))
+             (min (car-safe bounds))
+             (max (car-safe (cdr-safe bounds))))
+        (and (cl-typep val (car type))
+             (if (memq min '(* nil)) t
+               (if (consp min) (> val (car min)) (>= val min)))
+             (if (memq max '(* nil)) t
+               (if (consp max) (< val (car max)) (<= val max))))))
+     ((and (eq (car-safe type) 'not) (consp (cdr type)) (null (cdr (cdr type))))
+      (not (cl-typep val (car (cdr type)))))
+     ((memq (car-safe type) '(and or))
+      (let ((types (cdr type)))
+        (cond ((null types) (eq (car type) 'and))
+              ((null (cdr types)) (cl-typep val (car types)))
+              ((eq (car type) 'and)
+               (and (cl-typep val (car types)) (cl-typep val (cons 'and (cdr types)))))
+              (t (or (cl-typep val (car types)) (cl-typep val (cons 'or (cdr types))))))))
+     ((and (eq (car-safe type) 'eql) (consp (cdr type)) (null (cdr (cdr type))))
+      (and (eql val (car (cdr type))) t))
+     ((eq (car-safe type) 'member) (and (memql val (cdr type)) t))
+     ((and (eq (car-safe type) 'satisfies) (consp (cdr type)) (null (cdr (cdr type))))
+      (funcall (car (cdr type)) val))
+     ((and type (symbolp type) (get type 'cl-deftype-handler))
+      (cl-typep val (funcall (get type 'cl-deftype-handler))))
+     ((memq type '(nil t)) type)
+     ((symbolp type)
+      (let* ((name (symbol-name type))
+             (namep (intern (concat name "p"))))
+        (cond ((fboundp namep) (funcall namep val))
+              ((fboundp (setq namep (intern (concat name "-p")))) (funcall namep val))
+              ((fboundp type) (funcall type val))
+              (t (error "Unknown type %S" type)))))
+     (t (error "Bad type spec: %S" type)))))
 
 ;; ---- cl-defgeneric / cl-defmethod: single/multi type-dispatch with CLOS
 ;; method combination — primary plus :before/:after/:around qualifiers and
@@ -6883,10 +7006,13 @@ Do nothing if HOOK does not currently contain FUNCTION."
 ;;                  any other atom is compared with `equal'
 ;; How `pred'/`app' call FN on the value: a lambda or symbol gets VAL as its one
 ;; argument; a partial application (F ARGS…) appends VAL.
+;; pcase.el `pcase--funcall': `_' in a call form stands for the matched value.
 (defun pcase--apply (fn val)
-  (cond ((and (consp fn) (eq (car fn) 'lambda)) (list 'funcall fn val))
-        ((consp fn) (append fn (list val)))
-        (t (list fn val))))
+  (cond ((symbolp fn) (list fn val))
+        ((eq 'not (car-safe fn)) (list 'not (pcase--apply (car (cdr fn)) val)))
+        ((or (functionp fn) (not (consp fn))) (list 'funcall (list 'function fn) val))
+        ((memq '_ fn) (mapcar (lambda (x) (if (eq '_ x) val x)) fn))
+        (t (append fn (list val)))))
 ;; ---- rx: compile an `rx' S-expression form to a regexp string (a useful
 ;; subset of rx.el — string/char literals, the named character classes and
 ;; anchors, group/or/seq, the quantifiers, char sets `(any …)' and `(not …)').
@@ -7475,16 +7601,10 @@ or the result is already atomic/grouped."
                                                     (list 'quote name)
                                                     val))))))))
           (cons tests binds)))
-       ;; (seq P0 P1 ...): match each subpattern against (nth i SV), where SV is
-       ;; the elements as a list (or nil if VAL is not a sequence).
+       ;; seq.el's `(pcase-defmacro seq (&rest patterns))': `(and (pred seqp)
+       ;; (app (seq--elt-safe _ I) PI)...)', the bindings in reverse order.
        ((eq head 'seq)
-        (let ((sv (make-symbol "sv")) (tests (list (list 'sequencep val))) (binds nil) (i 0))
-          (setq binds (list (list sv (list 'if (list 'sequencep val) (list 'append val nil) nil))))
-          (dolist (p (cdr pat))
-            (let ((r (pcase--compile p (list 'nth i sv))))
-              (setq tests (append tests (car r)) binds (append binds (cdr r))))
-            (setq i (1+ i)))
-          (cons tests binds)))
+        (pcase--compile `(and (pred seqp) ,@(seq--make-pcase-bindings (cdr pat))) val))
        (t (error "pcase: unsupported pattern %S" pat)))))
    (t (error "pcase: unsupported pattern %S" pat))))
 (defun pcase--clause (clause)
@@ -7538,22 +7658,33 @@ around BODY, so `(funcall (pcase-lambda (`(,a ,b)) (+ a b)) (list 1 2))' is 3."
       (setq i (1+ i)))
     (list 'lambda (nreverse parameters)
           (cons 'pcase-let* (cons (nreverse bindings) body)))))
-(defmacro pcase-setq (&rest args)
-  ;; Pairs of PATTERN VALUE: destructure each VALUE and `setq' the pattern's
-  ;; variables (the existing bindings, not new ones).
-  (let ((forms nil) (i 0))
-    (while args
-      (let* ((pat (car args)) (val (car (cdr args)))
-             (tv (intern (concat "--ps-" (number-to-string i) "--")))
-             (r (pcase--compile pat tv)))
-        (setq args (cdr (cdr args)) i (1+ i))
-        (setq forms
-              (cons (list 'let (list (list tv val))
-                          (cons 'progn
-                                (mapcar (lambda (b) (list 'setq (car b) (car (cdr b))))
-                                        (cdr r))))
-                    forms))))
-    (cons 'progn (reverse forms))))
+;; pcase.el `pcase-setq': pairs after the first become a `progn' of single
+;; `pcase-setq's; a trivial pattern is a plain `setq'; otherwise each pattern
+;; variable is `setq' to its value, the last assignment being the value.
+(defconst pcase--dontcare-upats '(t _ pcase--dontcare))
+(defun pcase--trivial-upat-p (upat)
+  (and (symbolp upat) (not (memq upat pcase--dontcare-upats))))
+(defmacro pcase-setq (pat val &rest args)
+  (cond
+   (args
+    (let ((arg-length (length args)))
+      (unless (evenp arg-length)
+        (signal 'wrong-number-of-arguments
+                (list 'pcase-setq (+ 2 arg-length)))))
+    (let ((result))
+      (while args
+        (push `(pcase-setq ,(pop args) ,(pop args))
+              result))
+      `(progn
+         (pcase-setq ,pat ,val)
+         ,@(nreverse result))))
+   ((pcase--trivial-upat-p pat)
+    `(setq ,pat ,val))
+   (t
+    (let* ((tv (make-symbol "x"))
+           (r (pcase--compile pat tv)))
+      `(let ((,tv ,val))
+         ,@(mapcar (lambda (b) (list 'setq (car b) (car (cdr b)))) (cdr r)))))))
 (defmacro pcase-dolist (spec &rest body)
   ;; Iterate (cadr SPEC), destructuring each element against (car SPEC).
   (let ((ev (make-symbol "e")))
@@ -7589,29 +7720,6 @@ When SECTION is \\='usage or \\='doc, return only that part."
       (`t (cons usage doc))
       (`usage usage)
       (`doc doc))))
-(defmacro seq-let (args seq &rest body)
-  ;; Positionally bind ARGS to the elements of SEQ for BODY; `&rest` binds the
-  ;; tail. ARGS may be a list or a vector pattern.
-  (when (vectorp args) (setq args (append args nil)))
-  (let ((s (make-symbol "seq")) (binds nil) (i 0) (more t))
-    (while (and args more)
-      (let ((a (car args)))
-        (if (eq a '&rest)
-            (setq binds (cons (list (car (cdr args)) (list 'seq-drop s i)) binds) more nil)
-          (setq binds (cons (list a (list 'elt s i)) binds) i (1+ i))))
-      (setq args (cdr args)))
-    `(let* ((,s ,seq) ,@(reverse binds)) ,@body)))
-(defmacro seq-setq (args seq)
-  ;; Like `seq-let` but assigns to existing places with `setq` (positional, plus
-  ;; `&rest` for the tail).
-  (let ((s (make-symbol "seq")) (sets nil) (i 0) (more t) (rest args))
-    (while (and rest more)
-      (let ((a (car rest)))
-        (if (eq a '&rest)
-            (setq sets (cons (list 'setq (car (cdr rest)) (list 'seq-drop s i)) sets) more nil)
-          (setq sets (cons (list 'setq a (list 'elt s i)) sets) i (1+ i))))
-      (setq rest (cdr rest)))
-    `(let ((,s ,seq)) ,@(reverse sets))))
 (defmacro seq-doseq (spec &rest body)
   ;; (seq-doseq (VAR SEQUENCE) BODY...) — iterate VAR over any sequence's
   ;; elements. Returns the sequence (like Emacs, via seq-do).
@@ -7622,6 +7730,36 @@ When SECTION is \\='usage or \\='doc, return only that part."
          ,@body
          (setq --seq-doseq-tail-- (cdr --seq-doseq-tail--)))
        ,sv)))
+;; seq.el: `seq-let' and `seq-setq' are `pcase-let' / `pcase-setq' over the
+;; `seq' pattern `seq--make-pcase-patterns' builds from ARGS.
+(defun seq--elt-safe (sequence n)
+  (ignore-errors (seq-elt sequence n)))
+(defun seq--make-pcase-bindings (args)
+  (let ((bindings '())
+        (index 0)
+        (rest-marker nil))
+    (seq-doseq (name args)
+      (unless rest-marker
+        (if (eq name '&rest)
+            (progn (push `(app (seq-drop _ ,index)
+                               ,(seq--elt-safe args (1+ index)))
+                         bindings)
+                   (setq rest-marker t))
+          (push `(app (seq--elt-safe _ ,index) ,name) bindings)))
+      (setq index (1+ index)))
+    bindings))
+(defun seq--make-pcase-patterns (args)
+  (cons 'seq
+        (seq-map (lambda (elt)
+                   (if (seqp elt)
+                       (seq--make-pcase-patterns elt)
+                     elt))
+                 args)))
+(defmacro seq-let (args sequence &rest body)
+  `(pcase-let ((,(seq--make-pcase-patterns args) ,sequence))
+     ,@body))
+(defmacro seq-setq (args sequence)
+  `(pcase-setq ,(seq--make-pcase-patterns args) ,sequence))
 (defun macroexp-progn (forms) (if (cdr forms) (cons 'progn forms) (car forms)))
 
 ;; macroexp-unprogn / macroexp-let* / macroexp-let2 (macroexp.el:560,565,601).
@@ -13402,6 +13540,28 @@ regardless if `funcall' would accept to call them."
   "Type of functions that have been compiled by the native compiler.")
 (cl--define-built-in-type primitive-function (subr compiled-function)
   "Type of functions hand written in C.")
+
+;; cl-preloaded.el: the derived types defined alongside the built-in ones.
+(cl-deftype natnum  () (declare (parents integer)) '(satisfies natnump))
+(cl-deftype keyword () (declare (parents symbol)) '(satisfies keywordp))
+(cl-deftype command () '(satisfies commandp))
+;; cl-macs.el: the character and real-number derived types.
+(cl-deftype character () (declare (parents fixnum natnum))
+            '(and fixnum natnum))
+(cl-deftype base-char () (declare (parents character))
+            '(satisfies characterp))
+(cl-deftype extended-char () (declare (parents character))
+            '(and character (not base-char)))
+(cl-deftype real (&optional min max)
+  (list 'and 'number
+        (if (memq min '(* nil)) t
+          `(satisfies . ,(if (consp min)
+                             (lambda (val) (> val (car min)))
+                           (lambda (val) (>= val min)))))
+        (if (memq max '(* nil)) t
+          `(satisfies . ,(if (consp max)
+                             (lambda (val) (< val (car max)))
+                           (lambda (val) (<= val max)))))))
 
 ;; -- cl-defstruct class registry (faithful subset of cl-preloaded.el) --
 ;; cl-generic's typeof generalizer also dispatches on cl-defstruct types: it
