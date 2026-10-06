@@ -290,8 +290,8 @@ fn warm_cache_keeps_the_introspection_function_cells() {
 /// The image `heap` deliberately starts at `builtin_count`: a builtin object is
 /// rebuilt by `install` on every run, and an `Obj::Subr` has a function pointer
 /// that `SerObj` cannot represent at all. But the prelude *writes* to symbols
-/// below that line — `save-current-buffer`, `save-excursion`, `save-restriction`
-/// and `interactive` are installed as special forms and then given a macro
+/// below that line — `save-current-buffer`, `save-excursion` and
+/// `save-restriction` are installed as special forms and then given a macro
 /// function cell by the prelude — and those writes were dropped from the image:
 ///
 /// ```text
@@ -311,7 +311,9 @@ fn warm_cache_keeps_the_prelude_cells_on_builtin_symbols() {
          '(save-current-buffer save-excursion save-restriction interactive)))",
     );
     assert_eq!(cold, warm, "cold and warm disagree");
-    assert_eq!(cold, "(t t t t)");
+    // `interactive` is a pure special form (eval.c `Finteractive`) with no
+    // prelude macro cell, so it stays non-macro on both runs, as in Emacs 31.1.
+    assert_eq!(cold, "(t t t nil)");
 }
 
 /// The same gap, at the point where it actually broke a program: a form the

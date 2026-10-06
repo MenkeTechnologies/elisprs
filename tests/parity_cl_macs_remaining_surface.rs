@@ -169,13 +169,17 @@ fn struct_introspection_follows_the_struct_type() {
                 (cl-defstruct (a4 (:include a1)) z) ";
     // cl-struct-sequence-type was void.
     assert_eq!(
-        eval(&format!("(progn {defs}(mapcar #'cl-struct-sequence-type '(a1 a2 a3 a4)))")),
+        eval(&format!(
+            "(progn {defs}(mapcar #'cl-struct-sequence-type '(a1 a2 a3 a4)))"
+        )),
         "(nil list vector nil)"
     );
     // Only a record gets the bare (cl-tag-slot) entry; a :named typed struct
     // carries the tag as a real slot; an unnamed one has none.
     assert_eq!(
-        eval(&format!("(progn {defs}(mapcar #'cl-struct-slot-info '(a1 a2 a3 a4)))")),
+        eval(&format!(
+            "(progn {defs}(mapcar #'cl-struct-slot-info '(a1 a2 a3 a4)))"
+        )),
         "(((cl-tag-slot) (x nil) (y 3 :read-only t)) ((x nil)) ((cl-tag-slot nil) (x nil)) \
          ((cl-tag-slot) (x nil) (y 3 :read-only t) (z nil)))"
     );
@@ -187,7 +191,9 @@ fn struct_introspection_follows_the_struct_type() {
         "(0 1 3)"
     );
     assert_eq!(
-        eval(&format!("(progn {defs}(condition-case e (cl-struct-slot-offset 'a1 'q) (error e)))")),
+        eval(&format!(
+            "(progn {defs}(condition-case e (cl-struct-slot-offset 'a1 'q) (error e)))"
+        )),
         "(cl-struct-unknown-slot a1 q)"
     );
     assert_eq!(
