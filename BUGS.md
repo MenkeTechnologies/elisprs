@@ -5956,6 +5956,59 @@ docstring before the prelude defines `put`, so recording
 `elisprs: prelude form failed: void-function: put` twice. They are now defined
 after `put`.
 
+### R34-K. ✅ FIXED — buffer modification state was void
+
+`buffer-modified-p`, `set-buffer-modified-p`, `restore-buffer-modified-p`,
+`buffer-modified-tick`, `buffer-chars-modified-tick` and
+`with-silent-modifications` were void. Each buffer now carries `MODIFF`,
+`CHARS_MODIFF`, `SAVE_MODIFF` and `AUTOSAVE_MODIFF`: a text change of N
+characters advances `MODIFF` by `modiff_incr` (`floor(log2 N) + 1`) and sets
+`CHARS_MODIFF` to it, a text-property change that changes something advances
+`MODIFF` by one, and `buffer-modified-p` answers `autosaved` after
+`(restore-buffer-modified-p 'autosaved)`. `set-text-properties` follows
+`validate_interval_range`: nil on an empty range, and nil without a change on
+a buffer that has no interval tree — one that outlives its properties until
+all of the buffer's text is deleted.
+
+```text
+(with-temp-buffer (insert "abcd") (erase-buffer) (insert (make-string 1000 ?a))
+  (buffer-modified-tick))
+emacs:   17          ; 1 + 3 + 3 + 10
+before:  (void-function buffer-modified-tick)
+```
+
+### R34-L. ✅ FIXED — region case commands collapsed markers
+
+`upcase-region`, `downcase-region`, `capitalize-region` and
+`subst-char-in-region` deleted the region and inserted the converted text, so
+a marker inside it collapsed to its start and point moved. They now overwrite
+the text in place (`casify_region`, `Fsubst_char_in_region`), keeping markers,
+point and text properties, and count one change of the region (from the first
+replaced character, for `subst-char-in-region`, which changes nothing when
+FROMCHAR does not occur). A case conversion that changes the length (`ß`)
+still deletes and re-inserts.
+
+### R34-M. ✅ FIXED — `position-bytes` and `byte-to-position` were void
+
+Both are editfns.c's: they work on the whole buffer regardless of the
+restriction, answer nil outside it, and `byte-to-position` of a byte inside a
+multibyte character is that character's position.
+
+### R34-N. ✅ FIXED — two `format` corners
+
+`(format "%3%")` signalled `Not enough arguments`; `styled_format` copies a
+`%` for a `%` conversion whatever flags or width precede it, without consuming
+an argument. A field number now repositions the argument counter, so
+`(format "%2$s %s" 1 2 3)` is `"2 3"` (it was `"2 1"`). The `#` flag always
+leaves a decimal point: `(format "%#.0f" 1.0)` is `"1."` and `(format "%#g"
+100000.0)` is `"100000."`.
+
+### R34-O. ✅ FIXED — `\?` in replacement text
+
+`Freplace_match` keeps `\?` in a string replacement (`"a\?c"`) and signals
+`Invalid use of ‘\’ in replacement text` in a buffer one; elisprs turned it
+into `?` in both.
+
 ### Still open after round 34
 
 - **A bounded regexp search whose leftmost match crosses BOUND.** Emacs stops
@@ -5967,6 +6020,12 @@ after `put`.
   on the elisprs behaviour.
 - `word_boundary_p`'s script split (`abcαβγ` is two words in Emacs) needs
   `char-script-table`.
+- A string keeps its interval tree after `remove-text-properties` strips its
+  last property, so a later `(set-text-properties 0 2 nil S)` answers t in
+  Emacs; elisprs answers nil there (buffers are modelled, strings are not).
+- `string-collate-lessp` with IGNORE-CASE (`"a"` vs `"B"`) and `sxhash-eq`
+  values differ; both depend on the C library and the object layout.
+- `\cg` and the other category escapes are unsupported in regexps.
 
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 

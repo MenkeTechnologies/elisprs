@@ -1544,6 +1544,48 @@ pub const SUBRS: &[Entry] = &[
         doc: "Delete the entire contents of the current buffer.",
     },
     Entry {
+        name: "buffer-modified-p",
+        kind: Kind::Function,
+        sig: "(buffer-modified-p &optional BUFFER)",
+        doc: "Non-nil if BUFFER (default the current one) was modified since it was last marked unmodified: t, or `autosaved' when it was auto-saved since its last change.",
+    },
+    Entry {
+        name: "set-buffer-modified-p",
+        kind: Kind::Function,
+        sig: "(set-buffer-modified-p FLAG)",
+        doc: "Mark the current buffer modified (FLAG non-nil) or unmodified (nil). Returns nil.",
+    },
+    Entry {
+        name: "restore-buffer-modified-p",
+        kind: Kind::Function,
+        sig: "(restore-buffer-modified-p FLAG)",
+        doc: "Like `set-buffer-modified-p' without the side effects; FLAG `autosaved' also marks the buffer auto-saved. Returns FLAG.",
+    },
+    Entry {
+        name: "buffer-modified-tick",
+        kind: Kind::Function,
+        sig: "(buffer-modified-tick &optional BUFFER)",
+        doc: "BUFFER's modification count: it advances on every change to its text or text properties.",
+    },
+    Entry {
+        name: "buffer-chars-modified-tick",
+        kind: Kind::Function,
+        sig: "(buffer-chars-modified-tick &optional BUFFER)",
+        doc: "BUFFER's character-change count: like `buffer-modified-tick', but text-property changes leave it alone.",
+    },
+    Entry {
+        name: "position-bytes",
+        kind: Kind::Function,
+        sig: "(position-bytes POSITION)",
+        doc: "The byte position of character POSITION in the whole buffer, or nil if POSITION is outside it.",
+    },
+    Entry {
+        name: "byte-to-position",
+        kind: Kind::Function,
+        sig: "(byte-to-position BYTEPOS)",
+        doc: "The character position whose bytes include byte position BYTEPOS, or nil if it is outside the buffer.",
+    },
+    Entry {
         name: "char-after",
         kind: Kind::Function,
         sig: "(char-after &optional POS)",

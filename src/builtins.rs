@@ -2754,6 +2754,17 @@ fn format_g(v: f64, prec: usize, alt: bool) -> String {
         }
     }
 }
+/// Insert the decimal point printf's `#` flag guarantees: before the exponent of
+/// an `e` form, else at the end, when S has none.
+fn with_decimal_point(s: String) -> String {
+    if s.contains('.') {
+        return s;
+    }
+    match s.find('e') {
+        Some(ep) => format!("{}.{}", &s[..ep], &s[ep..]),
+        None => s + ".",
+    }
+}
 fn format_e(v: f64, prec: usize) -> String {
     // Beyond FMT_PREC_CAP, render the mantissa at the cap and zero-pad the extra
     // fractional digits before the exponent (Rust's u16 precision would panic).
@@ -3003,6 +3014,16 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>
         let Some(conv) = chars.next() else {
             return Err("Format string ends in middle of format specifier".to_string());
         };
+        // editfns.c `styled_format`: a `%` conversion copies a `%` whatever the
+        // flags, width and precision before it, and consumes no argument — but a
+        // field number still repositions the argument counter.
+        if conv == '%' {
+            if let Some(f) = field {
+                ai = f;
+            }
+            out.push('%');
+            continue;
+        }
         let mut spec = FmtSpec {
             left,
             zero,
@@ -3135,6 +3156,13 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>
                         'f' => format_fixed(v, spec.prec.unwrap_or(6)),
                         _ => format_g(v, spec.prec.unwrap_or(6), spec.alt),
                     };
+                    // printf's `#`: the result always has a decimal point, even
+                    // with no digits after it (`%#.0f` of 1.0 is "1.").
+                    let raw = if spec.alt {
+                        with_decimal_point(raw)
+                    } else {
+                        raw
+                    };
                     apply_sign(raw, &spec)
                 } else {
                     // inf/nan: Emacs renders "inf"/"-inf"/"nan", ignoring precision
@@ -3161,9 +3189,8 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>
                 return Err(format!("Invalid format operation %{other}"));
             }
         };
-        if field.is_none() {
-            ai += 1;
-        }
+        // A field number repositions the counter: `(format "%2$s %s" 1 2 3)` is "2 3".
+        ai = idx + 1;
         // Literal format-string text since the last directive carries nothing.
         let before = out.chars().count();
         if before > placed {
@@ -8299,6 +8326,103 @@ fn goto_char(h: &mut ElispHost, a: &[Value]) -> R {
     buf.point = arg.clamp(buf.begv as i64, buf.zv as i64) as usize;
     Ok(a[0].clone())
 }
+/// `(position-bytes POSITION)` (editfns.c): the byte position of POSITION in
+/// the whole buffer — the restriction does not apply — or nil outside it.
+/// Bytes are counted in the internal UTF-8 encoding.
+fn position_bytes(h: &mut ElispHost, a: &[Value]) -> R {
+    let pos = fix_position(h, &a[0])?;
+    let text = &h.cur_buf_ref().text;
+    if !(1 <= pos && pos <= text.len() as i64 + 1) {
+        return Ok(Value::Undef);
+    }
+    let bytes: usize = text[..pos as usize - 1].iter().map(|c| c.len_utf8()).sum();
+    Ok(Value::Int(bytes as i64 + 1))
+}
+/// `(byte-to-position BYTEPOS)` (editfns.c): the character position whose
+/// bytes include BYTEPOS, or nil outside the whole buffer.
+fn byte_to_position(h: &mut ElispHost, a: &[Value]) -> R {
+    let want = as_fixnum_named(h, &a[0], "fixnump")?;
+    if want < 1 {
+        return Ok(Value::Undef);
+    }
+    let mut byte = 1i64;
+    for (i, c) in h.cur_buf_ref().text.iter().enumerate() {
+        let next = byte + c.len_utf8() as i64;
+        if want < next {
+            return Ok(Value::Int(i as i64 + 1));
+        }
+        byte = next;
+    }
+    Ok(if want == byte {
+        Value::Int(h.cur_buf_ref().text.len() as i64 + 1)
+    } else {
+        Value::Undef
+    })
+}
+/// `decode_buffer` (buffer.c): nil is the current buffer; anything else must
+/// be a buffer object, live or killed — a buffer NAME is not accepted.
+fn decode_buffer(h: &mut ElispHost, v: Option<&Value>) -> Result<usize, String> {
+    match v {
+        None => Ok(h.current),
+        Some(v) if is_nil(v) => Ok(h.current),
+        Some(v) => match h.obj(v) {
+            Some(Obj::Buffer(idx)) => Ok(*idx),
+            _ => Err(h.signal_wrong_type("bufferp", v)),
+        },
+    }
+}
+/// `Fbuffer_modified_p`: nil when `SAVE_MODIFF >= MODIFF`, else `autosaved`
+/// when the buffer was auto-saved since its last change, else t.
+fn buffer_modified_p(h: &mut ElispHost, a: &[Value]) -> R {
+    let bi = decode_buffer(h, a.first())?;
+    let m = h.buffers[bi].mods;
+    Ok(if m.save_modiff >= m.modiff {
+        Value::Undef
+    } else if m.autosave_modiff == m.modiff {
+        h.intern("autosaved")
+    } else {
+        Value::Bool(true)
+    })
+}
+/// `Frestore_buffer_modified_p`: FLAG nil marks the current buffer unmodified;
+/// non-nil makes it modified (advancing `MODIFF` when it was not), and
+/// `autosaved` also records it as auto-saved. Answers FLAG.
+fn restore_buffer_modified_p(h: &mut ElispHost, a: &[Value]) -> R {
+    let flag = a[0].clone();
+    let autosaved = h
+        .find_symbol("autosaved")
+        .is_some_and(|s| h.values_eq(&s, &flag));
+    let m = &mut h.cur_buf().mods;
+    if is_nil(&flag) {
+        m.save_modiff = m.modiff;
+    } else {
+        if m.save_modiff >= m.modiff {
+            m.save_modiff = m.modiff;
+            m.incr(1);
+        }
+        if autosaved {
+            m.autosave_modiff = m.modiff;
+        }
+    }
+    Ok(flag)
+}
+/// `set-buffer-modified-p`: `restore-buffer-modified-p` plus the file-lock and
+/// mode-line bookkeeping batch has no use for; it answers nil.
+fn set_buffer_modified_p(h: &mut ElispHost, a: &[Value]) -> R {
+    restore_buffer_modified_p(h, a)?;
+    Ok(Value::Undef)
+}
+/// `(buffer-modified-tick &optional BUFFER)`: BUFFER's `MODIFF`.
+fn buffer_modified_tick(h: &mut ElispHost, a: &[Value]) -> R {
+    let bi = decode_buffer(h, a.first())?;
+    Ok(Value::Int(h.buffers[bi].mods.modiff))
+}
+/// `(buffer-chars-modified-tick &optional BUFFER)`: BUFFER's `CHARS_MODIFF`,
+/// which text-property changes leave alone.
+fn buffer_chars_modified_tick(h: &mut ElispHost, a: &[Value]) -> R {
+    let bi = decode_buffer(h, a.first())?;
+    Ok(Value::Int(h.buffers[bi].mods.chars_modiff))
+}
 fn erase_buffer(h: &mut ElispHost, _a: &[Value]) -> R {
     // Delete the whole buffer (ignoring narrowing) and remove the restriction.
     let len = h.cur_buf().text.len();
@@ -8603,9 +8727,15 @@ fn put_text_property_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let (prop, val) = (a[2].clone(), a[3].clone());
     let obj = prop_object(h, a.get(4))?;
     let (lo, hi) = prop_range(&obj, start, end, h);
+    let changed = props_would_change(h, &obj, lo, hi, &[(prop.clone(), val.clone())], true);
     match obj {
         PropObj::Str(s) => h.string_put_prop(&s, lo, hi, &prop, &val),
-        PropObj::Buf(bi) => with_buffer(h, bi, |h| h.buffer_put_prop(lo, hi, &prop, &val)),
+        PropObj::Buf(bi) => {
+            with_buffer(h, bi, |h| h.buffer_put_prop(lo, hi, &prop, &val));
+            if changed {
+                h.note_prop_change(bi);
+            }
+        }
     }
     Ok(Value::Undef)
 }
@@ -8615,20 +8745,30 @@ fn set_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let plist = a[2].clone();
     let obj = prop_object(h, a.get(3))?;
     let (lo, hi) = prop_range(&obj, start, end, h);
-    // textprop.c `set_text_properties`: an object with no intervals at all and
-    // nil PROPERTIES returns nil without touching anything; otherwise t.
+    // textprop.c `set_text_properties`: an empty range, or an object with no
+    // intervals at all and nil PROPERTIES, returns nil without touching
+    // anything; otherwise t. A buffer keeps its interval tree after its
+    // properties are removed, until all of its text is deleted.
     let has_props = |h: &ElispHost| match &obj {
         PropObj::Str(s) => h
             .string_props_vec(s)
             .is_some_and(|v| v.iter().any(|p| !is_nil(p))),
-        PropObj::Buf(bi) => h.buffers[*bi].props.iter().any(|p| !is_nil(p)),
+        PropObj::Buf(bi) => h.buffers[*bi].has_intervals,
     };
+    if lo == hi {
+        return Ok(Value::Undef);
+    }
     if is_nil(&plist) && !has_props(h) {
         return Ok(Value::Undef);
     }
     match obj {
         PropObj::Str(s) => h.string_set_props(&s, lo, hi, &plist),
-        PropObj::Buf(bi) => with_buffer(h, bi, |h| h.buffer_set_props(lo, hi, &plist)),
+        PropObj::Buf(bi) => {
+            with_buffer(h, bi, |h| h.buffer_set_props(lo, hi, &plist));
+            if lo < hi {
+                h.note_prop_change(bi);
+            }
+        }
     }
     Ok(Value::Bool(true))
 }
@@ -8706,6 +8846,9 @@ fn add_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
             }
         }
     }
+    if let (true, PropObj::Buf(bi)) = (changed, &obj) {
+        h.note_prop_change(*bi);
+    }
     Ok(Value::Bool(changed))
 }
 fn remove_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
@@ -8724,7 +8867,30 @@ fn remove_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
             }
         }
     }
+    if let (true, PropObj::Buf(bi)) = (changed, &obj) {
+        h.note_prop_change(*bi);
+    }
     Ok(Value::Bool(changed))
+}
+/// `(elisprs--replace-chars-in-place START END STRING)`: overwrite the text
+/// from START to END with STRING's characters when it has exactly as many,
+/// leaving text properties, markers and point where they are — what casefiddle.c
+/// and `subst-char-in-region` do to the buffer through `modify_text`, which
+/// counts one change of END - START characters. Answers nil, changing nothing,
+/// when the lengths differ, so the Lisp caller can fall back to delete and
+/// insert. An elisprs-internal primitive: Emacs does this in C.
+fn replace_chars_in_place_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let (lo, hi) = validate_region(h, &a[0], &a[1])?;
+    let new: Vec<char> = as_string(h, &a[2])?.chars().collect();
+    if new.len() != hi - lo {
+        return Ok(Value::Undef);
+    }
+    if lo < hi {
+        h.barf_if_read_only()?;
+        h.note_text_change(hi - lo);
+        h.cur_buf().text[lo - 1..hi - 1].copy_from_slice(&new);
+    }
+    Ok(Value::Bool(true))
 }
 /// `(elisprs--carry-text-properties SRC DST)` — DST with SRC's per-character
 /// text properties, when the two are the same length.
@@ -9233,7 +9399,11 @@ fn looking_at_p(h: &mut ElispHost, a: &[Value]) -> R {
 /// error, not a character to drop: `search.c`'s `Freplace_match` signals
 /// `Invalid use of ‘\’ in replacement text` there, so `\q` and a trailing `\`
 /// both fail rather than quietly producing `q` and nothing.
-fn expand_repl(newtext: &str, gt: &dyn Fn(usize) -> String) -> Result<String, String> {
+fn expand_repl(
+    newtext: &str,
+    gt: &dyn Fn(usize) -> String,
+    in_string: bool,
+) -> Result<String, String> {
     const BAD: &str = "error: Invalid use of ‘\\’ in replacement text";
     let chars: Vec<char> = newtext.chars().collect();
     let mut out = String::new();
@@ -9246,9 +9416,11 @@ fn expand_repl(newtext: &str, gt: &dyn Fn(usize) -> String) -> Result<String, St
             match c {
                 '&' => out.push_str(&gt(0)),
                 '0'..='9' => out.push_str(&gt(c as usize - '0' as usize)),
-                // `\\` is a literal backslash and `\?` is a literal `?` (the
-                // latter only means something to `query-replace-regexp`).
-                '\\' | '?' => out.push(c),
+                '\\' => out.push(c),
+                // `\?` (meaningful only to `query-replace-regexp`) is kept as
+                // is in a string, and is an error in a buffer: search.c's
+                // string loop lets `?` through, its buffer loop does not.
+                '?' if in_string => out.push_str("\\?"),
                 _ => return Err(BAD.to_string()),
             }
             i += 2;
@@ -9337,7 +9509,7 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
         let rep = if literal {
             newtext
         } else {
-            expand_repl(&newtext, &gt)?
+            expand_repl(&newtext, &gt, true)?
         };
         let rep = if fixedcase {
             rep
@@ -9373,7 +9545,7 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
     let rep = if literal {
         newtext
     } else {
-        expand_repl(&newtext, &gt)?
+        expand_repl(&newtext, &gt, false)?
     };
     let rep = if fixedcase {
         rep
@@ -10507,6 +10679,23 @@ pub fn install(h: &mut ElispHost) {
     s("point-max", 0, Some(0), point_max);
     s("goto-char", 1, Some(1), goto_char);
     s("erase-buffer", 0, Some(0), erase_buffer);
+    s("buffer-modified-p", 0, Some(1), buffer_modified_p);
+    s("position-bytes", 1, Some(1), position_bytes);
+    s("byte-to-position", 1, Some(1), byte_to_position);
+    s(
+        "restore-buffer-modified-p",
+        1,
+        Some(1),
+        restore_buffer_modified_p,
+    );
+    s("set-buffer-modified-p", 1, Some(1), set_buffer_modified_p);
+    s("buffer-modified-tick", 0, Some(1), buffer_modified_tick);
+    s(
+        "buffer-chars-modified-tick",
+        0,
+        Some(1),
+        buffer_chars_modified_tick,
+    );
     s("char-after", 0, Some(1), char_after);
     s("buffer-substring", 2, Some(2), buffer_substring);
     s(
@@ -10550,6 +10739,12 @@ pub fn install(h: &mut ElispHost) {
         remove_text_properties_fn,
     );
     s("propertize", 1, None, propertize_fn);
+    s(
+        "elisprs--replace-chars-in-place",
+        3,
+        Some(3),
+        replace_chars_in_place_fn,
+    );
     s(
         "elisprs--carry-text-properties",
         2,

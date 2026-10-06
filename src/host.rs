@@ -1213,6 +1213,45 @@ pub struct EditBuffer {
     pub locals: HashMap<u32, Option<Value>>,
     /// The buffer's local keymap slot (`use-local-map`/`current-local-map`).
     pub local_map: Value,
+    /// `MODIFF`, `CHARS_MODIFF`, `SAVE_MODIFF` and `AUTOSAVE_MODIFF`.
+    pub mods: ModCounts,
+    /// Whether the buffer has an interval tree: set by the first text-property
+    /// change, cleared when all of its text is deleted
+    /// (`adjust_intervals_for_deletion`). `set-text-properties` with nil
+    /// PROPERTIES answers nil and changes nothing when there is none.
+    pub has_intervals: bool,
+}
+
+/// A buffer's modification counters (buffer.h). A text change of N characters
+/// advances `modiff` by `modiff_incr` (`floor(log2 N) + 1`) and sets
+/// `chars_modiff` to it; a text-property change advances `modiff` by 1 only.
+/// The buffer is modified while `save_modiff < modiff`.
+#[derive(Clone, Copy)]
+pub struct ModCounts {
+    pub modiff: i64,
+    pub chars_modiff: i64,
+    pub save_modiff: i64,
+    pub autosave_modiff: i64,
+}
+
+impl Default for ModCounts {
+    /// `Fget_buffer_create` starts every counter at 1, and `reset_buffer` the
+    /// auto-save counter at 0.
+    fn default() -> Self {
+        ModCounts {
+            modiff: 1,
+            chars_modiff: 1,
+            save_modiff: 1,
+            autosave_modiff: 0,
+        }
+    }
+}
+
+impl ModCounts {
+    /// `modiff_incr` (lisp.h) for a change of LEN characters.
+    pub fn incr(&mut self, len: usize) {
+        self.modiff += if len == 0 { 1 } else { len.ilog2() as i64 + 1 };
+    }
 }
 
 /// Adjust a marker-like position `m` for an insertion of `len` chars at `pos`.
@@ -1298,6 +1337,8 @@ impl ElispHost {
                 restrict_stack: Vec::new(),
                 locals: HashMap::new(),
                 local_map: Value::Undef,
+                mods: ModCounts::default(),
+                has_intervals: false,
             }],
             current: 0,
             need_newline: false,
@@ -4391,6 +4432,8 @@ impl ElispHost {
             restrict_stack: Vec::new(),
             locals: HashMap::new(),
             local_map: Value::Undef,
+            mods: ModCounts::default(),
+            has_intervals: false,
         });
         let handle = self.alloc(Obj::Buffer(idx));
         self.buffers[idx].self_obj = handle.clone();
@@ -4507,6 +4550,7 @@ impl ElispHost {
         b.name = None;
         b.text.clear();
         b.props.clear();
+        b.has_intervals = false;
         b.locals.clear();
         b.se_markers.clear();
         b.restrict_stack.clear();
@@ -4730,6 +4774,18 @@ impl ElispHost {
         self.set_pending_error(&msg, obj);
         Err(msg)
     }
+    /// Count a change to LEN characters of the current buffer's text
+    /// (`insert_1_both` / `del_range_2`: `modiff_incr`, then `CHARS_MODIFF = MODIFF`).
+    pub fn note_text_change(&mut self, len: usize) {
+        let m = &mut self.buffers[self.current].mods;
+        m.incr(len);
+        m.chars_modiff = m.modiff;
+    }
+    /// Count a text-property change in buffer BI (`modify_text_properties`:
+    /// `MODIFF` advances by one, `CHARS_MODIFF` stays).
+    pub fn note_prop_change(&mut self, bi: usize) {
+        self.buffers[bi].mods.incr(1);
+    }
     /// Insert `chars` at point in the current buffer. `leave_after` puts point
     /// after the inserted text (the `insert` default); otherwise point is left at
     /// the start (`insert-file-contents`). Markers are adjusted per Emacs rules.
@@ -4739,6 +4795,7 @@ impl ElispHost {
         if len == 0 {
             return;
         }
+        self.note_text_change(len);
         let b = &mut self.buffers[self.current];
         b.text.splice((pos - 1)..(pos - 1), chars);
         // Plain insert gives the new characters nil properties (no inheritance).
@@ -4756,6 +4813,7 @@ impl ElispHost {
         if len == 0 {
             return;
         }
+        self.note_text_change(len);
         let b = &mut self.buffers[self.current];
         b.text.splice((pos - 1)..(pos - 1), chars);
         b.props
@@ -4775,6 +4833,10 @@ impl ElispHost {
     pub fn cur_delete(&mut self, from: usize, to: usize) {
         if from >= to {
             return;
+        }
+        self.note_text_change(to - from);
+        if to - from == self.buffers[self.current].text.len() {
+            self.buffers[self.current].has_intervals = false;
         }
         let b = &mut self.buffers[self.current];
         b.text.drain((from - 1)..(to - 1));
@@ -4980,6 +5042,9 @@ impl ElispHost {
     /// Overwrite the property plist at absolute char index `idx0` in the current
     /// buffer (used by `insert` to carry an inserted string's text properties).
     pub fn buffer_set_plist_at(&mut self, idx0: usize, plist: Value) {
+        if el_truthy(&plist) {
+            self.buffers[self.current].has_intervals = true;
+        }
         if let Some(slot) = self.buffers[self.current].props.get_mut(idx0) {
             *slot = plist;
         }
@@ -4999,6 +5064,7 @@ impl ElispHost {
     }
     /// `put-text-property` on the current buffer over char indices `[s0, e0)`.
     pub fn buffer_put_prop(&mut self, s0: usize, e0: usize, prop: &Value, val: &Value) {
+        self.buffers[self.current].has_intervals |= s0 < e0;
         let n = self.cur_buf_ref().props.len();
         for idx in s0..e0.min(n) {
             let cur = self.buffers[self.current].props[idx].clone();
@@ -5009,6 +5075,7 @@ impl ElispHost {
     /// `set-text-properties` on the current buffer: replace each char's plist over
     /// `[s0, e0)` with PLIST (shared — the slots are never mutated in place).
     pub fn buffer_set_props(&mut self, s0: usize, e0: usize, plist: &Value) {
+        self.buffers[self.current].has_intervals |= s0 < e0;
         let n = self.cur_buf_ref().props.len();
         for idx in s0..e0.min(n) {
             self.buffers[self.current].props[idx] = plist.clone();

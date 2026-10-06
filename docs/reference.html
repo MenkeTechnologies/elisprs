@@ -142,7 +142,7 @@
           <span class="sep">/</span>
           <a href="https://github.com/MenkeTechnologies/elisprs" target="_blank" rel="noopener noreferrer">GitHub</a>
         </nav>
-        <p class="docs-build-line">elisprs v0.1.19 · 304 builtins &amp; special forms · 10 chapters · generated from <code>elisprs/lsp.rs</code></p>
+        <p class="docs-build-line">elisprs v0.1.19 · 311 builtins &amp; special forms · 10 chapters · generated from <code>elisprs/lsp.rs</code></p>
       </div>
       <div class="tutorial-toolbar">
         <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -176,7 +176,7 @@
         <li><a href="#ch-i-o-print-format">I/O, Print &amp; Format</a> <span class="chapter-count">10</span></li>
         <li><a href="#ch-control-functional">Control &amp; Functional</a> <span class="chapter-count">11</span></li>
         <li><a href="#ch-association-lists-hash-tables">Association Lists &amp; Hash Tables</a> <span class="chapter-count">11</span></li>
-        <li><a href="#ch-other">Other</a> <span class="chapter-count">123</span></li>
+        <li><a href="#ch-other">Other</a> <span class="chapter-count">130</span></li>
       </ul>
     </section>
     <section class="tutorial-section" id="ch-special-forms">
@@ -1303,7 +1303,7 @@
     </section>
     <section class="tutorial-section" id="ch-other">
       <h2>Other</h2>
-      <p class="chapter-meta">123 entries</p>
+      <p class="chapter-meta">130 entries</p>
       <article class="doc-entry" id="doc-format-time-string">
         <h3><a class="doc-anchor" href="#doc-format-time-string">#</a> <code>format-time-string</code></h3>
         <pre><code class="lang-elisp">(format-time-string FORMAT &amp;optional TIME ZONE)
@@ -1711,6 +1711,48 @@
         <pre><code class="lang-elisp">(erase-buffer)
 </code></pre>
         <p>Delete the entire contents of the current buffer.</p>
+      </article>
+      <article class="doc-entry" id="doc-buffer-modified-p">
+        <h3><a class="doc-anchor" href="#doc-buffer-modified-p">#</a> <code>buffer-modified-p</code></h3>
+        <pre><code class="lang-elisp">(buffer-modified-p &amp;optional BUFFER)
+</code></pre>
+        <p>Non-nil if BUFFER (default the current one) was modified since it was last marked unmodified: t, or `autosaved&#39; when it was auto-saved since its last change.</p>
+      </article>
+      <article class="doc-entry" id="doc-set-buffer-modified-p">
+        <h3><a class="doc-anchor" href="#doc-set-buffer-modified-p">#</a> <code>set-buffer-modified-p</code></h3>
+        <pre><code class="lang-elisp">(set-buffer-modified-p FLAG)
+</code></pre>
+        <p>Mark the current buffer modified (FLAG non-nil) or unmodified (nil). Returns nil.</p>
+      </article>
+      <article class="doc-entry" id="doc-restore-buffer-modified-p">
+        <h3><a class="doc-anchor" href="#doc-restore-buffer-modified-p">#</a> <code>restore-buffer-modified-p</code></h3>
+        <pre><code class="lang-elisp">(restore-buffer-modified-p FLAG)
+</code></pre>
+        <p>Like <code>set-buffer-modified-p&#39; without the side effects; FLAG </code>autosaved&#39; also marks the buffer auto-saved. Returns FLAG.</p>
+      </article>
+      <article class="doc-entry" id="doc-buffer-modified-tick">
+        <h3><a class="doc-anchor" href="#doc-buffer-modified-tick">#</a> <code>buffer-modified-tick</code></h3>
+        <pre><code class="lang-elisp">(buffer-modified-tick &amp;optional BUFFER)
+</code></pre>
+        <p>BUFFER&#39;s modification count: it advances on every change to its text or text properties.</p>
+      </article>
+      <article class="doc-entry" id="doc-buffer-chars-modified-tick">
+        <h3><a class="doc-anchor" href="#doc-buffer-chars-modified-tick">#</a> <code>buffer-chars-modified-tick</code></h3>
+        <pre><code class="lang-elisp">(buffer-chars-modified-tick &amp;optional BUFFER)
+</code></pre>
+        <p>BUFFER&#39;s character-change count: like `buffer-modified-tick&#39;, but text-property changes leave it alone.</p>
+      </article>
+      <article class="doc-entry" id="doc-position-bytes">
+        <h3><a class="doc-anchor" href="#doc-position-bytes">#</a> <code>position-bytes</code></h3>
+        <pre><code class="lang-elisp">(position-bytes POSITION)
+</code></pre>
+        <p>The byte position of character POSITION in the whole buffer, or nil if POSITION is outside it.</p>
+      </article>
+      <article class="doc-entry" id="doc-byte-to-position">
+        <h3><a class="doc-anchor" href="#doc-byte-to-position">#</a> <code>byte-to-position</code></h3>
+        <pre><code class="lang-elisp">(byte-to-position BYTEPOS)
+</code></pre>
+        <p>The character position whose bytes include byte position BYTEPOS, or nil if it is outside the buffer.</p>
       </article>
       <article class="doc-entry" id="doc-char-after">
         <h3><a class="doc-anchor" href="#doc-char-after">#</a> <code>char-after</code></h3>

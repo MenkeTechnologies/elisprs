@@ -4495,23 +4495,33 @@ removed, and one that spans the range is split in two -- which is why this needs
 (defmacro save-restriction (&rest body)
   `(progn (--save-restriction--)
      (unwind-protect (progn ,@body) (--restore-restriction--))))
-;; Region case conversion: rewrite [BEG,END) through FN (length-preserving, so
-;; save-excursion's integer restore stays accurate).
+;; Region case conversion: rewrite [BEG,END) through FN. A length-preserving
+;; result overwrites the text in place, as casefiddle.c's `casify_region'
+;; does (markers, point and text properties stay; one `modify_text' of the
+;; whole region); a result of another length is deleted and re-inserted.
 (defun buffer--map-region (beg end fn)
-  (let ((lo (min beg end)) (hi (max beg end)))
-    (save-excursion
-      (let ((s (buffer-substring lo hi)))
-        (delete-region lo hi)
-        (goto-char lo)
-        (insert (funcall fn s))))))
+  (let* ((lo (min beg end)) (hi (max beg end))
+         (new (funcall fn (buffer-substring-no-properties lo hi))))
+    (unless (elisprs--replace-chars-in-place lo hi new)
+      (save-excursion
+        (let ((s (buffer-substring lo hi)))
+          (delete-region lo hi)
+          (goto-char lo)
+          (insert (funcall fn s)))))))
 (defun upcase-region (beg end &optional _region) (buffer--map-region beg end #'upcase) nil)
 (defun downcase-region (beg end &optional _region) (buffer--map-region beg end #'downcase) nil)
 (defun capitalize-region (beg end &optional _region) (buffer--map-region beg end #'capitalize) nil)
+;; editfns.c `Fsubst_char_in_region': the text from the first FROMCHAR to END
+;; is rewritten in place (one `modify_text' from there), and nothing at all
+;; happens when FROMCHAR does not occur.
 (defun subst-char-in-region (start end fromchar tochar &optional _noundo)
-  (buffer--map-region start end
-    (lambda (s)
-      (mapconcat (lambda (c) (char-to-string (if (eq c fromchar) tochar c))) (append s nil) "")))
-  nil)
+  (let* ((lo (min start end)) (hi (max start end))
+         (s (buffer-substring-no-properties lo hi))
+         (i (seq-position s fromchar #'eq)))
+    (when i
+      (elisprs--replace-chars-in-place
+       (+ lo i) hi (subst-char-in-string fromchar tochar (substring s i))))
+    nil))
 ;; Case-convert ARG words forward from point, leaving point after them.
 (defun buffer--case-word (arg fn)
   (let ((beg (point)))
@@ -12091,6 +12101,24 @@ A value of t means undo information is not being recorded.")
   "Start keeping undo information for the current buffer."
   (when (eq buffer-undo-list t)
     (setq buffer-undo-list nil)))
+
+;; subr.el `with-silent-modifications': run BODY without it counting as a
+;; modification -- the modified flag is restored unless the buffer was already
+;; modified (and not merely auto-saved) on entry.
+(defvar inhibit-modification-hooks nil)
+(defmacro with-silent-modifications (&rest body)
+  "Execute BODY, pretending it does not modify the buffer."
+  (declare (debug t) (indent 0))
+  (let ((modified (make-symbol "modified")))
+    `(let* ((,modified (buffer-modified-p))
+            (buffer-undo-list t)
+            (inhibit-read-only t)
+            (inhibit-modification-hooks t))
+       (unwind-protect
+           (progn
+             ,@body)
+         (when (memq ,modified '(nil autosaved))
+           (restore-buffer-modified-p ,modified))))))
 
 ;; fundamental-mode (simple.el): the root major mode.  Body is empty; it just
 ;; resets local variables and installs itself as `major-mode'.

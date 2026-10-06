@@ -23,6 +23,10 @@ All notable changes to elisprs are documented here. The format follows
   `%z`'s flags and width follow nstrftime; `print-escape-multibyte` and
   `octalout`'s three-digit rule are honoured; startup no longer writes
   `void-function: put` to stderr.
+  Buffer modification state (`buffer-modified-p`, the two ticks,
+  `with-silent-modifications`), `position-bytes` / `byte-to-position`,
+  in-place region case commands, `%` with flags or a field number, `#` on
+  `%e`/`%f`/`%g`, and `\?` in replacement text.
 - **Round 33 parity vs Emacs 31.1** (see BUGS.md): `search-forward` /
   `search-backward` ignored `case-fold-search`; `forward-word` was not
   syntax.c `scan_words` (negative counts did nothing, the narrowing and the
