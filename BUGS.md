@@ -6165,6 +6165,17 @@ answered 2. It is pcase.el's: every EXP is evaluated first (into a
 temporary unless its pattern is a plain variable), then `pcase-let*`
 destructures them.
 
+### R35-M. ✅ FIXED — `lambda` was not a macro, and `cond` conditions were not expanded
+
+`(macroexpand '(lambda (x) x))` answered the form itself and `(fboundp
+'lambda)` was nil; subr.el defines `lambda` as a macro expanding to
+`#'(lambda ...)`. The compiler still lowers `lambda` directly, and
+`macroexpand`, `macroexpand-1` and the function cell now see the macro, as for
+`when`/`unless`. `macroexpand-all` walked a `cond` clause as a call, so a
+`(lambda ...)` condition kept its bare head; macroexp.el's
+`macroexp--all-clauses` expands every element of every clause. Tracked by
+`tests/parity_lambda_macro_and_cond_clauses.rs`.
+
 ### Still open after round 35
 
 - Subrs carry no interactive spec, so `(commandp 'forward-char)` is nil
@@ -6173,8 +6184,7 @@ destructures them.
 - A macro's function cell is a closure object, not the cons `(macro . FN)`:
   `(car-safe (symbol-function 'push))` is nil where Emacs answers `macro`.
 - `(when)` / `(unless)` with no arguments are compiler intrinsics and answer nil;
-  Emacs signals `(wrong-number-of-arguments (1 . 1) 0)`. `(macroexpand
-  '(lambda ...))` answers the form itself; Emacs expands it to `#'(lambda ...)`.
+  Emacs signals `(wrong-number-of-arguments (1 . 1) 0)`.
 - elisprs expands a top-level form completely before running it, so a macro
   error inside `condition-case` escapes it; Emacs falls back to lazy expansion
   after an eager-expansion failure and the handler catches it.

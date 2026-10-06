@@ -20,6 +20,8 @@ All notable changes to elisprs are documented here. The format follows
   honoured by `format-message`, `error` and `substitute-command-keys`, and
   `substitute-quotes` / `format-prompt` are defined; supplied-p variables bind
   in cl lambda lists; `pcase-let` evaluates every expression before binding.
+  `lambda` is a macro to `macroexpand` and `fboundp`, and `macroexpand-all`
+  expands every form of a `cond` clause.
 - **Round 34 parity vs Emacs 31.1** (see BUGS.md): `match-data` after a
   buffer search answers markers into the searched buffer, appends the buffer
   under INTEGERS, and honours REUSE and RESEAT; `set-match-data` takes markers

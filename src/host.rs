@@ -7126,6 +7126,11 @@ pub fn expand_intrinsic_macro(form: &Value) -> Option<Value> {
         // channel, which this tree does not model.)
         let empty_body = body.is_empty();
         match name.as_str() {
+            // subr.el: (defmacro lambda (&rest cdr) (list 'function (cons 'lambda cdr)))
+            "lambda" => {
+                let function_sym = h.intern("function");
+                Some(h.list_from(vec![function_sym, form.clone()]))
+            }
             // (if COND (progn BODY...)), or (progn COND nil) with no body.
             "when" => {
                 if empty_body {
@@ -7489,6 +7494,32 @@ fn macroexpand_all_impl(
                     apply_cmacros,
                     env,
                 )?);
+            }
+            Ok(with_host(|h| h.list_from(out)))
+        }
+        // macroexp.el: `(cond . ,clauses)` expands every element of every clause
+        // as a form (`macroexp--all-clauses`), the condition included, so a
+        // `(lambda ...)` condition becomes `#'(lambda ...)`. A non-list clause
+        // is kept as it is.
+        Some("cond") => {
+            let mut out = Vec::with_capacity(elems.len());
+            out.push(elems[0].clone());
+            for clause in &elems[1..] {
+                match with_host(|h| h.list_vec(clause)) {
+                    Some(forms) if !forms.is_empty() => {
+                        let mut nc = Vec::with_capacity(forms.len());
+                        for f in &forms {
+                            nc.push(macroexpand_all_impl(
+                                f,
+                                expand_intrinsics,
+                                apply_cmacros,
+                                env,
+                            )?);
+                        }
+                        out.push(with_host(|h| h.list_from(nc)));
+                    }
+                    _ => out.push(clause.clone()),
+                }
             }
             Ok(with_host(|h| h.list_from(out)))
         }

@@ -3527,6 +3527,9 @@ share `error' list it once."
  'when (cons 'macro (lambda (cond &rest body) (list 'if cond (cons 'progn body)))))
 (--set-intrinsic-macro-cell
  'unless (cons 'macro (lambda (cond &rest body) (cons 'if (cons cond (cons nil body))))))
+;; subr.el: (defmacro lambda (&rest cdr) (list 'function (cons 'lambda cdr)))
+(--set-intrinsic-macro-cell
+ 'lambda (cons 'macro (lambda (&rest cdr) (list 'function (cons 'lambda cdr)))))
 (defun add-to-list (var elt &optional append compare-fn)
   "Add ELT to VAR's list value unless it is already there.
 VAR should not name a lexical variable -- the compiler macro below rewrites
