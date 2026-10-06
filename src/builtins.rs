@@ -6889,7 +6889,10 @@ fn read_fn(h: &mut ElispHost, a: &[Value]) -> R {
         let b = &h.buffers[bi];
         let start = marker.as_ref().map_or(b.point, |m| m.borrow().pos);
         let start = start.clamp(b.begv, b.zv);
-        (start, b.text[start - 1..b.zv - 1].iter().collect::<String>())
+        (
+            start,
+            b.text[start - 1..b.zv - 1].iter().collect::<String>(),
+        )
     };
     // Running out of text consumes all of it: point (or the marker) is at
     // `ZV` when `end-of-file` is signalled.
@@ -7146,11 +7149,9 @@ fn random_fn(h: &mut ElispHost, a: &[Value]) -> R {
             if h.is_string(&limit) {
                 let s = as_string(h, &limit)?;
                 // `seed_random`: the same string always restarts the same sequence.
-                let seed = s
-                    .bytes()
-                    .fold(0xcbf2_9ce4_8422_2325u64, |acc, c| {
-                        (acc ^ c as u64).wrapping_mul(0x0100_0000_01b3)
-                    });
+                let seed = s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |acc, c| {
+                    (acc ^ c as u64).wrapping_mul(0x0100_0000_01b3)
+                });
                 RNG_STATE.with(|st| st.set(seed | 1));
             }
         }
