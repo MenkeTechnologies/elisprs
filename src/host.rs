@@ -3750,7 +3750,19 @@ impl ElispHost {
         parts
     }
 
+    /// One nesting level of the printer is a few Rust frames, and with
+    /// `print-circle` non-nil there is no `PRINT_CIRCLE` ceiling at all, so a
+    /// deep-but-finite nest recurses as deep as the data. Grow the stack on
+    /// demand on the same thread, as `reader.rs`'s `read_form` and
+    /// `run_closure` do, so a caller on a default-sized thread (an embedder, a
+    /// libtest worker) prints what the `elisp` binary's interpreter thread prints.
     fn print_inner(&self, v: &Value, readable: bool, depth: usize) -> String {
+        stacker::maybe_grow(128 * 1024, 8 * 1024 * 1024, || {
+            self.print_inner_frame(v, readable, depth)
+        })
+    }
+
+    fn print_inner_frame(&self, v: &Value, readable: bool, depth: usize) -> String {
         // print.c `print_object`'s prologue, in its own order: the whole
         // `being_printed` mechanism (and the `PRINT_CIRCLE` ceiling that guards it)
         // is the `NILP (Vprint_circle)` arm, and the `#N=`/`#N#` label table is the
