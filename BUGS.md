@@ -6190,6 +6190,12 @@ destructures them.
   after an eager-expansion failure and the handler catches it.
 - `(cl-typep 5 '(real 1 (6)))` signals `Bad type spec: (satisfies . FN)` on
   both, but FN prints as an interpreted closure here and as byte code in Emacs.
+- No unibyte strings: `string-limit` with a CODING-SYSTEM, `"\M-a"` in a string
+  literal (Emacs: unibyte `"\341"`) and `encode-coding-string` need them.
+- `?\N{NAME}` needs the Unicode name table; only `U+XXXX` names read.
+- `(defvar X)` without a value marks X special globally; Emacs makes it special
+  only for the enclosing scope, so `special-variable-p` answers nil there.
+- pcase's `(rx ... (let VAR RX))` binding is not supported.
 
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
