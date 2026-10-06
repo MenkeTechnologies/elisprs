@@ -2455,19 +2455,35 @@ fn throw_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// `\=` is NOT an escape here — that is `substitute-command-keys`, a different
 /// function. Measured on GNU Emacs 30.2: `(error "a %s" "x `y'")` keeps the
 /// argument's quotes, and `(error "a \\=`b c")` still curves the backtick.
-fn curve_quotes(fmt: &str) -> String {
+fn curve_quotes(h: &ElispHost, fmt: &str) -> String {
+    // doc.c `Ftext_quoting_style`: `grave` leaves both alone, `straight` turns a
+    // grave accent into an apostrophe, nil or anything else is `curve`.
+    let style = h
+        .find_symbol("text-quoting-style")
+        .and_then(|s| match h.obj(&s) {
+            Some(Obj::Symbol(d)) => d.value.clone(),
+            _ => None,
+        })
+        .and_then(|v| h.sym_name(&v));
     fmt.chars()
-        .map(|c| match c {
-            '`' => '\u{2018}',
-            '\'' => '\u{2019}',
-            other => other,
+        .map(|c| match (c, style.as_deref()) {
+            (_, Some("grave")) => c,
+            ('`', Some("straight")) => '\'',
+            (_, Some("straight")) => c,
+            ('`', _) => '\u{2018}',
+            ('\'', _) => '\u{2019}',
+            _ => c,
         })
         .collect()
 }
 
 /// `el_format` with the format template curve-quoted (`format-message`).
 fn el_format_message(h: &mut ElispHost, a: &[Value]) -> Result<String, String> {
-    match a.first().and_then(|v| h.str_text(v)).map(curve_quotes) {
+    match a
+        .first()
+        .and_then(|v| h.str_text(v))
+        .map(|t| curve_quotes(h, t))
+    {
         Some(curved) => {
             let mut args = a.to_vec();
             args[0] = h.new_string(curved);
@@ -5385,8 +5401,14 @@ fn string_to_number(h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── sxhash ──
-// Hash values are NOT bit-compatible with GNU Emacs (impl-specific), but they are
-// self-consistent: `equal`/`eq`/`eql` objects hash equally, within bounded depth.
+// fns.c's `sxhash_obj` for the objects whose hash Emacs derives from their
+// contents (fixnums, floats, bignums, strings, conses, vectors, bool-vectors),
+// on a 64-bit build (`EMACS_INT_WIDTH` 64, `FIXNUM_BITS` 62). Symbols and the
+// other objects Emacs hashes by address keep an elisprs-local hash: equal
+// objects still hash equally, but the numbers are not Emacs's.
+const SXHASH_MAX_DEPTH: u32 = 3;
+const SXHASH_MAX_LEN: usize = 7;
+const INTMASK: u64 = (1 << 62) - 1;
 fn hash_mix(acc: u64, x: u64) -> u64 {
     (acc ^ x)
         .wrapping_mul(0x100000001b3)
@@ -5399,56 +5421,120 @@ fn hash_bytes(s: &str) -> u64 {
     }
     acc
 }
-/// Structural hash (for `sxhash-equal`), depth-bounded like Emacs.
-fn sxhash_equal(h: &ElispHost, v: &Value, depth: u32) -> u64 {
-    // A bignum hashes by value: `(equal (expt 2 70) (expt 2 70))` is t, so the
-    // two must land in the same bucket even though their handles differ.
-    if let Some(b) = h.as_bigint(v) {
-        return hash_bytes(&b.to_string());
+/// lisp.h `sxhash_combine`.
+fn sxhash_combine(x: u64, y: u64) -> u64 {
+    (x << 4).wrapping_add(x >> 60).wrapping_add(y)
+}
+/// fns.c `hash_char_array` over a string's internal (UTF-8) bytes.
+fn hash_char_array(p: &[u8]) -> u64 {
+    let len = p.len();
+    let mut hash = len as u64;
+    let word = |i: usize| u64::from_ne_bytes(p[i..i + 8].try_into().unwrap());
+    if len >= 8 {
+        let step = 8.max(len >> 3);
+        let mut i = 0;
+        while i + 8 <= len {
+            hash = sxhash_combine(hash, word(i));
+            i += step;
+        }
+        hash = sxhash_combine(hash, word(len - 8));
+    } else {
+        let mut tail = 0u64;
+        let mut i = 0;
+        if len - i >= 4 {
+            tail = (tail << 32) + u32::from_ne_bytes(p[i..i + 4].try_into().unwrap()) as u64;
+            i += 4;
+        }
+        if len - i >= 2 {
+            tail = (tail << 16) + u16::from_ne_bytes(p[i..i + 2].try_into().unwrap()) as u64;
+            i += 2;
+        }
+        if i < len {
+            tail = (tail << 8) + p[i] as u64;
+        }
+        hash = sxhash_combine(hash, tail);
+    }
+    hash
+}
+/// fns.c `sxhash_obj`.
+fn sxhash_obj(h: &ElispHost, v: &Value, depth: u32) -> u64 {
+    if depth > SXHASH_MAX_DEPTH {
+        return 0;
+    }
+    // `sxhash_bignum`: the sign, then each 64-bit limb of the magnitude.
+    if let Some(b) = h.as_bigint(v).filter(|_| h.is_bignum(v)) {
+        let mut hash = u64::from(b.sign() == num_bigint::Sign::Minus);
+        for limb in b.magnitude().iter_u64_digits() {
+            hash = sxhash_combine(hash, limb);
+        }
+        return hash;
     }
     match v {
-        Value::Int(n) => *n as u64,
-        Value::Float(f) => f.to_bits(),
-        Value::Str(s) => hash_bytes(s),
+        Value::Int(n) => (*n as u64) & INTMASK,
+        // `sxhash_float`: one word per double on a 64-bit build.
+        Value::Float(f) => sxhash_combine(0, f.to_bits()),
+        Value::Str(s) => hash_char_array(s.as_bytes()),
+        // `XHASH (Qnil)` is 0: nil is the first entry of `lispsym`.
         Value::Bool(false) | Value::Undef => 0,
         Value::Bool(true) => 1,
         Value::Obj(_) => match h.obj(v) {
-            // A string cell hashes as its text, like a transient: `equal`
-            // compares text, so `sxhash-equal` has to agree.
-            Some(Obj::Str(s)) => hash_bytes(s),
-            Some(Obj::Symbol(s)) => hash_mix(0x5111, hash_bytes(&s.name)),
-            Some(Obj::Cons(car, cdr)) => {
-                if depth >= 5 {
-                    0x3
-                } else {
-                    let (car, cdr) = (car.clone(), cdr.clone());
-                    hash_mix(
-                        hash_mix(0xc0, sxhash_equal(h, &car, depth + 1)),
-                        sxhash_equal(h, &cdr, depth + 1),
-                    )
+            Some(Obj::Str(s)) => hash_char_array(s.as_bytes()),
+            // `XHASH` of a symbol is its tagged address, which on a 64-bit
+            // host stays below 2^47; the name-derived stand-in keeps that range.
+            Some(Obj::Symbol(s)) => hash_mix(0x5111, hash_bytes(&s.name)) & ((1 << 47) - 1),
+            Some(Obj::Cons(..)) => {
+                // `sxhash_list`.
+                let mut hash = 0u64;
+                let mut list = v.clone();
+                if depth < SXHASH_MAX_DEPTH {
+                    let mut i = 0;
+                    while let Some(Obj::Cons(car, cdr)) = h.obj(&list) {
+                        if i >= SXHASH_MAX_LEN {
+                            break;
+                        }
+                        let (car, cdr) = (car.clone(), cdr.clone());
+                        hash = sxhash_combine(hash, sxhash_obj(h, &car, depth + 1));
+                        list = cdr;
+                        i += 1;
+                    }
                 }
+                if !matches!(list, Value::Undef | Value::Bool(false)) {
+                    hash = sxhash_combine(hash, sxhash_obj(h, &list, depth + 1));
+                }
+                hash
             }
             Some(Obj::Vector(items)) => {
-                if depth >= 5 {
-                    0x4
-                } else {
-                    let items = items.clone();
-                    let mut acc = 0x7e;
-                    for it in &items {
-                        acc = hash_mix(acc, sxhash_equal(h, it, depth + 1));
-                    }
-                    acc
+                // `sxhash_vector`.
+                let mut hash = items.len() as u64;
+                for it in items.iter().take(SXHASH_MAX_LEN) {
+                    hash = sxhash_combine(hash, sxhash_obj(h, it, depth + 1));
                 }
+                hash
+            }
+            Some(Obj::BoolVector(bits)) => {
+                // `sxhash_bool_vector`: the size, then the first words of bits.
+                let mut hash = bits.len() as u64;
+                for chunk in bits.chunks(64).take(SXHASH_MAX_LEN) {
+                    let word =
+                        chunk
+                            .iter()
+                            .enumerate()
+                            .fold(0u64, |w, (i, &b)| if b { w | (1 << i) } else { w });
+                    hash = sxhash_combine(hash, word);
+                }
+                hash
             }
             _ => 0x6,
         },
         _ => 0x8,
     }
 }
-/// Identity-ish hash (for `sxhash-eq`): heap objects by arena id, numbers by value.
+/// fns.c `sxhash_eq` (`XHASH (k) ^ XTYPE (k)`) for a fixnum, whose tag is
+/// `Lisp_Int0` (2) or `Lisp_Int1` (6) by its low bit; other objects hash by
+/// identity here (an address in Emacs).
 fn sxhash_eq(v: &Value) -> u64 {
     match v {
-        Value::Int(n) => *n as u64,
+        Value::Int(n) => ((*n as u64) & INTMASK) ^ if n & 1 == 0 { 2 } else { 6 },
         Value::Float(f) => f.to_bits(),
         Value::Bool(false) | Value::Undef => 0,
         Value::Bool(true) => 1,
@@ -5457,22 +5543,23 @@ fn sxhash_eq(v: &Value) -> u64 {
         _ => 0x8,
     }
 }
-/// Mask a raw hash to a non-negative fixnum, as Emacs's sxhash returns.
+/// fns.c `reduce_emacs_uint_to_fixnum`: `SXHASH_REDUCE` folds the top bits in
+/// and masks to `INTMASK`; `make_ufixnum` then reads back as a signed fixnum.
 fn sxhash_fixnum(x: u64) -> Value {
-    Value::Int((x & 0x1FFF_FFFF_FFFF_FFFF) as i64)
+    let r = (x ^ (x >> 2)) & INTMASK;
+    Value::Int(((r << 2) as i64) >> 2)
 }
 fn sxhash_equal_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(sxhash_fixnum(sxhash_equal(h, &a[0], 0)))
+    Ok(sxhash_fixnum(sxhash_obj(h, &a[0], 0)))
 }
 fn sxhash_eq_fn(_h: &mut ElispHost, a: &[Value]) -> R {
     Ok(sxhash_fixnum(sxhash_eq(&a[0])))
 }
 fn sxhash_eql_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    // eql: numbers by value (bignums included — they are `eql` by value),
-    // everything else by identity.
+    // fns.c `sxhash_eql`: floats and bignums by value, the rest as `sxhash_eq`.
     let x = match &a[0] {
-        Value::Int(_) | Value::Float(_) => sxhash_equal(h, &a[0], 0),
-        other if h.is_bignum(other) => sxhash_equal(h, other, 0),
+        Value::Float(_) => sxhash_obj(h, &a[0], 0),
+        other if h.is_bignum(other) => sxhash_obj(h, other, 0),
         other => sxhash_eq(other),
     };
     Ok(sxhash_fixnum(x))

@@ -15,7 +15,11 @@ All notable changes to elisprs are documented here. The format follows
   pcase.el's; a macro called with the wrong argument count names its expander
   (or `(MANDATORY . NONREST)` for preloaded macros); `(lambda ...)` lists are
   callable, `functionp` and have a `func-arity`; `commandp` and
-  `interactive-form` are ported (`commandp` was a stub).
+  `interactive-form` are ported (`commandp` was a stub). `sxhash-equal`,
+  `sxhash-eql` and `sxhash-eq` compute fns.c's values; `text-quoting-style` is
+  honoured by `format-message`, `error` and `substitute-command-keys`, and
+  `substitute-quotes` / `format-prompt` are defined; supplied-p variables bind
+  in cl lambda lists; `pcase-let` evaluates every expression before binding.
 - **Round 34 parity vs Emacs 31.1** (see BUGS.md): `match-data` after a
   buffer search answers markers into the searched buffer, appends the buffer
   under INTEGERS, and honours REUSE and RESEAT; `set-match-data` takes markers

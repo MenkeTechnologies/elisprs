@@ -6123,6 +6123,48 @@ vectors (keyboard macros), autoloads (the INTERACTIVE element) and the
 `interactive-form` symbol property. `closurep` is nil for a macro, whose cell
 is a cons in Emacs.
 
+### R35-I. ✅ FIXED — `sxhash-equal` / `sxhash-eql` / `sxhash-eq` values
+
+The hashes were an elisprs-local FNV mix: `(sxhash-equal 1)` was
+`980419151183746833` where Emacs answers 1. They are now fns.c's `sxhash_obj`
+on a 64-bit build — fixnums by their 62-bit value, floats by their bits,
+bignums by sign and limbs, strings by `hash_char_array` over their UTF-8
+bytes, lists and vectors combined to depth 3 and length 7, bool-vectors by
+words — reduced by `reduce_emacs_uint_to_fixnum`, which can give a negative
+fixnum. A fixnum's `sxhash-eq`/`sxhash-eql` is `XHASH ^ XTYPE`. Symbols and
+other objects Emacs hashes by address keep a stand-in in the address range.
+Tracked by `tests/parity_sxhash_quoting_and_supplied_p.rs`.
+
+```text
+(list (sxhash-equal "abc") (sxhash-equal -1) (sxhash-eql 1.5))
+emacs:   (8059383 -1152921504606846976 -1151232654746583040)
+before:  (302266944369876780 2305843009213693951 2303591209400008704)
+```
+
+### R35-J. ✅ FIXED — `text-quoting-style`
+
+The variable did not exist and `(text-quoting-style)` always answered `curve`,
+so `(let ((text-quoting-style 'grave)) (format-message "`x'"))` curved the
+quotes. doc.c's `Ftext_quoting_style` now reads it (`grave`, `straight`, else
+`curve`), and `format-message`, `error`/`user-error`/`message` and
+`substitute-command-keys` follow it as `styled_format` and help.el do.
+help.el's `substitute-quotes` and minibuffer.el's `format-prompt` (with
+`minibuffer-default-prompt-format`) were void and are defined.
+
+### R35-K. ✅ FIXED — supplied-p variables in cl lambda lists
+
+`(VAR DEFAULT SVAR)` after `&optional` or `&key` left SVAR unbound
+(`void-variable`), in `cl-destructuring-bind`, `cl-defun` and `cl-defmacro`.
+SVAR is now t exactly when the argument was supplied, and a
+`((KEYWORD VAR) DEFAULT SVAR)` key spec names its keyword.
+
+### R35-L. ✅ FIXED — `pcase-let` bound sequentially
+
+`pcase-let` was `pcase-let*`, so `(let ((a 1)) (pcase-let ((a 2) (b a)) b))`
+answered 2. It is pcase.el's: every EXP is evaluated first (into a
+temporary unless its pattern is a plain variable), then `pcase-let*`
+destructures them.
+
 ### Still open after round 35
 
 - Subrs carry no interactive spec, so `(commandp 'forward-char)` is nil

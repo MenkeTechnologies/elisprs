@@ -1594,8 +1594,14 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
   (if ignore-case (string-lessp (downcase s1) (downcase s2)) (string-lessp s1 s2)))
 (defun string-collate-equalp (s1 s2 &optional _locale ignore-case)
   (if ignore-case (string-equal (downcase s1) (downcase s2)) (string-equal s1 s2)))
-;; Curly quotes are always displayable here, so the effective style is `curve'.
-(defun text-quoting-style () 'curve)
+;; doc.c `Ftext_quoting_style': `grave' and `straight' are taken as given; nil
+;; and anything else are `curve' (startup sets `internal--text-quoting-flag' and
+;; curved quotes are always displayable here).
+(defvar text-quoting-style nil)
+(defun text-quoting-style ()
+  (cond ((eq text-quoting-style 'grave) 'grave)
+        ((eq text-quoting-style 'straight) 'straight)
+        (t 'curve)))
 (defun string-reverse (s) (reverse s))
 ;; `upcase` / `downcase` are primitive subrs (accept a string or a character).
 (defun char-or-string--check (s)
@@ -3025,7 +3031,12 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
 ;;   (format-message "a \\=`b")        => "a \\=‘b"
 ;;   (substitute-command-keys "a \\=`b") => "a `b"
 (defun --curve-quotes-- (string)
-  (and string (string-replace "'" "’" (string-replace "`" "‘" string))))
+  ;; help.el `substitute-quotes', which `styled_format' agrees with.
+  (and string
+       (cond ((eq (text-quoting-style) 'curve)
+              (string-replace "'" "’" (string-replace "`" "‘" string)))
+             ((eq (text-quoting-style) 'straight) (string-replace "`" "'" string))
+             (t string))))
 (defun format-message (fmt &rest args)
   (apply (function format) (--curve-quotes-- fmt) args))
 ;; `substitute-command-keys' without a keymap database: the key-substitution
@@ -3049,10 +3060,34 @@ Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
          ((and (eq c ?\\) (< (+ i 2) n) (eq (aref string (1+ i)) ?=))
           (push (aref string (+ i 2)) out)
           (setq i (+ i 3)))
-         ((eq c ?`) (push ?‘ out) (setq i (1+ i)))
-         ((eq c ?') (push ?’ out) (setq i (1+ i)))
+         ((and (eq c ?`) (eq (text-quoting-style) 'curve)) (push ?‘ out) (setq i (1+ i)))
+         ((and (eq c ?') (eq (text-quoting-style) 'curve)) (push ?’ out) (setq i (1+ i)))
+         ((and (eq c ?`) (eq (text-quoting-style) 'straight)) (push ?' out) (setq i (1+ i)))
          (t (push c out) (setq i (1+ i)))))
       (apply (function string) (nreverse out)))))
+;; help.el `substitute-quotes'.
+(defun substitute-quotes (string)
+  (cond ((eq (text-quoting-style) 'curve)
+         (string-replace "`" "‘"
+                         (string-replace "'" "’" string)))
+        ((eq (text-quoting-style) 'straight)
+         (string-replace "`" "'" string))
+        (t string)))
+;; minibuffer.el `format-prompt' and its format.
+(defvar minibuffer-default-prompt-format " (default %s)")
+(defun format-prompt (prompt default &rest format-args)
+  (concat
+   (if (null format-args)
+       (substitute-command-keys prompt)
+     (apply #'format (substitute-command-keys prompt) format-args))
+   (and default
+        (or (not (stringp default))
+            (length> default 0))
+        (format (substitute-command-keys minibuffer-default-prompt-format)
+                (if (consp default)
+                    (car default)
+                  default)))
+   ": "))
 (defun cl--digitp (c) (and (>= c ?0) (<= c ?9)))
 ;; value<: a canonical total order within a type (numbers/strings/symbols/lists/
 ;; vectors); cross-type comparison signals an error, like Emacs 30.
@@ -6571,17 +6606,29 @@ reports and the one a hash table's slots are observable in."
           (let ((var (if (consp a) (car a) a)) (def (and (consp a) (car (cdr a)))))
             (setq binds (cons (list var def) binds))))
          ((eq mode 'key)
-          (let* ((var (if (consp a) (car a) a))
+          ;; cl-macs.el: VAR, (VAR DEFAULT SVAR) or ((KEYWORD VAR) DEFAULT SVAR);
+          ;; SVAR is t when the keyword was supplied.
+          (let* ((spec (if (consp a) (car a) a))
+                 (var (if (consp spec) (car (cdr spec)) spec))
                  (def (and (consp a) (car (cdr a))))
-                 (kw (intern (concat ":" (symbol-name var)))))
+                 (svar (and (consp a) (car (cdr (cdr a)))))
+                 (kw (if (consp spec) (car spec) (intern (concat ":" (symbol-name var))))))
             (setq keywords (cons kw keywords))
             (setq binds (cons (list var (list 'cl-db--plist-get (list 'nthcdr i v)
                                               (list 'quote kw) def))
-                              binds))))
+                              binds))
+            (when svar
+              (setq binds (cons (list svar (list 'and (list 'plist-member (list 'nthcdr i v)
+                                                           (list 'quote kw))
+                                                 t))
+                                binds)))))
          ((eq mode 'opt)
-          (let ((var (if (consp a) (car a) a)) (def (and (consp a) (car (cdr a)))))
+          (let ((var (if (consp a) (car a) a)) (def (and (consp a) (car (cdr a))))
+                (svar (and (consp a) (car (cdr (cdr a))))))
             (setq binds (cons (list var (list 'if (list 'nthcdr i v) (list 'nth i v) def))
                               binds))
+            (when svar
+              (setq binds (cons (list svar (list 'and (list 'nthcdr i v) t)) binds)))
             (setq i (1+ i))))
          ((consp a)
           ;; Nested pattern: bind a temp to the element, then destructure it.
@@ -7628,9 +7675,9 @@ or the result is already atomic/grouped."
   `(let ((--pcase-v-- ,expr))
      (cond ,@(mapcar (function pcase--clause) clauses)
            (t (error "No clause matching `%S'" --pcase-v--)))))
-(defmacro pcase-let (bindings &rest body)
+(defmacro pcase-let* (bindings &rest body)
   ;; Each binding is (PATTERN VALUE); destructure VALUE against PATTERN (reusing
-  ;; `pcase--compile'), binding the pattern variables for BODY.
+  ;; `pcase--compile'), binding the pattern variables for BODY, in order.
   (let ((lets nil) (i 0))
     (dolist (b bindings)
       (let* ((tv (intern (concat "--pl-" (number-to-string i) "--")))
@@ -7639,9 +7686,23 @@ or the result is already atomic/grouped."
         (dolist (bind (cdr r)) (setq lets (cons bind lets)))
         (setq i (1+ i))))
     `(let* ,(reverse lets) ,@body)))
-(defmacro pcase-let* (bindings &rest body)
-  ;; Sequential pcase-let; our `let*' expansion already binds in order.
-  (cons 'pcase-let (cons bindings body)))
+;; pcase.el `pcase-let': every EXP is evaluated first (into a temporary unless
+;; the pattern is a plain variable), then `pcase-let*' destructures them.
+(defmacro pcase-let (bindings &rest body)
+  (if (null (cdr bindings))
+      `(pcase-let* ,bindings ,@body)
+    (let ((matches '()))
+      (dolist (binding (prog1 bindings (setq bindings nil)))
+        (cond
+         ((memq (car binding) '(t _ pcase--dontcare))
+          (push (cons (make-symbol "_") (cdr binding)) bindings))
+         ((and (symbolp (car binding)) (not (memq (car binding) '(t _ pcase--dontcare))))
+          (push binding bindings))
+         (t
+          (let ((tmpvar (make-symbol (format "x%d" (length bindings)))))
+            (push (cons tmpvar (cdr binding)) bindings)
+            (push (list (car binding) tmpvar) matches)))))
+      `(let ,(nreverse bindings) (pcase-let* ,matches ,@body)))))
 (defmacro pcase-lambda (lambda-list &rest body)
   "A `lambda' whose parameters may be pcase PATTERNS instead of names.
 Each pattern parameter becomes a fresh name that a `pcase-let*' destructures
