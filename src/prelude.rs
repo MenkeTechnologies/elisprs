@@ -15064,6 +15064,13 @@ and if a matching region is found, place point at the start of the region."
       (if f (function-documentation f)
         (signal 'void-function (list function)))))
    ((eq (car-safe function) 'macro) (function-documentation (cdr function)))
+   ;; elisprs holds a defmacro's `(macro . FN)' as FN's closure flagged as a
+   ;; macro: `car-safe' does not open it and `closurep' rejects it, but its
+   ;; docstring slot is FN's.
+   ((and (not (symbolp function)) (macrop function))
+    (when (> (length function) 4)
+      (let ((doc (aref function 4)))
+        (when (or (stringp doc) (fixnump doc) (fixnump (cdr-safe doc))) doc))))
    ((subrp function) nil)
    (t (signal 'invalid-function (list function)))))
 (defun documentation (function &optional raw)

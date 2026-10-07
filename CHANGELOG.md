@@ -22,6 +22,8 @@ All notable changes to elisprs are documented here. The format follows
   in cl lambda lists; `pcase-let` evaluates every expression before binding.
   `lambda` is a macro to `macroexpand` and `fboundp`, and `macroexpand-all`
   expands every form of a `cond` clause.
+  `documentation` of a `defmacro` returns its docstring again (it signalled
+  `invalid-function` once `closurep` stopped answering t for a macro cell).
 - **Round 34 parity vs Emacs 31.1** (see BUGS.md): `match-data` after a
   buffer search answers markers into the searched buffer, appends the buffer
   under INTEGERS, and honours REUSE and RESEAT; `set-match-data` takes markers
