@@ -44,7 +44,7 @@
 
 ## [0x00] SYSTEM SCAN
 
-**Positioning:** Emacs Lisp has only ever run inside Emacs. `elisprs` takes the language out of the editor and runs `.el` as ordinary programs — with a REPL, no Emacs process required. It is built to become the fifth language hosted on [`fusevm`](https://github.com/MenkeTechnologies/fusevm), after `zshrs`, `stryke`, `awkrs`, and `vimlrs`.
+**Positioning:** Emacs Lisp has only ever run inside Emacs. `elisprs` takes the language out of the editor and runs `.el` as ordinary programs — with a REPL, no Emacs process required. It is a language hosted on [`fusevm`](https://github.com/MenkeTechnologies/fusevm).
 
 **Why it's built this way:** Emacs Lisp is a **Lisp-2** (every symbol carries a separate *value* cell and *function* cell) and supports both **lexical and dynamic** scoping. Those facts are the whole personality of the language, so elisprs owns the value model and the semantics, and leans on `fusevm` purely for execution:
 
@@ -97,7 +97,7 @@ elisp --version
 
 **Reader syntax.** integers, floats, strings (with escapes), symbols (including `1+` / `1-` / `<=` / `:keywords`), `nil` / `t`, `'quote`, `#'function`, `?c` char literals, `;` comments, backquote (`` ` `` / `,` / `,@`), radix literals (`#x1f` / `#o17` / `#b101` / `#16rFF`), `#:uninterned` and `##` (the empty-named symbol), `#s(NAME …)` records and `#s(hash-table …)`, `#&N"…"` bool-vectors, `#("text" START END PLIST …)` propertized strings, and `#N=` / `#N#` labels for shared and circular structure — so anything the printer emits under `print-circle` reads back to the same object graph.
 
-**Special forms (21).** `quote` `function` `lambda` `progn` `prog1` `if` `when` `unless` `cond` `and` `or` `while` `setq` `let` `let*` `defun` `defmacro` `defvar` `defconst` `condition-case` `unwind-protect`.
+**Special forms.** `quote` `function` `lambda` `progn` `prog1` `if` `when` `unless` `cond` `and` `or` `while` `setq` `let` `let*` `defun` `defmacro` `defvar` `defconst` `condition-case` `unwind-protect`.
 
 **Subrs.** (The live count is whatever `elisp -e "(let ((n 0)) (mapatoms (lambda (s) (when (and (fboundp s) (subrp (symbol-function s))) (setq n (1+ n))))) n)"` reports; it moves every round, so it is not written down here.)
 
@@ -212,7 +212,7 @@ The grid reflects the current state of the tree.
 | `Value` / `List` / `Symbol` model (`rust_lisp`) | Reused |
 | Lisp-2 obarray (value + function cells) | Working |
 | Dynamic binding (`let`/`let*`, special vars) | Working |
-| Special forms (21) + macros (`defmacro`) | Working |
+| Special forms + macros (`defmacro`) | Working |
 | Subr standard library | Working |
 | Hash tables (`make-hash-table`/`gethash`/`puthash`/`maphash`) | Working |
 | Dotted pairs, backquote/unquote, `setcar`/`setcdr` | Working |
