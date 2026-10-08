@@ -166,3 +166,15 @@ fn startup_writes_nothing_to_stderr() {
         .expect("run elisp");
     assert_eq!(String::from_utf8_lossy(&out.stderr), "");
 }
+
+/// lread.c `read_internal_start` reads ONE object from a string stream and
+/// never looks at what follows it: `(read "a)")` is `a`. elisprs parsed the
+/// whole string and signalled on the trailing text.
+#[test]
+fn read_from_a_string_ignores_what_follows() {
+    check(
+        "(mapcar (lambda (s) (condition-case e (read s) (error e))) \
+                 '(\"a)\" \"1 2\" \"a]\" \"(a))\" \"\\\"x\\\")\" \"\" \"(a\"))",
+        "(a 1 a (a) \"x\" (end-of-file) (end-of-file))",
+    );
+}

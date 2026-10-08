@@ -7064,13 +7064,11 @@ fn read_fn(h: &mut ElispHost, a: &[Value]) -> R {
             Some(idx) => (idx, Some(m.clone())),
             None => return Err("error: Marker does not point anywhere".to_string()),
         },
+        // lread.c `read_internal_start`: one object from the start of the
+        // string; whatever follows it is never looked at.
         _ => {
             let s = as_string(h, &stream)?;
-            let forms = crate::reader::read_all(h, &s)?;
-            return forms
-                .into_iter()
-                .next()
-                .ok_or_else(|| "end-of-file".to_string());
+            return crate::reader::read_one(h, &s, 0).map(|(form, _)| form);
         }
     };
     let (start, text) = {
