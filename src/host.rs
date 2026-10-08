@@ -91,10 +91,11 @@ pub enum SerObj {
         body: Chunk,
         is_macro: bool,
         /// The captured lexical environment, innermost binding first, as
-        /// `(symbol-handle, value)`. A closure without its captures is a closure
-        /// whose body cannot run.
+        /// `(symbol-handle, value)`, the value None for a local special
+        /// declaration. A closure without its captures is a closure whose body
+        /// cannot run.
         #[serde(default)]
-        env: Vec<(u32, Value)>,
+        env: Vec<(u32, Option<Value>)>,
         /// Dynamic-binding closure — see [`Obj::Closure::dynamic`].
         #[serde(default)]
         dynamic: bool,
@@ -205,6 +206,11 @@ pub struct Scope {
     /// and answer 1.
     val: Rc<RefCell<Value>>,
     parent: Lex,
+    /// A bare SYMBOL in Emacs's environment rather than a `(SYMBOL . VALUE)`
+    /// binding: what eval.c `Fdefvar` conses on for a value-less `(defvar
+    /// SYMBOL)`, declaring SYMBOL dynamically bound for the rest of the scope.
+    /// It binds nothing, so lookups and `setq` pass over it.
+    special: bool,
 }
 pub type Lex = Option<Rc<Scope>>;
 
@@ -215,13 +221,31 @@ impl Scope {
             sym,
             val: Rc::new(RefCell::new(val)),
             parent,
+            special: false,
         }
+    }
+
+    /// A local special declaration of SYM, linked in front of `parent`.
+    pub(crate) fn declaration(sym: u32, parent: Lex) -> Self {
+        Scope {
+            special: true,
+            ..Scope::new(sym, Value::Undef, parent)
+        }
+    }
+    /// Whether this node is a local special declaration, not a binding.
+    pub(crate) fn is_declaration(&self) -> bool {
+        self.special
     }
 
     /// A node re-using an existing binding's value cell — the pruned-capture
     /// counterpart of Emacs's `(assq fv env)`, which hands back the same cons.
     pub(crate) fn sharing(sym: u32, val: Rc<RefCell<Value>>, parent: Lex) -> Self {
-        Scope { sym, val, parent }
+        Scope {
+            sym,
+            val,
+            parent,
+            special: false,
+        }
     }
 
     /// The bound symbol's arena handle.
@@ -246,7 +270,7 @@ impl Scope {
         while let Some(s) = cur {
             // Head is the newest binding: the first match down the chain
             // shadows older same-name bindings (Emacs lexical `let*`).
-            if s.sym == sym {
+            if s.sym == sym && !s.special {
                 return Some(s.val.borrow().clone());
             }
             cur = s.parent.clone();
@@ -258,8 +282,31 @@ impl Scope {
         while let Some(s) = cur {
             // Newest binding wins (see `lookup`): `setq` updates the most
             // recently established cell for the symbol.
-            if s.sym == sym {
+            if s.sym == sym && !s.special {
                 *s.val.borrow_mut() = val.clone();
+                return true;
+            }
+            cur = s.parent.clone();
+        }
+        false
+    }
+    /// eval.c `Flet`'s `Fmemq (var, Vinternal_interpreter_environment)`: a
+    /// local special declaration of SYM is in force.
+    fn declares_special(self: &Rc<Scope>, sym: u32) -> bool {
+        let mut cur = Some(self.clone());
+        while let Some(s) = cur {
+            if s.sym == sym && s.special {
+                return true;
+            }
+            cur = s.parent.clone();
+        }
+        false
+    }
+    /// Whether the chain holds a lexical binding (not only declarations).
+    pub(crate) fn has_bindings(self: &Rc<Scope>) -> bool {
+        let mut cur = Some(self.clone());
+        while let Some(s) = cur {
+            if !s.special {
                 return true;
             }
             cur = s.parent.clone();
@@ -1114,9 +1161,10 @@ pub struct ElispHost {
 
 /// What [`ElispHost::closure_parts`] reports: `(is_macro, dynamic, arglist,
 /// body, captures)`, where `captures` is the lexical chain innermost-first as
-/// `(symbol-handle, value)`. This is exactly the `#[ARGLIST BODY ENV]`
-/// structure Emacs's `equal` walks for an interpreted closure.
-pub type ClosureParts = (bool, bool, Value, Vec<Value>, Vec<(u32, Value)>);
+/// `(symbol-handle, value)`, a local special declaration's value being None.
+/// This is exactly the `#[ARGLIST BODY ENV]` structure Emacs's `equal` walks
+/// for an interpreted closure.
+pub type ClosureParts = (bool, bool, Value, Vec<Value>, Vec<(u32, Option<Value>)>);
 
 /// A closure's printable source: the arglist as written and the body forms.
 #[derive(Default)]
@@ -2334,6 +2382,17 @@ impl ElispHost {
         Ok(())
     }
     /// Mark a symbol special (dynamically scoped) — used by `defvar`/`defconst`.
+    /// eval.c `Fdefvar` with no VALUE: under lexical binding, a variable that
+    /// is not already special becomes dynamically bound for the rest of the
+    /// current scope only — a bare symbol consed onto the environment — and
+    /// `special-variable-p` stays nil. Under dynamic binding it does nothing.
+    pub fn declare_special_locally(&mut self, v: &Value) {
+        let Some(id0) = self.sym_handle(v) else { return };
+        let id = self.indirect_var(id0);
+        if !self.dynamic_binding && !self.is_special(id) {
+            self.lex = Some(Rc::new(Scope::declaration(id, self.lex.take())));
+        }
+    }
     pub fn set_special(&mut self, v: &Value) {
         if let Some(id) = self.sym_handle(v) {
             if let Obj::Symbol(s) = &mut self.arena[id as usize] {
@@ -2609,17 +2668,16 @@ impl ElispHost {
     /// the dynamic path, which is what makes a `lambda` made in that mode see the
     /// caller's bindings and not its birthplace's.
     pub fn bind_here(&mut self, id: u32, val: Value) {
-        if self.dynamic_binding || self.is_special(id) {
+        if self.dynamic_binding
+            || self.is_special(id)
+            || self.lex.as_ref().is_some_and(|s| s.declares_special(id))
+        {
             let _ = self.specbind(&Value::Obj(id), val);
         } else {
             // Cons a fresh single-binding node onto the lexical chain. A later
             // same-name rebind conses another node in front (shadows it);
             // closures that captured the earlier head never see it.
-            self.lex = Some(Rc::new(Scope {
-                sym: id,
-                val: Rc::new(RefCell::new(val)),
-                parent: self.lex.take(),
-            }));
+            self.lex = Some(Rc::new(Scope::new(id, val, self.lex.take())));
         }
     }
     /// Bind a symbol value into the current scope (lexical/dynamic per special).
@@ -2754,7 +2812,12 @@ impl ElispHost {
     /// one template, and re-walking its source every time would put an O(body)
     /// cost on every evaluation of the `lambda` form.
     fn trim_lex(&mut self, template_id: u32, src: &Rc<ClosureSrc>) -> Lex {
-        self.lex.as_ref()?;
+        // cconv.el skips the analysis when the environment has no lexical
+        // binding (`(null lexvars)`), keeping it — local special declarations
+        // included — exactly as it is.
+        if !self.lex.as_ref()?.has_bindings() {
+            return self.lex.clone();
+        }
         let free = match self.closure_free.get(&template_id) {
             Some(f) => Rc::clone(f),
             None => {
@@ -2766,18 +2829,34 @@ impl ElispHost {
             }
         };
         let mut kept: Vec<(u32, Rc<RefCell<Value>>)> = Vec::new();
+        let mut declared: Vec<u32> = Vec::new();
         let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut cur = self.lex.clone();
         while let Some(scope) = cur {
             let sym = scope.sym_handle();
-            if free.contains(&sym) && seen.insert(sym) {
+            if scope.is_declaration() {
+                declared.push(sym);
+            } else if free.contains(&sym) && seen.insert(sym) {
                 kept.push((sym, scope.value_cell()));
             }
             cur = scope.parent_lex();
         }
-        // `kept` is innermost-first; re-link from the outermost in so the head
-        // stays the innermost binding.
+        // `newenv` is `(nconc LEXICAL-CAPTURES DYNS)`: the declarations kept are
+        // the ones the body `let`-binds (`cconv--dynbindings`), after the
+        // captured bindings.
+        let dyns: Vec<u32> = if declared.is_empty() {
+            Vec::new()
+        } else {
+            crate::freevars::let_bound_vars(self, &src.arglist, &src.body)
+                .into_iter()
+                .filter(|s| declared.contains(s))
+                .collect()
+        };
+        // Re-link from the outermost in so the head stays the innermost binding.
         let mut env: Lex = None;
+        for &sym in dyns.iter().rev() {
+            env = Some(Rc::new(Scope::declaration(sym, env)));
+        }
         for (sym, cell) in kept.into_iter().rev() {
             env = Some(Rc::new(Scope::sharing(sym, cell, env)));
         }
@@ -2826,7 +2905,8 @@ impl ElispHost {
                 let mut captures = Vec::new();
                 let mut cur = env.clone();
                 while let Some(scope) = cur {
-                    captures.push((scope.sym_handle(), scope.value()));
+                    let val = (!scope.is_declaration()).then(|| scope.value());
+                    captures.push((scope.sym_handle(), val));
                     cur = scope.parent_lex();
                 }
                 Some((
@@ -2858,13 +2938,20 @@ impl ElispHost {
             Value::Undef
         } else {
             let mut cells = Vec::new();
+            let only_declarations = env.as_ref().is_some_and(|s| !s.has_bindings());
             let mut cur = env;
             while let Some(scope) = cur {
                 let name = Value::Obj(scope.sym_handle());
-                cells.push(self.cons(name, scope.value()));
+                if scope.is_declaration() {
+                    cells.push(name);
+                } else {
+                    cells.push(self.cons(name, scope.value()));
+                }
                 cur = scope.parent_lex();
             }
-            if cells.is_empty() {
+            // An environment of declarations only was kept whole, down to the
+            // `t` that ends every lexical environment.
+            if cells.is_empty() || only_declarations {
                 cells.push(Value::Bool(true));
             }
             self.list_from(cells)
@@ -2970,11 +3057,7 @@ impl ElispHost {
         // Prepend in reverse so slot[0] ends up frontmost (found first on lookup).
         let mut env = base_env;
         for (k, &sym) in slots.iter().enumerate().rev() {
-            env = Some(Rc::new(Scope {
-                sym,
-                val: Rc::new(RefCell::new(vals[k].clone())),
-                parent: env.take(),
-            }));
+            env = Some(Rc::new(Scope::new(sym, vals[k].clone(), env.take())));
         }
         let newv = self.alloc(Obj::Closure {
             params,
@@ -3089,15 +3172,25 @@ impl ElispHost {
     /// (`t` is Emacs's marker that the closure is lexically bound).
     fn captured_alist(&self, env: &Lex, readable: bool, depth: usize) -> String {
         let mut cells = Vec::new();
+        let only_declarations = env.as_ref().is_some_and(|s| !s.has_bindings());
         let mut cur = env.clone();
         while let Some(scope) = cur {
             let name = match self.arena.get(scope.sym_handle() as usize) {
                 Some(Obj::Symbol(s)) => s.name.clone(),
                 _ => break,
             };
-            let val = self.print_inner(&scope.value(), readable, depth + 1);
-            cells.push(format!("({name} . {val})"));
+            if scope.is_declaration() {
+                cells.push(name);
+            } else {
+                let val = self.print_inner(&scope.value(), readable, depth + 1);
+                cells.push(format!("({name} . {val})"));
+            }
             cur = scope.parent_lex();
+        }
+        // An environment of declarations only was kept whole (cconv.el's
+        // `(null lexvars)` case), down to the `t` that ends it.
+        if only_declarations {
+            cells.push("t".to_string());
         }
         if cells.is_empty() {
             "(t)".to_string()
@@ -3176,23 +3269,28 @@ impl ElispHost {
     }
     /// Snapshot the value cells of symbols in `[start, end)` (used to capture the
     /// post-prelude baseline before running a user script for the cache).
-    /// A scope chain as `(symbol-handle, value)` pairs, innermost first.
-    pub fn flatten_lex(&self, env: &Lex) -> Vec<(u32, Value)> {
+    /// A scope chain as `(symbol-handle, value)` pairs, innermost first; a
+    /// local special declaration has no value.
+    pub fn flatten_lex(&self, env: &Lex) -> Vec<(u32, Option<Value>)> {
         let mut out = Vec::new();
         let mut cur = env.clone();
         while let Some(scope) = cur {
-            out.push((scope.sym_handle(), scope.value()));
+            let val = (!scope.is_declaration()).then(|| scope.value());
+            out.push((scope.sym_handle(), val));
             cur = scope.parent_lex();
         }
         out
     }
 
     /// Rebuild a scope chain from [`Self::flatten_lex`]'s output.
-    pub fn rebuild_lex(&self, pairs: Vec<(u32, Value)>) -> Lex {
+    pub fn rebuild_lex(&self, pairs: Vec<(u32, Option<Value>)>) -> Lex {
         let mut env: Lex = None;
         // Innermost first on the way out, so re-link from the outermost in.
         for (sym, val) in pairs.into_iter().rev() {
-            env = Some(Rc::new(Scope::new(sym, val, env)));
+            env = Some(Rc::new(match val {
+                Some(val) => Scope::new(sym, val, env),
+                None => Scope::declaration(sym, env),
+            }));
         }
         env
     }
@@ -6732,26 +6830,6 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 if matches!(form, Value::Bool(true)) {
                     return Ok(form.clone());
                 }
-                // eval.c `eval_sub` interprets a `progn` one subform at a time,
-                // expanding each only when it is reached, so a `cl-defstruct`,
-                // `defmacro` or `gv-define-setter` earlier in the body is in
-                // effect for the forms after it. Compiling the whole form first
-                // expanded `(setf (S-x p) v)` before S existed.
-                let progn_body = with_host(|h| {
-                    h.list_vec(form)
-                        .filter(|v| !v.is_empty() && h.sym_name(&v[0]).as_deref() == Some("progn"))
-                });
-                if let Some(body) = progn_body {
-                    let mut last = Value::Undef;
-                    for sub in &body[1..] {
-                        let mut sub_args = vec![sub.clone()];
-                        sub_args.extend(args.get(1).cloned());
-                        last = call_function(f, &sub_args)?;
-                    }
-                    return Ok(last);
-                }
-                let expanded = macroexpand_all_for_eval(form)?;
-                let chunk = with_host(|h| crate::compiler::compile_top(h, &expanded))?;
                 // FORM is evaluated in the lexical environment given by LEXICAL —
                 // NOT in the caller's. `(let ((x 5)) (eval 'x t))` signals
                 // `void-variable x` in Emacs: `t` means "lexical binding, empty
@@ -6766,7 +6844,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 let lexical = args.get(1).is_some_and(el_truthy);
                 let saved = with_host(|h| h.take_lex());
                 let prev_mode = with_host(|h| std::mem::replace(&mut h.dynamic_binding, !lexical));
-                let out = run_chunk(chunk);
+                let out = eval_in_place(form);
                 with_host(|h| {
                     h.restore_lex(saved);
                     h.dynamic_binding = prev_mode;
@@ -8333,6 +8411,35 @@ pub fn ext_dispatch(vm: &mut VM, id: u16, arg: u8) {
     }
 }
 
+/// The body of `eval` once its environment is in place. eval.c `eval_sub`
+/// interprets a `progn` one subform at a time, expanding each only when it is
+/// reached, so a `cl-defstruct`, `defmacro` or `gv-define-setter` earlier in
+/// the body is in effect for the forms after it (compiling the whole form
+/// first expanded `(setf (S-x p) v)` before S existed). The subforms share one
+/// environment, so a value-less `(defvar SYM)` among them reaches the rest.
+fn eval_in_place(form: &Value) -> Result<Value, String> {
+    let progn_body = with_host(|h| {
+        h.list_vec(form)
+            .filter(|v| !v.is_empty() && h.sym_name(&v[0]).as_deref() == Some("progn"))
+    });
+    if let Some(body) = progn_body {
+        let mut last = Value::Undef;
+        for sub in &body[1..] {
+            last = eval_in_place(sub)?;
+        }
+        return Ok(last);
+    }
+    // `t` is a self-evaluating constant symbol (its value slot holds itself),
+    // represented as `Value::Bool(true)`, which `compile_top` would lower to
+    // the integer 1.
+    if matches!(form, Value::Bool(true)) {
+        return Ok(form.clone());
+    }
+    let expanded = macroexpand_all_for_eval(form)?;
+    let chunk = with_host(|h| crate::compiler::compile_top(h, &expanded))?;
+    run_chunk(chunk)
+}
+
 /// The printed source of a closure the `eval` walk built, settled when the
 /// closure is made — cconv.el `cconv-make-interpreted-closure`, which eval.c
 /// `Ffunction` calls with the lambda's body as written:
@@ -8351,7 +8458,11 @@ fn eval_closure_source(clo: &Value) -> Result<(), String> {
     let Some((arglist, raw, has_lexvars)) = with_host(|h| match h.obj(clo) {
         Some(Obj::Closure { src, dynamic, .. }) => {
             let raw = src.raw_body.clone()?;
-            Some((src.arglist.clone(), raw, !*dynamic && h.lex.is_some()))
+            Some((
+                src.arglist.clone(),
+                raw,
+                !*dynamic && h.lex.as_ref().is_some_and(|s| s.has_bindings()),
+            ))
         }
         _ => None,
     }) else {

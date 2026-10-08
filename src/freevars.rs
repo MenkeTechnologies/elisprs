@@ -37,21 +37,42 @@ use crate::host::{ElispHost, Obj};
 /// environment in force, so a symbol that names a global, a keyword, or a
 /// function is dropped there rather than needing a test here.
 pub fn free_vars(h: &ElispHost, arglist: &Value, body: &[Value]) -> HashSet<u32> {
+    walk(h, arglist, body).out
+}
+
+/// The variables a `let` or `let*` in `(lambda ARGLIST . BODY)` binds, most
+/// recently reached first and without repeats: cconv.el's
+/// `cconv--dynbindings` before `cconv-fv` intersects it with the locally
+/// declared special variables of the closure's environment.
+pub fn let_bound_vars(h: &ElispHost, arglist: &Value, body: &[Value]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for sym in walk(h, arglist, body).let_bound.into_iter().rev() {
+        if !out.contains(&sym) {
+            out.push(sym);
+        }
+    }
+    out
+}
+
+fn walk<'a>(h: &'a ElispHost, arglist: &Value, body: &[Value]) -> Walk<'a> {
     let mut w = Walk {
         h,
         out: HashSet::new(),
+        let_bound: Vec::new(),
     };
     let mut bound = Vec::new();
     w.params(arglist, &mut bound);
     for form in body {
         w.form(form, &bound);
     }
-    w.out
+    w
 }
 
 struct Walk<'a> {
     h: &'a ElispHost,
     out: HashSet<u32>,
+    /// Every `let`/`let*` binder, in the order the walk reaches it.
+    let_bound: Vec<u32>,
 }
 
 impl Walk<'_> {
@@ -118,6 +139,7 @@ impl Walk<'_> {
                     }
                     if let Some(s) = self.sym_handle(&sym) {
                         inner.push(s);
+                        self.let_bound.push(s);
                     }
                 }
                 for f in elems.get(2..).unwrap_or(&[]) {

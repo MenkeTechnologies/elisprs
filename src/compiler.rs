@@ -776,6 +776,17 @@ fn compile_defvar(
     constant: bool,
 ) -> Result<(), String> {
     let name = elems.get(1).cloned().ok_or("defvar: missing name")?;
+    // A value-less `(defvar SYM)` in user code declares SYM dynamic only for
+    // the rest of its scope, decided when it runs. The prelude stands for
+    // Emacs's byte-compiled preloaded files, where it is a compile-time
+    // declaration, so there it keeps marking the symbol special.
+    if !constant && elems.len() == 2 && !crate::host::prelude_compiling() {
+        let declare = h.intern("--defvar-declare--");
+        let quote = h.intern("quote");
+        let qname = h.list_from(vec![quote, name]);
+        let form = h.list_from(vec![declare, qname]);
+        return compile_form(h, b, &form);
+    }
     // defvar/defconst declare a dynamically-scoped (special) variable.
     h.set_special(&name);
     // eval.c `internal--define-uninitialized-variable`: a docstring goes on

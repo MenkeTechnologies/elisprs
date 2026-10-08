@@ -548,7 +548,14 @@ fn el_equal(h: &ElispHost, a: &Value, b: &Value) -> bool {
                             && aenv
                                 .iter()
                                 .zip(&benv)
-                                .all(|((s1, v1), (s2, v2))| s1 == s2 && el_equal(h, v1, v2))
+                                .all(|((s1, v1), (s2, v2))| {
+                                    s1 == s2
+                                        && match (v1, v2) {
+                                            (Some(v1), Some(v2)) => el_equal(h, v1, v2),
+                                            (None, None) => true,
+                                            _ => false,
+                                        }
+                                })
                     }
                     _ => false,
                 }
@@ -3441,7 +3448,9 @@ fn hash_into(h: &ElispHost, test: u8, v: &Value, depth: u32, st: &mut impl std::
                     st.write_usize(captures.len());
                     for (sym, val) in &captures {
                         st.write_u32(*sym);
-                        hash_into(h, test, val, depth + 1, st);
+                        if let Some(val) = val {
+                            hash_into(h, test, val, depth + 1, st);
+                        }
                     }
                 }
             }
@@ -8487,6 +8496,12 @@ fn early_declarations_fn(h: &mut ElispHost, _a: &[Value]) -> R {
     let forms = std::mem::take(&mut h.early_declarations);
     Ok(h.list_from(forms))
 }
+/// `(--defvar-declare-- SYM)`: what a value-less `(defvar SYM)` does at run
+/// time (see `ElispHost::declare_special_locally`). Returns SYM.
+fn defvar_declare_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    h.declare_special_locally(&a[0]);
+    Ok(a[0].clone())
+}
 fn buffer_local_value_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // BUFFER (a[1]) selects the buffer; default to the current one.
     let idx = match a.get(1) {
@@ -10959,6 +10974,7 @@ pub fn install(h: &mut ElispHost) {
     );
     s("--make-always-local--", 2, Some(2), make_always_local_fn);
     s("--early-declarations--", 0, Some(0), early_declarations_fn);
+    s("--defvar-declare--", 1, Some(1), defvar_declare_fn);
     s("buffer-local-value", 2, Some(2), buffer_local_value_fn);
     s("default-value", 1, Some(1), default_value_fn);
     s("set-default", 2, Some(2), set_default_fn);

@@ -111,7 +111,10 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// positionally, so a v12 shard read as v13 is not a partial answer but a wrong
 /// one. Rebuilding silently costs one cold compile per script and is the same
 /// path every previous bump took.
-pub const SHARD_FORMAT_VERSION: u32 = 13;
+///
+/// v14: a closure's `SerObj::Closure::env` entries carry an optional value, None
+/// for a local special declaration (`(defvar SYM)` under lexical binding).
+pub const SHARD_FORMAT_VERSION: u32 = 14;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next
