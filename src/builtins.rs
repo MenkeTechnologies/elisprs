@@ -8415,11 +8415,32 @@ fn make_local_variable(h: &mut ElispHost, a: &[Value]) -> R {
 fn make_variable_buffer_local(h: &mut ElispHost, a: &[Value]) -> R {
     h.make_variable_buffer_local(&a[0])
 }
-fn local_variable_p(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(h.local_variable_p(&a[0])))
+fn check_symbol(h: &mut ElispHost, v: &Value) -> Result<(), String> {
+    if !is_nil(&symbolp(h, std::slice::from_ref(v))?) {
+        Ok(())
+    } else {
+        Err(h.signal_wrong_type("symbolp", v))
+    }
 }
+/// data.c `Flocal_variable_p`: BUFFER is decoded before VARIABLE is checked.
+fn local_variable_p(h: &mut ElispHost, a: &[Value]) -> R {
+    let bi = decode_buffer(h, a.get(1))?;
+    check_symbol(h, &a[0])?;
+    Ok(nil_or(h.local_variable_p(&a[0], bi)))
+}
+/// data.c `Flocal_variable_if_set_p`: an automatically buffer-local variable
+/// answers t for every buffer; otherwise it is `local-variable-p`, and a plain
+/// variable answers nil before BUFFER is looked at.
 fn local_variable_if_set_p(h: &mut ElispHost, a: &[Value]) -> R {
-    Ok(nil_or(h.local_variable_if_set_p(&a[0])))
+    check_symbol(h, &a[0])?;
+    if h.is_auto_local_var(&a[0]) {
+        return Ok(Value::Bool(true));
+    }
+    if !h.has_any_local(&a[0]) {
+        return Ok(Value::Undef);
+    }
+    let bi = decode_buffer(h, a.get(1))?;
+    Ok(nil_or(h.local_variable_p(&a[0], bi)))
 }
 fn kill_local_variable(h: &mut ElispHost, a: &[Value]) -> R {
     h.kill_local_variable(&a[0])

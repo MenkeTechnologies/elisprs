@@ -112,3 +112,31 @@ fn always_local_per_buffer_slots() {
         "((t t) fundamental-mode \"Fundamental\" t \"/a/\" t t)",
     );
 }
+
+/// data.c `Flocal_variable_p` asks about BUFFER (decoded before VARIABLE is
+/// checked), not always the current buffer; `Flocal_variable_if_set_p` checks
+/// the symbol first and answers nil for a plain variable without looking at
+/// BUFFER.
+#[test]
+fn local_variable_p_takes_a_buffer() {
+    check(
+        "(with-temp-buffer (setq-local zzq 1) \
+           (let ((b (current-buffer))) \
+             (with-temp-buffer \
+               (list (local-variable-p 'zzq) (local-variable-p 'zzq b) \
+                     (local-variable-p 'major-mode (get-buffer \"*Messages*\")) \
+                     (local-variable-if-set-p 'zzq b) \
+                     (condition-case e (local-variable-p 'zzq 3) (error e))))))",
+        "(nil t t t (wrong-type-argument bufferp 3))",
+    );
+    check(
+        "(list (condition-case e (local-variable-if-set-p 3 4) (error e)) \
+               (condition-case e (local-variable-if-set-p 'x 4) (error e)) \
+               (local-variable-p nil) (local-variable-p t) (local-variable-p :k) \
+               (condition-case e (local-variable-p 3 4) (error e)) \
+               (condition-case e (local-variable-p 3) (error e)) \
+               (local-variable-if-set-p 'fill-column 5))",
+        "((wrong-type-argument symbolp 3) nil nil nil nil (wrong-type-argument bufferp 4) \
+(wrong-type-argument symbolp 3) t)",
+    );
+}

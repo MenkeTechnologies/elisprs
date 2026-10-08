@@ -2104,11 +2104,11 @@ impl ElispHost {
         }
         Ok(v.clone())
     }
-    /// `(local-variable-p SYM)` — non-nil if SYM has a buffer-local binding in the
-    /// current buffer.
-    pub fn local_variable_p(&self, v: &Value) -> bool {
+    /// `(local-variable-p SYM BUFFER)` — non-nil if SYM has a buffer-local
+    /// binding in the buffer at index BI.
+    pub fn local_variable_p(&self, v: &Value, bi: usize) -> bool {
         match self.sym_handle(v) {
-            Some(id) => self.buffers[self.cur_buf_idx()]
+            Some(id) => self.buffers[bi]
                 .locals
                 .contains_key(&self.indirect_var(id)),
             None => false,
@@ -2154,16 +2154,19 @@ impl ElispHost {
             })
             .collect()
     }
-    /// `(local-variable-if-set-p SYM)` — non-nil if SYM is local in the current
-    /// buffer or would become local when set (automatically buffer-local).
-    pub fn local_variable_if_set_p(&self, v: &Value) -> bool {
-        match self.sym_handle(v) {
-            Some(id0) => {
-                let id = self.indirect_var(id0);
-                self.buffers[self.cur_buf_idx()].locals.contains_key(&id) || self.is_auto_local(id)
-            }
-            None => false,
-        }
+    /// Whether any buffer has a local binding of SYM: Emacs's
+    /// `SYMBOL_LOCALIZED`, as opposed to a plain variable.
+    pub fn has_any_local(&self, v: &Value) -> bool {
+        self.sym_handle(v).is_some_and(|id0| {
+            let id = self.indirect_var(id0);
+            self.buffers.iter().any(|b| b.locals.contains_key(&id))
+        })
+    }
+    /// Whether SYM is automatically buffer-local, the case in which
+    /// `local-variable-if-set-p` answers t without consulting BUFFER.
+    pub fn is_auto_local_var(&self, v: &Value) -> bool {
+        self.sym_handle(v)
+            .is_some_and(|id0| self.is_auto_local(self.indirect_var(id0)))
     }
     /// `(kill-local-variable SYM)` — remove the current buffer's local binding for
     /// SYM (the default becomes effective again). Returns SYM.
