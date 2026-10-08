@@ -1036,6 +1036,10 @@ pub struct ElispHost {
     /// the body each had as written; the compiler moves it into the
     /// template's [`ClosureSrc::raw_body`] when it lowers that form.
     pub(crate) eval_lambda_raw: HashMap<u32, Vec<Value>>,
+    /// `(defun|defmacro NAME ARGLIST . BODY)` forms with a `declare` that were
+    /// expanded before the prelude defined the declaration bridge; the prelude
+    /// replays their declarations once it exists (`--early-declarations--`).
+    pub(crate) early_declarations: Vec<Value>,
     /// Symbols a `compiler-macro` property has been put on.
     ///
     /// [`macroexpand_all`] has to ask whether a call's head has one, and the
@@ -1383,6 +1387,7 @@ impl ElispHost {
             string_props: HashMap::new(),
             closure_free: HashMap::new(),
             eval_lambda_raw: HashMap::new(),
+            early_declarations: Vec::new(),
             compiler_macros: std::collections::HashSet::new(),
             empty_string: Value::Undef, // fixed below, once the arena exists
             empty_vector: Value::Undef,
@@ -7737,12 +7742,43 @@ fn macroexpand_all_impl(form: &Value, walk: Walk, env: &Value) -> Result<Value, 
                     return macroexpand_all_impl(&replaced, walk, env);
                 }
             }
+            // Too early for the bridge: keep the form so the prelude can replay
+            // its `declare` (indent, doc-string, gv-setter, …) once the handlers
+            // exist, and drop the `declare` from the body as byte-run.el's
+            // `defun`/`defmacro` do. It can only follow the optional docstring,
+            // so the first two body forms are all that matter.
+            let early_declare = if bridge_ready {
+                None
+            } else {
+                with_host(|h| {
+                    let declare = h.intern("declare");
+                    let at = (3..elems.len().min(5)).find(|&i| {
+                        h.list_vec(&elems[i])
+                            .and_then(|l| l.first().cloned())
+                            .is_some_and(|head| head == declare)
+                    });
+                    if at.is_some() {
+                        h.early_declarations.push(f.clone());
+                    }
+                    at
+                })
+            };
             let mut out = Vec::with_capacity(elems.len());
             out.push(elems[0].clone());
             out.push(elems[1].clone()); // NAME, untouched
             out.push(elems[2].clone()); // ARGLIST, untouched
-            for e in &elems[3..] {
-                out.push(macroexpand_all_impl(e, walk, env)?);
+            for (i, e) in elems.iter().enumerate().skip(3) {
+                if Some(i) != early_declare {
+                    out.push(macroexpand_all_impl(e, walk, env)?);
+                }
+            }
+            // byte-run.el: a body left empty (or only a docstring) by removing
+            // the `declare` becomes `(nil)`.
+            if early_declare.is_some() {
+                let doc = out.len() > 3 && with_host(|h| h.is_string(&out[3]));
+                if out.len() == 3 + doc as usize {
+                    out.push(Value::Undef);
+                }
             }
             let def = with_host(|h| h.list_from(out));
             if let (Walk::Eval, Value::Obj(id)) = (walk, &def) {

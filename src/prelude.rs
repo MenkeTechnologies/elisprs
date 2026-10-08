@@ -8,6 +8,9 @@
 //! every macro is defined before its first use.
 
 pub const PRELUDE: &str = r#"
+;; declare: a no-op at runtime (specs are advisory; defun/lambda ignore them).
+;; Defined first so that every later definition may carry one.
+(defmacro declare (&rest _specs) nil)
 ;;; backquote.el. The reader makes `X, ,X and ,@X into (\` X), (\, X) and
 ;;; (\,@ X), as Emacs's does; these macros expand them through
 ;;; `backquote-process' (src/backquote.rs). Defined first because every later
@@ -885,7 +888,7 @@ pub const PRELUDE: &str = r#"
 ;; host can answer.
 
 ;;; ---- control macros ----
-(defmacro prog2 (a b &rest body) (list (quote progn) a (cons (quote prog1) (cons b body))))
+(defmacro prog2 (a b &rest body) (declare (indent 2) (debug t)) (list (quote progn) a (cons (quote prog1) (cons b body))))
 ;; ---- read-modify-write places (push/pop/incf/decf/cl-callf) ----
 ;;
 ;; Every one of these mentions PLACE at least twice: once to read it, once to
@@ -988,6 +991,7 @@ pub const PRELUDE: &str = r#"
             (list (quote car-safe)
                   (list (quote prog1) p (list (quote setf) p (list (quote cdr) p))))))))
 (defmacro dolist (spec &rest body)
+  (declare (indent 1) (debug ((symbolp form &optional form) body)))
   ;; (dolist (VAR LIST [RESULT]) BODY...) — RESULT is the value of the form; nil
   ;; if omitted.
   ;;
@@ -1010,6 +1014,7 @@ pub const PRELUDE: &str = r#"
            (setq ,tail (cdr ,tail))))
        ,@result)))
 (defmacro dotimes (spec &rest body)
+  (declare (indent 1) (debug dolist))
   ;; (dotimes (VAR COUNT [RESULT]) BODY...) — RESULT (with VAR bound to COUNT) is
   ;; the value of the form; nil if omitted.
   ;;
@@ -1030,12 +1035,10 @@ pub const PRELUDE: &str = r#"
        ,@(if result `((let ((,var ,counter)) ,@result))))))
 
 ;;; ---- error handling ----
-(defmacro ignore-errors (&rest body) `(condition-case nil (progn ,@body) (error nil)))
-(defmacro ignore-error (condition &rest body) `(condition-case nil (progn ,@body) (,condition nil)))
-(defmacro with-suppressed-warnings (_warnings &rest body) `(progn ,@body))
-(defmacro with-no-warnings (&rest body) `(progn ,@body))
-;; declare: a no-op at runtime (specs are advisory; defun/lambda ignore them).
-(defmacro declare (&rest _specs) nil)
+(defmacro ignore-errors (&rest body) (declare (debug t) (indent 0)) `(condition-case nil (progn ,@body) (error nil)))
+(defmacro ignore-error (condition &rest body) (declare (debug t) (indent 1)) `(condition-case nil (progn ,@body) (,condition nil)))
+(defmacro with-suppressed-warnings (_warnings &rest body) (declare (debug (sexp body)) (indent 1)) `(progn ,@body))
+(defmacro with-no-warnings (&rest body) (declare (indent 0)) `(progn ,@body))
 ;; declare-function (subr.el:31): a pure byte-compiler hint that FN is defined
 ;; in FILE; `byte-compile-macroexpand-declare-function' does the real work.  In
 ;; the interpreter it expands to nil (matching `emacs -Q --batch').
@@ -1047,8 +1050,8 @@ interpreter; expands to nil."
 	    (fn file &optional arglist fileonly) nil))
   nil)
 ;; Compile-time evaluation: elisprs interprets, so these just run BODY.
-(defmacro eval-when-compile (&rest body) (cons 'progn body))
-(defmacro eval-and-compile (&rest body) (cons 'progn body))
+(defmacro eval-when-compile (&rest body) (declare (debug (&rest def-form)) (indent 0)) (cons 'progn body))
+(defmacro eval-and-compile (&rest body) (declare (debug (&rest def-form)) (indent 0)) (cons 'progn body))
 (defmacro cl-eval-when (situations &rest body)
   ;; Run BODY when a runtime situation (eval/load/:execute/:load-toplevel) applies.
   (if (or (memq 'eval situations) (memq 'load situations)
@@ -1277,12 +1280,14 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
 (defvar defun-declarations-alist nil)
 (defvar macro-declarations-alist nil)
 (defmacro defvar-local (var val &optional doc)
+  (declare (debug defvar) (doc-string 3) (indent defun))
   `(progn (defvar ,var ,val ,doc) (make-variable-buffer-local ',var)))
-(defmacro with-demoted-errors (fmt &rest body) `(condition-case --err-- (progn ,@body) (error (message ,fmt --err--) nil)))
+(defmacro with-demoted-errors (fmt &rest body) (declare (debug t) (indent 1)) `(condition-case --err-- (progn ,@body) (error (message ,fmt --err--) nil)))
 
 ;; Evaluate BODY with the regexp match data preserved: any `string-match` inside
 ;; BODY won't clobber the caller's match state.
 (defmacro save-match-data (&rest body)
+  (declare (indent 0) (debug t))
   `(let ((--save-match-- (match-data)))
      (unwind-protect (progn ,@body)
        (set-match-data --save-match-- t))))
@@ -2183,12 +2188,16 @@ TYPE nil maps for side effects only and returns nil."
 (defun if-let--norm (spec)
   (if (and (consp spec) (symbolp (car spec))) (list spec) spec))
 (defmacro if-let* (bindings then &rest else)
+  (declare (indent 2))
   (if-let--chain bindings then (cons 'progn else)))
 (defmacro when-let* (bindings &rest body)
+  (declare (indent 1) (debug if-let*))
   (if-let--chain bindings (cons 'progn body) nil))
 (defmacro if-let (bindings then &rest else)
+  (declare (indent 2))
   (if-let--chain (if-let--norm bindings) then (cons 'progn else)))
 (defmacro when-let (bindings &rest body)
+  (declare (indent 1) (debug if-let))
   (if-let--chain (if-let--norm bindings) (cons 'progn body) nil))
 (defmacro named-let (name bindings &rest body)
   ;; A self-recursive local loop: (named-let f ((i 0)) (if … (f (1+ i)) i)).
@@ -2290,6 +2299,7 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 ;; per-slot defaults), `NAME-p' predicate, `NAME-SLOT' accessors (setf-able), and
 ;; `copy-NAME' copier. Parentage is tracked by bare NAME in `cl-struct--parent'.
 (defmacro cl-defstruct (name-spec &rest slots)
+  (declare (doc-string 2) (indent 1))
   ;; An optional docstring may precede the slot specs (cl-macs.el pops it via
   ;; `(if (stringp (car descs)) (pop descs))').  Record it on the struct's plist
   ;; and drop it so it is not mistaken for a slot.
@@ -2520,6 +2530,7 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
           ((eq (cdr (assq struct-type cl-struct--base)) 1) (cons '(cl-tag-slot nil) slots))
           (t slots))))
 (defmacro and-let* (bindings &rest body)
+  (declare (indent 1) (debug if-let*))
   ;; Like when-let* but with no body returns the last bound value (SRFI-2).
   (if-let--chain bindings
                  (if body (cons 'progn body)
@@ -2681,12 +2692,14 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 (defmacro cl-symbol-macrolet (bindings &rest body)
   (cons 'progn (cl-symbol-macrolet--walk body bindings)))
 (defmacro letrec (bindings &rest body)
+  (declare (debug let) (indent 1))
   ;; Bind to nil, then assign — so the (by-reference) closures can recurse / refer
   ;; to each other.
   `(let ,(mapcar (lambda (b) (list (car b) nil)) bindings)
      ,@(mapcar (lambda (b) (list 'setq (car b) (car (cdr b)))) bindings)
      ,@body))
 (defmacro dlet (bindings &rest body)
+  (declare (indent 1) (debug let))
   ;; Dynamic let. (No buffer-local distinction here, so a plain `let'.)
   `(let ,bindings ,@body))
 (defmacro cl-letf (bindings &rest body)
@@ -3530,6 +3543,24 @@ share `error' list it once."
 ;; subr.el: (defmacro lambda (&rest cdr) (list 'function (cons 'lambda cdr)))
 (--set-intrinsic-macro-cell
  'lambda (cons 'macro (lambda (&rest cdr) (list 'function (cons 'lambda cdr)))))
+;; byte-run.el's `defmacro' and `defun' are compiler special forms here; their
+;; properties are the ones byte-run.el puts and declares.
+(function-put 'defmacro 'doc-string-elt 3)
+(function-put 'defmacro 'lisp-indent-function 2)
+(function-put 'defmacro 'autoload-macro 'expand)
+(function-put 'defun 'doc-string-elt 3)
+(function-put 'defun 'lisp-indent-function 2)
+(function-put 'defun 'autoload-macro 'expand)
+;; The subr.el `declare's of the three intrinsic macros above: when/unless
+;; `(indent 1) (debug t)', lambda `(doc-string 2) (indent defun) (debug ...)'.
+(function-put 'when 'lisp-indent-function 1)
+(put 'when 'edebug-form-spec t)
+(function-put 'unless 'lisp-indent-function 1)
+(put 'unless 'edebug-form-spec t)
+(function-put 'lambda 'doc-string-elt 2)
+(function-put 'lambda 'lisp-indent-function 'defun)
+(put 'lambda 'edebug-form-spec
+     '(&define lambda-list lambda-doc [&optional ("interactive" interactive)] def-body))
 (defun add-to-list (var elt &optional append compare-fn)
   "Add ELT to VAR's list value unless it is already there.
 VAR should not name a lexical variable -- the compiler macro below rewrites
@@ -4389,10 +4420,12 @@ remote, otherwise search locally."
        (when (buffer-live-p --scb--) (set-buffer --scb--)))))
 ;; with-current-buffer: evaluate BODY with BUFFER-OR-NAME current, restoring after.
 (defmacro with-current-buffer (buffer-or-name &rest body)
+  (declare (indent 1) (debug t))
   `(save-current-buffer (set-buffer ,buffer-or-name) ,@body))
 ;; with-temp-buffer: run BODY in a fresh temporary buffer, killing it afterward.
 ;; Returns BODY's value, not the buffer text.
 (defmacro with-temp-buffer (&rest body)
+  (declare (indent 0) (debug t))
   `(let ((--tb-- (generate-new-buffer " *temp*")))
      (unwind-protect
          (with-current-buffer --tb-- ,@body)
@@ -5686,7 +5719,7 @@ If all LST elements are zeros or LST is nil, return zero."
 ;; help.el: obsolete alias for `help--make-usage' (help usage helpers ported above).
 (define-obsolete-function-alias 'help-make-usage #'help--make-usage "25.1")
 ;; with-memoization: cache BODY's value in PLACE; reuse it on later calls.
-(defmacro with-memoization (place &rest body) `(or ,place (setf ,place (progn ,@body))))
+(defmacro with-memoization (place &rest body) (declare (indent 1) (debug (gv-place body))) `(or ,place (setf ,place (progn ,@body))))
 ;; regexp-opt: a regexp matching any of STRINGS (sorted, regexp-quoted alternation).
 ;; NOTE: this does NOT replicate Emacs's trie/shared-prefix optimization, so the
 ;; output string differs for prefix-overlapping inputs — but it matches the same
@@ -5860,6 +5893,7 @@ PAREN controls the surrounding group: a string is used as the opening bracket,
       (not (null pos)))))
 
 (defmacro while-let (binding &rest body)
+  (declare (indent 1) (debug if-let))
   (let ((var (car (car binding))) (val (car (cdr (car binding)))))
     `(let ((,var ,val)) (while ,var ,@body (setq ,var ,val)))))
 
@@ -6261,6 +6295,7 @@ reports and the one a hash table's slots are observable in."
     (when arglist (setq max nil))
     (cons min max)))
 (defmacro cl-deftype (name arglist &rest body)
+  (declare (debug cl-defmacro) (doc-string 3) (indent 2))
   (let ((decls nil) (forms body) (parents nil))
     (while (and forms
                 (or (and (stringp (car forms)) (cdr forms))
@@ -6443,6 +6478,7 @@ reports and the one a hash table's slots are observable in."
     (list 'quote (list 'head (car (cdr sp)))))
    (t (list 'quote sp))))
 (defmacro cl-defmethod (name &rest body)
+  (declare (doc-string cl--defmethod-doc-pos) (indent defun))
   ;; (cl-defmethod NAME [QUALIFIER] ARGLIST BODY...) — QUALIFIER is an optional
   ;; :before/:after/:around keyword.
   (let ((qualifier nil) (arglist nil) (plain nil) (specs nil) (mode 'req))
@@ -6463,6 +6499,7 @@ reports and the one a hash table's slots are observable in."
                 (list 'cl--generic-dispatch (list 'quote name) '--args--))
           (list 'quote name))))
 (defmacro cl-defgeneric (name arglist &rest body)
+  (declare (indent 2) (doc-string 3))
   ;; Establish the dispatcher; real body forms become an unspecialized default.
   (let ((real (cl-remove-if
                (lambda (f) (or (stringp f)
@@ -6708,9 +6745,11 @@ reports and the one a hash table's slots are observable in."
 ;; cl-defun/cl-defmacro: defun/defmacro accepting a full cl-lambda-list
 ;; (&optional/&key/&rest/&aux with per-arg defaults), via cl-destructuring-bind.
 (defmacro cl-defun (name arglist &rest body)
+  (declare (doc-string 3) (indent 2))
   `(defun ,name (&rest --cl-args--)
      (cl-destructuring-bind ,arglist --cl-args-- ,@body)))
 (defmacro cl-defmacro (name arglist &rest body)
+  (declare (doc-string 3) (indent 2))
   `(defmacro ,name (&rest --cl-args--)
      (cl-destructuring-bind ,arglist --cl-args-- ,@body)))
 ;; cl multiple values are just lists in this model.
@@ -7744,6 +7783,7 @@ or the result is already atomic/grouped."
   "A `lambda' whose parameters may be pcase PATTERNS instead of names.
 Each pattern parameter becomes a fresh name that a `pcase-let*' destructures
 around BODY, so `(funcall (pcase-lambda (`(,a ,b)) (+ a b)) (list 1 2))' is 3."
+  (declare (doc-string 2) (indent defun))
   ;; As in pcase.el: a symbol (including `&optional'/`&rest') is an ordinary
   ;; parameter, anything else -- a `(\=` PAT)' form among them -- is a pattern.
   (let ((bindings nil) (parameters nil) (i 0))
@@ -7819,6 +7859,7 @@ When SECTION is \\='usage or \\='doc, return only that part."
       (`usage usage)
       (`doc doc))))
 (defmacro seq-doseq (spec &rest body)
+  (declare (indent 1) (debug ((symbolp form &optional form) body)))
   ;; (seq-doseq (VAR SEQUENCE) BODY...) — iterate VAR over any sequence's
   ;; elements. Returns the sequence (like Emacs, via seq-do).
   (let ((var (car spec)) (seq (car (cdr spec))) (sv (make-symbol "seq")))
@@ -7854,6 +7895,7 @@ When SECTION is \\='usage or \\='doc, return only that part."
                      elt))
                  args)))
 (defmacro seq-let (args sequence &rest body)
+  (declare (indent 2) (debug (sexp form body)))
   `(pcase-let ((,(seq--make-pcase-patterns args) ,sequence))
      ,@body))
 (defmacro seq-setq (args sequence)
@@ -8657,10 +8699,12 @@ If NOSET is non-nil, don't bother autoloading LOAD when setting the variable."
 
 ;; custom.el:512 — no backquote here, matching the upstream bootstrap note.
 (defmacro defgroup (symbol members doc &rest args)
+  (declare (doc-string 3) (indent defun))
   (nconc (list 'custom-declare-group (list 'quote symbol) members doc) args))
 
 ;; custom.el:249
 (defmacro defcustom (symbol standard doc &rest args)
+  (declare (doc-string 3) (debug (name body)) (indent defun))
   `(custom-declare-variable
     ',symbol
     ,(if lexical-binding
@@ -8671,6 +8715,7 @@ If NOSET is non-nil, don't bother autoloading LOAD when setting the variable."
 
 ;; custom.el:409
 (defmacro defface (face spec doc &rest args)
+  (declare (doc-string 3) (indent defun))
   (nconc (list 'custom-declare-face (list 'quote face) spec doc) args))
 
 ;;; ---- password-prompt recognition data (international/mule-conf.el) ----
@@ -9177,6 +9222,7 @@ needs live buffer state that elisprs does not provide."
   "Create a new keymap and define KEY/DEFINITION pairs as key bindings.
 Return the new keymap.  Options may be given as keywords before the
 pairs: :full :suppress :parent :keymap :name :prefix."
+  (declare (indent defun))
   (let (full suppress parent name prefix keymap)
     (while (and definitions
                 (keywordp (car definitions))
@@ -11931,6 +11977,7 @@ The table's own \"\" property symbol does not count."
   "Define an abbrev NAME in TABLE expanding to EXPANSION.
 Answers the abbrev's symbol, whose VALUE is the expansion -- which is what
 `abbrev-expansion' reads back."
+  (declare (indent defun))
   ;; The obsolete positional calling convention: (… HOOK COUNT SYSTEM).
   (when (and (consp props) (or (null (car props)) (numberp (car props))))
     (setq props (append (list :count (car props))
@@ -11958,6 +12005,7 @@ Answers the abbrev's symbol, whose VALUE is the expansion -- which is what
 (defun define-abbrev-table (tablename &optional definitions _docstring &rest props)
   "Define TABLENAME as an abbrev table name, with DEFINITIONS in it.
 Answers nil, as Emacs does -- the table is reached through the variable."
+  (declare (doc-string 3) (indent defun))
   (unless (and (boundp tablename) (abbrev-table-p (symbol-value tablename)))
     (set tablename (make-abbrev-table)))
   (let ((table (symbol-value tablename)))
@@ -12691,6 +12739,16 @@ rather than files.  These modes usually use read-only buffers."
         (if declarations
             (cons 'prog1 (cons def (car declarations)))
           def)))))
+;; A `defun'/`defmacro' the prelude defined before this bridge existed kept
+;; its `declare' unprocessed; Emacs's preloaded files are byte-compiled with
+;; every declaration applied, so run the side-effect forms the bridge would
+;; have threaded after each of those definitions (without redefining them).
+(dolist (def (--early-declarations--))
+  (let ((replaced (elisprs--expand-defun-declarations
+                   (car def) (nth 1 def) (nth 2 def) (nthcdr 3 def))))
+    (when (eq (car-safe replaced) 'prog1)
+      (dolist (form (cddr replaced))
+        (eval form t)))))
 ;; custom-local-buffer (custom.el): when non-nil in a Customization buffer,
 ;; :set functions target that buffer's local binding instead of the default.
 (defvar custom-local-buffer nil
@@ -13339,6 +13397,7 @@ No problems result if this variable is not bound.
 (defun ert-pass () t)
 
 (defmacro ert-deftest (name arglist &rest body)
+  (declare (doc-string 3) (indent 2))
   ;; Strip an optional docstring, then leading :expected-result / :tags args.
   (if (stringp (car body)) (setq body (cdr body)))
   (let ((expected :passed))
@@ -13892,6 +13951,7 @@ regardless if `funcall' would accept to call them."
 
 (defmacro oclosure--lambda (type bindings mutables args &rest body)
   "Low level construction of an OClosure object."
+  (declare (indent 3) (debug (sexp (&rest (sexp form)) sexp def-body)))
   (let* ((parsed (macroexp-parse-body body))
          (prebody (car parsed))
          (realbody (cdr parsed))
@@ -15221,6 +15281,42 @@ and if a matching region is found, place point at the start of the region."
 ;; The startup buffers now hold the working directory; the default, which only
 ;; `default-value' sees, is nil as in Emacs.
 (setq-default default-directory nil)
+;; lisp-mode.el (preloaded): the docstring positions and indentation of the
+;; definers and special forms, which have no `declare' of their own.
+(put 'autoload 'doc-string-elt 3)
+(put 'defmethod 'doc-string-elt 3)
+(put 'defvar   'doc-string-elt 3)
+(put 'defconst 'doc-string-elt 3)
+(put 'defalias 'doc-string-elt 3)
+(put 'defvaralias 'doc-string-elt 3)
+(put 'define-category 'doc-string-elt 2)
+(put 'defconstant 'doc-string-elt 3)
+(put 'define-compiler-macro 'doc-string-elt 3)
+(put 'define-setf-expander 'doc-string-elt 3)
+(put 'defparameter 'doc-string-elt 3)
+(put 'defstruct 'doc-string-elt 2)
+(put 'deftype 'doc-string-elt 3)
+(put 'autoload 'lisp-indent-function 'defun) ;Elisp
+(put 'progn 'lisp-indent-function 0)
+(put 'defvar 'lisp-indent-function 'defun)
+(put 'defalias 'lisp-indent-function 'defun)
+(put 'defvaralias 'lisp-indent-function 'defun)
+(put 'defconst 'lisp-indent-function 'defun)
+(put 'define-category 'lisp-indent-function 'defun)
+(put 'define-charset-internal 'lisp-indent-function 'defun)
+(put 'define-fringe-bitmap 'lisp-indent-function 'defun)
+(put 'prog1 'lisp-indent-function 1)
+(put 'save-excursion 'lisp-indent-function 0)      ;Elisp
+(put 'save-restriction 'lisp-indent-function 0)    ;Elisp
+(put 'save-current-buffer 'lisp-indent-function 0) ;Elisp
+(put 'let 'lisp-indent-function 1)
+(put 'let* 'lisp-indent-function 1)
+(put 'while 'lisp-indent-function 1)
+(put 'if 'lisp-indent-function 2)
+(put 'catch 'lisp-indent-function 1)
+(put 'condition-case 'lisp-indent-function 2)
+(put 'handler-case 'lisp-indent-function 1) ;CL
+(put 'unwind-protect 'lisp-indent-function 1)
 "#;
 
 /// Faithful port of emacs-lisp/nadvice.el (Emacs 30.2) — the modern light-weight

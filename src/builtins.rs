@@ -8460,6 +8460,13 @@ fn make_always_local_fn(h: &mut ElispHost, a: &[Value]) -> R {
     };
     h.make_always_local(&a[0], init)
 }
+/// `(--early-declarations--)`: the `defun`/`defmacro` forms whose `declare`
+/// was expanded before the prelude's declaration bridge existed, emptied as
+/// they are handed over.
+fn early_declarations_fn(h: &mut ElispHost, _a: &[Value]) -> R {
+    let forms = std::mem::take(&mut h.early_declarations);
+    Ok(h.list_from(forms))
+}
 fn buffer_local_value_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // BUFFER (a[1]) selects the buffer; default to the current one.
     let idx = match a.get(1) {
@@ -10931,6 +10938,7 @@ pub fn install(h: &mut ElispHost) {
         buffer_local_symbols_fn,
     );
     s("--make-always-local--", 2, Some(2), make_always_local_fn);
+    s("--early-declarations--", 0, Some(0), early_declarations_fn);
     s("buffer-local-value", 2, Some(2), buffer_local_value_fn);
     s("default-value", 1, Some(1), default_value_fn);
     s("set-default", 2, Some(2), set_default_fn);
