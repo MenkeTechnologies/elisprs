@@ -3579,17 +3579,7 @@ pub(crate) fn make_hash_table_with(
         None => Value::Undef,
         Some(i) => {
             let w = a[i].clone();
-            let named = h.sym_name(&w);
-            let ok = crate::host::el_nil(&w)
-                || matches!(w, Value::Bool(true))
-                || matches!(
-                    named.as_deref(),
-                    Some("key") | Some("value") | Some("key-or-value") | Some("key-and-value")
-                );
-            if !ok {
-                return Err(h.signal_error_arg("Invalid hash table weakness", &w));
-            }
-            w
+            hash_table_weakness_arg(h, &w)?
         }
     };
     // "Now, all args should have been used up, or there's a problem."
@@ -3614,6 +3604,27 @@ pub(crate) fn make_hash_table_with(
     }
     Ok(h.alloc(Obj::HashTable(t)))
 }
+/// Validate a `:weakness` value the way `Fmake_hash_table` does: nil, `key`,
+/// `value`, `key-or-value` and `key-and-value` are kept, `t` is the historical
+/// spelling of `key-and-value` and is stored as that, anything else is
+/// `(error "Invalid hash table weakness" W)`. The `#s(hash-table weakness W)`
+/// reader goes through the same check.
+pub(crate) fn hash_table_weakness_arg(h: &mut ElispHost, w: &Value) -> R {
+    if matches!(w, Value::Bool(true)) {
+        return Ok(h.intern("key-and-value"));
+    }
+    let named = h.sym_name(w);
+    let ok = crate::host::el_nil(w)
+        || matches!(
+            named.as_deref(),
+            Some("key") | Some("value") | Some("key-or-value") | Some("key-and-value")
+        );
+    if !ok {
+        return Err(h.signal_error_arg("Invalid hash table weakness", w));
+    }
+    Ok(w.clone())
+}
+
 /// The `(NAME TESTFN HASHFN)` of TABLE's user-defined test, if it has one.
 pub(crate) fn ht_user_test(table: &Value) -> Option<(Value, Value, Value)> {
     crate::host::with_host(|h| ht_ref(h, table).ok().and_then(|t| t.user_test.clone()))
@@ -3770,16 +3781,12 @@ fn hash_table_values(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.list_from(vals))
 }
 fn copy_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
+    // `Fcopy_hash_table` copies the table structure as it stands: the test
+    // (a `define-hash-table-test` one included), weakness, size, slot order,
+    // free list and hashes. Rehashing here would need the user test's HASHFN,
+    // which is elisp, and would compact the free list Emacs keeps.
     ht_ensure_index(h, &a[0])?;
-    let t = ht_ref(h, &a[0])?;
-    let (test, size, weakness) = (t.test, t.size, t.weakness.clone());
-    let pairs: Vec<(Value, Value)> = t.pairs().cloned().collect();
-    let mut copy = ElHashTable::new(test, size, weakness);
-    // Rebuilt in slot order, so the copy walks the way the original does.
-    let hashes: Vec<u64> = pairs.iter().map(|(k, _)| hash_key(h, test, k)).collect();
-    for ((k, v), hk) in pairs.into_iter().zip(hashes) {
-        copy.insert(hk, k, v);
-    }
+    let copy = ht_ref(h, &a[0])?.clone();
     Ok(h.alloc(Obj::HashTable(copy)))
 }
 

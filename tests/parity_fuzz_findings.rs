@@ -1501,7 +1501,12 @@ fn make_hash_table_rejects_a_malformed_argument_list() {
     assert_eq!(eval("(make-hash-table :purecopy t)"), "#s(hash-table)");
     assert_eq!(eval("(make-hash-table :size nil)"), "#s(hash-table)");
     assert_eq!(eval("(hash-table-size (make-hash-table :size 5))"), "5");
-    assert_eq!(eval("(make-hash-table :weakness t)"), "#s(hash-table)");
+    // `t` is stored as `key-and-value`, and a non-nil weakness prints
+    // (GNU Emacs 31.1: `#s(hash-table weakness key-and-value)`).
+    assert_eq!(
+        eval("(make-hash-table :weakness t)"),
+        "#s(hash-table weakness key-and-value)"
+    );
 }
 
 /// A special form is a subr, so `eval_sub` checks its `DEFUN` arity before

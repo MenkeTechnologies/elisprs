@@ -4178,10 +4178,20 @@ impl ElispHost {
                     // Emacs-30 syntax: omit `test` when eql (the default), and
                     // `data` when empty — `#s(hash-table test equal data (k v …))`.
                     let mut s = String::from("#s(hash-table");
-                    match test {
-                        0 => s.push_str(" test eq"),
-                        2 => s.push_str(" test equal"),
+                    // print.c: `test` unless eql (a `define-hash-table-test`
+                    // table prints its NAME), then `weakness` unless nil.
+                    match (&tbl.user_test, test) {
+                        (Some((name, _, _)), _) => {
+                            s.push_str(" test ");
+                            s.push_str(&self.print_inner(name, readable, depth + 1));
+                        }
+                        (None, 0) => s.push_str(" test eq"),
+                        (None, 2) => s.push_str(" test equal"),
                         _ => {}
+                    }
+                    if !el_nil(&tbl.weakness) {
+                        s.push_str(" weakness ");
+                        s.push_str(&self.print_inner(&tbl.weakness, readable, depth + 1));
                     }
                     if !entries.is_empty() {
                         s.push_str(" data (");

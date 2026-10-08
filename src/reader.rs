@@ -854,10 +854,14 @@ impl Reader {
         }
         if h.sym_name(&items[0]).as_deref() == Some("hash-table") {
             let mut test = 1u8; // eql
+            let mut weakness = Value::Undef;
             let mut data: Vec<Value> = Vec::new();
             let mut i = 1;
             while i + 1 < items.len() {
                 match h.sym_name(&items[i]).as_deref() {
+                    Some("weakness") => {
+                        weakness = crate::builtins::hash_table_weakness_arg(h, &items[i + 1])?;
+                    }
                     Some("test") => {
                         test = match h.sym_name(&items[i + 1]).as_deref() {
                             Some("eq") => 0,
@@ -885,7 +889,7 @@ impl Reader {
                 slots,
                 Vec::new(),
                 size,
-                Value::Undef,
+                weakness,
             ))))
         } else {
             // A record literal `#s(NAME slot…)`: slot 0 is the type symbol NAME,
