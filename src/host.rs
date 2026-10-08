@@ -1002,6 +1002,11 @@ pub struct ElispHost {
     /// Slots are never removed — `kill-buffer` marks a buffer dead (`name: None`)
     /// so its index (and any live buffer object referencing it) stays valid.
     pub(crate) buffers: Vec<EditBuffer>,
+    /// buffer.c's always-local per-buffer slots (`buffer_local_flags` of -1 in
+    /// `init_buffer_once`): every buffer has its own value from birth, so
+    /// `local-variable-p` is t in a fresh buffer and `kill-local-variable` leaves
+    /// them alone. Each entry is the symbol and the value a new buffer starts with.
+    pub(crate) always_local: Vec<(u32, SlotInit)>,
     /// Index into `buffers` of the current buffer (`current-buffer`/`set-buffer`).
     pub(crate) current: usize,
     /// xdisp.c `noninteractive_need_newline`: stdout has been written since the
@@ -1238,6 +1243,20 @@ pub struct EditBuffer {
     pub has_intervals: bool,
 }
 
+/// What a new buffer's always-local slot starts as (buffer.c `reset_buffer`,
+/// `reset_buffer_local_variables` and `Fget_buffer_create`).
+#[derive(Clone)]
+pub enum SlotInit {
+    /// A fixed value, whatever the default has since been set to.
+    Value(Value),
+    /// `bset_directory (b, BVAR (current_buffer, directory))`: the creating
+    /// buffer's value.
+    Inherit,
+    /// `bset_undo_list (b, SREF (name, 0) != ' ' ? Qnil : Qt)`: undo is off in
+    /// a buffer whose name starts with a space.
+    UndoList,
+}
+
 /// A buffer's modification counters (buffer.h). A text change of N characters
 /// advances `modiff` by `modiff_incr` (`floor(log2 N) + 1`) and sets
 /// `chars_modiff` to it; a text-property change advances `modiff` by 1 only.
@@ -1357,6 +1376,7 @@ impl ElispHost {
                 mods: ModCounts::default(),
                 has_intervals: false,
             }],
+            always_local: Vec::new(),
             current: 0,
             need_newline: false,
             load_buf: 0, // fixed below, once the slot exists
@@ -2094,6 +2114,46 @@ impl ElispHost {
             None => false,
         }
     }
+    /// Register SYM as an always-local per-buffer slot whose new-buffer value
+    /// is INIT. Every existing buffer gets a local holding the value SYM has
+    /// there now, as the C slot would have had all along.
+    pub fn make_always_local(&mut self, v: &Value, init: SlotInit) -> Result<Value, String> {
+        let id0 = self.sym_handle(v).ok_or("--make-always-local--: not a symbol")?;
+        let id = self.indirect_var(id0);
+        if let Obj::Symbol(s) = &mut self.arena[id as usize] {
+            s.special = true;
+        }
+        let default = match &self.arena[id as usize] {
+            Obj::Symbol(s) => s.value.clone(),
+            _ => None,
+        };
+        for b in &mut self.buffers {
+            b.locals.entry(id).or_insert_with(|| default.clone());
+        }
+        self.always_local.retain(|(s, _)| *s != id);
+        self.always_local.push((id, init));
+        Ok(v.clone())
+    }
+    /// The always-local slots a buffer named NAME starts with, made while the
+    /// current buffer is still the creator.
+    fn initial_slots(&self, name: &str) -> HashMap<u32, Option<Value>> {
+        let creator = &self.buffers[self.cur_buf_idx()];
+        self.always_local
+            .iter()
+            .map(|(id, init)| {
+                let val = match init {
+                    SlotInit::Value(v) => Some(v.clone()),
+                    SlotInit::Inherit => creator.locals.get(id).cloned().flatten(),
+                    SlotInit::UndoList => Some(if name.starts_with(' ') {
+                        Value::Bool(true)
+                    } else {
+                        Value::Undef
+                    }),
+                };
+                (*id, val)
+            })
+            .collect()
+    }
     /// `(local-variable-if-set-p SYM)` — non-nil if SYM is local in the current
     /// buffer or would become local when set (automatically buffer-local).
     pub fn local_variable_if_set_p(&self, v: &Value) -> bool {
@@ -2110,6 +2170,12 @@ impl ElispHost {
     pub fn kill_local_variable(&mut self, v: &Value) -> Result<Value, String> {
         if let Some(id0) = self.sym_handle(v) {
             let id = self.indirect_var(id0);
+            // data.c `Fkill_local_variable`: a per-buffer slot resets only when
+            // its `buffer_local_flags` index is positive; an always-local one
+            // (index -1) keeps its value.
+            if self.always_local.iter().any(|(s, _)| *s == id) {
+                return Ok(v.clone());
+            }
             let bi = self.cur_buf_idx();
             self.buffers[bi].locals.remove(&id);
         }
@@ -4483,6 +4549,7 @@ impl ElispHost {
     /// handle. The caller guarantees `name` is not already taken.
     fn new_buffer(&mut self, name: String) -> Value {
         let idx = self.buffers.len();
+        let locals = self.initial_slots(&name);
         self.buffers.push(EditBuffer {
             overlays: Vec::new(),
             name: Some(name),
@@ -4496,7 +4563,7 @@ impl ElispHost {
             mark: None,
             se_markers: Vec::new(),
             restrict_stack: Vec::new(),
-            locals: HashMap::new(),
+            locals,
             local_map: Value::Undef,
             mods: ModCounts::default(),
             has_intervals: false,

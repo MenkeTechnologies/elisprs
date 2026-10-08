@@ -8427,6 +8427,18 @@ fn kill_local_variable(h: &mut ElispHost, a: &[Value]) -> R {
 fn buffer_local_symbols_fn(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(h.buffer_local_symbols())
 }
+/// `(--make-always-local-- SYM INIT)`: SYM becomes an always-local per-buffer
+/// slot. INIT is what a new buffer starts with: `:inherit` (the creating
+/// buffer's value), `:undo-list` (t when the name starts with a space), or a
+/// value.
+fn make_always_local_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let init = match h.sym_name(&a[1]).as_deref() {
+        Some(":inherit") => crate::host::SlotInit::Inherit,
+        Some(":undo-list") => crate::host::SlotInit::UndoList,
+        _ => crate::host::SlotInit::Value(a[1].clone()),
+    };
+    h.make_always_local(&a[0], init)
+}
 fn buffer_local_value_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // BUFFER (a[1]) selects the buffer; default to the current one.
     let idx = match a.get(1) {
@@ -10897,6 +10909,7 @@ pub fn install(h: &mut ElispHost) {
         Some(0),
         buffer_local_symbols_fn,
     );
+    s("--make-always-local--", 2, Some(2), make_always_local_fn);
     s("buffer-local-value", 2, Some(2), buffer_local_value_fn);
     s("default-value", 1, Some(1), default_value_fn);
     s("set-default", 2, Some(2), set_default_fn);

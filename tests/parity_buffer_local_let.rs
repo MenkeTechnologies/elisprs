@@ -71,3 +71,44 @@ fn per_buffer_c_variables() {
         "((t 70) (t 0) (t nil) (t nil) (t nil) (t utf-8-unix) (t t) (t 0))",
     );
 }
+
+/// buffer.c's always-local slots (`buffer_local_flags` -1): every buffer has
+/// its own value from birth, so `local-variable-p` is t in a fresh buffer,
+/// `kill-local-variable` keeps the value, and a new buffer starts from
+/// `reset_buffer`'s constants — not the defaults — except `default-directory`
+/// (the creating buffer's) and `buffer-undo-list` (t in a buffer whose name
+/// starts with a space). `kill-all-local-variables` resets only the slots
+/// `reset_buffer_local_variables` stores.
+#[test]
+fn always_local_per_buffer_slots() {
+    check(
+        "(with-temp-buffer (mapcar (lambda (v) (local-variable-p v)) \
+           '(buffer-file-name buffer-file-truename default-directory buffer-backed-up \
+             buffer-saved-size buffer-auto-save-file-name buffer-read-only major-mode \
+             local-minor-modes mode-name buffer-undo-list mark-active point-before-scroll \
+             buffer-invisibility-spec buffer-file-format buffer-auto-save-file-format \
+             buffer-display-count buffer-display-time fill-column)))",
+        "(t t t t t t t t t t t t t t t t t t nil)",
+    );
+    check(
+        "(list (mapcar #'default-value \
+                 '(default-directory major-mode mode-name buffer-undo-list buffer-invisibility-spec)) \
+               (with-temp-buffer (list major-mode mode-name buffer-undo-list)) \
+               (with-current-buffer (get-buffer-create \"zzb\") buffer-undo-list) \
+               (let ((default-directory \"/usr/\")) (with-temp-buffer default-directory)) \
+               (progn (setq-default buffer-read-only t major-mode 'text-mode) \
+                      (with-temp-buffer (list buffer-read-only major-mode))))",
+        "((nil fundamental-mode nil nil t) (fundamental-mode \"Fundamental\" t) nil \"/usr/\" (nil fundamental-mode))",
+    );
+    check(
+        "(with-temp-buffer \
+           (setq major-mode 'foo mode-name \"x\" buffer-read-only t default-directory \"/a/\" \
+                 buffer-invisibility-spec nil) \
+           (kill-local-variable 'buffer-read-only) \
+           (let ((r (list buffer-read-only (local-variable-p 'buffer-read-only)))) \
+             (kill-all-local-variables) \
+             (list r major-mode mode-name buffer-read-only default-directory \
+                   buffer-invisibility-spec (local-variable-p 'major-mode))))",
+        "((t t) fundamental-mode \"Fundamental\" t \"/a/\" t t)",
+    );
+}

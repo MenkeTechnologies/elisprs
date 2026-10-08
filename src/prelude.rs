@@ -12027,6 +12027,9 @@ LISTS is a list of lists of elements."
 ;; `change-major-mode-hook', then eliminate the current buffer's local variables
 ;; except those with a non-nil `permanent-local' property, and reset the local
 ;; keymap. (Syntax-table/abbrev-table resets belong to subsystems not modeled.)
+;; The always-local slots survive, but `reset_buffer_local_variables' stores
+;; Fundamental mode's `major-mode' and `mode-name' and a t
+;; `buffer-invisibility-spec' into them.
 (defun kill-all-local-variables (&optional kill-permanent)
   "Switch to Fundamental mode by killing current buffer's local variables."
   (run-hooks 'change-major-mode-hook)
@@ -12034,6 +12037,9 @@ LISTS is a list of lists of elements."
     (unless (and (not kill-permanent) (get sym 'permanent-local))
       (kill-local-variable sym)))
   (use-local-map nil)
+  (setq major-mode 'fundamental-mode
+        mode-name "Fundamental"
+        buffer-invisibility-spec t)
   nil)
 
 ;; run-mode-hooks / delay-mode-hooks (subr.el, ported faithfully). The
@@ -15120,11 +15126,10 @@ and if a matching region is found, place point at the start of the region."
 ;; variables Emacs makes automatically buffer-local at startup, as GNU Emacs
 ;; 31.1 `emacs -Q --batch' has them: every one is bound, and setting one in a
 ;; buffer gives that buffer its own value instead of changing every buffer's.
-;; Defaults are the measured `default-value's. Left out: `default-directory'
-;; (a new buffer inherits the creating buffer's, which this model does not
-;; do), `lexical-binding' (rebound by `load'), `enable-multibyte-characters'
-;; (set only through `set-buffer-multibyte'), and `mode-line-format' (whose
-;; default is bindings.el's mode-line construct, not modelled).
+;; Defaults are the measured `default-value's. Left out: `lexical-binding'
+;; (rebound by `load'), `enable-multibyte-characters' (set only through
+;; `set-buffer-multibyte'), and `mode-line-format' (whose default is
+;; bindings.el's mode-line construct, not modelled).
 (dolist (var '(case-fold-search case-symbols-as-words deactivate-mark
                multibyte-syntax-as-symbol parse-sexp-ignore-comments
                parse-sexp-lookup-properties show-trailing-whitespace tab-width))
@@ -15196,6 +15201,26 @@ and if a matching region is found, place point at the start of the region."
 (defvar-local vertical-scroll-bar t)
 (defvar-local word-wrap nil)
 (defvar-local wrap-prefix nil)
+;; The always-local slots: `buffer_local_flags' is -1 for these in buffer.c
+;; `init_buffer_once', so every buffer has its own value from birth
+;; (`local-variable-p' is t in a fresh buffer) and `kill-local-variable' keeps
+;; it. The second element is what a new buffer starts with: `reset_buffer' /
+;; `reset_buffer_local_variables' store constants, `default-directory' is the
+;; creating buffer's, and `buffer-undo-list' is t only in a buffer whose name
+;; starts with a space (`Fget_buffer_create').
+(dolist (slot '((buffer-file-name nil) (buffer-file-truename nil)
+                (default-directory :inherit) (buffer-backed-up nil)
+                (buffer-saved-size 0) (buffer-auto-save-file-name nil)
+                (buffer-read-only nil) (major-mode fundamental-mode)
+                (local-minor-modes nil) (mode-name "Fundamental")
+                (buffer-undo-list :undo-list) (mark-active nil)
+                (point-before-scroll nil) (buffer-invisibility-spec t)
+                (buffer-file-format nil) (buffer-auto-save-file-format t)
+                (buffer-display-count 0) (buffer-display-time nil)))
+  (--make-always-local-- (car slot) (cadr slot)))
+;; The startup buffers now hold the working directory; the default, which only
+;; `default-value' sees, is nil as in Emacs.
+(setq-default default-directory nil)
 "#;
 
 /// Faithful port of emacs-lisp/nadvice.el (Emacs 30.2) — the modern light-weight
