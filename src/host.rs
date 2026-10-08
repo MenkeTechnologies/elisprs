@@ -7258,7 +7258,25 @@ pub fn expand_intrinsic_macro(form: &Value) -> Result<Option<Value>, String> {
 /// be *both* a special variable and a macro (e.g. `delay-mode-hooks`) — expanding
 /// the binding head there loops forever.
 pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
-    macroexpand_all_impl(form, false, true, &Value::Undef)
+    macroexpand_all_impl(form, Walk::Load, &Value::Undef)
+}
+
+/// Which of Emacs's three macro walks [`macroexpand_all_impl`] performs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    /// `load`'s eager `internal-macroexpand-for-load`, i.e. `macroexpand-all`
+    /// ahead of lowering: compiler macros apply and `when`/`unless` unfold,
+    /// so a closure's printed body is the expanded one
+    /// (`#[(x) ((if x (progn y))) ((y . 1))]`). A COND-less `(when)` is left
+    /// for the compiler, which signals its arity error only if it runs.
+    Load,
+    /// eval.c `eval_sub` under the `eval` builtin: no compiler macros, no
+    /// `when`/`unless` unfolding, and an expander's failure is deferred to
+    /// the point the call is reached.
+    Eval,
+    /// The `macroexpand-all` builtin: everything unfolds, and every failure
+    /// signals at once.
+    Builtin,
 }
 
 /// [`macroexpand_all`] for the `eval` builtin, which does NOT apply compiler
@@ -7274,13 +7292,13 @@ pub fn macroexpand_all(form: &Value) -> Result<Value, String> {
 /// (eval '(let ((l nil)) (add-to-list 'l 1) l) t)   ; (void-variable l)
 /// ```
 pub fn macroexpand_all_for_eval(form: &Value) -> Result<Value, String> {
-    macroexpand_all_impl(form, false, false, &Value::Undef)
+    macroexpand_all_impl(form, Walk::Eval, &Value::Undef)
 }
 
 /// `macroexpand-all` as the elisp builtin exposes it: identical to
-/// [`macroexpand_all`] but also unfolds the intrinsic `when`/`unless` macros
-/// (see [`expand_intrinsic_macro`]). Kept off the compile pipeline so the
-/// compiler's dedicated `when`/`unless` lowering (`compile_when`) still fires.
+/// [`macroexpand_all`] except that a COND-less `(when)` / `(unless)` signals
+/// its arity error during the walk, as the expander does in Emacs, instead of
+/// being left for the compiler to signal when the form runs.
 pub fn macroexpand_all_builtin(form: &Value, env: &Value) -> Result<Value, String> {
     // macroexp.el binds `macroexpand-all-environment' around the walk, so an
     // expander that expands its own body (`cl-tagbody', `cl-macrolet') sees
@@ -7291,7 +7309,7 @@ pub fn macroexpand_all_builtin(form: &Value, env: &Value) -> Result<Value, Strin
         let _ = h.specbind(&sym, env.clone());
         d
     });
-    let out = macroexpand_all_impl(form, true, true, env);
+    let out = macroexpand_all_impl(form, Walk::Builtin, env);
     with_host(|h| h.unbind_to(depth));
     out
 }
@@ -7310,22 +7328,12 @@ fn lambda_parts(v: Option<&Value>) -> Option<Vec<Value>> {
 /// head. The ARGLIST is a parameter list, not code — a parameter named after a
 /// macro (e.g. `rx`) must NOT be macroexpanded — and the `function` wrapper is
 /// added by whichever caller wants it, so this never double-wraps.
-fn expand_lambda_bare(
-    elems: &[Value],
-    expand_intrinsics: bool,
-    apply_cmacros: bool,
-    env: &Value,
-) -> Result<Value, String> {
+fn expand_lambda_bare(elems: &[Value], walk: Walk, env: &Value) -> Result<Value, String> {
     let mut out = Vec::with_capacity(elems.len());
     out.push(elems[0].clone());
     out.push(elems[1].clone()); // ARGLIST, untouched
     for e in &elems[2..] {
-        out.push(macroexpand_all_impl(
-            e,
-            expand_intrinsics,
-            apply_cmacros,
-            env,
-        )?);
+        out.push(macroexpand_all_impl(e, walk, env)?);
     }
     Ok(with_host(|h| h.list_from(out)))
 }
@@ -7432,12 +7440,17 @@ fn deferred_expansion_failure(err: String) -> Value {
     })
 }
 
-fn macroexpand_all_impl(
-    form: &Value,
-    expand_intrinsics: bool,
-    apply_cmacros: bool,
-    env: &Value,
-) -> Result<Value, String> {
+/// `(when)` / `(unless)` with no COND: the form the compiler lowers to its
+/// run-time arity signal, so the [`Walk::Load`] walk leaves it as written.
+fn is_condless_when(form: &Value) -> bool {
+    with_host(|h| {
+        h.list_vec(form).is_some_and(|v| {
+            v.len() == 1 && matches!(h.sym_name(&v[0]).as_deref(), Some("when" | "unless"))
+        })
+    })
+}
+
+fn macroexpand_all_impl(form: &Value, walk: Walk, env: &Value) -> Result<Value, String> {
     let mut f = form.clone();
     loop {
         match env_expand(&f, env)? {
@@ -7462,16 +7475,21 @@ fn macroexpand_all_impl(
             // eval.c `eval_sub`, which expands a macro call only when the call
             // is REACHED: `(eval '(if nil (BROKEN-MACRO) 'ok))` is `ok`, and a
             // `condition-case` in the same form catches the expander's error.
-            Err(e) if !apply_cmacros => return Ok(deferred_expansion_failure(e)),
+            Err(e) if walk == Walk::Eval => return Ok(deferred_expansion_failure(e)),
             Err(e) => return Err(e),
         }
-        if expand_intrinsics {
+        let unfold_intrinsics = match walk {
+            Walk::Eval => false,
+            Walk::Load => !is_condless_when(&f),
+            Walk::Builtin => true,
+        };
+        if unfold_intrinsics {
             if let Some(e) = expand_intrinsic_macro(&f)? {
                 f = e;
                 continue;
             }
         }
-        if apply_cmacros {
+        if walk != Walk::Eval {
             if let Some(e) = apply_compiler_macro(&f)? {
                 f = e;
                 continue;
@@ -7519,7 +7537,7 @@ fn macroexpand_all_impl(
             // Expand the lambda BARE — `expand_lambda_bare` does not re-add the
             // wrapper, so `#'(lambda ...)` cannot come back as
             // `#'#'(lambda ...)`.
-            let lam = expand_lambda_bare(&inner, expand_intrinsics, apply_cmacros, env)?;
+            let lam = expand_lambda_bare(&inner, walk, env)?;
             Ok(with_host(|h| h.list_from(vec![elems[0].clone(), lam])))
         }
         // Binding forms: expand each binding's INIT (never the VAR, which may name
@@ -7544,12 +7562,7 @@ fn macroexpand_all_impl(
                                 let mut np = Vec::with_capacity(parts.len());
                                 np.push(parts[0].clone()); // VAR, untouched
                                 for p in &parts[1..] {
-                                    np.push(macroexpand_all_impl(
-                                        p,
-                                        expand_intrinsics,
-                                        apply_cmacros,
-                                        env,
-                                    )?);
+                                    np.push(macroexpand_all_impl(p, walk, env)?);
                                 }
                                 out.push(with_host(|h| h.list_from(np)));
                             }
@@ -7564,12 +7577,7 @@ fn macroexpand_all_impl(
             out.push(elems[0].clone());
             out.push(new_bindings);
             for e in &elems[2..] {
-                out.push(macroexpand_all_impl(
-                    e,
-                    expand_intrinsics,
-                    apply_cmacros,
-                    env,
-                )?);
+                out.push(macroexpand_all_impl(e, walk, env)?);
             }
             let _ = kw;
             Ok(with_host(|h| h.list_from(out)))
@@ -7584,7 +7592,7 @@ fn macroexpand_all_impl(
         // `cconv-make-interpreted-closure` stores the expanded body, so a
         // closure whose body contains a nested `lambda` PRINTS the `#'`.
         Some("lambda") if elems.len() >= 2 => {
-            let lam = expand_lambda_bare(&elems, expand_intrinsics, apply_cmacros, env)?;
+            let lam = expand_lambda_bare(&elems, walk, env)?;
             Ok(with_host(|h| {
                 let fsym = h.intern("function");
                 h.list_from(vec![fsym, lam])
@@ -7622,7 +7630,7 @@ fn macroexpand_all_impl(
                 // Non-nil ⇒ BODY had a `declare'; expand the rewritten form (its
                 // inner defun has the `declare' stripped, so this does not recurse).
                 if el_truthy(&replaced) {
-                    return macroexpand_all_impl(&replaced, expand_intrinsics, apply_cmacros, env);
+                    return macroexpand_all_impl(&replaced, walk, env);
                 }
             }
             let mut out = Vec::with_capacity(elems.len());
@@ -7630,12 +7638,7 @@ fn macroexpand_all_impl(
             out.push(elems[1].clone()); // NAME, untouched
             out.push(elems[2].clone()); // ARGLIST, untouched
             for e in &elems[3..] {
-                out.push(macroexpand_all_impl(
-                    e,
-                    expand_intrinsics,
-                    apply_cmacros,
-                    env,
-                )?);
+                out.push(macroexpand_all_impl(e, walk, env)?);
             }
             Ok(with_host(|h| h.list_from(out)))
         }
@@ -7651,12 +7654,7 @@ fn macroexpand_all_impl(
                     Some(forms) if !forms.is_empty() => {
                         let mut nc = Vec::with_capacity(forms.len());
                         for f in &forms {
-                            nc.push(macroexpand_all_impl(
-                                f,
-                                expand_intrinsics,
-                                apply_cmacros,
-                                env,
-                            )?);
+                            nc.push(macroexpand_all_impl(f, walk, env)?);
                         }
                         out.push(with_host(|h| h.list_from(nc)));
                     }
@@ -7674,10 +7672,8 @@ fn macroexpand_all_impl(
                 // would be `invalid-function` — `#'(lambda …)` is a form that
                 // evaluates to a closure, not a closure.
                 let expanded = match (i == 0).then(|| lambda_parts(Some(e))).flatten() {
-                    Some(parts) => {
-                        expand_lambda_bare(&parts, expand_intrinsics, apply_cmacros, env)?
-                    }
-                    None => macroexpand_all_impl(e, expand_intrinsics, apply_cmacros, env)?,
+                    Some(parts) => expand_lambda_bare(&parts, walk, env)?,
+                    None => macroexpand_all_impl(e, walk, env)?,
                 };
                 // A `defmacro' among sibling forms has to take effect BEFORE its
                 // siblings are expanded, or a macro defined and used in the same

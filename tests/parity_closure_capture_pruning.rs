@@ -190,3 +190,27 @@ fn a_reference_in_a_dead_branch_still_captures() {
         "\"#[nil ((if t nil m k) n) ((k . 3) (m . 2) (n . 1))]\""
     );
 }
+
+/// A loaded file's top-level forms go through `macroexpand-all`, which unfolds
+/// `when`/`unless` too, so a closure prints its body with them expanded.
+/// GNU Emacs 31.1, `emacs -Q --batch -l` of a `lexical-binding: t` file.
+#[test]
+fn a_closure_prints_when_and_unless_unfolded() {
+    assert_eq!(
+        eval("(let ((y 1)) (format \"%S\" (lambda (x) (when x y))))"),
+        "\"#[(x) ((if x (progn y))) ((y . 1))]\""
+    );
+    assert_eq!(
+        eval("(format \"%S\" (lambda (x) (unless x 2)))"),
+        "\"#[(x) ((if x nil 2)) (t)]\""
+    );
+    assert_eq!(
+        eval("(progn (defun gg (x) (when x 1)) (format \"%S\" (symbol-function 'gg)))"),
+        "\"#[(x) ((if x (progn 1))) (t)]\""
+    );
+    // The empty-body arm of subr.el's `when`.
+    assert_eq!(
+        eval("(format \"%S\" (lambda (x) (when x)))"),
+        "\"#[(x) ((progn x nil)) (t)]\""
+    );
+}

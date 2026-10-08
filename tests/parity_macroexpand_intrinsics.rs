@@ -90,8 +90,8 @@ fn dolist_dotimes_still_expand() {
     assert_eq!(eval("(car (macroexpand '(dotimes (i 3) (foo i))))"), "let");
 }
 
-/// Runtime `when`/`unless` are unchanged: the compiler still lowers them via its
-/// dedicated fast path (the intrinsic expansion is off the compile pipeline).
+/// Runtime `when`/`unless` evaluate as before, whether the compiler sees them
+/// unfolded to `if` (the load walk) or as written (the `eval` walk).
 #[test]
 fn runtime_when_unless_unchanged() {
     assert_eq!(eval("(when t 1 2 3)"), "3");
