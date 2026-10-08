@@ -8489,11 +8489,10 @@ context rather than the build-time context."
     ;; delay it, so initialize it "normally" (bug#47072).
     (custom-initialize-reset symbol value)))
 
-;; C subr (eval.c): mark SYMBOL special (dynamically bound) and record DOC,
-;; without touching its value. Bare `(defvar SYMBOL)' marks special without
-;; binding; the docstring lives on the `variable-documentation' property.
+;; eval.c `internal--define-uninitialized-variable': mark SYMBOL special
+;; (dynamically bound) for good and record DOC, without touching its value.
 (defun internal--define-uninitialized-variable (symbol &optional doc)
-  (eval (list 'defvar symbol))
+  (--declare-special symbol)
   (when doc (put symbol 'variable-documentation doc))
   nil)
 

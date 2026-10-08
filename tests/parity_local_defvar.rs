@@ -89,3 +89,16 @@ fn top_level_declaration_lasts_for_the_file() {
         "(1 #[nil ((let ((xx 1)) (g))) (xx t)] nil)",
     );
 }
+
+/// eval.c `internal--define-uninitialized-variable` (what `defcustom` and the
+/// custom initializers call) sets `declared_special` for good, unlike a
+/// value-less `defvar`.
+#[test]
+fn define_uninitialized_variable_is_special_for_good() {
+    check(
+        "(progn (internal--define-uninitialized-variable 'qqq \"d\") \
+                (list (special-variable-p 'qqq) (get 'qqq 'variable-documentation) \
+                      (boundp 'qqq) (let ((qqq 1)) (symbol-value 'qqq))))",
+        "(t \"d\" nil 1)",
+    );
+}

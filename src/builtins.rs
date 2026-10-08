@@ -8502,6 +8502,12 @@ fn defvar_declare_fn(h: &mut ElispHost, a: &[Value]) -> R {
     h.declare_special_locally(&a[0]);
     Ok(a[0].clone())
 }
+/// `(--declare-special SYM)`: set SYM's `declared_special` flag, the part of
+/// eval.c `internal--define-uninitialized-variable` that has no Lisp spelling.
+fn declare_special_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    h.set_special(&a[0]);
+    Ok(Value::Undef)
+}
 fn buffer_local_value_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // BUFFER (a[1]) selects the buffer; default to the current one.
     let idx = match a.get(1) {
@@ -10975,6 +10981,7 @@ pub fn install(h: &mut ElispHost) {
     s("--make-always-local--", 2, Some(2), make_always_local_fn);
     s("--early-declarations--", 0, Some(0), early_declarations_fn);
     s("--defvar-declare--", 1, Some(1), defvar_declare_fn);
+    s("--declare-special", 1, Some(1), declare_special_fn);
     s("buffer-local-value", 2, Some(2), buffer_local_value_fn);
     s("default-value", 1, Some(1), default_value_fn);
     s("set-default", 2, Some(2), set_default_fn);
