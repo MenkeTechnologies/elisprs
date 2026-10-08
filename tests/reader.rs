@@ -120,3 +120,20 @@ fn backquote_with_unquote_and_splice() {
         "(a 4 5 6 b)"
     );
 }
+
+/// lread.c `read_char_literal`: a character literal must be followed by a
+/// delimiter (whitespace or one of `"';()[]#?`,.` and backquote), else
+/// `(invalid-read-syntax "?")`. elisprs read `?ab` as 97.
+#[test]
+fn char_literal_needs_a_delimiter() {
+    elisprs::reset_host();
+    let v = elisprs::eval_str(
+        r#"(mapcar (lambda (s) (condition-case e (read s) (error e)))
+                   (list "?ab" "?a)" "?a." "?a;" "?a#" "(?a?b)" "?\\C-ab" "?\\x41g" "?\\(" "?\\sa"))"#,
+    )
+    .expect("eval failed");
+    assert_eq!(
+        elisprs::print(&v, true),
+        r#"((invalid-read-syntax "?") 97 97 97 97 (97 98) (invalid-read-syntax "?") (invalid-read-syntax "?") 40 (invalid-read-syntax "?"))"#
+    );
+}

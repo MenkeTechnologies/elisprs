@@ -378,7 +378,21 @@ impl Reader {
 
     fn read_char_literal(&mut self) -> Result<Value, String> {
         self.pos += 1; // consume '?'
-        Ok(Value::Int(self.read_char_spec()?))
+        let ch = self.read_char_spec()?;
+        // lread.c `read_char_literal`: the character must be followed by a
+        // delimiter, so `?ab` is not 97 followed by the symbol `b`.
+        match self.peek() {
+            Some(c)
+                if !(c as u32 <= 32
+                    || matches!(
+                        c,
+                        '"' | '\'' | ';' | '(' | ')' | '[' | ']' | '#' | '?' | '`' | ',' | '.'
+                    )) =>
+            {
+                Err("invalid-read-syntax: ?".to_string())
+            }
+            _ => Ok(Value::Int(ch)),
+        }
     }
 
     /// Read one character specification (after `?`), honoring the modifier
