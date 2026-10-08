@@ -239,12 +239,16 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
                 .map(|f| h.sym_name(f).as_deref() == Some("lambda"))
                 .unwrap_or(false);
             if is_lambda {
-                compile_lambda(h, b, &arg_elems.unwrap(), false)?;
+                let raw = eval_lambda_raw(h, &arg);
+                compile_lambda(h, b, &arg_elems.unwrap(), false, raw)?;
             } else {
                 load_const(b, arg);
             }
         }
-        Some("lambda") => compile_lambda(h, b, &elems, false)?,
+        Some("lambda") => {
+            let raw = eval_lambda_raw(h, form);
+            compile_lambda(h, b, &elems, false, raw)?
+        }
         Some("progn") => compile_progn(h, b, &elems[1..])?,
         // eval.c `Finteractive`: nil, its arguments never evaluated.
         Some("interactive") => {
@@ -261,8 +265,14 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
         Some("let") => compile_let(h, b, &elems[1..], false)?,
         Some("let*") => compile_let(h, b, &elems[1..], true)?,
         Some("setq") => compile_setq(h, b, &elems[1..])?,
-        Some("defun") => compile_defun(h, b, &elems, false)?,
-        Some("defmacro") => compile_defun(h, b, &elems, true)?,
+        Some("defun") => {
+            let raw = eval_lambda_raw(h, form);
+            compile_defun(h, b, &elems, false, raw)?
+        }
+        Some("defmacro") => {
+            let raw = eval_lambda_raw(h, form);
+            compile_defun(h, b, &elems, true, raw)?
+        }
         Some("defvar") => compile_defvar(h, b, &elems, false)?,
         Some("defconst") => compile_defvar(h, b, &elems, true)?,
         Some("catch") => compile_catch(h, b, &elems)?,
@@ -305,7 +315,7 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
                 b.emit(Op::Extended(ops::CHECK_ARITY, argc as u8), 0);
             }
             if head_is_lambda {
-                compile_lambda(h, b, &head_elems.unwrap(), false)?;
+                compile_lambda(h, b, &head_elems.unwrap(), false, None)?;
             } else {
                 // Inside the prelude, a call to one of the primitives Emacs's
                 // byte compiler open-codes loads the subr itself, not the
@@ -664,11 +674,21 @@ fn printable_body(forms: &[Value]) -> Vec<Value> {
     }
 }
 
+/// The as-written body the `eval` walk recorded for this `(lambda ...)` form,
+/// if it came from there (see `ElispHost::eval_lambda_raw`).
+fn eval_lambda_raw(h: &mut ElispHost, form: &Value) -> Option<Vec<Value>> {
+    match form {
+        Value::Obj(id) => h.eval_lambda_raw.remove(id),
+        _ => None,
+    }
+}
+
 fn compile_lambda(
     h: &mut ElispHost,
     b: &mut ChunkBuilder,
     elems: &[Value],
     is_macro: bool,
+    raw_body: Option<Vec<Value>>,
 ) -> Result<(), String> {
     let arglist = elems.get(1).cloned().unwrap_or(Value::Undef);
     let params = h.parse_params(&arglist)?;
@@ -678,6 +698,7 @@ fn compile_lambda(
     let src = Rc::new(crate::host::ClosureSrc {
         arglist: arglist.clone(),
         body: printable_body(elems.get(2..).unwrap_or(&[])),
+        raw_body: raw_body.map(|r| printable_body(&r)),
     });
     let template = h.alloc(Obj::Closure {
         params: Rc::new(params),
@@ -700,6 +721,7 @@ fn compile_defun(
     b: &mut ChunkBuilder,
     elems: &[Value],
     is_macro: bool,
+    raw_body: Option<Vec<Value>>,
 ) -> Result<(), String> {
     let name = elems.get(1).cloned().ok_or("defun: missing name")?;
     if !matches!(h.obj(&name), Some(Obj::Symbol(_))) {
@@ -708,9 +730,18 @@ fn compile_defun(
     let arglist = elems.get(2).cloned().unwrap_or(Value::Undef);
     let params = h.parse_params(&arglist)?;
     let body = compile_body_chunk(h, elems.get(3..).unwrap_or(&[]))?;
+    // A macro made by the `eval` walk captures nothing, so `Ffunction` keeps
+    // its body as written; a function settles its source when MAKE_CLOSURE
+    // instantiates it (`host::eval_closure_source`).
+    let raw_body = raw_body.map(|r| printable_body(&r));
+    let (shown, raw_body) = match (is_macro, raw_body) {
+        (true, Some(raw)) => (raw, None),
+        (_, raw) => (printable_body(elems.get(3..).unwrap_or(&[])), raw),
+    };
     let src = Rc::new(crate::host::ClosureSrc {
         arglist: arglist.clone(),
-        body: printable_body(elems.get(3..).unwrap_or(&[])),
+        body: shown,
+        raw_body,
     });
     let template = h.alloc(Obj::Closure {
         params: Rc::new(params),

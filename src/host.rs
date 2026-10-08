@@ -1024,6 +1024,10 @@ pub struct ElispHost {
     /// for it once. Derived from the template's source, so it is never
     /// serialized: a cache hit recomputes it on the first instantiation.
     pub(crate) closure_free: HashMap<u32, Rc<std::collections::HashSet<u32>>>,
+    /// The `eval` walk's expanded `(lambda ...)` forms (by cons handle) and
+    /// the body each had as written; the compiler moves it into the
+    /// template's [`ClosureSrc::raw_body`] when it lowers that form.
+    pub(crate) eval_lambda_raw: HashMap<u32, Vec<Value>>,
     /// Symbols a `compiler-macro` property has been put on.
     ///
     /// [`macroexpand_all`] has to ask whether a call's head has one, and the
@@ -1104,6 +1108,12 @@ pub type ClosureParts = (bool, bool, Value, Vec<Value>, Vec<(u32, Value)>);
 pub struct ClosureSrc {
     pub arglist: Value,
     pub body: Vec<Value>,
+    /// For a `lambda` reached by the `eval` walk: its body as written, before
+    /// any expansion. eval.c `Ffunction` hands that unexpanded body to
+    /// `cconv-make-interpreted-closure`, which keeps it when no lexical
+    /// variable is in scope and otherwise replaces it by its `macroexpand-all`
+    /// — see [`eval_closure_source`].
+    pub raw_body: Option<Vec<Value>>,
 }
 
 /// A closure's source body split the way eval.c `Ffunction` splits a lambda
@@ -1349,6 +1359,7 @@ impl ElispHost {
             load_buf: 0, // fixed below, once the slot exists
             string_props: HashMap::new(),
             closure_free: HashMap::new(),
+            eval_lambda_raw: HashMap::new(),
             compiler_macros: std::collections::HashSet::new(),
             empty_string: Value::Undef, // fixed below, once the arena exists
             empty_vector: Value::Undef,
@@ -3352,6 +3363,7 @@ impl ElispHost {
                     src: Rc::new(ClosureSrc {
                         arglist,
                         body: src_body,
+                        raw_body: None,
                     }),
                     body: Rc::new(body),
                     is_macro,
@@ -7335,7 +7347,11 @@ fn expand_lambda_bare(elems: &[Value], walk: Walk, env: &Value) -> Result<Value,
     for e in &elems[2..] {
         out.push(macroexpand_all_impl(e, walk, env)?);
     }
-    Ok(with_host(|h| h.list_from(out)))
+    let lam = with_host(|h| h.list_from(out));
+    if let (Walk::Eval, Value::Obj(id)) = (walk, &lam) {
+        with_host(|h| h.eval_lambda_raw.insert(*id, elems[2..].to_vec()));
+    }
+    Ok(lam)
 }
 
 /// Apply the head symbol's COMPILER MACRO, if it has one.
@@ -7640,7 +7656,11 @@ fn macroexpand_all_impl(form: &Value, walk: Walk, env: &Value) -> Result<Value, 
             for e in &elems[3..] {
                 out.push(macroexpand_all_impl(e, walk, env)?);
             }
-            Ok(with_host(|h| h.list_from(out)))
+            let def = with_host(|h| h.list_from(out));
+            if let (Walk::Eval, Value::Obj(id)) = (walk, &def) {
+                with_host(|h| h.eval_lambda_raw.insert(*id, elems[3..].to_vec()));
+            }
+            Ok(def)
         }
         // macroexp.el: `(cond . ,clauses)` expands every element of every clause
         // as a form (`macroexp--all-clauses`), the condition included, so a
@@ -8167,7 +8187,10 @@ pub fn ext_dispatch(vm: &mut VM, id: u16, arg: u8) {
         ops::MAKE_CLOSURE => {
             let template = vm.pop();
             let clo = with_host(|h| h.instantiate_closure(&template));
-            vm.push(clo);
+            match eval_closure_source(&clo) {
+                Ok(()) => vm.push(clo),
+                Err(e) => abort(vm, e),
+            }
         }
         ops::DBG_LINE => {
             // A DAP statement marker (emitted only in debug mode). The line rides
@@ -8180,6 +8203,80 @@ pub fn ext_dispatch(vm: &mut VM, id: u16, arg: u8) {
         }
         _ => {}
     }
+}
+
+/// The printed source of a closure the `eval` walk built, settled when the
+/// closure is made — cconv.el `cconv-make-interpreted-closure`, which eval.c
+/// `Ffunction` calls with the lambda's body as written:
+///
+/// - with no lexical variable in scope (or under dynamic binding, where
+///   `Ffunction` does not call it at all) the body is kept as written:
+///   `(eval '(lambda () (push 1 z)) t)` is `#[nil ((push 1 z)) (t)]`;
+/// - otherwise the body becomes its `macroexpand-all`, and an expander's error
+///   is signalled here, at closure creation:
+///   `(eval '(let ((y 1)) (lambda (x) (when x y))) t)` is
+///   `#[(x) ((if x (progn y))) ((y . 1))]`.
+///
+/// The compiled body is the `eval` walk's in both cases; only the source a
+/// closure prints (and compares by, under `equal`) is chosen here.
+fn eval_closure_source(clo: &Value) -> Result<(), String> {
+    let Some((arglist, raw, has_lexvars)) = with_host(|h| match h.obj(clo) {
+        Some(Obj::Closure { src, dynamic, .. }) => {
+            let raw = src.raw_body.clone()?;
+            Some((src.arglist.clone(), raw, !*dynamic && h.lex.is_some()))
+        }
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    let body = if has_lexvars {
+        let (form, env) = with_host(|h| {
+            let mut lam = vec![h.intern("lambda"), arglist.clone()];
+            lam.extend(raw.iter().cloned());
+            let lam = h.list_from(lam);
+            let function = h.intern("function");
+            let env_sym = h.intern("macroexpand-all-environment");
+            let env = h.get_value(&env_sym).unwrap_or(Value::Undef);
+            (h.list_from(vec![function, lam]), env)
+        });
+        let expanded = macroexpand_all_builtin(&form, &env)?;
+        // `(pcase expanded-form (`#'(lambda ,_args ,_iform . ,newbody) newbody)
+        // (_ body))` — Emacs's pattern also binds the interactive form slot,
+        // which elisprs keeps inside the body.
+        with_host(|h| {
+            let lam = h.list_vec(&expanded).and_then(|v| v.get(1).cloned());
+            match lam.and_then(|l| h.list_vec(&l)) {
+                Some(parts) if parts.len() >= 2 => parts[2..].to_vec(),
+                _ => raw.clone(),
+            }
+        })
+    } else {
+        raw
+    };
+    with_host(|h| {
+        let new_src = Rc::new(ClosureSrc {
+            arglist,
+            body: if body.is_empty() {
+                vec![Value::Undef]
+            } else {
+                body
+            },
+            raw_body: None,
+        });
+        // cconv-fv runs on the EXPANDED form, so the captures are recomputed
+        // from it: `(let ((y 2)) (lambda () (add-to-list 'y 3)))` closes over
+        // y only once the compiler macro has turned the call into `(setq y ...)`.
+        let new_env = has_lexvars.then(|| h.trim_lex(u32::MAX, &new_src));
+        if let Value::Obj(id) = clo {
+            if let Some(Obj::Closure { src, env, .. }) = h.arena.get_mut(*id as usize) {
+                *src = new_src;
+                if let Some(e) = new_env {
+                    *env = e;
+                }
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Wide extension handler — for ops with a usize payload (LETBIND/UNBIND counts).
