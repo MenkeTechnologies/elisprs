@@ -47,3 +47,27 @@ fn setq_under_a_default_binding_depends_on_the_buffer() {
         "((6 nil 6) (5 t 4) 1)",
     );
 }
+
+/// buffer.c's per-buffer variables are bound with Emacs's defaults and are
+/// automatically buffer-local, so setting one in a buffer leaves every other
+/// buffer's value alone, and a `let` of one with no local binds the default.
+#[test]
+fn per_buffer_c_variables() {
+    check(
+        "(list (let ((case-fold-search nil)) \
+                 (with-temp-buffer (insert \"A\") (goto-char 1) (search-forward \"a\" nil t))) \
+               (with-temp-buffer (setq case-fold-search nil) (with-temp-buffer case-fold-search)) \
+               (progn (setq tab-width 4) (with-temp-buffer tab-width)) \
+               (with-temp-buffer (let ((tab-width 3)) (with-temp-buffer tab-width))) \
+               (with-temp-buffer (setq-local tab-width 5) \
+                 (let ((tab-width 3)) (list tab-width (default-value 'tab-width) (with-temp-buffer tab-width)))) \
+               (with-temp-buffer (setq-local fill-column 33) (list fill-column (default-value 'fill-column))))",
+        "(nil t 8 3 (3 8 8) (33 70))",
+    );
+    check(
+        "(mapcar (lambda (v) (list (local-variable-if-set-p v) (default-value v))) \
+                 '(fill-column left-margin buffer-file-name truncate-lines word-wrap \
+                   buffer-file-coding-system selective-display-ellipses buffer-display-count))",
+        "((t 70) (t 0) (t nil) (t nil) (t nil) (t utf-8-unix) (t t) (t 0))",
+    );
+}
