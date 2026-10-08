@@ -7331,6 +7331,49 @@ fn apply_compiler_macro(form: &Value) -> Result<Option<Value>, String> {
     Ok(Some(out))
 }
 
+/// The form that replays a macro expander's failure at the point the macro
+/// call is evaluated, for the lazy `eval` walk (see [`macroexpand_all_impl`]).
+///
+/// An error becomes `(signal 'SYMBOL 'DATA)` with the expander's own error
+/// object, so a handler sees the same DATA. A `throw` becomes `(throw 'TAG
+/// 'VALUE)`: one aimed at a `catch` already active when the walk ran is still
+/// aimed at it, and one that found no `catch` then (`no-catch`) is thrown again
+/// at run time, where a `catch` inside the evaluated form can now receive it —
+/// `(eval '(catch 'x (list 1 (THROWING-MACRO))))` is the thrown value in Emacs.
+/// With no `catch` at run time either, `throw` signals the same `no-catch`.
+fn deferred_expansion_failure(err: String) -> Value {
+    with_host(|h| {
+        let quote = h.intern("quote");
+        let thrown = if err == "--throw--" {
+            h.pending_throw.take()
+        } else {
+            None
+        };
+        let (head, a, b) = match thrown {
+            Some((tag, val)) => (h.intern("throw"), tag, val),
+            None => {
+                let obj = h
+                    .take_pending_error(&err)
+                    .unwrap_or_else(|| h.make_error_object(&err));
+                let (sym, data) = match h.obj(&obj) {
+                    Some(Obj::Cons(a, d)) => (a.clone(), d.clone()),
+                    _ => (h.intern("error"), Value::Undef),
+                };
+                let no_catch = h.sym_name(&sym).as_deref() == Some("no-catch");
+                match h.list_vec(&data) {
+                    Some(d) if no_catch && d.len() == 2 => {
+                        (h.intern("throw"), d[0].clone(), d[1].clone())
+                    }
+                    _ => (h.intern("signal"), sym, data),
+                }
+            }
+        };
+        let qa = h.list_from(vec![quote.clone(), a]);
+        let qb = h.list_from(vec![quote, b]);
+        h.list_from(vec![head, qa, qb])
+    })
+}
+
 fn macroexpand_all_impl(
     form: &Value,
     expand_intrinsics: bool,
@@ -7351,9 +7394,18 @@ fn macroexpand_all_impl(
             EnvHit::Shadowed => break,
             EnvHit::Miss => {}
         }
-        if let Some(e) = macroexpand_1(&f)? {
-            f = e;
-            continue;
+        match macroexpand_1(&f) {
+            Ok(Some(e)) => {
+                f = e;
+                continue;
+            }
+            Ok(None) => {}
+            // The `eval` walk (the only caller that skips compiler macros) is
+            // eval.c `eval_sub`, which expands a macro call only when the call
+            // is REACHED: `(eval '(if nil (BROKEN-MACRO) 'ok))` is `ok`, and a
+            // `condition-case` in the same form catches the expander's error.
+            Err(e) if !apply_cmacros => return Ok(deferred_expansion_failure(e)),
+            Err(e) => return Err(e),
         }
         if expand_intrinsics {
             if let Some(e) = expand_intrinsic_macro(&f)? {
