@@ -5860,6 +5860,26 @@ fn intern_soft(h: &mut ElispHost, a: &[Value]) -> R {
 fn subrp(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(matches!(h.obj(&a[0]), Some(Obj::Subr { .. }))))
 }
+/// `(--set-subr-intspec SYMBOL SPEC)`: the primitive in SYMBOL's function cell
+/// is a command whose `DEFUN` intspec is SPEC (a string, or the form a spec
+/// starting with `(` reads as). Called from the prelude; not an Emacs function.
+fn set_subr_intspec(h: &mut ElispHost, a: &[Value]) -> R {
+    match h.introspect_function_cell(&a[0]) {
+        Some(Value::Obj(id)) if matches!(h.obj(&Value::Obj(id)), Some(Obj::Subr { .. })) => {
+            h.subr_intspecs.insert(id, a[1].clone());
+            Ok(a[0].clone())
+        }
+        _ => Err(h.signal_wrong_type("subrp", &a[0])),
+    }
+}
+/// `(--subr-intspec SUBR)`: SUBR's interactive spec, or nil when it is not a
+/// command (eval.c `Fcommandp` / data.c `Finteractive_form` read `intspec`).
+fn subr_intspec(h: &mut ElispHost, a: &[Value]) -> R {
+    Ok(match &a[0] {
+        Value::Obj(id) => h.subr_intspecs.get(id).cloned().unwrap_or(Value::Undef),
+        _ => Value::Undef,
+    })
+}
 // Forms elisprs lowers as compiler intrinsics but which Emacs classifies as
 // *macros* (`lambda`/`when`/… are macros there, not special forms). Each carries
 // the minimum arity of its Emacs `subr.el` lambda-list (max is always `many`),
@@ -11213,6 +11233,8 @@ pub fn install(h: &mut ElispHost) {
     );
     s("intern-soft", 1, Some(2), intern_soft);
     s("subrp", 1, Some(1), subrp);
+    s("--set-subr-intspec", 2, Some(2), set_subr_intspec);
+    s("--subr-intspec", 1, Some(1), subr_intspec);
     s("macrop", 1, Some(1), macrop);
     s("special-form-p", 1, Some(1), special_form_p);
     s("char-uppercase-p", 1, Some(1), char_uppercase_p);

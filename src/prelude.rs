@@ -503,9 +503,9 @@ pub const PRELUDE: &str = r#"
         (sort seq pred)))))
 ;; data.c `Finteractive_form' and eval.c `Fcommandp'.  A macro's function cell
 ;; is `(macro . FN)' in Emacs, a cons whose car is not `lambda', so neither
-;; treats one as a command.  Not modelled: subr interactive specs (no subr
-;; here records an `intspec'), loading an autoload to read its form, and the
-;; OClosure `oclosure-interactive-form' delegation.
+;; treats one as a command.  A primitive's `intspec' is recorded by
+;; `--set-subr-intspec' below.  Not modelled: loading an autoload to read its
+;; form, and the OClosure `oclosure-interactive-form' delegation.
 (defun interactive-form (cmd)
   (let ((fun (indirect-function cmd)) (found nil) (spec nil))
     (when fun
@@ -517,6 +517,9 @@ pub const PRELUDE: &str = r#"
             (setq fun (symbol-function fun)))))
       (cond
        (found spec)
+       ((subrp fun)
+        (let ((spec (--subr-intspec fun)))
+          (and spec (list 'interactive spec))))
        ((and (closurep fun) (> (length fun) 5))
         (let ((form (aref fun 5)))
           (list 'interactive (if (vectorp form) (aref form 0) form))))
@@ -529,7 +532,7 @@ pub const PRELUDE: &str = r#"
   (let ((fun (indirect-function function)))
     (cond
      ((null fun) nil)
-     ((subrp fun) nil)
+     ((subrp fun) (and (--subr-intspec fun) t))
      ((closurep fun) (> (length fun) 5))
      ((or (stringp fun) (vectorp fun)) (null for-call-interactively))
      ((not (consp fun)) nil)
@@ -544,6 +547,36 @@ pub const PRELUDE: &str = r#"
      ((eq (car fun) 'lambda)
       (and (assq 'interactive (cdr-safe (cdr fun))) t))
      (t nil))))
+;; The primitives that are commands, with their DEFUN intspecs (Emacs 31.1;
+;; `search-forward-regexp' / `search-backward-regexp' share the `re-search-*'
+;; subr objects).
+(--set-subr-intspec 'backward-char "^p")
+(--set-subr-intspec 'beginning-of-line "^p")
+(--set-subr-intspec 'copy-file "fCopy file: \nGCopy %s to file: \np\nP")
+(--set-subr-intspec 'delete-char "p\nP")
+(--set-subr-intspec 'delete-region "r")
+(--set-subr-intspec 'end-of-line "^p")
+(--set-subr-intspec 'erase-buffer "*")
+(--set-subr-intspec 'forward-char "^p")
+(--set-subr-intspec 'forward-line "^p")
+(--set-subr-intspec 'forward-word "^p")
+(--set-subr-intspec 'goto-char '(goto-char--read-natnum-interactive "Go to char: "))
+(--set-subr-intspec 'indent-to "NIndent to column: ")
+(--set-subr-intspec 'insert-char '(list (read-char-by-name "Insert character (Unicode name or hex): ") (prefix-numeric-value current-prefix-arg) t))
+(--set-subr-intspec 'kill-buffer "bKill buffer: ")
+(--set-subr-intspec 'kill-local-variable "vKill Local Variable: ")
+(--set-subr-intspec 'make-local-variable "vMake Local Variable: ")
+(--set-subr-intspec 'make-variable-buffer-local "vMake Variable Buffer Local: ")
+(--set-subr-intspec 'move-to-column "NMove to column: ")
+(--set-subr-intspec 'narrow-to-region "r")
+(--set-subr-intspec 're-search-backward "sRE search backward: ")
+(--set-subr-intspec 're-search-forward "sRE search: ")
+(--set-subr-intspec 'rename-buffer '(list (read-string "Rename buffer (to new name): " nil 'buffer-name-history (buffer-name (current-buffer))) current-prefix-arg))
+(--set-subr-intspec 'rename-file "fRename file: \nGRename %s to file: \np")
+(--set-subr-intspec 'search-backward "MSearch backward: ")
+(--set-subr-intspec 'search-forward "MSearch: ")
+(--set-subr-intspec 'widen "")
+(--set-subr-intspec 'write-region "r\nFWrite region to file: \ni\ni\ni\np")
 (defun plistp (l)
   (let ((n 0)) (while (consp l) (setq n (1+ n)) (setq l (cdr l))) (and (null l) (= 0 (% n 2)))))
 ;; Port of cl-some/cl-every from cl-extra.el: with extra SEQs (or a non-list
@@ -4664,9 +4697,9 @@ removed, and one that spans the range is split in two -- which is why this needs
           (delete-region lo hi)
           (goto-char lo)
           (insert (funcall fn s)))))))
-(defun upcase-region (beg end &optional _region) (buffer--map-region beg end #'upcase) nil)
-(defun downcase-region (beg end &optional _region) (buffer--map-region beg end #'downcase) nil)
-(defun capitalize-region (beg end &optional _region) (buffer--map-region beg end #'capitalize) nil)
+(defun upcase-region (beg end &optional _region) (interactive (list (region-beginning) (region-end) (region-noncontiguous-p))) (buffer--map-region beg end #'upcase) nil)
+(defun downcase-region (beg end &optional _region) (interactive (list (region-beginning) (region-end) (region-noncontiguous-p))) (buffer--map-region beg end #'downcase) nil)
+(defun capitalize-region (beg end &optional _region) (interactive (list (region-beginning) (region-end) (region-noncontiguous-p))) (buffer--map-region beg end #'capitalize) nil)
 ;; editfns.c `Fsubst_char_in_region': the text from the first FROMCHAR to END
 ;; is rewritten in place (one `modify_text' from there), and nothing at all
 ;; happens when FROMCHAR does not occur.
@@ -4687,9 +4720,9 @@ removed, and one that spans the range is split in two -- which is why this needs
       (goto-char lo)
       (insert (funcall fn s))
       (goto-char (+ lo (length s))))))
-(defun upcase-word (arg) (buffer--case-word arg #'upcase) nil)
-(defun downcase-word (arg) (buffer--case-word arg #'downcase) nil)
-(defun capitalize-word (arg) (buffer--case-word arg #'capitalize) nil)
+(defun upcase-word (arg) (interactive "p") (buffer--case-word arg #'upcase) nil)
+(defun downcase-word (arg) (interactive "p") (buffer--case-word arg #'downcase) nil)
+(defun capitalize-word (arg) (interactive "p") (buffer--case-word arg #'capitalize) nil)
 ;; The kill ring, ported from simple.el / subr.el (Emacs 31.1). There is no
 ;; window system here, so the interprogram cut/paste hooks start nil (in
 ;; `emacs --batch' they are `gui-select-text'/`gui-selection-value', which do
@@ -9733,6 +9766,7 @@ standard syntax table)."
 CHAR may be a cons (MIN . MAX), in which case, syntaxes of all characters
 in the range between MIN and MAX, inclusive, are set.  SYNTAX-TABLE
 defaults to the current buffer's syntax table."
+  (interactive "cSet syntax for character: \nsSet syntax for %s to: ")
   (set-char-table-range (or syntax-table (syntax-table))
                         char (string-to-syntax newentry))
   nil)
@@ -12389,6 +12423,7 @@ A value of t means undo information is not being recorded.")
   (setq buffer-undo-list t))
 (defun buffer-enable-undo (&optional _buffer)
   "Start keeping undo information for the current buffer."
+  (interactive "")
   (when (eq buffer-undo-list t)
     (setq buffer-undo-list nil)))
 

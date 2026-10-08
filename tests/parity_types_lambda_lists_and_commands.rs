@@ -305,3 +305,16 @@ fn commandp_and_interactive_form() {
         r##"(nil t)"##,
     );
 }
+
+/// eval.c `Fcommandp` / data.c `Finteractive_form` on a primitive read its
+/// `DEFUN` intspec: `forward-char` is a command, `car` is not, an intspec
+/// starting with `(` is the form it reads as, and an alias of the same subr
+/// object (`search-forward-regexp`) is one too.
+#[test]
+fn primitive_commands_have_their_intspecs() {
+    check(
+        r##"(condition-case e (list (commandp 'forward-char) (commandp (symbol-function 'erase-buffer)) (commandp 'search-forward-regexp) (commandp 'goto-char t) (interactive-form 'forward-char) (interactive-form 'goto-char) (interactive-form 'write-region) (interactive-form 'upcase-word) (interactive-form 'car)) (error (list 'signal e)))"##,
+        "(t t t t (interactive \"^p\") (interactive (goto-char--read-natnum-interactive \"Go to char: \")) \
+(interactive \"r\nFWrite region to file: \ni\ni\ni\np\") (interactive \"p\") nil)",
+    );
+}

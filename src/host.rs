@@ -1040,6 +1040,9 @@ pub struct ElispHost {
     /// expanded before the prelude defined the declaration bridge; the prelude
     /// replays their declarations once it exists (`--early-declarations--`).
     pub(crate) early_declarations: Vec<Value>,
+    /// The interactive specs of the primitives that are commands (the
+    /// `intspec` of a C `DEFUN`), keyed by the subr object's handle.
+    pub(crate) subr_intspecs: HashMap<u32, Value>,
     /// Symbols a `compiler-macro` property has been put on.
     ///
     /// [`macroexpand_all`] has to ask whether a call's head has one, and the
@@ -1388,6 +1391,7 @@ impl ElispHost {
             closure_free: HashMap::new(),
             eval_lambda_raw: HashMap::new(),
             early_declarations: Vec::new(),
+            subr_intspecs: HashMap::new(),
             compiler_macros: std::collections::HashSet::new(),
             empty_string: Value::Undef, // fixed below, once the arena exists
             empty_vector: Value::Undef,
