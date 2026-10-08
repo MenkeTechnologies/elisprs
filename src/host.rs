@@ -839,7 +839,6 @@ const LISP_LEVEL_ARITY: &[(&str, u16, u16)] = &[
     ("macroexpand-1", 1, 2),
     ("macroexpand-all", 1, 2),
     ("macrop", 1, 1),
-    ("make-directory", 1, 2),
     ("mark", 0, 1),
     ("match-string", 1, 2),
     ("member-ignore-case", 2, 2),
@@ -6149,7 +6148,66 @@ fn intrinsic_wrong_nargs(f: &Value, argc: usize) -> String {
     with_host(|h| h.signal_wrong_nargs(f, argc))
 }
 
+/// The file-name arguments a Rust file subr receives already expanded.
+///
+/// Each of these C functions (fileio.c, dired.c) starts with
+/// `Fexpand_file_name (FILENAME, Qnil)`, so a relative name resolves against
+/// `default-directory` and every error reports the absolute name:
+/// `(insert-file-contents "x")` signals `(file-missing "Opening input file"
+/// "No such file or directory" "<default-directory>x")`. `expand-file-name` is
+/// prelude Lisp, which a subr cannot call from inside the host borrow, so the
+/// expansion happens here, on the way in. `delete-file` is files.el's
+/// `(delete-file-internal (expand-file-name FILENAME))` collapsed into one subr.
+const FILE_NAME_ARGS: &[(&str, &[usize])] = &[
+    ("insert-file-contents", &[0]),
+    ("write-region", &[2]),
+    ("delete-file", &[0]),
+    ("make-directory-internal", &[0]),
+    ("rename-file", &[0, 1]),
+    ("copy-file", &[0, 1]),
+    ("--directory-files--", &[0]),
+];
+
+/// ARGS with the [`FILE_NAME_ARGS`] positions expanded when F resolves to one
+/// of those subrs; None otherwise (including when the user redefined it). A
+/// non-string is left alone for the subr's own `stringp` check.
+fn expand_file_name_args(f: &Value, args: &[Value]) -> Result<Option<Vec<Value>>, String> {
+    // This runs on every call, so the name is compared in place (no clone),
+    // and the function cell is resolved only for one of the listed names.
+    let positions = with_host(|h| {
+        let name = match h.obj(f) {
+            Some(Obj::Symbol(s)) => s.name.as_str(),
+            Some(Obj::Subr { name, .. }) => name.as_str(),
+            _ => return None,
+        };
+        let (listed, positions) = FILE_NAME_ARGS.iter().find(|(n, _)| *n == name)?;
+        match h.resolve_function(f) {
+            Ok(Resolved::Subr { name, .. }) if name == *listed => Some(*positions),
+            _ => None,
+        }
+    });
+    let Some(positions) = positions else {
+        return Ok(None);
+    };
+    let expand = with_host(|h| h.intern("expand-file-name"));
+    let mut out = args.to_vec();
+    for &i in positions {
+        if out.get(i).is_some_and(|v| with_host(|h| h.is_string(v))) {
+            out[i] = call_function(&expand, &out[i..=i])?;
+        }
+    }
+    Ok(Some(out))
+}
+
 pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
+    let expanded_args;
+    let args = match expand_file_name_args(f, args)? {
+        Some(v) => {
+            expanded_args = v;
+            &expanded_args[..]
+        }
+        None => args,
+    };
     // A special form is fbound but not callable. Emacs's `funcall` sees a subr
     // with `max_args == UNEVALLED` and signals `(invalid-function #<subr if>)`
     // before looking at the arguments at all, so `(funcall 'if 1 2)` and
@@ -7776,10 +7834,12 @@ fn intrinsic_load(f: &Value, args: &[Value]) -> Result<Value, String> {
             if noerror {
                 return Ok(Value::Undef);
             }
-            // Emacs signals `file-missing` "Cannot open load file: FILE".
-            return Err(format!(
-                "file-missing: Cannot open load file: No such file or directory, {file}"
-            ));
+            // lread.c `Fload`: `report_file_error ("Cannot open load file",
+            // file)` with errno ENOENT, FILE as given (not expanded).
+            let enoent = std::io::Error::from_raw_os_error(libc::ENOENT);
+            return Err(with_host(|h| {
+                crate::builtins::report_file_errno(h, "Cannot open load file", &[&file], &enoent)
+            }));
         }
     };
 

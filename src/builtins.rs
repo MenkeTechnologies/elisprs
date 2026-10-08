@@ -2538,8 +2538,19 @@ fn symbol_get(h: &mut ElispHost, sym: &Value, prop: &str) -> Value {
 /// signal becomes `(error "Invalid error symbol" SYM)`; a non-list conditions
 /// property is `wrong-type-argument listp`.
 fn signal_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let (mut symv, mut data) = (a[0].clone(), a[1].clone());
-    if is_nil(&symv) {
+    let (mut symv, mut data) = (a[0].clone(), a.get(1).cloned().unwrap_or(Value::Undef));
+    // Emacs 31 made DATA optional: `(signal ERR)` with ERR a whole error
+    // object `(SYMBOL . DATA)` re-signals it, which is how files.el's
+    // `files--ensure-directory` re-raises a caught error. With DATA given, a
+    // cons ERROR-SYMBOL is still `(wrong-type-argument symbolp ...)`.
+    let whole_error = match h.obj(&symv) {
+        Some(Obj::Cons(car, cdr)) if is_nil(&data) => Some((car.clone(), cdr.clone())),
+        _ => None,
+    };
+    if let Some((car, cdr)) = whole_error {
+        symv = car;
+        data = cdr;
+    } else if is_nil(&symv) {
         match h.obj(&data) {
             Some(Obj::Cons(car, cdr)) => {
                 let (car, cdr) = (car.clone(), cdr.clone());
@@ -8003,12 +8014,26 @@ fn func_arity(h: &mut ElispHost, a: &[Value]) -> R {
     };
     Ok(h.cons(Value::Int(min), maxv))
 }
+/// sysdep.c `emacs_get_current_dir_name`: `$PWD` when it is absolute and names
+/// the same file as `.` (same device and inode), else `getcwd`. So a shell
+/// that entered a directory through a symlink keeps that spelling —
+/// `/var/folders/…` on macOS, where `getcwd` answers `/private/var/folders/…`.
 fn current_directory(h: &mut ElispHost, _a: &[Value]) -> R {
-    Ok(h.new_string(
+    use std::os::unix::fs::MetadataExt;
+    let same_file =
+        |a: &std::fs::Metadata, b: &std::fs::Metadata| a.dev() == b.dev() && a.ino() == b.ino();
+    let from_pwd = std::env::var("PWD").ok().filter(|pwd| {
+        pwd.starts_with('/')
+            && match (std::fs::metadata(pwd), std::fs::metadata(".")) {
+                (Ok(p), Ok(d)) => same_file(&p, &d),
+                _ => false,
+            }
+    });
+    Ok(h.new_string(from_pwd.unwrap_or_else(|| {
         std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "/".to_string()),
-    ))
+            .unwrap_or_else(|_| "/".to_string())
+    })))
 }
 
 /// Emacs C `Vsystem_type` (emacs.c), computed at build/configure time. We derive
@@ -8080,6 +8105,47 @@ fn temp_directory(h: &mut ElispHost, _a: &[Value]) -> R {
         }
     }
     Ok(h.new_string("/tmp/".to_string()))
+}
+
+/// fileio.c `report_file_errno`: signal the failure of a file operation the
+/// way Emacs does, as `(CONDITION STRING ERRSTRING NAME...)`.
+///
+/// `get_file_errno_data` picks the condition from errno — `file-missing` for
+/// ENOENT, `permission-denied` for EACCES, `file-error` otherwise — and EEXIST
+/// is `file-already-exists` with no STRING at all: `(make-directory-internal
+/// "/tmp")` is `(file-already-exists "File exists" "/tmp")`. ERRSTRING is
+/// `strerror`'s text, which is also what `io::Error` displays for an OS error
+/// (minus its " (os error N)" suffix).
+pub(crate) fn report_file_errno(
+    h: &mut ElispHost,
+    string: &str,
+    names: &[&str],
+    err: &std::io::Error,
+) -> String {
+    let errno = err.raw_os_error();
+    let shown = err.to_string();
+    let errstring = match shown.rfind(" (os error ") {
+        Some(i) if errno.is_some() => shown[..i].to_string(),
+        _ => shown,
+    };
+    let condition = match errno {
+        Some(libc::EEXIST) => "file-already-exists",
+        Some(libc::ENOENT) => "file-missing",
+        Some(libc::EACCES) => "permission-denied",
+        _ => "file-error",
+    };
+    let mut data = Vec::with_capacity(names.len() + 2);
+    if errno != Some(libc::EEXIST) {
+        data.push(h.new_string(string.to_string()));
+    }
+    data.push(h.new_string(errstring));
+    data.extend(names.iter().map(|n| h.new_string(n.to_string())));
+    let sym = h.intern(condition);
+    let data = h.list_from(data);
+    let obj = h.cons(sym, data);
+    let msg = format!("{condition}: {}", h.print(&obj, true));
+    h.set_pending_error(&msg, obj);
+    msg
 }
 
 // ── filesystem (read-only queries) ──
@@ -8155,7 +8221,7 @@ fn directory_files_raw(h: &mut ElispHost, a: &[Value]) -> R {
     };
     let nosort = a.get(2).is_some_and(|v| !is_nil(v));
     let rd = std::fs::read_dir(fs_expand(&raw))
-        .map_err(|_| format!("file-missing: Opening directory: No such file: {raw}"))?;
+        .map_err(|e| report_file_errno(h, "Opening directory", &[&raw], &e))?;
     let mut names: Vec<String> = vec![".".into(), "..".into()];
     for e in rd.flatten() {
         names.push(e.file_name().to_string_lossy().into_owned());
@@ -9131,8 +9197,11 @@ fn delete_region(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn insert_file_contents(h: &mut ElispHost, a: &[Value]) -> R {
     let raw = as_string(h, &a[0])?;
-    let content = std::fs::read_to_string(fs_expand(&raw))
-        .map_err(|_| format!("file-missing: Opening input file: No such file: {raw}"))?;
+    let mut file = std::fs::File::open(fs_expand(&raw))
+        .map_err(|e| report_file_errno(h, "Opening input file", &[&raw], &e))?;
+    let mut content = String::new();
+    std::io::Read::read_to_string(&mut file, &mut content)
+        .map_err(|e| report_file_errno(h, "Read error", &[&raw], &e))?;
     let chars: Vec<char> = content.chars().collect();
     let n = chars.len() as i64;
     h.cur_insert(chars, false); // leaves point at the beginning of the inserted text
@@ -9973,35 +10042,56 @@ fn write_region(h: &mut ElispHost, a: &[Value]) -> R {
     } else {
         std::fs::write(&path, content.as_bytes())
     };
-    res.map_err(|_| format!("file-error: Opening output file: {filename}"))?;
+    res.map_err(|e| report_file_errno(h, "Opening output file", &[&filename], &e))?;
     Ok(Value::Undef)
 }
 fn delete_file(h: &mut ElispHost, a: &[Value]) -> R {
     let f = as_string(h, &a[0])?;
-    std::fs::remove_file(fs_expand(&f)).map_err(|_| format!("file-error: Removing file: {f}"))?;
-    Ok(Value::Undef)
+    // `Fdelete_file_internal`: a file that is already gone is not an error.
+    match std::fs::remove_file(fs_expand(&f)) {
+        Err(e) if e.raw_os_error() != Some(libc::ENOENT) => {
+            Err(report_file_errno(h, "Removing file", &[&f], &e))
+        }
+        _ => Ok(Value::Undef),
+    }
 }
-fn make_directory(h: &mut ElispHost, a: &[Value]) -> R {
+/// `(make-directory-internal DIR)` — fileio.c: one `mkdir`, no parents.
+/// `make-directory` itself is files.el's, in the prelude.
+fn make_directory_internal(h: &mut ElispHost, a: &[Value]) -> R {
     let f = as_string(h, &a[0])?;
-    let parents = a.get(1).is_some_and(|v| !is_nil(v));
-    let p = fs_expand(&f);
-    let r = if parents {
-        std::fs::create_dir_all(&p)
-    } else {
-        std::fs::create_dir(&p)
-    };
-    r.map_err(|_| format!("file-error: Creating directory: {f}"))?;
+    std::fs::create_dir(fs_expand(&f))
+        .map_err(|e| report_file_errno(h, "Creating directory", &[&f], &e))?;
     Ok(Value::Undef)
 }
 fn rename_file(h: &mut ElispHost, a: &[Value]) -> R {
     let (o, n) = (as_string(h, &a[0])?, as_string(h, &a[1])?);
     std::fs::rename(fs_expand(&o), fs_expand(&n))
-        .map_err(|_| format!("file-error: Renaming: {o}"))?;
+        .map_err(|e| report_file_errno(h, "Renaming", &[&o, &n], &e))?;
     Ok(Value::Undef)
 }
 fn copy_file(h: &mut ElispHost, a: &[Value]) -> R {
     let (o, n) = (as_string(h, &a[0])?, as_string(h, &a[1])?);
-    std::fs::copy(fs_expand(&o), fs_expand(&n)).map_err(|_| format!("file-error: Copying: {o}"))?;
+    // fileio.c `Fcopy_file`: an existing NEWNAME is refused before FILE is
+    // even opened, unless OK-IF-ALREADY-EXISTS is non-nil (and not a number).
+    let ok_if_exists = a
+        .get(2)
+        .is_some_and(|v| !is_nil(v) && !matches!(v, Value::Int(_)));
+    if !ok_if_exists && std::fs::symlink_metadata(fs_expand(&n)).is_ok() {
+        let sym = h.intern("file-already-exists");
+        let data = vec![
+            h.new_string("File already exists".to_string()),
+            h.new_string(n.clone()),
+        ];
+        let data = h.list_from(data);
+        let obj = h.cons(sym, data);
+        let msg = format!("file-already-exists: {}", h.print(&obj, true));
+        h.set_pending_error(&msg, obj);
+        return Err(msg);
+    }
+    std::fs::File::open(fs_expand(&o))
+        .map_err(|e| report_file_errno(h, "Opening input file", &[&o], &e))?;
+    std::fs::copy(fs_expand(&o), fs_expand(&n))
+        .map_err(|e| report_file_errno(h, "Opening output file", &[&n], &e))?;
     Ok(Value::Undef)
 }
 
@@ -10030,7 +10120,7 @@ fn call_process(h: &mut ElispHost, a: &[Value]) -> R {
     let out = std::process::Command::new(&program)
         .args(&args)
         .output()
-        .map_err(|_| format!("file-error: Searching for program: {program}"))?;
+        .map_err(|e| report_file_errno(h, "Searching for program", &[&program], &e))?;
     if insert {
         let chars: Vec<char> = String::from_utf8_lossy(&out.stdout).chars().collect();
         h.cur_insert(chars, true);
@@ -10048,7 +10138,7 @@ fn process_lines(h: &mut ElispHost, a: &[Value]) -> R {
     let out = std::process::Command::new(&program)
         .args(&args)
         .output()
-        .map_err(|_| format!("file-error: Searching for program: {program}"))?;
+        .map_err(|e| report_file_errno(h, "Searching for program", &[&program], &e))?;
     if !out.status.success() {
         return Err(format!("error: {program} exited with non-zero status"));
     }
@@ -10716,7 +10806,7 @@ pub fn install(h: &mut ElispHost) {
     s("throw", 2, Some(2), throw_fn);
     s("error", 1, None, error_fn);
     s("user-error", 1, None, user_error_fn);
-    s("signal", 2, Some(2), signal_fn);
+    s("signal", 1, Some(2), signal_fn);
     // hash tables (maphash is intercepted in host::call_function)
     // Intercepted: resolving a `define-hash-table-test` name reads an elisp
     // plist, which cannot happen inside a host borrow.
@@ -10939,7 +11029,12 @@ pub fn install(h: &mut ElispHost) {
     // filesystem writes / mutations
     s("write-region", 3, Some(7), write_region);
     s("delete-file", 1, Some(2), delete_file);
-    s("make-directory", 1, Some(2), make_directory);
+    s(
+        "make-directory-internal",
+        1,
+        Some(1),
+        make_directory_internal,
+    );
     s("rename-file", 2, Some(3), rename_file);
     s("copy-file", 2, Some(6), copy_file);
     s(

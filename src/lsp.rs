@@ -1072,7 +1072,7 @@ pub const SUBRS: &[Entry] = &[
     Entry {
         name: "signal",
         kind: Kind::Function,
-        sig: "(signal ERROR-SYMBOL DATA)",
+        sig: "(signal ERROR-SYMBOL &optional DATA)",
         doc: "Signal the error named ERROR-SYMBOL with associated DATA.",
     },
     Entry {

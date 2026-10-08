@@ -4226,6 +4226,40 @@ of `load-path'."
     (if (and home (string-prefix-p (file-name-as-directory home) filename))
         (concat "~/" (substring filename (length (file-name-as-directory home))))
       filename)))
+;; files.el (Emacs 31.1), without the file-name-handler dispatch. The one
+;; `mkdir' is `make-directory-internal' (a Rust subr, fileio.c's).
+(defun files--ensure-directory (dir)
+  "Make directory DIR if it is not already a directory.
+Return non-nil if DIR is already a directory."
+  (condition-case err
+      (make-directory-internal dir)
+    (error
+     (or (file-directory-p dir)
+	 (signal err)))))
+(defun make-directory (dir &optional parents)
+  "Create the directory DIR and optionally any nonexistent parent dirs.
+Return non-nil if PARENTS is non-nil and DIR already exists as a
+directory, and nil if DIR did not already exist but was created.
+Signal an error if unsuccessful."
+  (setq dir (expand-file-name dir))
+  (if (not parents)
+      (make-directory-internal dir)
+    (let ((dir (directory-file-name (expand-file-name dir)))
+	  already-dir create-list parent)
+      (while (progn
+	       (setq parent (directory-file-name
+			     (file-name-directory dir)))
+	       (condition-case ()
+		   (ignore (setq already-dir
+				 (files--ensure-directory dir)))
+		 (error
+		  ;; Do not loop if root does not exist (Bug#2309).
+		  (not (string= dir parent)))))
+	(setq create-list (cons dir create-list)
+	      dir parent))
+      (dolist (dir create-list)
+	(setq already-dir (files--ensure-directory dir)))
+      already-dir)))
 (defun directory-files (dir &optional full match nosort)
   ;; Names in DIR (incl. "." ".."), sorted unless NOSORT, filtered by MATCH regexp;
   ;; with FULL, each name is prefixed with DIR's expanded path (uncollapsed).
