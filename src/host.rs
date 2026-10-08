@@ -7501,6 +7501,33 @@ pub fn macroexpand_all_builtin(form: &Value, env: &Value) -> Result<Value, Strin
     out
 }
 
+/// macroexp.el `internal-macroexpand-for-load`, which `load` runs over each
+/// top-level form before evaluating it: the whole form is `macroexpand-all`ed
+/// up front, and an error raised by an expander becomes
+/// `(error "Eager macro-expansion failure: %S" ERR)` — signalled before any of
+/// the form runs, so a `condition-case` inside the form does not see it. A
+/// `throw` is not an error and passes through.
+pub fn macroexpand_for_load(form: &Value) -> Result<Value, String> {
+    macroexpand_all_builtin(form, &Value::Undef).map_err(|err| {
+        if err == "--throw--" {
+            return err;
+        }
+        with_host(|h| {
+            let obj = h
+                .take_pending_error(&err)
+                .unwrap_or_else(|| h.make_error_object(&err));
+            let text = format!("Eager macro-expansion failure: {}", h.print(&obj, true));
+            let msg = format!("error: {text}");
+            let sym = h.intern("error");
+            let s = h.new_string(&text);
+            let data = h.list_from(vec![s]);
+            let obj = h.cons(sym, data);
+            h.set_pending_error(&msg, obj);
+            msg
+        })
+    })
+}
+
 /// `v`'s elements when it is a `(lambda ARGLIST . BODY)` form, else None.
 fn lambda_parts(v: Option<&Value>) -> Option<Vec<Value>> {
     let v = v?;
@@ -8102,7 +8129,7 @@ fn intrinsic_load(f: &Value, args: &[Value]) -> Result<Value, String> {
     // kills it on the way out (`unwind-protect`), so a nested load is visible in
     // `(buffer-list)` while it runs and gone afterward.
     let load_buf = with_host(|h| h.open_load_buffer(&src, false));
-    let result = crate::run_top_forms(&src);
+    let result = crate::run_top_forms(&src, true);
     with_host(|h| {
         let obj = h.buffer_object(load_buf);
         h.kill_buffer(Some(&obj));

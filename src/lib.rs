@@ -113,7 +113,14 @@ fn splice_top_forms(h: &mut host::ElispHost, forms: Vec<Value>) -> Vec<Value> {
 /// of the last form. This is the single "run these forms in the live host"
 /// machinery shared by `eval_forms`, `eval_file`'s cache-miss path, and the
 /// `load` builtin, so none of them re-implement a divergent evaluator.
-pub(crate) fn run_top_forms(src: &str) -> Result<(Vec<fusevm::Chunk>, Value), String> {
+///
+/// `loading` is true for a file being loaded, whose forms are expanded the way
+/// `load` expands them ([`host::macroexpand_for_load`]); `eval_str` stands in
+/// for `--eval` and keeps the walk that defers an expander's failure.
+pub(crate) fn run_top_forms(
+    src: &str,
+    loading: bool,
+) -> Result<(Vec<fusevm::Chunk>, Value), String> {
     // Rewrite any inline `rust { ... }` FFI block into a `(__rust-compile ...)`
     // call before the reader runs (no-op when the source has no `rust` token).
     let src = rust_ffi::desugar(src);
@@ -137,7 +144,11 @@ pub(crate) fn run_top_forms(src: &str) -> Result<(Vec<fusevm::Chunk>, Value), St
         // signalling must not leave the host stuck in compile mode.
         let prev = host::with_host(|h| h.set_compiling_form(true));
         let lowered = (|| -> Result<fusevm::Chunk, String> {
-            let expanded = host::macroexpand_all(form)?;
+            let expanded = if loading {
+                host::macroexpand_for_load(form)?
+            } else {
+                host::macroexpand_all(form)?
+            };
             host::with_host(|h| compiler::compile_top(h, &expanded))
         })();
         host::with_host(|h| h.set_compiling_form(prev));
@@ -150,7 +161,7 @@ pub(crate) fn run_top_forms(src: &str) -> Result<(Vec<fusevm::Chunk>, Value), St
 
 /// Evaluate a sequence of top-level forms (macro-expand → lower → run).
 fn eval_forms(src: &str) -> Result<Value, String> {
-    run_top_forms(src).map(|(_, last)| last)
+    run_top_forms(src, false).map(|(_, last)| last)
 }
 
 /// Load the derived-surface prelude once per host, best-effort (a broken
@@ -454,7 +465,7 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
 
     // Bind load-file-name only while the forms run; unbind before the clean heap
     // image is captured so the cached image carries no transient load binding.
-    let (chunks, last) = with_load_file_name(path, || run_top_forms(&src))?;
+    let (chunks, last) = with_load_file_name(path, || run_top_forms(&src, true))?;
     // Only the part of the image this FILE owns: `clean_prelude` is the rest,
     // and the cache stores it once per shard rather than once per entry.
     let heap_tail = host::with_host(|h| h.export_heap_tail_clean(prelude_end));
