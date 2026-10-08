@@ -6198,6 +6198,107 @@ destructures them.
   only for the enclosing scope, so `special-variable-p` answers nil there.
 - pcase's `(rx ... (let VAR RX))` binding is not supported.
 
+## Round 36 — lazy `eval` expansion, cconv closure sources, file-error data, per-buffer variables
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch`; the fuzzer with
+`EMACS_VERSION_EXPECT=31.1`). Every expectation below is in a `tests/parity_*`
+file named with the fix.
+
+### R36-A. ✅ FIXED — `(when)` / `(unless)` with no COND
+
+Closes the round-35 open item. Both are `(cond &rest body)` macros in subr.el,
+so a missing COND is `(wrong-number-of-arguments (1 . 1) 0)` from the
+expander — signalled when the form runs (or is expanded by `macroexpand*`),
+never when the enclosing code is compiled. `tests/parity_macroexpand_intrinsics.rs`.
+
+### R36-B. ✅ FIXED — hash table weakness and user test names
+
+`:weakness t` is stored as `key-and-value`; a non-nil weakness prints
+(`#s(hash-table weakness key)`) and the `#s(hash-table …)` reader takes it
+(validating it like `make-hash-table`); a `define-hash-table-test` table
+prints `test NAME`; `copy-hash-table` keeps the user test and the free list.
+`tests/parity_hash_table_weakness_and_user_tests.rs`.
+
+### R36-C. ✅ FIXED — `eval` expands a macro call only when it is reached
+
+Closes the round-35 item "a macro error inside `condition-case` escapes it"
+for the `eval` path (which is what the fuzzer drives). eval.c `eval_sub`
+expands at the call, so `(eval '(if nil (BROKEN) 'ok))` is `ok`, and a
+`condition-case`/`catch` inside the form receives the expander's error or
+throw. The `eval` walk now replaces a failing expansion with a form that
+replays it (`(signal 'SYM 'DATA)` / `(throw 'TAG 'VAL)`).
+`tests/parity_lazy_eval_expansion.rs`.
+
+### R36-D. ✅ FIXED — `max` / `min` are `minmax_driver`
+
+A marker answers as its position (Emacs returned `3`, elisprs the marker), and
+a NaN after the first argument is returned before the rest are type-checked:
+`(max 1 0.0e+NaN "x")` is NaN. `tests/parity_minmax_driver.rs`.
+
+### R36-E. ✅ FIXED — file errors carry `report_file_errno` data
+
+`(file-missing "Opening input file: No such file: x")` (and plain `file-error`
+for most operations) is now fileio.c's shape:
+`(file-missing "Opening input file" "No such file or directory" "/abs/x")`,
+with `permission-denied` for EACCES and `file-already-exists` (no operation
+string) for EEXIST. File names are expanded against `default-directory`
+before the subr runs, as each C function does; `default-directory` starts
+from `$PWD` when it names `.` (sysdep.c); `delete-file` of a missing file is
+not an error; `copy-file` refuses an existing NEWNAME first;
+`make-directory` is files.el's over a new `make-directory-internal`; and
+`signal` takes a whole error object when DATA is omitted (Emacs 31).
+`tests/parity_file_error_data.rs`.
+
+### R36-F. ✅ FIXED — closures print `when` / `unless` unfolded
+
+The load walk is `macroexpand-all`, which unfolds them, so
+`(let ((y 1)) (lambda (x) (when x y)))` prints `#[(x) ((if x (progn y))) ((y . 1))]`.
+`tests/parity_closure_capture_pruning.rs`.
+
+### R36-G. ✅ FIXED — a closure made under `eval` prints the source cconv leaves
+
+`Ffunction` hands `cconv-make-interpreted-closure` the body as written: kept
+when no lexical variable is in scope (`#[nil ((push 1 z)) (t)]`), otherwise
+replaced by its `macroexpand-all`, with captures recomputed from the expansion
+and an expander error signalled at creation.
+`tests/parity_lazy_eval_expansion.rs`.
+
+### R36-H. ✅ FIXED — `let` over an automatically buffer-local variable
+
+With no local in the current buffer, `let` binds the DEFAULT
+(SPECPDL_LET_DEFAULT), so a buffer made inside the `let` sees the value, and a
+`setq` in the same buffer while it is live sets the default
+(`let_shadows_buffer_binding_p`). elisprs always made a local.
+`tests/parity_buffer_local_let.rs`.
+
+### R36-I. ✅ FIXED — buffer.c's per-buffer variables
+
+`fill-column`, `left-margin`, `buffer-file-name`, `word-wrap` and the rest of
+`DEFVAR_PER_BUFFER` were void, and `case-fold-search`/`tab-width` were plain
+globals, so `(with-temp-buffer (setq case-fold-search nil))` leaked into
+every buffer. They are bound with the measured defaults and automatically
+buffer-local. `tests/parity_buffer_local_let.rs`.
+
+### Still open after round 36
+
+- Version drift, not elisprs bugs against 30.2, but divergences against the
+  31.1 oracle the fuzzer now runs with: `make-hash-table` argument errors
+  (`Odd number of arguments` / `Invalid keyword argument`), `split-string`'s
+  `sequencep`, and cl-seq.el's `*-if` functions, which 31.1 routes through
+  `:test #'funcall` so a nil PRED is `(void-function nil)`. Retargeting the
+  tree to 31.1 is a decision, not a fix.
+- `handler-bind` (Emacs 30) is not implemented; its handlers run at signal
+  time, before unwinding, which the error-propagation model has no hook for.
+- "Always local" per-buffer variables (`buffer-file-name`, `major-mode`,
+  `default-directory`, …) are not `local-variable-p` in a fresh buffer, and a
+  new buffer does not inherit the creating buffer's `default-directory`.
+- `lisp-indent-function` / `doc-string-elt` properties from `declare` are not
+  recorded (`(get 'when 'lisp-indent-function)` is nil, Emacs 1).
+- `fill-region` and the rest of fill.el are void.
+- Loading a file does not wrap an eager-expansion failure as
+  `(error "Eager macro-expansion failure: …")`.
+
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the
