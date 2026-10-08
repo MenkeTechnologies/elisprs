@@ -373,31 +373,33 @@ fn mod_fn(h: &mut ElispHost, a: &[Value]) -> R {
 /// ([`num_cmp`]) and a mixed integer/float pair is decided on real values:
 /// `(min (expt 3 34) (float (expt 3 34)))` is the *float*, because it is the
 /// smaller number even though both round to the same `f64`.
+/// data.c `minmax_driver`. Every argument goes through
+/// `check_number_coerce_marker`, so a marker answers as its position (an
+/// integer), never as the marker. A NaN that turns up AFTER the first argument
+/// is returned on the spot, without type-checking the rest: `(max 1 0.0e+NaN
+/// "x")` is NaN, while `(min 0.0e+NaN 'a)` still rejects `a`.
 fn min_max(h: &mut ElispHost, a: &[Value], want_max: bool) -> R {
-    let mut best = as_number(h, &a[0])?;
-    let mut best_v = a[0].clone();
-    for v in &a[1..] {
+    let coerce = |h: &mut ElispHost, v: &Value| -> Result<(Num, Value), String> {
         let n = as_number(h, v)?;
-        // A NaN operand wins, as in Emacs.
-        let nan = matches!(n, Num::Float(f) if f.is_nan());
-        // `None` is a NaN pair, which the `nan` flag above already handles.
-        let better = match num_cmp(&n, &best) {
-            Some(o) => {
-                if want_max {
-                    o.is_gt()
-                } else {
-                    o.is_lt()
-                }
-            }
-            None => false,
+        let v = match h.marker_position(v) {
+            Some(p) => h.make_integer(BigInt::from(p)),
+            None => v.clone(),
         };
-        if better || nan {
+        Ok((n, v))
+    };
+    let (mut best, mut best_v) = coerce(h, &a[0])?;
+    for v in &a[1..] {
+        let (n, v) = coerce(h, v)?;
+        // `arithcompare (val, accum, comparison)`: false on a NaN pair.
+        let better =
+            num_cmp(&n, &best).is_some_and(|o| if want_max { o.is_gt() } else { o.is_lt() });
+        if better {
             best = n;
-            best_v = v.clone();
+            best_v = v;
+        } else if matches!(n, Num::Float(f) if f.is_nan()) {
+            return Ok(v);
         }
     }
-    // Return the argument itself, so a marker stays a marker as in Emacs.
-    let _ = &best;
     Ok(best_v)
 }
 fn max_fn(h: &mut ElispHost, a: &[Value]) -> R {
