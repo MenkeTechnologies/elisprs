@@ -160,8 +160,11 @@ pub type SubrFn = fn(&mut ElispHost, &[Value]) -> Result<Value, String>;
 /// One dynamic (`let`) binding recorded on the specstack, restored by `unbind_to`.
 #[derive(Clone)]
 enum SpecEntry {
-    /// A binding of a symbol's global (default) value cell: (sym, previous value).
-    Global(u32, Option<Value>),
+    /// A binding of a symbol's global (default) value cell: (sym, the buffer
+    /// current when it was bound, previous value). The buffer matters for an
+    /// automatically buffer-local variable bound this way (SPECPDL_LET_DEFAULT):
+    /// a `setq` in that same buffer sets the default rather than making a local.
+    Global(u32, usize, Option<Value>),
     /// A binding of a buffer-local slot, matching Emacs `let` over a buffer-local
     /// variable: (sym, buffer index, previous local slot). The previous slot is
     /// `None` when no local existed (a temporary local created for the binding's
@@ -2022,7 +2025,9 @@ impl ElispHost {
         // Write the current buffer's local slot if it already has one, or if the
         // variable is automatically buffer-local (create the local on first set).
         let bi = self.cur_buf_idx();
-        if self.buffers[bi].locals.contains_key(&id) || self.is_auto_local(id) {
+        if self.buffers[bi].locals.contains_key(&id)
+            || (self.is_auto_local(id) && !self.let_shadows_buffer_binding(id, bi))
+        {
             self.buffers[bi].locals.insert(id, Some(val));
             return Ok(());
         }
@@ -2030,6 +2035,15 @@ impl ElispHost {
             s.value = Some(val);
         }
         Ok(())
+    }
+    /// data.c `let_shadows_buffer_binding_p`: a `let` made in buffer BI bound
+    /// the default of automatically buffer-local ID, so setting it in BI sets
+    /// that default instead of creating a local. In another buffer it does
+    /// create one.
+    fn let_shadows_buffer_binding(&self, id: u32, bi: usize) -> bool {
+        self.specstack
+            .iter()
+            .any(|e| matches!(e, SpecEntry::Global(i, b, _) if *i == id && *b == bi))
     }
     fn is_auto_local(&self, id: u32) -> bool {
         matches!(self.arena.get(id as usize), Some(Obj::Symbol(s)) if s.buffer_local_auto)
@@ -2412,9 +2426,13 @@ impl ElispHost {
         let id0 = self.sym_handle(sym).ok_or("cannot bind a non-symbol")?;
         let id = self.indirect_var(id0);
         let bi = self.cur_buf_idx();
-        // `let` over a buffer-local variable rebinds the current buffer's local
-        // slot (Emacs SPECPDL_LET_LOCAL), not the global default.
-        if self.buffers[bi].locals.contains_key(&id) || self.is_auto_local(id) {
+        // eval.c `specbind`: `let` over a variable that HAS a local binding in
+        // the current buffer rebinds that local (SPECPDL_LET_LOCAL). One that is
+        // merely automatically buffer-local, with no local here yet, binds the
+        // DEFAULT (SPECPDL_LET_DEFAULT), so every buffer without its own value —
+        // including one made inside the `let` — sees the bound value:
+        // `(let ((case-fold-search nil)) (with-temp-buffer case-fold-search))`.
+        if self.buffers[bi].locals.contains_key(&id) {
             let old = self.buffers[bi].locals.get(&id).cloned();
             self.specstack.push(SpecEntry::Local(id, bi, old));
             self.buffers[bi].locals.insert(id, Some(val));
@@ -2425,7 +2443,7 @@ impl ElispHost {
         } else {
             None
         };
-        self.specstack.push(SpecEntry::Global(id, old));
+        self.specstack.push(SpecEntry::Global(id, bi, old));
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.value = Some(val);
         }
@@ -2434,7 +2452,7 @@ impl ElispHost {
     pub fn unbind_to(&mut self, depth: usize) {
         while self.specstack.len() > depth {
             match self.specstack.pop().unwrap() {
-                SpecEntry::Global(id, old) => {
+                SpecEntry::Global(id, _, old) => {
                     if let Obj::Symbol(s) = &mut self.arena[id as usize] {
                         s.value = old;
                     }
