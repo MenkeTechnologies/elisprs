@@ -214,6 +214,13 @@ fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
             compile_wrong_nargs_signal(h, b, &head, argc)?;
             return Ok(());
         }
+        // `when`/`unless` are subr.el macros over `(cond &rest body)`: with no
+        // COND the expander signals `((1 . 1) 0)`, again only when the form runs.
+        if matches!(n, "when" | "unless") && elems.len() == 1 {
+            let template = h.cons(Value::Int(1), Value::Int(1));
+            compile_wrong_nargs_signal(h, b, &template, 0)?;
+            return Ok(());
+        }
     }
     match name.as_deref() {
         Some("quote") => load_const(b, elems.get(1).cloned().unwrap_or(Value::Undef)),

@@ -110,3 +110,21 @@ fn classification_predicates() {
         "(nil nil)"
     );
 }
+
+/// A missing COND is an arity error from the `(cond &rest body)` expander,
+/// whose byte-compiled arity template is `(1 . 1)`. It is signalled only when
+/// the form is evaluated or expanded, never when the enclosing code compiles.
+/// Measured against GNU Emacs 31.1 (`emacs -Q --batch --eval`; `-l` would
+/// eager-expand the whole top-level form first).
+#[test]
+fn missing_cond_is_an_expander_arity_error() {
+    let caught = |form: &str| eval(&format!("(condition-case e {form} (error (list 'err e)))"));
+    let want = "(err (wrong-number-of-arguments (1 . 1) 0))";
+    assert_eq!(caught("(when)"), want);
+    assert_eq!(caught("(unless)"), want);
+    assert_eq!(caught("(macroexpand '(when))"), want);
+    assert_eq!(caught("(macroexpand-1 '(unless))"), want);
+    assert_eq!(caught("(macroexpand-all '(progn (when)))"), want);
+    assert_eq!(caught("(funcall (lambda () (when)))"), want);
+    assert_eq!(eval("(if nil (when) 'ok)"), "ok");
+}

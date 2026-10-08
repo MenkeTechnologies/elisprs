@@ -5623,6 +5623,18 @@ impl ElispHost {
         msg
     }
 
+    /// `(when)` / `(unless)`: the byte-compiled `(cond &rest body)` expander
+    /// rejects a missing COND with its arity template, `((1 . 1) 0)`.
+    pub fn signal_intrinsic_macro_wrong_nargs(&mut self) -> String {
+        let sym = self.intern("wrong-number-of-arguments");
+        let template = self.cons(Value::Int(1), Value::Int(1));
+        let data = self.list_from(vec![template, Value::Int(0)]);
+        let obj = self.cons(sym, data);
+        let msg = "wrong-number-of-arguments: (1 . 1) 0".to_string();
+        self.set_pending_error(&msg, obj);
+        msg
+    }
+
     pub fn signal_wrong_nargs(&mut self, callee: &Value, argc: usize) -> String {
         let sym = self.intern("wrong-number-of-arguments");
         let count = Value::Int(argc as i64);
@@ -6600,7 +6612,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 if let Some(e) = macroexpand_1(form)? {
                     return Ok(e);
                 }
-                return Ok(expand_intrinsic_macro(form).unwrap_or_else(|| form.clone()));
+                return Ok(expand_intrinsic_macro(form)?.unwrap_or_else(|| form.clone()));
             }
             "macroexpand" => {
                 // Expand the head to a fixpoint; don't recurse into sub-forms.
@@ -6628,7 +6640,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                         f = e;
                         continue;
                     }
-                    if let Some(e) = expand_intrinsic_macro(&f) {
+                    if let Some(e) = expand_intrinsic_macro(&f)? {
                         f = e;
                         continue;
                     }
@@ -7102,13 +7114,23 @@ pub fn macroexpand_1(form: &Value) -> Result<Option<Value>, String> {
 /// (defmacro when   (cond &rest body) (list 'if cond (cons 'progn body)))
 /// (defmacro unless (cond &rest body) (cons 'if (cons cond (cons nil body))))
 /// ```
-pub fn expand_intrinsic_macro(form: &Value) -> Option<Value> {
+pub fn expand_intrinsic_macro(form: &Value) -> Result<Option<Value>, String> {
     with_host(|h| {
-        let elems = h.list_vec(form)?;
+        let Some(elems) = h.list_vec(form) else {
+            return Ok(None);
+        };
         if elems.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let name = h.sym_name(&elems[0])?;
+        let Some(name) = h.sym_name(&elems[0]) else {
+            return Ok(None);
+        };
+        // Both lambda lists are `(cond &rest body)`, so a call with no COND
+        // is rejected by the byte-compiled expander before it runs:
+        // `(wrong-number-of-arguments (1 . 1) 0)`.
+        if elems.len() == 1 && matches!(name.as_str(), "when" | "unless") {
+            return Err(h.signal_intrinsic_macro_wrong_nargs());
+        }
         let body = &elems[2.min(elems.len())..];
         let cond = elems.get(1).cloned().unwrap_or(Value::Undef);
         // An EMPTY body is a different expansion in both macros. subr.el:
@@ -7125,7 +7147,7 @@ pub fn expand_intrinsic_macro(form: &Value) -> Option<Value> {
         // `macroexp-warn-and-return` needs the byte-compiler's diagnostic
         // channel, which this tree does not model.)
         let empty_body = body.is_empty();
-        match name.as_str() {
+        Ok(match name.as_str() {
             // subr.el: (defmacro lambda (&rest cdr) (list 'function (cons 'lambda cdr)))
             "lambda" => {
                 let function_sym = h.intern("function");
@@ -7135,7 +7157,7 @@ pub fn expand_intrinsic_macro(form: &Value) -> Option<Value> {
             "when" => {
                 if empty_body {
                     let progn_sym = h.intern("progn");
-                    return Some(h.list_from(vec![progn_sym, cond, Value::Undef]));
+                    return Ok(Some(h.list_from(vec![progn_sym, cond, Value::Undef])));
                 }
                 let if_sym = h.intern("if");
                 let mut progn = vec![h.intern("progn")];
@@ -7147,14 +7169,14 @@ pub fn expand_intrinsic_macro(form: &Value) -> Option<Value> {
             "unless" => {
                 if empty_body {
                     let progn_sym = h.intern("progn");
-                    return Some(h.list_from(vec![progn_sym, cond, Value::Undef]));
+                    return Ok(Some(h.list_from(vec![progn_sym, cond, Value::Undef])));
                 }
                 let mut out = vec![h.intern("if"), cond, Value::Undef];
                 out.extend_from_slice(body);
                 Some(h.list_from(out))
             }
             _ => None,
-        }
+        })
     })
 }
 
@@ -7324,7 +7346,7 @@ fn macroexpand_all_impl(
             continue;
         }
         if expand_intrinsics {
-            if let Some(e) = expand_intrinsic_macro(&f) {
+            if let Some(e) = expand_intrinsic_macro(&f)? {
                 f = e;
                 continue;
             }
