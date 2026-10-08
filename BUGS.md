@@ -6299,6 +6299,95 @@ buffer-local. `tests/parity_buffer_local_let.rs`.
   `(error "Eager macro-expansion failure: …")`.
 
 
+## Round 37 — always-local slots, `declare` properties, primitive commands, scope-local `defvar`, eager load expansion, reader
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch`; the fuzzer with
+`EMACS_VERSION_EXPECT=31.1`). Every expectation below is in a `tests/` file
+named with the fix.
+
+### R37-A. ✅ FIXED — buffer.c's always-local slots
+
+Closes the round-36 item. The slots `init_buffer_once` flags -1
+(`buffer-file-name`, `major-mode`, `mode-name`, `default-directory`,
+`buffer-read-only`, `buffer-undo-list`, …) are local in every buffer from birth;
+a new buffer starts from `reset_buffer`'s constants, inherits the creating
+buffer's `default-directory`, and has `buffer-undo-list` t when its name starts
+with a space; `kill-local-variable` keeps them; `kill-all-local-variables`
+resets `major-mode`/`mode-name`/`buffer-invisibility-spec`; `(default-value
+'default-directory)` is nil. `tests/parity_buffer_local_let.rs`.
+
+### R37-B. ✅ FIXED — `local-variable-p` BUFFER
+
+It always asked about the current buffer; it now decodes BUFFER (before
+checking VARIABLE, `(wrong-type-argument bufferp 4)`), and
+`local-variable-if-set-p` follows `Flocal_variable_if_set_p`.
+`tests/parity_buffer_local_let.rs`.
+
+### R37-C. ✅ FIXED — `declare` properties of the preloaded definitions
+
+Closes the round-36 item: `(get 'when 'lisp-indent-function)` is 1. A
+`declare` in a prelude definition made before the declaration bridge was
+dropped; those are now recorded and replayed (and stripped from the body, as
+byte-run.el does), the subr.el/byte-run.el/custom.el/keymap.el `declare`s the
+ports lacked are added, and lisp-mode.el's `put` block is ported.
+Definitions Emacs only autoloads (`cl-defun`, `define-minor-mode`, …) carry
+their full `declare` here, matching Emacs after the library is loaded.
+`tests/parity_declare_properties.rs`.
+
+### R37-D. ✅ FIXED — primitives that are commands
+
+`commandp` and `interactive-form` read a primitive's `DEFUN` intspec:
+`(commandp 'forward-char)` is t, `(interactive-form 'goto-char)` is the spec
+form. The case/syntax commands elisprs defines in Lisp gained their
+`interactive` specs. `tests/parity_types_lambda_lists_and_commands.rs`.
+
+### R37-E. ✅ FIXED — a value-less `(defvar SYM)` is scope-local
+
+Closes the round-36 target. Under lexical binding `Fdefvar` conses the bare
+SYM onto the environment: SYM is dynamically bound by the `let`s of the rest
+of that scope only (to the end of the file at top level), and
+`special-variable-p` stays nil. The environment carries the declaration, so a
+closure keeps it when its body `let`-binds SYM (`((y . 2) ww)`), and an
+environment of declarations only is kept whole (`(xx t)`). `eval`'s `progn`
+subforms now share one environment. `internal--define-uninitialized-variable`
+still sets `declared_special` for good. The shard format is 14 (a closure's
+environment entry may be a declaration). `tests/parity_local_defvar.rs`.
+
+### R37-F. ✅ FIXED — eager macro-expansion on `load`
+
+Closes the round-36 item. A loaded file's top-level forms are
+`macroexpand-all`ed whole before they run, and an expander's error is
+`(error "Eager macro-expansion failure: %S" ERR)`, outside any
+`condition-case` in the form. `elisp -e` keeps `--eval`'s lazy expansion.
+`tests/parity_eager_load_expansion.rs`.
+
+### R37-G. ✅ FIXED — reader
+
+`(read STRING)` read every object in the string and signalled on trailing
+text (`(read "a)")`); it reads one. A character literal must be followed by a
+delimiter: `?ab` is `(invalid-read-syntax "?")`.
+`tests/parity_read_streams_random_and_print_escapes.rs`, `tests/reader.rs`.
+
+### Still open after round 37
+
+- Version drift (unchanged): `make-hash-table` argument errors,
+  `split-string`'s `sequencep`, cl-seq.el's `*-if` with a nil PRED, and the
+  `end-of-file` data of a `read` inside a loaded file.
+- `documentation` of a primitive is nil: its docstring lives in Emacs's
+  `etc/DOC`, which elisprs neither ships nor reads. Embedding Emacs's
+  docstrings, or reading an installed Emacs's DOC file, is a decision.
+- Unibyte strings (`unibyte-string`, `"\x80"`, `string-as-unibyte`,
+  `encode-coding-string`, `byte-to-string`) — design decision, not attempted.
+- Void: `transpose-regions`, `indent-rigidly`, `substitute-in-file-name`,
+  `text-mode`, `emacs-lisp-mode`, `get-char-code-property`, `?\N{NAME}`.
+- Reader: `#_SYMBOL` (31.1's shorthand-free symbol) and `#[...]` as an
+  interpreted-function literal.
+- A char-table prints its ranges, not Emacs's `#^[...]` slot layout.
+- A closure pruned to only `let`-bound declarations prints `(ww t)` where
+  cconv gives `(ww)`; `(let () (defvar x))` ends the declaration with the
+  `let`, where Emacs's `Flet` leaves the environment unbound.
+- `handler-bind`, fill.el — design decisions, not attempted.
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the
