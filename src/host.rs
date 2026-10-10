@@ -82,7 +82,11 @@ pub enum SerObj {
         default: Value,
         parent: Value,
         extra: Vec<Value>,
-        ranges: Vec<(u32, Value)>,
+        /// The tree, flattened by [`CharTable::flatten`].
+        contents: Vec<CtSer>,
+        /// The cached ASCII slot when it is a plain value; `None` when it is
+        /// the tree's depth-3 table.
+        ascii: Option<Value>,
     },
     Closure {
         required: Vec<u32>,
@@ -685,27 +689,141 @@ impl ElHashTable {
     }
 }
 
-/// An Emacs char-table's payload. Per-char values use efficient range storage:
-/// `ranges` is a sorted list of `(start, value)` breakpoints whose first entry
-/// always starts at `0`; a breakpoint `(s, v)` means every char in `s..next_s`
-/// maps to `v` (the last breakpoint runs through `MAX_CHAR`). Setting a whole
-/// range is O(range-count), not O(chars), so `(set-char-table-range t …)` is cheap.
+/// `chartab_size`: the number of slots of a char-table (depth 0) and of a
+/// sub-char-table at depth 1, 2 and 3.
+const CT_SIZE: [usize; 4] = [64, 16, 32, 128];
+/// `chartab_chars`: how many characters one slot covers at each depth.
+const CT_CHARS: [u32; 4] = [65_536, 4_096, 128, 1];
+
+/// One slot of a char-table or sub-char-table: a value, or a deeper table that
+/// covers the slot's characters.
+#[derive(Clone)]
+pub enum CtSlot {
+    Val(Value),
+    Sub(Box<SubCharTable>),
+}
+
+/// Emacs's `struct Lisp_Sub_Char_Table`.
+#[derive(Clone)]
+pub struct SubCharTable {
+    pub depth: u8,
+    pub min_char: u32,
+    pub contents: Vec<CtSlot>,
+}
+
+impl SubCharTable {
+    /// `make_sub_char_table`: every slot holds `init`.
+    fn new(depth: u8, min_char: u32, init: &Value) -> SubCharTable {
+        SubCharTable {
+            depth,
+            min_char,
+            contents: vec![CtSlot::Val(init.clone()); CT_SIZE[depth as usize]],
+        }
+    }
+
+    fn index(&self, c: u32) -> usize {
+        ((c - self.min_char) / CT_CHARS[self.depth as usize]) as usize
+    }
+
+    /// `optimize_sub_char_table`: `Some(value)` when every slot, after its own
+    /// optimisation, is a plain value SAME as the first.
+    fn optimize(&mut self, same: &dyn Fn(&Value, &Value) -> bool) -> Option<Value> {
+        for slot in &mut self.contents {
+            if let CtSlot::Sub(s) = slot {
+                if let Some(v) = s.optimize(same) {
+                    *slot = CtSlot::Val(v);
+                }
+            }
+        }
+        let CtSlot::Val(first) = &self.contents[0] else {
+            return None;
+        };
+        let all_same = self.contents[1..]
+            .iter()
+            .all(|slot| matches!(slot, CtSlot::Val(v) if same(v, first)));
+        all_same.then(|| first.clone())
+    }
+
+    /// `sub_char_table_set`.
+    fn set(&mut self, c: u32, val: Value) {
+        let i = self.index(c);
+        if self.depth == 3 {
+            self.contents[i] = CtSlot::Val(val);
+            return;
+        }
+        let depth = self.depth;
+        let min = self.min_char + i as u32 * CT_CHARS[depth as usize];
+        let slot = &mut self.contents[i];
+        if let CtSlot::Val(old) = slot {
+            let sub = SubCharTable::new(depth + 1, min, old);
+            *slot = CtSlot::Sub(Box::new(sub));
+        }
+        if let CtSlot::Sub(sub) = slot {
+            sub.set(c, val);
+        }
+    }
+
+    /// `sub_char_table_set_range`.
+    fn set_range(&mut self, from: u32, to: u32, val: &Value) {
+        let depth = self.depth as usize;
+        let block = CT_CHARS[depth];
+        let from = from.max(self.min_char);
+        let mut i = self.index(from);
+        let mut c = self.min_char + block * i as u32;
+        while i < CT_SIZE[depth] {
+            if c > to {
+                break;
+            }
+            if from <= c && c + block - 1 <= to {
+                self.contents[i] = CtSlot::Val(val.clone());
+            } else {
+                let slot = &mut self.contents[i];
+                if let CtSlot::Val(old) = slot {
+                    let sub = SubCharTable::new(self.depth + 1, c, old);
+                    *slot = CtSlot::Sub(Box::new(sub));
+                }
+                if let CtSlot::Sub(sub) = slot {
+                    sub.set_range(from, to, val);
+                }
+            }
+            i += 1;
+            c += block;
+        }
+    }
+}
+
+/// The `ascii` slot of a char-table: Emacs caches the table or value covering
+/// the ASCII block, and refreshes it only when an operation touches ASCII.
+#[derive(Clone)]
+pub enum CtAscii {
+    /// A plain value (also a stale one, after a non-ASCII operation).
+    Val(Value),
+    /// The depth-3 sub-char-table at slot `[0][0][0]` of the tree.
+    Tree,
+}
+
+/// An Emacs char-table, laid out as `chartab.c` lays it out: 64 top-level slots
+/// each covering 65536 characters, refined through sub-char-tables of 16, 32 and
+/// 128 slots. The layout is observable — `prin1` prints it, and a range that
+/// covers a whole block stores a value where a single character stores a chain
+/// of sub-tables — so operations follow the C ones step for step.
 ///
 /// Lookup (`aref`, `char-table-range`) falls back like Emacs's `char_table_ref`:
-/// own char value; if nil → `default`; if that is nil and `parent` is a char-table
-/// → recurse into the parent.
+/// own char value; if nil → `default`; if that is nil and `parent` is a
+/// char-table → recurse into the parent.
 #[derive(Clone)]
 pub struct CharTable {
     pub subtype: Value,
     pub default: Value,
     pub parent: Value,
     pub extra: Vec<Value>,
-    pub ranges: Vec<(u32, Value)>,
+    pub contents: Vec<CtSlot>,
+    pub ascii: CtAscii,
 }
 
-/// Shallow `eq`-style equality for coalescing adjacent char-table breakpoints
-/// (identical adjacent runs collapse to one entry). Mirrors [`ElispHost::values_eq`]
-/// but is a free function usable while the arena is mutably borrowed.
+/// Shallow `eq`-style equality for coalescing adjacent char-table runs. Mirrors
+/// [`ElispHost::values_eq`] but is a free function usable while the arena is
+/// mutably borrowed.
 fn ct_val_eq(a: &Value, b: &Value) -> bool {
     if !el_truthy(a) && !el_truthy(b) {
         return true;
@@ -719,58 +837,251 @@ fn ct_val_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-impl CharTable {
-    pub fn new(subtype: Value, init: Value, n_extra: usize) -> CharTable {
-        CharTable {
-            subtype,
-            default: Value::Undef,
-            parent: Value::Undef,
-            extra: vec![Value::Undef; n_extra],
-            ranges: vec![(0, init)],
+/// High bit of a print-label key: names the sub-char-table `ascii` shares with
+/// the tree of the char-table whose heap id is the low bits.
+const CT_ASCII_LABEL: u32 = 0x8000_0000;
+
+impl SubCharTable {
+    /// Every plain value stored below this table, in slot order.
+    fn leaf_values(&self, out: &mut Vec<Value>) {
+        for slot in &self.contents {
+            slot.leaf_values(out, false);
         }
     }
-    /// The raw value stored for char `c` in this table alone (no parent/default
-    /// fallback): the value of the breakpoint that covers `c`.
-    pub fn raw_get(&self, c: u32) -> Value {
-        // `ranges` is sorted by start with ranges[0].0 == 0, so the covering
-        // breakpoint is the last one whose start <= c.
-        let idx = match self.ranges.binary_search_by(|(s, _)| s.cmp(&c)) {
-            Ok(i) => i,
-            Err(0) => 0,
-            Err(i) => i - 1,
-        };
-        self.ranges[idx].1.clone()
-    }
-    /// Set every char in `from..=to` to `val`, splicing/coalescing breakpoints.
-    pub fn set_range(&mut self, from: u32, to: u32, val: Value) {
-        // The value covering the char just past the range (to restore after it).
-        let after = if to < MAX_CHAR {
-            Some(self.raw_get(to + 1))
-        } else {
-            None
-        };
-        // Drop breakpoints strictly inside (from, to].
-        self.ranges.retain(|(s, _)| *s <= from || *s > to);
-        Self::upsert(&mut self.ranges, from, val);
-        if let Some(after) = after {
-            Self::upsert(&mut self.ranges, to + 1, after);
-        }
-        // Coalesce adjacent equal-valued runs.
-        let mut i = 1;
-        while i < self.ranges.len() {
-            if ct_val_eq(&self.ranges[i].1, &self.ranges[i - 1].1) {
-                self.ranges.remove(i);
-            } else {
-                i += 1;
+}
+
+impl CtSlot {
+    /// The values below this slot, depth first. With SKIP_ASCII the depth-3
+    /// table at min-char 0 is skipped: it is the one `ascii` already listed.
+    fn leaf_values(&self, out: &mut Vec<Value>, skip_ascii: bool) {
+        match self {
+            CtSlot::Val(v) => out.push(v.clone()),
+            CtSlot::Sub(s) => {
+                if skip_ascii && s.depth == 3 && s.min_char == 0 {
+                    return;
+                }
+                for slot in &s.contents {
+                    slot.leaf_values(out, skip_ascii);
+                }
             }
         }
     }
-    fn upsert(ranges: &mut Vec<(u32, Value)>, start: u32, val: Value) {
-        match ranges.binary_search_by(|(s, _)| s.cmp(&start)) {
-            Ok(i) => ranges[i].1 = val,
-            Err(i) => ranges.insert(i, (start, val)),
+}
+
+impl CharTable {
+    /// `Fmake_char_table`: every slot — default, ascii and extras included —
+    /// starts as INIT, then the parent is nil.
+    pub fn new(subtype: Value, init: Value, n_extra: usize) -> CharTable {
+        CharTable {
+            subtype,
+            default: init.clone(),
+            parent: Value::Undef,
+            extra: vec![init.clone(); n_extra],
+            contents: vec![CtSlot::Val(init.clone()); CT_SIZE[0]],
+            ascii: CtAscii::Val(init),
         }
     }
+
+    /// The raw value stored for char `c` in this table alone (no parent/default
+    /// fallback).
+    pub fn raw_get(&self, c: u32) -> Value {
+        let mut slot = &self.contents[(c / CT_CHARS[0]) as usize];
+        loop {
+            match slot {
+                CtSlot::Val(v) => return v.clone(),
+                CtSlot::Sub(s) => slot = &s.contents[s.index(c)],
+            }
+        }
+    }
+
+    /// The depth-3 sub-char-table at `[0][0][0]`, when the tree reaches that deep.
+    pub fn ascii_table(&self) -> Option<&SubCharTable> {
+        let CtSlot::Sub(s1) = &self.contents[0] else {
+            return None;
+        };
+        let CtSlot::Sub(s2) = &s1.contents[0] else {
+            return None;
+        };
+        match &s2.contents[0] {
+            CtSlot::Sub(s3) => Some(s3),
+            CtSlot::Val(_) => None,
+        }
+    }
+
+    /// `copy_char_table`: a deep copy, with the cached ASCII slot recomputed.
+    pub fn copied(&self) -> CharTable {
+        let mut copy = self.clone();
+        copy.ascii = copy.derived_ascii();
+        copy
+    }
+
+    /// A deep copy that keeps the cached ASCII slot as it is.
+    pub fn copied_exact(&self) -> CharTable {
+        self.clone()
+    }
+
+    /// `Foptimize_char_table`: collapse every sub-table whose slots are all
+    /// SAME-equal, then refresh the cached ASCII slot.
+    pub fn optimize(&mut self, same: &dyn Fn(&Value, &Value) -> bool) {
+        for slot in &mut self.contents {
+            if let CtSlot::Sub(s) = slot {
+                if let Some(v) = s.optimize(same) {
+                    *slot = CtSlot::Val(v);
+                }
+            }
+        }
+        self.ascii = self.derived_ascii();
+    }
+
+    /// `char_table_ascii`: the value or depth-3 table covering the ASCII block,
+    /// reduced to `Val` when some level above it is uniform.
+    fn derived_ascii(&self) -> CtAscii {
+        let CtSlot::Sub(s1) = &self.contents[0] else {
+            return CtAscii::Val(match &self.contents[0] {
+                CtSlot::Val(v) => v.clone(),
+                CtSlot::Sub(_) => Value::Undef,
+            });
+        };
+        match &s1.contents[0] {
+            CtSlot::Val(v) => CtAscii::Val(v.clone()),
+            CtSlot::Sub(s2) => match &s2.contents[0] {
+                CtSlot::Val(v) => CtAscii::Val(v.clone()),
+                CtSlot::Sub(_) => CtAscii::Tree,
+            },
+        }
+    }
+
+    /// `char_table_set`.
+    pub fn set(&mut self, c: u32, val: Value) {
+        let i = (c / CT_CHARS[0]) as usize;
+        let slot = &mut self.contents[i];
+        if let CtSlot::Val(old) = slot {
+            let sub = SubCharTable::new(1, i as u32 * CT_CHARS[0], old);
+            *slot = CtSlot::Sub(Box::new(sub));
+        }
+        if let CtSlot::Sub(sub) = slot {
+            sub.set(c, val);
+        }
+        if c < 128 {
+            self.ascii = self.derived_ascii();
+        }
+    }
+
+    /// `char_table_set_range`: set every char in `from..=to` to `val`.
+    pub fn set_range(&mut self, from: u32, to: u32, val: Value) {
+        if from == to {
+            self.set(from, val);
+            return;
+        }
+        let lim = (to / CT_CHARS[0]) as usize;
+        let mut i = (from / CT_CHARS[0]) as usize;
+        let mut c = i as u32 * CT_CHARS[0];
+        while i <= lim {
+            if c > to {
+                break;
+            }
+            if from <= c && c + CT_CHARS[0] - 1 <= to {
+                self.contents[i] = CtSlot::Val(val.clone());
+            } else {
+                let slot = &mut self.contents[i];
+                if let CtSlot::Val(old) = slot {
+                    let sub = SubCharTable::new(1, c, old);
+                    *slot = CtSlot::Sub(Box::new(sub));
+                }
+                if let CtSlot::Sub(sub) = slot {
+                    sub.set_range(from, to, &val);
+                }
+            }
+            i += 1;
+            c += CT_CHARS[0];
+        }
+        if from < 128 {
+            self.ascii = self.derived_ascii();
+        }
+    }
+
+    /// `(set-char-table-range TABLE t VALUE)`: every top-level slot, and the
+    /// cached ASCII slot, becomes VALUE.
+    pub fn set_all(&mut self, val: Value) {
+        for slot in &mut self.contents {
+            *slot = CtSlot::Val(val.clone());
+        }
+        self.ascii = CtAscii::Val(val);
+    }
+
+    /// The table as `(start, value)` runs, coalescing neighbours holding the
+    /// same value; the first run starts at 0 and the last runs to `MAX_CHAR`.
+    pub fn runs(&self) -> Vec<(u32, Value)> {
+        fn walk(slots: &[CtSlot], min: u32, block: u32, out: &mut Vec<(u32, Value)>) {
+            for (i, slot) in slots.iter().enumerate() {
+                let start = min + i as u32 * block;
+                match slot {
+                    CtSlot::Val(v) => match out.last() {
+                        Some((_, last)) if ct_val_eq(last, v) => {}
+                        _ => out.push((start, v.clone())),
+                    },
+                    CtSlot::Sub(s) => {
+                        walk(&s.contents, s.min_char, CT_CHARS[s.depth as usize], out)
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.contents, 0, CT_CHARS[0], &mut out);
+        out
+    }
+
+    /// The tree flattened for the heap image: each top-level slot in order, a
+    /// sub-table as a `Sub` marker followed by its own slots, depth first.
+    pub fn flatten(&self) -> Vec<CtSer> {
+        fn walk(slots: &[CtSlot], out: &mut Vec<CtSer>) {
+            for slot in slots {
+                match slot {
+                    CtSlot::Val(v) => out.push(CtSer::Val(v.clone())),
+                    CtSlot::Sub(s) => {
+                        out.push(CtSer::Sub);
+                        walk(&s.contents, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.contents, &mut out);
+        out
+    }
+
+    /// Inverse of [`CharTable::flatten`].
+    pub fn unflatten(flat: &[CtSer]) -> Vec<CtSlot> {
+        fn read(flat: &[CtSer], pos: &mut usize, depth: usize, min: u32) -> Vec<CtSlot> {
+            let mut slots = Vec::with_capacity(CT_SIZE[depth]);
+            for i in 0..CT_SIZE[depth] {
+                let item = flat.get(*pos).cloned().unwrap_or(CtSer::Val(Value::Undef));
+                *pos += 1;
+                match item {
+                    CtSer::Val(v) => slots.push(CtSlot::Val(v)),
+                    CtSer::Sub => {
+                        let child_min = min + i as u32 * CT_CHARS[depth];
+                        let contents = read(flat, pos, depth + 1, child_min);
+                        slots.push(CtSlot::Sub(Box::new(SubCharTable {
+                            depth: (depth + 1) as u8,
+                            min_char: child_min,
+                            contents,
+                        })));
+                    }
+                }
+            }
+            slots
+        }
+        let mut pos = 0;
+        read(flat, &mut pos, 0, 0)
+    }
+}
+
+/// A char-table slot in a heap image ([`CharTable::flatten`]).
+#[derive(Serialize, Deserialize, Clone)]
+pub enum CtSer {
+    Val(Value),
+    Sub,
 }
 
 /// Resolution of a function designator to something callable.
@@ -1245,7 +1556,7 @@ pub struct ElispHost {
     /// upgrade → treated as unpropertized). Properties therefore travel with cheap
     /// `Arc` clones (`eq` strings) exactly like Emacs, but are lost across `concat`/
     /// `substring` (which mint fresh allocations) unless re-registered explicitly.
-    pub(crate) string_props: HashMap<usize, (Weak<String>, Vec<Value>)>,
+    pub(crate) string_props: HashMap<usize, StrProps>,
     /// Free-variable sets per closure TEMPLATE handle — the analysis
     /// [`Self::trim_lex`] runs, memoized so a `lambda` evaluated in a loop pays
     /// for it once. Derived from the template's source, so it is never
@@ -1419,6 +1730,10 @@ pub struct OClosureMeta {
     pub slots: Vec<u32>,
 }
 
+/// A string's text-property entry: the weak handle guarding against a reused
+/// pointer, one plist per character, and the recorded interval boundaries.
+pub(crate) type StrProps = (Weak<String>, Vec<Value>, Vec<u32>);
+
 /// An editing buffer: a char vector, a 1-based point, narrowing bounds, the mark,
 /// plus the buffer-local variable slots and the local keymap slot. Positions are
 /// 1-based (`point-min` = `begv`, `point-max` = `zv`). `begv`/`zv`/`mark`/the
@@ -1438,6 +1753,9 @@ pub struct EditBuffer {
     /// with every `cur_insert`/`cur_delete` (inserted chars get nil props — plain
     /// `insert` does not inherit, matching Emacs).
     pub props: Vec<Value>,
+    /// Recorded interval boundaries of `props` (0-based char indices; see
+    /// [`crate::textprop`]).
+    pub prop_bounds: Vec<u32>,
     /// Live markers pointing into this buffer, adjusted on every edit. Shared
     /// (`Rc`) with the corresponding `Obj::Marker`; a marker is removed here when
     /// it is re-pointed (`set-marker`) elsewhere or detached.
@@ -1600,6 +1918,7 @@ impl ElispHost {
                 self_obj: Value::Undef,
                 text: Vec::new(),
                 props: Vec::new(),
+                prop_bounds: Vec::new(),
                 markers: Vec::new(),
                 point: 1,
                 begv: 1,
@@ -1817,9 +2136,9 @@ impl ElispHost {
         let old_key = Arc::as_ptr(old) as usize;
         let fresh = Arc::new(text);
         let new_key = Arc::as_ptr(&fresh) as usize;
-        if let Some((_, props)) = self.string_props.remove(&old_key) {
+        if let Some((_, props, bounds)) = self.string_props.remove(&old_key) {
             self.string_props
-                .insert(new_key, (Arc::downgrade(&fresh), props));
+                .insert(new_key, (Arc::downgrade(&fresh), props, bounds));
         }
         self.arena[*id as usize] = Obj::Str(fresh);
         true
@@ -3293,7 +3612,11 @@ impl ElispHost {
                     default: t.default.clone(),
                     parent: t.parent.clone(),
                     extra: t.extra.clone(),
-                    ranges: t.ranges.clone(),
+                    contents: t.flatten(),
+                    ascii: match &t.ascii {
+                        CtAscii::Val(v) => Some(v.clone()),
+                        CtAscii::Tree => None,
+                    },
                 },
                 // Buffer/marker/obarray objects are runtime-only (created after
                 // prelude load) and never appear in a compiled/AOT heap image;
@@ -3510,7 +3833,11 @@ impl ElispHost {
                 default: t.default.clone(),
                 parent: t.parent.clone(),
                 extra: t.extra.clone(),
-                ranges: t.ranges.clone(),
+                contents: t.flatten(),
+                ascii: match &t.ascii {
+                    CtAscii::Val(v) => Some(v.clone()),
+                    CtAscii::Tree => None,
+                },
             },
             Obj::Closure {
                 params,
@@ -3747,13 +4074,18 @@ impl ElispHost {
                     default,
                     parent,
                     extra,
-                    ranges,
+                    contents,
+                    ascii,
                 } => Obj::CharTable(CharTable {
                     subtype,
                     default,
                     parent,
                     extra,
-                    ranges,
+                    contents: CharTable::unflatten(&contents),
+                    ascii: match ascii {
+                        Some(v) => CtAscii::Val(v),
+                        None => CtAscii::Tree,
+                    },
                 }),
                 SerObj::Closure {
                     required,
@@ -3895,6 +4227,22 @@ impl ElispHost {
         }
         None
     }
+    /// Follow `f` through symbol function cells; `Some(fundef)` when it ends at
+    /// an `(autoload FILE ...)` object (eval.c `funcall_general`'s autoload
+    /// case), which a call must load before it can run.
+    pub fn indirect_autoload(&self, f: &Value) -> Option<Value> {
+        let mut cur = f.clone();
+        for _ in 0..64 {
+            match self.obj(&cur) {
+                Some(Obj::Symbol(s)) => cur = s.function.clone()?,
+                Some(Obj::Cons(car, _)) => {
+                    return (self.sym_name(car).as_deref() == Some("autoload")).then_some(cur);
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
     pub fn resolve_function(&self, f: &Value) -> Result<Resolved, String> {
         let mut cur = f.clone();
         for _ in 0..64 {
@@ -4009,6 +4357,25 @@ impl ElispHost {
         let mut obj = v.clone();
         loop {
             if let Value::Obj(id) = obj {
+                // The marker a char-table pushes after the slots of the sub-table
+                // its `ascii` slot shares with the tree: reaching it is the SECOND
+                // encounter, which is when print.c numbers an object.
+                if id & CT_ASCII_LABEL != 0 {
+                    let mut labels = self.print_labels.borrow_mut();
+                    if let std::collections::hash_map::Entry::Vacant(e) = labels.entry(id) {
+                        let n = self.print_next_label.get();
+                        self.print_next_label.set(n + 1);
+                        e.insert(-(n as i64));
+                    }
+                    drop(labels);
+                    match stack.pop() {
+                        Some(next) => {
+                            obj = next;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
                 // Children in print order; `None` for a non-candidate.
                 let children: Option<Vec<Value>> = match self.arena.get(id as usize) {
                     Some(Obj::Cons(car, cdr)) => {
@@ -4047,26 +4414,40 @@ impl ElispHost {
                     // builds — was never labelled and the printer recursed into it
                     // until the stack overflowed.
                     Some(Obj::Str(a)) => {
-                        let props = self.string_props_vec(a).unwrap_or_default();
-                        let mut kids = Vec::new();
-                        let mut i = 0;
-                        while i < props.len() {
-                            let mut j = i + 1;
-                            while j < props.len()
-                                && (self.values_eq(&props[i], &props[j])
-                                    || self.plist_struct_eq(&props[i], &props[j]))
-                            {
-                                j += 1;
-                            }
-                            if el_truthy(&props[i]) {
-                                kids.push(props[i].clone());
-                            }
-                            i = j;
-                        }
+                        let kids: Vec<Value> = self
+                            .string_intervals(a)
+                            .into_iter()
+                            .filter(|(_, _, p)| el_truthy(p))
+                            .map(|(_, _, p)| p)
+                            .collect();
                         Some(kids)
                     }
+                    // print.c walks a char-table as a vector: defalt, parent,
+                    // purpose, the cached ASCII slot, the 64 contents slots,
+                    // then the extras. A sub-char-table is not a heap object,
+                    // but the depth-3 table `ascii` caches is the SAME object
+                    // as the tree's `[0][0][0]`, so it is met twice and gets a
+                    // label under `print-circle`, keyed by a synthetic id.
                     Some(Obj::CharTable(t)) => {
-                        Some(vec![t.default.clone(), t.parent.clone(), t.subtype.clone()])
+                        let mut kids = vec![t.default.clone(), t.parent.clone(), t.subtype.clone()];
+                        let shared = matches!(t.ascii, CtAscii::Tree);
+                        match &t.ascii {
+                            CtAscii::Val(v) => kids.push(v.clone()),
+                            CtAscii::Tree => {
+                                if let Some(sub) = t.ascii_table() {
+                                    sub.leaf_values(&mut kids);
+                                }
+                                // The shared table is met a second time on the way
+                                // down the tree, after its own slots: a marker object
+                                // numbers it at that point in the walk.
+                                kids.push(Value::Obj(id | CT_ASCII_LABEL));
+                            }
+                        }
+                        for slot in &t.contents {
+                            slot.leaf_values(&mut kids, shared);
+                        }
+                        kids.extend(t.extra.iter().cloned());
+                        Some(kids)
                     }
                     Some(Obj::Closure { src, .. }) => {
                         let mut kids = vec![src.arglist.clone()];
@@ -4307,6 +4688,45 @@ impl ElispHost {
         })
     }
 
+    fn print_ct_slot(&self, slot: &CtSlot, key: u32, readable: bool, depth: usize) -> String {
+        match slot {
+            CtSlot::Val(v) => self.print_inner(v, readable, depth),
+            CtSlot::Sub(s) => self.print_sub_char_table(s, key, readable, depth),
+        }
+    }
+
+    /// A sub-char-table. The one at `[0][0][0]` is the object `ascii` caches, so
+    /// under `print-circle` it prints as `#N=` the first time and `#N#` after.
+    fn print_sub_char_table(
+        &self,
+        sub: &SubCharTable,
+        key: u32,
+        readable: bool,
+        depth: usize,
+    ) -> String {
+        if sub.depth == 3 && sub.min_char == 0 && self.print_circle_on.get() {
+            let mut labels = self.print_labels.borrow_mut();
+            if let Some(slot) = labels.get_mut(&key) {
+                if *slot > 0 {
+                    return format!("#{slot}#");
+                }
+                let n = -*slot;
+                *slot = n;
+                drop(labels);
+                return format!("#{n}={}", self.print_sub_body(sub, key, readable, depth));
+            }
+        }
+        self.print_sub_body(sub, key, readable, depth)
+    }
+
+    fn print_sub_body(&self, sub: &SubCharTable, key: u32, readable: bool, depth: usize) -> String {
+        let mut parts = vec![sub.depth.to_string(), sub.min_char.to_string()];
+        for slot in &sub.contents {
+            parts.push(self.print_ct_slot(slot, key, readable, depth));
+        }
+        format!("#^^[{}]", parts.join(" "))
+    }
+
     fn print_inner_frame(&self, v: &Value, readable: bool, depth: usize) -> String {
         // print.c `print_object`'s prologue, in its own order: the whole
         // `being_printed` mechanism (and the `PRINT_CIRCLE` ceiling that guards it)
@@ -4477,20 +4897,33 @@ impl ElispHost {
                     }
                     format!("#&{}\"{}\"", bits.len(), inner)
                 }
+                // `#^[DEFALT PARENT PURPOSE ASCII CONTENTS×64 EXTRAS…]`, a
+                // sub-char-table as `#^^[DEPTH MIN-CHAR SLOTS…]`: print.c prints
+                // both as vectors of their raw slots.
                 Some(Obj::CharTable(t)) => {
-                    // Emacs prints char-tables as `#^[DEFAULT PARENT SUBTYPE …]`
-                    // where `…` is the raw sub-char-table tree layout. Reproducing
-                    // that tree byte-for-byte is infeasible without modeling the
-                    // exact multi-level bucket structure, so we print the readable
-                    // header slots only. Identity/`char-table-p`/`aref`/`equal`
-                    // (all `eq`-based) behave correctly regardless; only the printed
-                    // per-char body differs from the binary. NAMED limitation.
-                    format!(
-                        "#^[{} {} {}]",
+                    let key = match v {
+                        Value::Obj(id) => *id | CT_ASCII_LABEL,
+                        _ => 0,
+                    };
+                    let mut parts = vec![
                         self.print_inner(&t.default, readable, depth + 1),
                         self.print_inner(&t.parent, readable, depth + 1),
                         self.print_inner(&t.subtype, readable, depth + 1),
-                    )
+                    ];
+                    parts.push(match &t.ascii {
+                        CtAscii::Val(a) => self.print_inner(a, readable, depth + 1),
+                        CtAscii::Tree => match t.ascii_table() {
+                            Some(sub) => self.print_sub_char_table(sub, key, readable, depth + 1),
+                            None => "nil".to_string(),
+                        },
+                    });
+                    for slot in &t.contents {
+                        parts.push(self.print_ct_slot(slot, key, readable, depth + 1));
+                    }
+                    for e in &t.extra {
+                        parts.push(self.print_inner(e, readable, depth + 1));
+                    }
+                    format!("#^[{}]", parts.join(" "))
                 }
                 // A bignum prints exactly like a fixnum — same type in elisp.
                 Some(Obj::Bignum(b)) => b.to_string(),
@@ -4502,12 +4935,17 @@ impl ElispHost {
                 }
                 Some(Obj::Marker(m)) => {
                     let md = m.borrow();
+                    let moves = if md.insertion_type {
+                        "(moves after insertion) "
+                    } else {
+                        ""
+                    };
                     match md
                         .buffer
                         .and_then(|bi| self.buffers.get(bi).and_then(|b| b.name.as_ref()))
                     {
-                        Some(name) => format!("#<marker at {} in {}>", md.pos, name),
-                        None => "#<marker in no buffer>".to_string(),
+                        Some(name) => format!("#<marker {moves}at {} in {}>", md.pos, name),
+                        None => format!("#<marker {moves}in no buffer>"),
                     }
                 }
                 Some(Obj::Overlay(o)) => {
@@ -4883,6 +5321,7 @@ impl ElispHost {
             self_obj: Value::Undef,
             text: Vec::new(),
             props: Vec::new(),
+            prop_bounds: Vec::new(),
             markers: Vec::new(),
             point: 1,
             begv: 1,
@@ -5010,6 +5449,7 @@ impl ElispHost {
         b.name = None;
         b.text.clear();
         b.props.clear();
+        b.prop_bounds.clear();
         b.has_intervals = false;
         b.locals.clear();
         b.se_markers.clear();
@@ -5132,6 +5572,7 @@ impl ElispHost {
         let len = text.len();
         let b = &mut self.buffers[idx];
         b.props = vec![Value::Undef; len];
+        b.prop_bounds.clear();
         b.text = text;
         b.point = 1;
         b.begv = 1;
@@ -5261,6 +5702,7 @@ impl ElispHost {
         // Plain insert gives the new characters nil properties (no inheritance).
         b.props
             .splice((pos - 1)..(pos - 1), std::iter::repeat_n(Value::Undef, len));
+        self.shift_prop_bounds_for_insert(pos - 1, len);
         self.adjust_for_insert(pos, len);
         self.buffers[self.current].point = if leave_after { pos + len } else { pos };
     }
@@ -5278,6 +5720,7 @@ impl ElispHost {
         b.text.splice((pos - 1)..(pos - 1), chars);
         b.props
             .splice((pos - 1)..(pos - 1), std::iter::repeat_n(Value::Undef, len));
+        self.shift_prop_bounds_for_insert(pos - 1, len);
         self.adjust_for_insert(pos, len);
         // Bump any live marker that ended up exactly at the insertion point.
         for mk in self.buffers[self.current].markers.iter() {
@@ -5301,6 +5744,13 @@ impl ElispHost {
         let b = &mut self.buffers[self.current];
         b.text.drain((from - 1)..(to - 1));
         b.props.drain((from - 1)..(to - 1));
+        let (lo, hi) = ((from - 1) as u32, (to - 1) as u32);
+        b.prop_bounds.retain(|&p| p <= lo || p >= hi);
+        for p in &mut b.prop_bounds {
+            if *p >= hi {
+                *p -= hi - lo;
+            }
+        }
         self.adjust_for_delete(from, to);
     }
     /// `(narrow-to-region BEG END)` on the current buffer: clamp `begv`/`zv` to the
@@ -5440,57 +5890,6 @@ impl ElispHost {
         }
         Value::Undef
     }
-    /// A fresh plist equal to PLIST but with PROP → VAL (`eq` key match; appended
-    /// if absent). Never mutates the input.
-    fn plist_put_copy(&mut self, plist: &Value, prop: &Value, val: &Value) -> Value {
-        let mut flat: Vec<Value> = Vec::new();
-        let mut replaced = false;
-        let mut cur = plist.clone();
-        while let Some(Obj::Cons(k, d)) = self.obj(&cur) {
-            let k = k.clone();
-            let rest = d.clone();
-            let (v, rest2) = match self.obj(&rest) {
-                Some(Obj::Cons(v, d2)) => (v.clone(), d2.clone()),
-                _ => break,
-            };
-            if self.values_eq(&k, prop) {
-                flat.push(k);
-                flat.push(val.clone());
-                replaced = true;
-            } else {
-                flat.push(k);
-                flat.push(v);
-            }
-            cur = rest2;
-        }
-        if !replaced {
-            // Emacs prepends a newly-added property (existing keys keep their
-            // position); `text-properties-at` returns most-recently-added first.
-            let mut prepended = vec![prop.clone(), val.clone()];
-            prepended.extend(flat);
-            flat = prepended;
-        }
-        self.list_from(flat)
-    }
-    /// A fresh plist equal to PLIST with PROP removed (`eq` key match).
-    fn plist_remove_copy(&mut self, plist: &Value, prop: &Value) -> Value {
-        let mut flat: Vec<Value> = Vec::new();
-        let mut cur = plist.clone();
-        while let Some(Obj::Cons(k, d)) = self.obj(&cur) {
-            let k = k.clone();
-            let rest = d.clone();
-            let (v, rest2) = match self.obj(&rest) {
-                Some(Obj::Cons(v, d2)) => (v.clone(), d2.clone()),
-                _ => break,
-            };
-            if !self.values_eq(&k, prop) {
-                flat.push(k);
-                flat.push(v);
-            }
-            cur = rest2;
-        }
-        self.list_from(flat)
-    }
     /// The property plist at absolute char index `idx0` in the current buffer.
     pub fn buffer_plist_at(&self, idx0: usize) -> Value {
         self.cur_buf_ref()
@@ -5522,42 +5921,122 @@ impl ElispHost {
         let b = &self.buffers[bi];
         (b.begv, b.zv)
     }
+    /// After `len` characters were spliced into the buffer's plists at char index
+    /// `at`: boundaries past it move up, and — as `graft_intervals_into_buffer`
+    /// does for text with no intervals of its own — the new text becomes an
+    /// interval of its own when the buffer has intervals at all.
+    fn shift_prop_bounds_for_insert(&mut self, at: usize, len: usize) {
+        let has = self.buffers[self.current].has_intervals;
+        let b = &mut self.buffers[self.current];
+        for p in &mut b.prop_bounds {
+            if *p as usize > at {
+                *p += len as u32;
+            }
+        }
+        if has {
+            let total = b.props.len();
+            for edge in [at, at + len] {
+                if edge > 0 && edge < total {
+                    let e = edge as u32;
+                    if let Err(i) = b.prop_bounds.binary_search(&e) {
+                        b.prop_bounds.insert(i, e);
+                    }
+                }
+            }
+        }
+    }
+    /// Run an interval operation over buffer BI's plists and boundaries.
+    pub(crate) fn buffer_tp<T>(
+        &mut self,
+        bi: usize,
+        f: impl FnOnce(&mut Self, &mut Vec<Value>, &mut Vec<u32>) -> T,
+    ) -> T {
+        let mut props = std::mem::take(&mut self.buffers[bi].props);
+        let mut bounds = std::mem::take(&mut self.buffers[bi].prop_bounds);
+        let r = f(self, &mut props, &mut bounds);
+        self.buffers[bi].props = props;
+        self.buffers[bi].prop_bounds = bounds;
+        r
+    }
+    /// `add-text-properties` on the current buffer over char indices `[s0, e0)`.
+    pub fn buffer_add_props(
+        &mut self,
+        s0: usize,
+        e0: usize,
+        pairs: &[(Value, Value)],
+        set_type: crate::textprop::SetType,
+    ) -> bool {
+        let bi = self.current;
+        self.buffers[bi].has_intervals |= s0 < e0;
+        self.buffer_tp(bi, |h, props, bounds| {
+            let end = e0.min(props.len());
+            h.tp_add(props, bounds, s0, end, pairs, set_type)
+        })
+    }
     /// `put-text-property` on the current buffer over char indices `[s0, e0)`.
     pub fn buffer_put_prop(&mut self, s0: usize, e0: usize, prop: &Value, val: &Value) {
-        self.buffers[self.current].has_intervals |= s0 < e0;
-        let n = self.cur_buf_ref().props.len();
-        for idx in s0..e0.min(n) {
-            let cur = self.buffers[self.current].props[idx].clone();
-            let np = self.plist_put_copy(&cur, prop, val);
-            self.buffers[self.current].props[idx] = np;
-        }
+        self.buffer_add_props(
+            s0,
+            e0,
+            &[(prop.clone(), val.clone())],
+            crate::textprop::SetType::Replace,
+        );
     }
-    /// `set-text-properties` on the current buffer: replace each char's plist over
-    /// `[s0, e0)` with PLIST (shared — the slots are never mutated in place).
+    /// `set-text-properties` on the current buffer: `[s0, e0)` becomes one
+    /// interval holding a copy of PLIST.
     pub fn buffer_set_props(&mut self, s0: usize, e0: usize, plist: &Value) {
-        self.buffers[self.current].has_intervals |= s0 < e0;
-        let n = self.cur_buf_ref().props.len();
-        for idx in s0..e0.min(n) {
-            self.buffers[self.current].props[idx] = plist.clone();
-        }
+        let bi = self.current;
+        self.buffers[bi].has_intervals |= s0 < e0;
+        self.buffer_tp(bi, |h, props, bounds| {
+            let end = e0.min(props.len());
+            h.tp_set(props, bounds, s0, end, plist);
+        });
     }
-    /// `remove-text-properties` on the current buffer: drop PROP from each plist.
+    /// `remove-text-properties` on the current buffer.
+    pub fn buffer_remove_props(&mut self, s0: usize, e0: usize, names: &[Value]) -> bool {
+        let bi = self.current;
+        self.buffer_tp(bi, |h, props, bounds| {
+            let end = e0.min(props.len());
+            h.tp_remove(props, bounds, s0, end, names)
+        })
+    }
+    /// `remove-text-properties` of one property on the current buffer.
     pub fn buffer_remove_prop(&mut self, s0: usize, e0: usize, prop: &Value) {
-        let n = self.cur_buf_ref().props.len();
-        for idx in s0..e0.min(n) {
-            let cur = self.buffers[self.current].props[idx].clone();
-            let np = self.plist_remove_copy(&cur, prop);
-            self.buffers[self.current].props[idx] = np;
-        }
+        self.buffer_remove_props(s0, e0, std::slice::from_ref(prop));
     }
 
     /// The per-char property plists registered for string S, or `None` when it has
     /// none (or a stale/reused pointer — the `Weak` guard rejects that).
     pub fn string_props_vec(&self, s: &Arc<String>) -> Option<Vec<Value>> {
         let key = Arc::as_ptr(s) as usize;
-        let (weak, props) = self.string_props.get(&key)?;
+        let (weak, props, _) = self.string_props.get(&key)?;
         weak.upgrade().filter(|a| Arc::as_ptr(a) as usize == key)?;
         Some(props.clone())
+    }
+    /// The recorded interval boundaries of string S (see [`crate::textprop`]).
+    pub fn string_bounds_vec(&self, s: &Arc<String>) -> Vec<u32> {
+        let key = Arc::as_ptr(s) as usize;
+        match self.string_props.get(&key) {
+            Some((weak, _, bounds))
+                if weak
+                    .upgrade()
+                    .is_some_and(|a| Arc::as_ptr(&a) as usize == key) =>
+            {
+                bounds.clone()
+            }
+            _ => Vec::new(),
+        }
+    }
+    /// S's intervals as `(START, END, PLIST)`, nil-plist runs included.
+    pub fn string_intervals(&self, s: &Arc<String>) -> Vec<(usize, usize, Value)> {
+        let Some(props) = self.string_props_vec(s) else {
+            return Vec::new();
+        };
+        let bounds = self.string_bounds_vec(s);
+        self.tp_runs(&props, &bounds)
+            .into_iter()
+            .map(|(a, b)| (a, b, props[a].clone()))
+            .collect()
     }
     /// The property plist at char index `idx0` of string S.
     pub fn string_plist_at(&self, s: &Arc<String>, idx0: usize) -> Value {
@@ -5573,7 +6052,14 @@ impl ElispHost {
     /// Install (replacing any existing) the per-char plists for string S.
     pub fn string_set_props_vec(&mut self, s: &Arc<String>, vec: Vec<Value>) {
         let key = Arc::as_ptr(s) as usize;
-        self.string_props.insert(key, (Arc::downgrade(s), vec));
+        self.string_props
+            .insert(key, (Arc::downgrade(s), vec, Vec::new()));
+    }
+    /// Install the plists and the interval boundaries of string S.
+    pub fn string_set_props_bounded(&mut self, s: &Arc<String>, vec: Vec<Value>, bounds: Vec<u32>) {
+        let key = Arc::as_ptr(s) as usize;
+        self.string_props
+            .insert(key, (Arc::downgrade(s), vec, bounds));
     }
     /// The property vec for S, creating an all-nil one of the right length if the
     /// string has none registered yet.
@@ -5617,22 +6103,37 @@ impl ElispHost {
         out: &Arc<String>,
         pieces: &[(Option<Arc<String>>, usize, usize)],
     ) {
-        let mut vec: Vec<Value> = Vec::new();
+        let total: usize = pieces.iter().map(|p| p.2).sum();
+        let mut vec: Vec<Value> = vec![Value::Undef; total];
+        let mut bounds: Vec<u32> = Vec::new();
         let mut any = false;
+        let mut at = 0;
         for (src, start, len) in pieces {
-            match src.as_ref().and_then(|s| self.string_props_vec(s)) {
-                Some(props) => {
-                    any = true;
-                    for i in 0..*len {
-                        vec.push(props.get(start + i).cloned().unwrap_or(Value::Undef));
+            if let Some(s) = src {
+                if let Some(props) = self.string_props_vec(s) {
+                    let sb = self.string_bounds_vec(s);
+                    // One fresh copy of the plist per source interval, shared
+                    // by every character of it (`copy_properties`).
+                    for (rs, re) in self.tp_runs(&props, &sb) {
+                        if re <= *start || rs >= start + len || !el_truthy(&props[rs]) {
+                            continue;
+                        }
+                        any = true;
+                        let items = self.list_vec(&props[rs]).unwrap_or_default();
+                        let copy = self.list_from(items);
+                        let a = rs.max(*start) - start + at;
+                        let b = re.min(start + len) - start + at;
+                        for slot in &mut vec[a..b] {
+                            *slot = copy.clone();
+                        }
                     }
+                    self.tp_clip(&props, &sb, (*start, *len, at, total), &mut bounds);
                 }
-                None => vec.extend(std::iter::repeat_n(Value::Undef, *len)),
             }
+            at += len;
         }
         if any {
-            let vec = self.copy_plist_runs(vec);
-            self.string_set_props_vec(out, vec);
+            self.string_set_props_bounded(out, vec, bounds);
         }
     }
 
@@ -5652,29 +6153,69 @@ impl ElispHost {
         prop: &Value,
         val: &Value,
     ) {
-        let mut vec = self.string_props_or_new(s);
-        for idx in s0..e0.min(vec.len()) {
-            let cur = vec[idx].clone();
-            vec[idx] = self.plist_put_copy(&cur, prop, val);
-        }
-        self.string_set_props_vec(s, vec);
+        self.string_add_props(
+            s,
+            s0,
+            e0,
+            &[(prop.clone(), val.clone())],
+            crate::textprop::SetType::Replace,
+        );
     }
-    /// `set-text-properties` on string S over `[s0, e0)` (shared PLIST slots).
+    /// `add-text-properties` (and `add-face-text-property`, by SET_TYPE) on
+    /// string S over `[s0, e0)`; true when a property changed.
+    pub fn string_add_props(
+        &mut self,
+        s: &Arc<String>,
+        s0: usize,
+        e0: usize,
+        pairs: &[(Value, Value)],
+        set_type: crate::textprop::SetType,
+    ) -> bool {
+        let mut vec = self.string_props_or_new(s);
+        let mut bounds = self.string_bounds_vec(s);
+        let end = e0.min(vec.len());
+        let changed = self.tp_add(&mut vec, &mut bounds, s0, end, pairs, set_type);
+        self.string_set_props_bounded(s, vec, bounds);
+        changed
+    }
+    /// `set-text-properties` on string S over `[s0, e0)`: one interval holding
+    /// PLIST, or no intervals at all when PLIST is nil and the range is the
+    /// whole string.
     pub fn string_set_props(&mut self, s: &Arc<String>, s0: usize, e0: usize, plist: &Value) {
-        let mut vec = self.string_props_or_new(s);
-        for idx in s0..e0.min(vec.len()) {
-            vec[idx] = plist.clone();
+        let len = s.chars().count();
+        if !el_truthy(plist) && s0 == 0 && e0 >= len {
+            self.string_clear_props(s);
+            return;
         }
-        self.string_set_props_vec(s, vec);
+        let mut vec = self.string_props_or_new(s);
+        let mut bounds = self.string_bounds_vec(s);
+        let end = e0.min(vec.len());
+        self.tp_set(&mut vec, &mut bounds, s0, end, plist);
+        self.string_set_props_bounded(s, vec, bounds);
     }
-    /// `remove-text-properties` on string S over `[s0, e0)`.
+    /// `remove-text-properties` / `remove-list-of-text-properties` on string S
+    /// over `[s0, e0)`; true when a property was removed.
+    pub fn string_remove_props(
+        &mut self,
+        s: &Arc<String>,
+        s0: usize,
+        e0: usize,
+        names: &[Value],
+    ) -> bool {
+        // A string with no intervals is left alone (`validate_interval_range`
+        // is soft for removal).
+        let Some(mut vec) = self.string_props_vec(s) else {
+            return false;
+        };
+        let mut bounds = self.string_bounds_vec(s);
+        let end = e0.min(vec.len());
+        let changed = self.tp_remove(&mut vec, &mut bounds, s0, end, names);
+        self.string_set_props_bounded(s, vec, bounds);
+        changed
+    }
+    /// `remove-text-properties` of one property on string S over `[s0, e0)`.
     pub fn string_remove_prop(&mut self, s: &Arc<String>, s0: usize, e0: usize, prop: &Value) {
-        let mut vec = self.string_props_or_new(s);
-        for idx in s0..e0.min(vec.len()) {
-            let cur = vec[idx].clone();
-            vec[idx] = self.plist_remove_copy(&cur, prop);
-        }
-        self.string_set_props_vec(s, vec);
+        self.string_remove_props(s, s0, e0, std::slice::from_ref(prop));
     }
     /// Value comparison for merging text-property intervals: `eq` semantics, but
     /// strings also compare by content (adjacent cells that were given an
@@ -5705,7 +6246,7 @@ impl ElispHost {
     }
     /// Structural plist equality (same key→value set, `eq` on values) — used to
     /// merge adjacent text-property intervals when printing a propertized string.
-    fn plist_struct_eq(&self, a: &Value, b: &Value) -> bool {
+    pub(crate) fn plist_struct_eq(&self, a: &Value, b: &Value) -> bool {
         // An empty plist is not the same interval as one that names a property
         // whose value happens to be nil: `(propertize "ab" 'p nil)` followed by
         // an unpropertized character prints as two runs, not one. The subset
@@ -5720,34 +6261,16 @@ impl ElispHost {
     /// sharing a (non-nil) property list, as ` START END (plist)` segments. Empty
     /// when the string carries no properties.
     fn string_prop_intervals(&self, s: &Arc<String>, depth: usize) -> String {
-        let Some(props) = self.string_props_vec(s) else {
-            return String::new();
-        };
         let mut out = String::new();
-        let n = props.len();
-        let mut i = 0;
-        while i < n {
-            let mut j = i + 1;
-            // Chars that share the SAME plist object (one `propertize`/
-            // `set-text-properties` call covers a range with one plist) are one
-            // Emacs interval no matter what the plist holds — `values_eq` catches
-            // that even when the plist's keys (e.g. a string key) would defeat
-            // the structural walk below.
-            while j < n
-                && (self.values_eq(&props[i], &props[j])
-                    || self.plist_struct_eq(&props[i], &props[j]))
-            {
-                j += 1;
-            }
-            if el_truthy(&props[i]) {
+        for (i, j, plist) in self.string_intervals(s) {
+            if el_truthy(&plist) {
                 out.push_str(&format!(
                     " {} {} {}",
                     i,
                     j,
-                    self.print_inner(&props[i], true, depth + 1)
+                    self.print_inner(&plist, true, depth + 1)
                 ));
             }
-            i = j;
         }
         out
     }
@@ -5823,7 +6346,7 @@ impl ElispHost {
     /// class` per character as it matches; elisprs translates to a `fancy_regex`
     /// pattern up front, so the same question has to be answered for the whole
     /// character space at compile time. That is cheap here because a `CharTable`
-    /// stores runs (`ranges: Vec<(u32, Value)>`), not 4M slots: the breakpoints
+    /// stores a block tree (see [`CharTable`]), not 4M slots: the breakpoints
     /// of the table and of every table in its parent chain bound every place the
     /// answer can change.
     ///
@@ -5837,7 +6360,7 @@ impl ElispHost {
             let Some(Obj::CharTable(t)) = self.obj(&cur) else {
                 break;
             };
-            breaks.extend(t.ranges.iter().map(|(s, _)| *s));
+            breaks.extend(t.runs().iter().map(|(s, _)| *s));
             cur = t.parent.clone();
         }
         breaks.sort_unstable();
@@ -6099,7 +6622,7 @@ impl ElispHost {
         self.signal_wrong_nargs(object, argc)
     }
 
-    fn signal_wrong_nargs_subject(&mut self, subject: Value, argc: usize) -> String {
+    pub fn signal_wrong_nargs_subject(&mut self, subject: Value, argc: usize) -> String {
         let sym = self.intern("wrong-number-of-arguments");
         let data = self.list_from(vec![subject.clone(), Value::Int(argc as i64)]);
         let display = format!("{} {}", self.print(&subject, true), argc);
@@ -7003,20 +7526,23 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             // elisp plist — so the lookup happens here, outside the borrow, and
             // the resolved functions are handed to the table's constructor.
             "make-hash-table" => {
-                let named = with_host(|h| {
-                    let mut i = 0;
-                    while i + 1 < args.len() {
-                        if h.sym_name(&args[i]).as_deref() == Some(":test") {
-                            if let Some(n) = h.sym_name(&args[i + 1]) {
-                                if !matches!(n.as_str(), "eq" | "eql" | "equal") {
-                                    return Some((args[i + 1].clone(), n));
-                                }
-                            }
+                // The argument-list checks run before any test lookup, in
+                // `Fmake_hash_table's order (odd count, invalid keyword, then
+                // the TEST value: it must be a symbol).
+                let named = with_host(|h| -> Result<Option<(Value, String)>, String> {
+                    let kw = crate::builtins::hash_table_keywords(h, args)?;
+                    let Some(t) = kw.test else { return Ok(None) };
+                    match h.sym_name(&t) {
+                        Some(n) if !matches!(n.as_str(), "eq" | "eql" | "equal" | "nil") => {
+                            Ok(Some((t, n)))
                         }
-                        i += 2;
+                        Some(_) => Ok(None),
+                        None => Err(format!(
+                            "wrong-type-argument: symbolp {}",
+                            h.print(&t, true)
+                        )),
                     }
-                    None
-                });
+                })?;
                 let user = match named {
                     None => None,
                     Some((sym, _)) => {
@@ -7238,6 +7764,16 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             // dynamic binding — `(funcall '(lambda (x) x) 4)` is 4.
             if let Some(fun) = with_host(|h| h.indirect_lambda_list(f)) {
                 return call_lambda_list(&fun, args);
+            }
+            // A symbol whose function cell is an `autoload` object: load its
+            // file (`autoload-do-load` signals if the file does not define the
+            // function) and call again, as `funcall_general` does.
+            if matches!(f, Value::Obj(_)) {
+                if let Some(fundef) = with_host(|h| h.indirect_autoload(f)) {
+                    let loader = with_host(|h| h.intern("autoload-do-load"));
+                    call_function(&loader, &[fundef, f.clone()])?;
+                    return call_function(f, args);
+                }
             }
             // Inline Rust FFI fallback: a `rust { ... }` exported function is
             // callable by bareword when no elisp function shadows it. A user
@@ -8348,9 +8884,38 @@ fn intrinsic_load(f: &Value, args: &[Value]) -> Result<Value, String> {
         }
     }
 
-    let path = match resolved {
-        Some(p) => p,
-        None => {
+    // A library bundled from the Emacs tree answers when no file on
+    // `load-path` does, as Emacs's own `lisp/` directory is its last entry.
+    let bundled = if resolved.is_none() {
+        crate::bundled::find(&file)
+    } else {
+        None
+    };
+
+    let (src, path_text) = match (resolved, bundled) {
+        (Some(path), _) => {
+            // Read the resolved file. A `.gz` target is decompressed in memory
+            // (jka-compr does the same via `load` -> `insert-file-contents` ->
+            // `jka-compr-insert`), so a stock `*.el.gz` library evaluates
+            // identically to its `.el` form.
+            let src = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
+                let bytes = std::fs::read(&path).map_err(|e| {
+                    format!("file-error: Cannot open load file: {}: {e}", path.display())
+                })?;
+                let mut dec = flate2::read::GzDecoder::new(&bytes[..]);
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut dec, &mut s)
+                    .map_err(|e| format!("file-error: uncompressing {}: {e}", path.display()))?;
+                s
+            } else {
+                std::fs::read_to_string(&path).map_err(|e| {
+                    format!("file-error: Cannot open load file: {}: {e}", path.display())
+                })?
+            };
+            (src, path.to_string_lossy().into_owned())
+        }
+        (None, Some(lib)) => (lib.source.to_string(), crate::bundled::virtual_path(lib)),
+        (None, None) => {
             if noerror {
                 return Ok(Value::Undef);
             }
@@ -8362,26 +8927,7 @@ fn intrinsic_load(f: &Value, args: &[Value]) -> Result<Value, String> {
             }));
         }
     };
-
-    // Read the resolved file. A `.gz` target is decompressed in memory (jka-compr
-    // does the same via `load` -> `insert-file-contents` -> `jka-compr-insert`),
-    // so a stock `*.el.gz` library evaluates identically to its `.el` form.
-    let src = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-        let bytes = std::fs::read(&path)
-            .map_err(|e| format!("file-error: Cannot open load file: {}: {e}", path.display()))?;
-        let mut dec = flate2::read::GzDecoder::new(&bytes[..]);
-        let mut s = String::new();
-        std::io::Read::read_to_string(&mut dec, &mut s)
-            .map_err(|e| format!("file-error: uncompressing {}: {e}", path.display()))?;
-        s
-    } else {
-        std::fs::read_to_string(&path)
-            .map_err(|e| format!("file-error: Cannot open load file: {}: {e}", path.display()))?
-    };
-    let abs = with_host(|h| {
-        let text = path.to_string_lossy().into_owned();
-        h.new_string(text)
-    });
+    let abs = with_host(|h| h.new_string(path_text));
 
     // Dynamically bind the load vars, remembering the pre-load specstack depth
     // so we can unwind them even if a form errors.

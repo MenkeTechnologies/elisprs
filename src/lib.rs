@@ -10,6 +10,7 @@ pub mod aot_runtime;
 pub mod backquote;
 pub mod banner;
 pub mod builtins;
+pub mod bundled;
 pub mod cache;
 pub mod compiler;
 pub mod dap;
@@ -19,9 +20,12 @@ pub mod intercepts;
 pub mod json;
 pub mod lsp;
 pub mod prelude;
+pub mod prelude_31;
 pub mod reader;
 pub mod regexp;
 pub mod rust_ffi;
+pub mod strftime;
+pub mod textprop;
 pub mod tiers;
 pub mod timefns;
 
@@ -182,7 +186,10 @@ fn load_prelude() {
     host::set_prelude_compiling(true);
     // The nadvice segment is loaded after the core PRELUDE because it depends on
     // oclosure/gv/cl-lib defined there (and is kept separate — see prelude::NADVICE).
-    for src in [prelude::PRELUDE, prelude::NADVICE] {
+    for src in [prelude::PRELUDE, prelude::NADVICE]
+        .into_iter()
+        .chain(prelude_31::SEGMENTS)
+    {
         let Ok(forms) = host::with_host(|h| reader::read_all(h, src)) else {
             continue;
         };

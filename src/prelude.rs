@@ -309,7 +309,13 @@ pub const PRELUDE: &str = r#"
   (if (memq elt list)
       (delq elt (copy-sequence list))
     list))
-(defun string-to-multibyte (s) s)
+;; `Fstring_to_multibyte': a unibyte string is converted into a fresh multibyte
+;; one without the original's properties; a multibyte one is returned as is.
+;; Strings carry no unibyte flag here, so an all-ASCII one stands for unibyte.
+(defun string-to-multibyte (s)
+  (if (and (stringp s) (string-match-p "\\`[[:ascii:]]*\\'" s))
+      (substring-no-properties s)
+    s))
 (defun string-as-multibyte (s) s)
 (defun string-to-unibyte (s &rest _) s)
 (defun string-as-unibyte (s) s)
@@ -806,13 +812,18 @@ interpreter; expands to nil."
           (memq :execute situations) (memq :load-toplevel situations))
       (cons 'progn body)
     nil))
-(defun byte-code-function-p (_object) nil)
-;; compiled-function-p: non-nil for a function whose implementation is compiled.
-;; elisprs has no byte-code or native functions, so only primitive subrs qualify
-;; (interpreted closures return nil, matching `emacs -Q --batch').
+;; elisprs has no byte compiler, but the closures the prelude defines stand for
+;; Lisp that Emacs ships byte-compiled: they answer these predicates as such,
+;; and a closure the user wrote is interpreted.
+(defun byte-code-function-p (object)
+  "Return t if OBJECT is a byte-compiled function object."
+  (elisprs--prelude-closure-p object))
+(defun interpreted-function-p (object)
+  "Return non-nil if OBJECT is an interpreted function."
+  (and (closurep object) (not (elisprs--prelude-closure-p object))))
 (defun compiled-function-p (object)
-  "Return non-nil if OBJECT is a function that is compiled (a primitive subr)."
-  (and (subrp object) t))
+  "Return non-nil if OBJECT is a function that is compiled."
+  (or (and (subrp object) t) (elisprs--prelude-closure-p object)))
 ;; Bound by `macroexpand-all' while it walks a form; libraries (e.g. rx) read it
 ;; to thread local macro environments.  Defaults to nil outside expansion.
 (defvar macroexpand-all-environment nil)
@@ -934,6 +945,23 @@ symbol itself."
 (defun autoloadp (object)
   "Non-nil if OBJECT is an autoload."
   (eq 'autoload (car-safe object)))
+(defun autoload-do-load (fundef &optional funname macro-only)
+  "If FUNDEF is an autoload form, load its file and return the new definition.
+FUNNAME names the function being autoloaded; it must be defined by the file."
+  (if (or (not (autoloadp fundef))
+          (and (eq macro-only (quote macro))
+               (not (memq (nth 4 fundef) (quote (t macro))))))
+      fundef
+    (let ((data (match-data)))
+      (unwind-protect (load (car (cdr fundef)) nil t nil t)
+        (set-match-data data)))
+    (if (null funname)
+        nil
+      (let ((fun (indirect-function funname)))
+        (if (equal fun fundef)
+            (error "Autoloading file %s failed to define function %s"
+                   (car (cdr fundef)) (symbol-name funname))
+          fun)))))
 (defun autoload (function file &optional docstring interactive type)
   "Define FUNCTION to autoload from FILE.
 Does nothing if FUNCTION is already defined as something other than an
@@ -1266,51 +1294,6 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
     (if (cl-every (lambda (c) (and (integerp c) (>= c 0) (<= c 127))) codes)
         (apply #'string codes)
       (vconcat codes))))
-;; Describe a function-key symbol name ("C-f1" → "C-<f1>"), wrapping the base in
-;; angle brackets and keeping any modifier prefixes.
-(defun kd--sym (name)
-  (let ((i 0) (n (length name)) (mods ""))
-    (while (and (< (1+ i) n) (eq (aref name (1+ i)) ?-) (memq (aref name i) '(?C ?M ?S ?H ?s ?A)))
-      (setq mods (concat mods (substring name i (+ i 2))))
-      (setq i (+ i 2)))
-    (concat mods "<" (substring name i) ">")))
-(defun single-key-description (key &optional _no-angles)
-  "Return a textual description of KEY (an event: integer or symbol)."
-  (if (symbolp key)
-      (kd--sym (symbol-name key))
-    (let* ((alt (/= 0 (logand key (ash 1 22))))
-           (super (/= 0 (logand key (ash 1 23))))
-           (hyper (/= 0 (logand key (ash 1 24))))
-           (shift (/= 0 (logand key (ash 1 25))))
-           (meta (/= 0 (logand key (ash 1 27))))
-           ;; Strip the non-control modifier bits; what's left holds the base
-           ;; char and possibly the explicit control bit (2^26).
-           (c (logand key (lognot (+ (ash 1 22) (ash 1 23) (ash 1 24) (ash 1 25) (ash 1 27)))))
-           (ctrl nil))
-      ;; Control: explicit 2^26 bit, or a folded control char (< 32, not named).
-      (cond ((/= 0 (logand c (ash 1 26))) (setq ctrl t c (logand c (lognot (ash 1 26)))))
-            ((and (< c 32) (not (memq c '(9 13 27 10))))
-             (setq ctrl t c (if (and (>= c 1) (<= c 26)) (+ c 96) (+ c 64)))))
-      (let ((base (cond ((eq c 9) "TAB") ((eq c 13) "RET") ((eq c 27) "ESC")
-                        ((eq c 10) "LFD") ((eq c 32) "SPC") ((eq c 127) "DEL")
-                        (t (char-to-string c)))))
-        ;; Modifier prefixes in Emacs's canonical A-C-H-M-S-s order.
-        (concat (if alt "A-" "") (if ctrl "C-" "") (if hyper "H-" "") (if meta "M-" "")
-                (if shift "S-" "") (if super "s-" "") base)))))
-(defun kd--add-meta (e)
-  (if (integerp e) (logior e (ash 1 27)) (intern (concat "M-" (symbol-name e)))))
-(defun key-description (keys &optional _prefix)
-  "Return a textual description of the key sequence KEYS (a string or vector)."
-  ;; An ESC (27) prefixing another event collapses into a Meta modifier.
-  (let ((evs (append keys nil)) (parts nil))
-    (while evs
-      (let ((e (car evs)))
-        (if (and (eq e 27) (cdr evs))
-            (progn (setq evs (cdr evs))
-                   (push (single-key-description (kd--add-meta (car evs))) parts))
-          (push (single-key-description e) parts)))
-      (setq evs (cdr evs)))
-    (mapconcat #'identity (nreverse parts) " ")))
 
 ;;; ---- strings (ASCII) ----
 ;; Emacs's string comparators accept symbols too, using their print names.
@@ -1516,6 +1499,7 @@ With VECTORS-AND-RECORDS non-nil, traverse and copy vectors and records too."
            (apply #'record (nreverse args))))
         ;; A bool-vector copies to a fresh, independent bool-vector.
         ((bool-vector-p seq) (apply #'bool-vector (append seq nil)))
+        ((char-table-p seq) (elisprs--copy-char-table seq))
         (t (signal 'wrong-type-argument (list 'sequencep seq)))))
 (defun ensure-list (x) (if (listp x) x (list x)))
 (defun mapcan (fn lst)
@@ -1627,7 +1611,9 @@ With VECTORS-AND-RECORDS non-nil, traverse and copy vectors and records too."
   ;; (seq-take nil 1.5) => integerp 1.5; (seq-take "abc" (quote x)) => number-or-marker-p x.
   (unless (listp seq)
     (unless (number-or-marker-p n) (signal (quote wrong-type-argument) (list (quote number-or-marker-p) n))))
-  (seq-into (take n (append seq nil)) (seq--type-of seq)))
+  (if (or (stringp seq) (vectorp seq))
+      (seq-subseq seq 0 (min (max n 0) (length seq)))
+    (seq-into (take n (append seq nil)) (seq--type-of seq))))
 (defun seq-drop (seq n)
   ;; seq.el: the list method is literally (nthcdr n list) -- so a non-integer
   ;; N signals `integerp' via nthcdr -- while other sequences go through the
@@ -1750,10 +1736,11 @@ With VECTORS-AND-RECORDS non-nil, traverse and copy vectors and records too."
       (when (funcall test (car l) elt) (setq out (cons i out)))
       (setq i (1+ i) l (cdr l)))
     (nreverse out)))
-(defun seq-remove-at-position (seq n)
-  (let ((i 0) (out nil) (l (append seq nil)))
-    (while l (unless (= i n) (setq out (cons (car l) out))) (setq i (1+ i) l (cdr l)))
-    (let ((r (nreverse out))) (if (vectorp seq) (vconcat r) r))))
+(defun seq-remove-at-position (sequence n)
+  (seq-concatenate
+   (if (listp sequence) (quote list) (type-of sequence))
+   (seq-subseq sequence 0 n)
+   (seq-subseq sequence (1+ n))))
 (defun seq--type-of (seq)
   (cond ((listp seq) 'list) ((vectorp seq) 'vector) ((stringp seq) 'string) (t 'list)))
 (defun seq-take-while (pred seq)
@@ -2199,11 +2186,13 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 (defmacro and-let* (bindings &rest body)
   (declare (indent 1) (debug if-let*))
   ;; Like when-let* but with no body returns the last bound value (SRFI-2).
-  (if-let--chain bindings
-                 (if body (cons 'progn body)
-                   (let ((lastb (car (last bindings))))
-                     (if (consp lastb) (car lastb) lastb)))
-                 nil))
+  (if (null bindings)
+      (cons 'let* (cons nil (or body '(t))))
+    (if-let--chain bindings
+                   (if body (cons 'progn body)
+                     (let ((lastb (car (last bindings))))
+                       (if (consp lastb) (car lastb) lastb)))
+                   nil)))
 ;; let-alist (lisp/emacs-lisp/let-alist.el): bind every `.KEY' symbol in BODY to
 ;; the corresponding value in ALIST.  A DOTTED CHAIN descends: `.a.b.c' reads
 ;; (cdr (assq 'c (cdr (assq 'b (cdr (assq 'a ALIST)))))), so an intermediate
@@ -2517,11 +2506,15 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 ;;   (substitute-command-keys "a \\=`b") => "a `b"
 (defun --curve-quotes-- (string)
   ;; help.el `substitute-quotes', which `styled_format' agrees with.
+  ;; The replacement is character for character, so the template's text
+  ;; properties stay where they were.
   (and string
-       (cond ((eq (text-quoting-style) 'curve)
-              (string-replace "'" "’" (string-replace "`" "‘" string)))
-             ((eq (text-quoting-style) 'straight) (string-replace "`" "'" string))
-             (t string))))
+       (elisprs--carry-text-properties
+        string
+        (cond ((eq (text-quoting-style) 'curve)
+               (string-replace "'" "’" (string-replace "`" "‘" string)))
+              ((eq (text-quoting-style) 'straight) (string-replace "`" "'" string))
+              (t string)))))
 (defun format-message (fmt &rest args)
   (apply (function format) (--curve-quotes-- fmt) args))
 ;; `substitute-command-keys' without a keymap database: the key-substitution
@@ -3065,37 +3058,23 @@ COMPARE-FN with side effects, and through how many times it is called."
 (defun equal-including-properties (a b)
   (and (equal a b)
        (or (not (stringp a))
+           ;; `compare_string_intervals': interval by interval, property values
+           ;; compared with `equal', whatever the two strings' splits are.
            (let ((i 0) (n (length a)) (ok t))
              (while (and ok (< i n))
-               (unless (--plists-equal (text-properties-at i a)
-                                       (text-properties-at i b))
-                 (setq ok nil))
+               (let ((pa (text-properties-at i a)) (pb (text-properties-at i b)))
+                 (unless (and (= (length pa) (length pb))
+                              (let ((p pa) (same t))
+                                (while (and same p)
+                                  (let ((cell (plist-member pb (car p))))
+                                    (unless (and cell (equal (cadr cell) (cadr p)))
+                                      (setq same nil)))
+                                  (setq p (cddr p)))
+                                same))
+                   (setq ok nil)))
                (setq i (1+ i)))
              ok))))
 
-;; ── text-property scanning (built on the primitive get/put/at) ──
-;; Structural plist equality: same key -> `eq' value set (a nil value = absent).
-(defun --plist-subset (a b)
-  (let ((ok t) (p a))
-    (while (and ok p)
-      (unless (eq (cadr p) (plist-get b (car p))) (setq ok nil))
-      (setq p (cddr p)))
-    ok))
-(defun --plists-equal (a b) (and (--plist-subset a b) (--plist-subset b a)))
-;; Overlays are not modeled, so get-char-property falls straight through to the
-;; text properties (NAMED boundary: no overlay lookup layer).
-(defun get-char-property (pos prop &optional object)
-  (get-text-property pos prop object))
-(defun next-single-property-change (pos prop &optional object limit)
-  (let* ((end (if (stringp object) (length object) (point-max)))
-         (lim (if limit (min limit end) end))
-         (val (get-text-property pos prop object))
-         (p (1+ pos)) (res nil))
-    (while (and (null res) (< p lim))
-      (if (not (eq val (get-text-property p prop object)))
-          (setq res p)
-        (setq p (1+ p))))
-    (or res (if limit lim nil))))
 ;; `Ftext_property_any' / `Ftext_property_not_all' (textprop.c): the first
 ;; position in [START, END) where PROP is -- or is not -- `eq' to VALUE, nil if
 ;; there is none.  OBJECT is a buffer or a string, defaulting to the current
@@ -3150,27 +3129,6 @@ The datum names START and END as GIVEN, which is why the walk cannot just let
     (mapcar (lambda (c) (if (> c 127) (logxor c listify-key-sequence-1) c))
             key)))
 
-(defun next-property-change (pos &optional object limit)
-  (let* ((end (if (stringp object) (length object) (point-max)))
-         (lim (if limit (min limit end) end))
-         (val (text-properties-at pos object))
-         (p (1+ pos)) (res nil))
-    (while (and (null res) (< p lim))
-      (if (not (--plists-equal val (text-properties-at p object)))
-          (setq res p)
-        (setq p (1+ p))))
-    (or res (if limit lim nil))))
-(defun previous-single-property-change (pos prop &optional object limit)
-  (let ((start (if (stringp object) 0 (point-min))))
-    (if (<= pos start) nil
-      (let* ((lim (if limit (max limit start) start))
-             (val (get-text-property (1- pos) prop object))
-             (p (1- pos)) (res nil))
-        (while (and (null res) (> p lim))
-          (if (not (eq val (get-text-property (1- p) prop object)))
-              (setq res p)
-            (setq p (1- p))))
-        (or res (if limit lim nil))))))
 
 (defun apply-partially (fn &rest args) (lambda (&rest more) (apply fn (append args more))))
 (defun complement (fn) (lambda (&rest args) (not (apply fn args))))
@@ -3204,29 +3162,6 @@ The datum names START and END as GIVEN, which is why the walk cannot just let
   (let ((w 0) (l (string-to-list s)))
     (while l (setq w (+ w (char-width (car l))) l (cdr l)))
     w))
-(defun truncate-string-to-width (str end-column &optional start-column padding ellipsis)
-  ;; Truncate STR so its display width is at most END-COLUMN (from START-COLUMN).
-  ;; When ELLIPSIS is non-nil and STR is truncated, append it (t means "…"),
-  ;; keeping the total width within END-COLUMN.
-  (let* ((chars (string-to-list str))
-         (total (let ((w 0)) (dolist (c chars) (setq w (+ w (char-width c)))) w))
-         (truncated (> total end-column))
-         (ell (cond ((null ellipsis) "") ((eq ellipsis t) "…") (t ellipsis)))
-         (limit (if truncated (- end-column (string-width ell)) end-column))
-         (col 0) (start (or start-column 0)) (out nil) (l chars) (stop nil))
-    (while (and l (not stop))
-      (let* ((c (car l)) (cw (char-width c)))
-        (if (> (+ col cw) limit) (setq stop t)
-          (when (>= col start) (setq out (cons c out)))
-          (setq col (+ col cw))))
-      (setq l (cdr l)))
-    (setq out (nreverse out))
-    (when truncated (setq out (append out (string-to-list ell)) col (+ col (string-width ell))))
-    (when (and padding (< col end-column))
-      (let ((pad nil))
-        (while (< col end-column) (setq pad (cons padding pad) col (1+ col)))
-        (setq out (append out pad))))
-    (concat out)))
 (defun cl-type-of (obj)
   (cond ((null obj) 'null)
         ((integerp obj) 'fixnum)
@@ -3915,43 +3850,6 @@ remote, otherwise search locally."
            (with-current-buffer standard-output
              (buffer-string)))
        (kill-buffer standard-output))))
-(defun insert-and-inherit (&rest args)
-  "Insert ARGS at point, inheriting text properties from the adjacent text.
-The inserted text takes the properties of the character BEFORE point, except
-those the preceding character marks `rear-nonsticky', plus the properties of the
-character AFTER point that it marks `front-sticky'.  At the beginning of the
-buffer there is no preceding character, so nothing is inherited."
-  ;; C `insert_and_inherit' -> `graft_intervals_into_buffer' (textprop.c). This
-  ;; is the insert `format-spec' uses to carry FORMAT's properties onto each
-  ;; substitution.
-  (let* ((start (point))
-         (before (and (> start (point-min)) (text-properties-at (1- start))))
-         (rear (plist-get before 'rear-nonsticky))
-         (inherited nil))
-    (apply #'insert args)
-    (let ((end (point)))
-      (while before
-        (let ((prop (car before)) (val (cadr before)))
-          (unless (or (eq prop 'rear-nonsticky)
-                      (eq rear t)
-                      (and (consp rear) (memq prop rear)))
-            (setq inherited (cons prop (cons val inherited)))))
-        (setq before (cddr before)))
-      ;; Anything the FOLLOWING character declares `front-sticky' is inherited
-      ;; too, and wins over the preceding character for the same property.
-      (let* ((after (and (< end (point-max)) (text-properties-at end)))
-             (front (plist-get after 'front-sticky))
-             (tail after))
-        (while tail
-          (let ((prop (car tail)) (val (cadr tail)))
-            (when (and (not (eq prop 'front-sticky))
-                       (or (eq front t) (and (consp front) (memq prop front))))
-              (setq inherited (cons prop (cons val inherited)))))
-          (setq tail (cddr tail))))
-      (when inherited
-        (add-text-properties start end inherited))))
-  nil)
-
 ;;; ---- format-spec.el ----
 ;; Faithful port of format-spec.el (Emacs 30.2). The previous implementation
 ;; substituted %CHAR and nothing else: it dropped the flag/width/precision
@@ -4917,7 +4815,6 @@ If all LST elements are zeros or LST is nil, return zero."
   "Return t if version V1 is equal to V2."
   (declare (side-effect-free t))
   (version-list-= (version-to-list v1) (version-to-list v2)))
-;; format-seconds: ported from time-date.el. %y/%d/%h/%m/%s units (upper-case adds
 ;; ---- Lisp timestamps: a port of timefns.c (Emacs 31.1) ----
 ;; Every time value decodes to an exact (TICKS . HZ) pair (bignum arithmetic,
 ;; no floats), so sums, differences and comparisons are exact and come back in
@@ -5001,61 +4898,6 @@ If all LST elements are zeros or LST is nil, return zero."
            (if (and (consp time) (eq form (cdr time)))
                time
              (cons (time--hz-ticks th form) form))))))
-;; time-date.el (Emacs 31.1).
-(fset 'time-to-seconds #'float-time)
-(defun seconds-to-time (seconds) (time-convert seconds 'list))
-(defun days-to-time (days)
-  (let ((time (time-convert (* 86400 days) 'list)))
-    (if (and (integerp days) (consp (cdr time)))
-        (setcdr (cdr time) nil))
-    time))
-(defun time-since (time)
-  (when (stringp time)
-    (setq time (date-to-time time)))
-  (time-subtract nil time))
-(fset 'subtract-time #'time-subtract)
-(defun date-leap-year-p (year)
-  (or (and (zerop (% year 4))
-           (not (zerop (% year 100))))
-      (zerop (% year 400))))
-(defun time-date--day-in-year (tim)
-  (let* ((month (nth 4 tim))
-         (day (nth 3 tim))
-         (year (nth 5 tim))
-         (day-of-year (+ day (* 31 (1- month)))))
-    (when (> month 2)
-      (setq day-of-year (- day-of-year (/ (+ 23 (* 4 month)) 10)))
-      (when (date-leap-year-p year)
-        (setq day-of-year (1+ day-of-year))))
-    day-of-year))
-(defun time-to-day-in-year (time)
-  (time-date--day-in-year (decode-time time)))
-(defun time-to-days (time)
-  (let* ((tim (decode-time time))
-         (year (nth 5 tim)))
-    (+ (time-date--day-in-year tim)
-       (* 365 (1- year))
-       (/ (1- year) 4)
-       (- (/ (1- year) 100))
-       (/ (1- year) 400))))
-(defun time-to-number-of-days (time)
-  (/ (float-time time) (* 60 60 24)))
-(defun date-days-in-month (year month)
-  (unless (and (numberp month) (<= 1 month 12))
-    (error "Month %s is invalid" month))
-  (if (= month 2)
-      (if (date-leap-year-p year)
-          29
-        28)
-    (if (memq month '(1 3 5 7 8 10 12))
-        31
-      30)))
-(defun date-ordinal-to-time (year ordinal)
-  (let ((month 1))
-    (while (> ordinal (date-days-in-month year month))
-      (setq ordinal (- ordinal (date-days-in-month year month))
-            month (1+ month)))
-    (list nil nil nil ordinal month year nil nil nil)))
 (defun current-time-zone (&optional time zone)
   ;; (OFFSET NAME). The local zone's offset comes from decode-time's zone field;
   ;; the abbreviated NAME is unavailable here, so it is nil.
@@ -5072,72 +4914,6 @@ If all LST elements are zeros or LST is nil, return zero."
 (defun decoded-time-weekday (dt) (nth 6 dt))
 (defun decoded-time-dst (dt) (nth 7 dt))
 (defun decoded-time-zone (dt) (nth 8 dt))
-;; ---- format-seconds ----
-;; the unit name), %z chops leading zero units, %x chops trailing zero units,
-;; %,Ns gives N decimals on seconds, width/zero-pad via %N / %.N.
-(defun format-seconds (string seconds)
-  "Use format control STRING to format the number SECONDS."
-  (let ((start 0)
-        (units '(("y" "year" 31536000) ("d" "day" 86400) ("h" "hour" 3600)
-                 ("m" "minute" 60) ("s" "second" 1) ("z") ("x")))
-        (case-fold-search t)
-        spec match usedunits zeroflag larger prev name unit num
-        leading-zeropos trailing-zeropos fraction chop-leading chop-trailing)
-    (while (string-match "%\\.?[0-9]*\\(,[0-9]\\)?\\(.\\)" string start)
-      (setq start (match-end 0) spec (match-string 2 string))
-      (unless (string-equal spec "%")
-        (or (setq match (assoc (downcase spec) units))
-            (error "Bad format specifier: `%s'" spec))
-        (if (assoc (downcase spec) usedunits)
-            (error "Multiple instances of specifier: `%s'" spec))
-        (if (or (string-equal (car match) "z") (string-equal (car match) "x"))
-            (setq zeroflag t)
-          (unless larger
-            (setq unit (nth 2 match) larger (and prev (> unit prev)) prev unit)))
-        (push match usedunits)))
-    (when (and zeroflag larger) (error "Units are not in decreasing order of size"))
-    (unless (numberp seconds) (setq seconds (float-time seconds)))
-    (setq fraction (mod seconds 1) seconds (round seconds))
-    (dolist (u units)
-      (setq spec (car u) name (cadr u) unit (nth 2 u))
-      (when (string-match
-             (format "%%\\(\\.?[0-9]+\\)?\\(,[0-9]+\\)?\\(%s\\)" spec) string)
-        (cond
-         ((string-equal spec "z")
-          (setq chop-leading (if leading-zeropos
-                                 (min leading-zeropos (match-beginning 0))
-                               (+ 2 (match-beginning 0)))))
-         ((string-equal spec "x") (setq chop-trailing t))
-         (t
-          (setq num (floor seconds unit) seconds (- seconds (* num unit)))
-          (let ((is-zero (zerop (if (= unit 1) (+ num fraction) num))))
-            (when (and (not leading-zeropos) (not is-zero))
-              (setq leading-zeropos (match-beginning 0)))
-            (unless is-zero (setq trailing-zeropos nil))
-            (when (and (not trailing-zeropos) is-zero)
-              (setq trailing-zeropos (match-beginning 0))))
-          (setq string
-                (replace-match
-                 (format (if (match-string 2 string)
-                             (concat "%"
-                                     (and (match-string 1 string)
-                                          (if (= (elt (match-string 1 string) 0) ?.)
-                                              (concat "0" (substring (match-string 1 string) 1))
-                                            (match-string 1 string)))
-                                     (concat "." (substring (match-string 2 string) 1)) "f%s")
-                           (concat "%" (match-string 1 string) "d%s"))
-                         (if (= unit 1) (+ num fraction) num)
-                         (if (string-equal (match-string 3 string) spec)
-                             ""
-                           (format " %s%s" name (if (= num 1) "" "s"))))
-                 t t string))))))
-    (let ((pre string))
-      (when (and chop-trailing trailing-zeropos)
-        (setq string (substring string 0 trailing-zeropos)))
-      (when chop-leading (setq string (substring string chop-leading)))
-      (when (equal string "") (setq string pre)))
-    (setq string (replace-regexp-in-string "%[zx]" "" string)))
-  (string-trim (string-replace "%%" "%" string)))
 (defun char-displayable-p (_char &optional _display) t)
 ;; Feature/module system: the libraries elisprs bundles are always "provided",
 ;; so (require 'cl-lib) etc. are no-ops — `require' checks `features' and never
@@ -5939,7 +5715,7 @@ PAREN controls the surrounding group: a string is used as the opening bracket,
         (let* ((key (car args)) (al (nth 1 args)) (default (nth 2 args))
                (remove (nth 3 args)) (testfn (nth 4 args))
                (getter (if testfn (list 'assoc key al testfn) (list 'assq key al)))
-               (eq-default (if testfn (list testfn '--ag-v-- default) (list 'eql '--ag-v-- default))))
+               (eq-default (list 'eql '--ag-v-- default)))
           (if remove
               (list 'let (list (list '--ag-v-- val) (list '--ag-p-- getter))
                     (list 'if eq-default
@@ -5970,11 +5746,18 @@ PAREN controls the surrounding group: a string is used as the opening bracket,
         (list 'setcar
               (list 'nthcdr (cdr (assq head cl-struct--slot-list-index)) (car args))
               val))
-       ;; (setf (map-elt MAP KEY) V): rebind MAP to a copy with KEY updated/added
-       ;; (hash-tables/arrays mutate in place; alists may grow at the head).
+       ;; (setf (map-elt MAP KEY [DEFAULT [TESTFN]]) V): map.el's gv-expander --
+       ;; `map-put!' in place, else rebind MAP to `map-insert' when the map has to
+       ;; grow (an alist, or nil).
        ((eq head 'map-elt)
-        (setf--expand (car args)
-                      (list 'map--put (car args) (car (cdr args)) val)))
+        (list 'let
+              (list (list '--me-v-- val))
+              (list 'condition-case nil
+                    (list 'map-put! (car args) (car (cdr args)) '--me-v-- (nth 3 args))
+                    (list 'map-not-inplace
+                          (setf--expand (car args)
+                                        (list 'map-insert (car args) (car (cdr args)) '--me-v--))
+                          '--me-v--))))
        ;; (setf (cl-subseq SEQ START &optional END) V): destructively copy V into
        ;; SEQ[START..END) via cl-replace, then yield V — matching cl-lib's setter.
        ((eq head 'cl-subseq)
@@ -6759,8 +6542,9 @@ or the result is already atomic/grouped."
        ;; (map KEY...): map.el's pattern. An element is a bare SYMBOL (bound to
        ;; the value at 'SYMBOL), a KEYWORD :k (binding k to the value at :k), or
        ;; a (KEY VAR [DEFAULT]) list whose KEY and DEFAULT are *evaluated*
-       ;; forms. `map-elt' answers DEFAULT for anything that is not a map, so
-       ;; the binders are safe to establish before the `mapp' test runs.
+       ;; forms. `map-elt' signals for anything that is not a map, and
+       ;; `pcase--clause' establishes the binders before the tests run, so each
+       ;; lookup is guarded by the same `mapp' the pattern tests.
        ((eq head 'map)
         (let ((tests (list (list 'mapp val))) (binds nil))
           (dolist (elt (cdr pat))
@@ -6769,11 +6553,15 @@ or the result is already atomic/grouped."
                           (list (cond
                                  ((consp elt)
                                   (list (nth 1 elt)
-                                        (list 'map-elt val (nth 0 elt) (nth 2 elt))))
+                                        (list 'if (list 'mapp val)
+                                              (list 'map-elt val (nth 0 elt) (nth 2 elt)))))
                                  ((keywordp elt)
                                   (list (intern (substring (symbol-name elt) 1))
-                                        (list 'map-elt val elt)))
-                                 (t (list elt (list 'map-elt val (list 'quote elt)))))))))
+                                        (list 'if (list 'mapp val)
+                                              (list 'map-elt val elt))))
+                                 (t (list elt
+                                          (list 'if (list 'mapp val)
+                                                (list 'map-elt val (list 'quote elt))))))))))
           (cons tests binds)))
        ;; (cl-struct TYPE SLOT...): cl-lib's pattern. A SLOT is a bare name
        ;; (bound to itself) or (SLOT VAR). The slot reads are guarded by the
@@ -7252,178 +7040,6 @@ This is like the `&' operator of the C language."
 (defun hash-table-rehash-size (_table) 1.5)
 (defun hash-table-rehash-threshold (_table) 0.8125)
 
-;;; ---- map.el (subset) ----
-;; A generic key/value interface over alists, hash-tables and arrays. A list
-;; whose first element is an atom is treated as a plist (KEY VALUE KEY VALUE...),
-;; exactly like Emacs map.el; otherwise it is an alist. Alist lookups default to
-;; `equal`, plist lookups default to `eq` (plist-member's default).
-(defun map--plist-p (list)
-  "Return non-nil if LIST is the start of a nonempty plist map."
-  (and (consp list) (atom (car list))))
-(defun mapp (map)
-  "Return non-nil if MAP is a map (list, array or hash-table)."
-  (or (listp map) (arrayp map) (hash-table-p map)))
-(defun map-elt (map key &optional default testfn)
-  (cond
-   ((hash-table-p map) (gethash key map default))
-   ((listp map)
-    (if (map--plist-p map)
-        (let ((res (plist-member map key testfn)))
-          (if res (cadr res) default))
-      (let ((entry (assoc key map (or testfn #'equal))))
-        (if entry (cdr entry) default))))
-   ((arrayp map)
-    (if (and (integerp key) (>= key 0) (< key (length map)))
-        (aref map key)
-      default))
-   (t default)))
-(defun map-contains-key (map key &optional testfn)
-  (cond
-   ((hash-table-p map)
-    (let ((sentinel (list 'map--miss)))
-      (not (eq sentinel (gethash key map sentinel)))))
-   ((listp map)
-    (if (map--plist-p map)
-        (plist-member map key testfn)
-      (and (assoc key map (or testfn #'equal)) t)))
-   ((arrayp map) (and (integerp key) (>= key 0) (< key (length map))))
-   (t nil)))
-(defun map-keys (map) (map-apply (lambda (k _v) k) map))
-(defun map-values (map) (map-apply (lambda (_k v) v) map))
-(defun map-pairs (map) (map-apply #'cons map))
-(defun map-length (map)
-  (cond
-   ((hash-table-p map) (hash-table-count map))
-   ((listp map) (if (map--plist-p map) (/ (length map) 2) (length map)))
-   ((arrayp map) (length map))
-   (t 0)))
-(defun map-empty-p (map) (= 0 (map-length map)))
-(defun map-do (function map)
-  (cond
-   ((hash-table-p map) (maphash function map) nil)
-   ((listp map)
-    (if (map--plist-p map)
-        (while map
-          (funcall function (car map) (cadr map))
-          (setq map (cddr map)))
-      (dolist (pair map) (funcall function (car pair) (cdr pair))))
-    nil)
-   ((arrayp map)
-    (dotimes (i (length map)) (funcall function i (aref map i)))
-    nil)))
-(defun map-apply (function map)
-  (let ((acc nil))
-    (map-do (lambda (k v) (setq acc (cons (funcall function k v) acc))) map)
-    (nreverse acc)))
-(defun map-filter (pred map)
-  (let ((acc nil))
-    (map-do (lambda (k v) (when (funcall pred k v) (setq acc (cons (cons k v) acc)))) map)
-    (nreverse acc)))
-(defun map-remove (pred map)
-  (map-filter (lambda (k v) (not (funcall pred k v))) map))
-(defun map-some (pred map)
-  (catch 'map--some
-    (map-do (lambda (k v) (let ((r (funcall pred k v))) (when r (throw 'map--some r)))) map)
-    nil))
-(defun map-every-p (pred map)
-  (catch 'map--every
-    (map-do (lambda (k v) (unless (funcall pred k v) (throw 'map--every nil))) map)
-    t))
-(defun map-nested-elt (map keys &optional default)
-  (let ((m map))
-    (while (and keys m)
-      (setq m (map-elt m (car keys)) keys (cdr keys)))
-    (if keys default (or m default))))
-(defun map-delete (map key)
-  (cond
-   ((hash-table-p map) (remhash key map) map)
-   ((listp map)
-    (if (map--plist-p map)
-        (let ((res nil))
-          (while map
-            (unless (eq (car map) key) (setq res (cons (cadr map) (cons (car map) res))))
-            (setq map (cddr map)))
-          (nreverse res))
-      (let ((res nil))
-        (dolist (pair map) (unless (equal (car pair) key) (setq res (cons pair res))))
-        (nreverse res))))
-   (t map)))
-;; Internal: return MAP updated so KEY maps to VALUE (used by setf map-elt).
-(defun map--put (map key value)
-  (cond
-   ((hash-table-p map) (puthash key value map) map)
-   ((listp map)
-    (if (map--plist-p map)
-        (plist-put map key value)
-      (let ((entry (assoc key map #'equal)))
-        (if entry (progn (setcdr entry value) map)
-          (cons (cons key value) map)))))
-   ((arrayp map) (aset map key value) map)
-   (t (error "map--put: unsupported map type"))))
-(defun map--into (pairs type)
-  (cond
-   ((eq type 'list) (let ((acc nil)) (dolist (p pairs) (setq acc (map--put acc (car p) (cdr p)))) (nreverse acc)))
-   ((eq type 'alist) (let ((acc nil)) (dolist (p pairs) (setq acc (map--put acc (car p) (cdr p)))) (nreverse acc)))
-   ((eq type 'hash-table)
-    (let ((h (make-hash-table :test 'equal)))
-      (dolist (p pairs) (puthash (car p) (cdr p) h)) h))
-   ;; (hash-table :test TEST …) — the keyword-spec form.
-   ((and (consp type) (eq (car type) 'hash-table))
-    (let ((h (make-hash-table :test (or (plist-get (cdr type) :test) 'eql))))
-      (dolist (p pairs) (puthash (car p) (cdr p) h)) h))
-   (t (error "map-into: unsupported type %S" type))))
-(defun map-into (map type) (map--into (map-pairs map) type))
-(defun map-insert (map key value)
-  "Return a new map like MAP with KEY mapped to VALUE (MAP is unchanged)."
-  (cond ((listp map)
-         (if (map--plist-p map) (cons key (cons value map)) (cons (cons key value) map)))
-        ((hash-table-p map) (let ((h (copy-hash-table map))) (puthash key value h) h))
-        (t (error "map-insert: unsupported map type"))))
-;; map.el's own condition -- an alist that has to grow is not a plain `error'.
-(define-error 'map-not-inplace "Cannot modify map in-place")
-(defun map-put! (map key value &optional testfn)
-  "Set KEY to VALUE in MAP in place; error if an alist must grow."
-  (cond
-   ((hash-table-p map) (puthash key value map) map)
-   ((listp map)
-    (if (map--plist-p map)
-        (progn (plist-put map key value) value)
-      (let ((entry (assoc key map (or testfn #'equal))))
-        (if entry (progn (setcdr entry value) map)
-          (signal 'map-not-inplace (list map))))))
-   ((arrayp map) (aset map key value) map)
-   (t (error "map-put!: unsupported map type"))))
-(defun map--make-pcase-patterns (args)
-  "Return a `(map ...)' pcase pattern built from ARGS (map.el:639)."
-  (cons 'map
-        (mapcar (lambda (elt)
-                  (if (eq (car-safe elt) 'map) (map--make-pcase-patterns elt) elt))
-                args)))
-(defmacro map-let (keys map &rest body)
-  "Bind the variables in KEYS to the elements of MAP, then evaluate BODY.
-KEYS is a list of symbols, or of (KEY VARNAME [DEFAULT]) sublists in which KEY
-and DEFAULT are unquoted forms.  MAP can be an alist, plist, hash-table or
-array."
-  ;; map.el:73 -- `map-let' IS a `pcase-let' over the `map' pattern.
-  `(pcase-let ((,(map--make-pcase-patterns keys) ,map))
-     ,@body))
-(defun map-values-apply (function map) (map-apply (lambda (_k v) (funcall function v)) map))
-(defun map-keys-apply (function map) (map-apply (lambda (k _v) (funcall function k)) map))
-(defun map-merge (type &rest maps)
-  (let ((pairs nil))
-    (dolist (m maps) (setq pairs (append pairs (map-pairs m))))
-    (map--into pairs type)))
-(defun map-merge-with (type function &rest maps)
-  ;; Combine values for duplicate keys with FUNCTION, preserving first-seen order.
-  (let ((result nil))
-    (dolist (m maps)
-      (map-do (lambda (k v)
-                (let ((entry (assoc k result #'equal)))
-                  (if entry
-                      (setcdr entry (funcall function (cdr entry) v))
-                    (setq result (append result (list (cons k v)))))))
-              m))
-    (map--into result type)))
 
 
 ;;; ---- Customize declaration machinery (custom.el / cus-face.el) ----
@@ -7977,7 +7593,6 @@ customize the variable `user-emacs-directory-warning'."
 ;; returns nil (correct with no active global/local remap keymaps).
 
 ;; With no buffer-local/global remap keymaps in effect, no command is remapped.
-(defun command-remapping (_command &optional _position _keymaps) nil)
 
 (defun make-sparse-keymap (&optional string)
   "Construct and return a new sparse keymap.
@@ -8035,22 +7650,48 @@ should be a keymap."
         (push e res)))
     (nreverse res)))
 
+;; `Fdefine_key' / `Flookup_key' read a unibyte string key's characters 128-255
+;; as meta characters (`c ^= 0200 | meta_modifier').  Strings here carry no
+;; unibyte flag, so a string whose characters all fit in a byte and include one
+;; above 127 is read that way.
+(defun keymap--key-events (key)
+  (if (and (stringp key)
+           (let ((hi nil) (ok t))
+             (mapc (lambda (c)
+                     (cond ((> c 255) (setq ok nil))
+                           ((> c 127) (setq hi t))))
+                   key)
+             (and ok hi)))
+      (mapcar (lambda (c)
+                (if (> c 127) (logxor c (logior #o200 #x8000000)) c))
+              key)
+    (append key nil)))
+
 (defun define-key (keymap key def &optional remove)
   "In KEYMAP, define key sequence KEY as DEF.
 KEY is a string or vector of events.  DEF is anything that can be a
 key definition (a command symbol, a keymap for a prefix key, nil, etc.).
 If optional REMOVE is non-nil, remove the binding instead.
 Returns DEF."
-  (let ((events (keymap--expand-meta (append key nil)))
-        (km keymap))
+  (let ((events (keymap--expand-meta (keymap--key-events key)))
+        (km keymap)
+        (consumed nil))
     (while (cdr events)
-      (let ((sub (keymap--get (cdr (or (keymap--own-binding km (car events))
-                                       (cons nil nil))))))
-        (if (keymapp sub)
-            (setq km (keymap--get sub))
+      (setq consumed (cons (car events) consumed))
+      (let* ((raw (cdr (or (keymap--own-binding km (car events))
+                           (cons nil nil))))
+             (sub (keymap--get raw)))
+        (cond
+         ((keymapp sub) (setq km (keymap--get sub)))
+         ;; A bound non-prefix key cannot start a longer sequence.
+         (raw
+          (error "Key sequence %s starts with non-prefix key %s"
+                 (key-description key)
+                 (key-description (vconcat (reverse consumed)))))
+         (t
           (let ((new (make-sparse-keymap)))
             (keymap--set-binding km (car events) new)
-            (setq km new))))
+            (setq km new)))))
       (setq events (cdr events)))
     (if remove
         (keymap--remove-binding km (car events))
@@ -8082,7 +7723,7 @@ KEY is a string or vector.  Returns nil if undefined.  If KEY is longer
 than needed to reach a non-prefix binding, returns the number of events
 at the front of KEY that were used.  ACCEPT-DEFAULT recognizes default
 (t) bindings."
-  (let ((events (keymap--expand-meta (append key nil)))
+  (let ((events (keymap--expand-meta (keymap--key-events key)))
         (km (keymap--get keymap)) (i 0) (res nil) (done nil))
     (if (null events)
         keymap
@@ -8713,13 +8354,20 @@ Return nil if SYNTAX is nil."
   "The standard syntax table (see `standard-syntax-table').")
 
 (defun --init-standard-syntax-table-- ()
-  (let ((tbl (make-char-table 'syntax-table))
-        (word (string-to-syntax "w"))
-        (space (string-to-syntax " "))
-        (punct (string-to-syntax "."))
-        (symbol (string-to-syntax "_")))
-    ;; Word everywhere by default (letters, digits, most non-ASCII).
-    (set-char-table-range tbl t word)
+  (let* ((word (string-to-syntax "w"))
+         (space (string-to-syntax " "))
+         (punct (string-to-syntax "."))
+         (symbol (string-to-syntax "_"))
+         ;; syntax.c `init_syntax_once': whitespace is the table's initial
+         ;; value and its default; everything else is set over it.
+         (tbl (make-char-table 'syntax-table space)))
+    ;; Word: letters, digits, `$' and `%', and every non-ASCII character.
+    (set-char-table-range tbl '(?a . ?z) word)
+    (set-char-table-range tbl '(?A . ?Z) word)
+    (set-char-table-range tbl '(?0 . ?9) word)
+    (aset tbl ?$ word)
+    (aset tbl ?% word)
+    (set-char-table-range tbl '(128 . #x3FFFFF) word)
     ;; Control chars 0..31 and DEL are PUNCTUATION here, and `?\n'/`?\r' are
     ;; whitespace -- syntax.c `init_syntax_once' sets exactly that, and
     ;;   emacs -Q --batch --eval '(with-syntax-table (standard-syntax-table) \

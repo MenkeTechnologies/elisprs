@@ -349,6 +349,18 @@ impl Reader {
                             self.pos += 2;
                             apply_control(self.read_control_target()?)
                         }
+                        // `\M-X` sets bit 7 of the (unibyte) character, as
+                        // lread.c does for a meta-modified escape in a string.
+                        'M' if dash => {
+                            self.pos += 2;
+                            let target = self.read_control_target()?;
+                            if !(0..128).contains(&target) {
+                                return Err(
+                                    "invalid-read-syntax: Invalid modifier in string".to_string()
+                                );
+                            }
+                            target | 0x80
+                        }
                         // `\s` (not `\s-`) is the space character.
                         's' if !dash => {
                             self.pos += 1;

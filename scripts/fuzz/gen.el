@@ -926,6 +926,16 @@ only the error datum does."
    ((fz-chance 5) (fz-seq-keyword-form))
    ((fz-chance 3) (fz-sort-form))
    ((fz-chance 3) (fz-void-head-form))
+   ((fz-chance 3) (fz-ht-args-form))
+   ((fz-chance 5) (fz-time-form))
+   ((fz-chance 4) (fz-keymap-form))
+   ((fz-chance 4) (fz-event-form))
+   ((fz-chance 3) (fz-char-table-form))
+   ((fz-chance 3) (fz-string-number-form))
+   ((fz-chance 3) (fz-format-spec-form))
+   ((fz-chance 3) (fz-text-property-form))
+   ((fz-chance 3) (fz-regexp-class-form))
+   ((fz-chance 2) (fz-lib-form))
    (t (fz-build (fz-pick fz-calls) (1- depth)))))
 
 ;;; ── cl-loop clause forms ─────────────────────────────────────────────────────
@@ -1098,6 +1108,241 @@ an optional filter and an accumulation; now and then a clause is damaged."
                       ((= via 1) (list 'funcall (list 'quote head) '(setq n 9)))
                       (t (list 'apply (list 'quote head) '(list (setq n 9))))))
           'n)))
+
+;;; ── round 39 families ────────────────────────────────────────────────────────
+
+;; The areas the early families did not reach: argument-list validation of
+;; `make-hash-table', the `format-time-string' directive grammar and the time
+;; range, keymap and event machinery, char-tables, and the stock libraries that
+;; load on demand. Every form is pure: times are explicit and zoned (`t', a
+;; number or an (OFFSET ABBR) list, never the local zone), and a keymap is built
+;; inside the form.
+
+(defun fz-ht-args-form ()
+  "A `make-hash-table' call with a random keyword argument list."
+  (let ((n (fz-int 7)) (args nil))
+    (while (> n 0)
+      (push (if (fz-chance 60)
+                (fz-pick '(:test :size :weakness :purecopy :rehash-size
+                           :rehash-threshold :foo :test :size))
+              (fz-pick '((quote eq) (quote eql) (quote equal) (quote nosuchtest)
+                         nil t 1 -1 3 1.5 (quote key) (quote value)
+                         (quote key-or-value) (quote key-and-value) "x" (quote a))))
+            args)
+      (setq n (1- n)))
+    (cons 'make-hash-table args)))
+
+(defvar fz-tflags '("" "-" "_" "0" "^" "#" "+" "-0" "_-" "^_" "0^"))
+(defvar fz-twidths '("" "" "" "1" "2" "3" "5" "10" "20"))
+(defvar fz-tmodifiers '("" "" "" "" "E" "O"))
+(defvar fz-tdirectives
+  '("Y" "C" "y" "G" "g" "m" "d" "e" "H" "I" "k" "l" "M" "S" "j" "U" "V" "W" "u"
+    "w" "a" "A" "b" "B" "h" "p" "P" "Z" "z" ":z" "::z" ":::z" "s" "N" "3N" "6N"
+    "%" "n" "t" "F" "T" "R" "D" "q" "Q" "L" "E" "O" "-" "5" ":" "::" "x"))
+(defvar fz-tyears '(-100000 -10000 -1000 -101 -100 -1 0 1 99 100 999 1000 1582
+                    1899 1900 1969 1970 1999 2000 2024 2038 9999 10000 12345
+                    100000 2147485547 -2147481748))
+(defvar fz-tzones '(t 0 3600 -3600 5400 3601 86399 (3600 "ABC") (-18000 "EST")
+                    "UTC" "UTC0" "EST5EDT" "JST-9" "<+0530>-5:30"))
+
+(defun fz-time-format ()
+  "A `format-time-string' format string built from the nstrftime grammar."
+  (let ((n (1+ (fz-int 3))) (out ""))
+    (while (> n 0)
+      (setq out (concat out
+                        (if (fz-chance 15) (fz-pick '("-" ":" " " "/" "x"))
+                          "%")
+                        (fz-pick fz-tflags) (fz-pick fz-twidths)
+                        (fz-pick fz-tmodifiers) (fz-pick fz-tdirectives)))
+      (setq n (1- n)))
+    out))
+
+(defun fz-time-form ()
+  "A time formatting / encoding / decoding call over an extreme time value."
+  (let ((year (fz-pick fz-tyears)) (zone (fz-pick fz-tzones))
+        (kind (fz-int 5)))
+    (cond
+     ((= kind 0)
+      (list 'format-time-string (fz-time-format)
+            (list 'encode-time (list 'list (fz-int 61) (fz-int 60) (fz-int 24)
+                                     (1+ (fz-int 31)) (1+ (fz-int 12)) year
+                                     nil -1 (list 'quote zone)))
+            (list 'quote zone)))
+     ((= kind 1)
+      (list 'format-time-string (fz-time-format)
+            (fz-pick '(0 1 -1 86399 1700000000 -62167219200 253402300799 1.5
+                       (quote (1 . 2)) (quote (1700000000 . 1000))
+                       (quote (1 2 3 4))))
+            (list 'quote zone)))
+     ((= kind 2)
+      (list 'encode-time (list 'list (fz-pick '(0 30 59 60 -1 100))
+                               (fz-pick '(0 30 59 60 -1))
+                               (fz-pick '(0 12 23 24 -1))
+                               (fz-pick '(1 15 31 32 0 -5))
+                               (fz-pick '(1 6 12 13 0 -1))
+                               year nil -1 (list 'quote zone))))
+     ((= kind 3)
+      (list 'decode-time (fz-pick '(0 -1 -62167219200 253402300799
+                                    -5000000000 5000000000000 -67768040609740800
+                                    67768036191676799 67768036191676800
+                                    1.5 (quote (1 . 2))))
+            (list 'quote zone)))
+     (t
+      (list 'decode-time
+            (list 'encode-time (list 'list 0 0 0 1 1 year nil -1 t))
+            (list 'quote zone))))))
+
+(defvar fz-keys '("a" "b" "\C-a" "\C-xa" "\C-xb" "\M-a" "\M-x" [f1] [C-f2]
+                  [?\C-x ?\C-f] [remap kill-line] [t] [mouse-1] "\e" "ab"))
+(defvar fz-key-events '(?a ?\C-a ?\M-a ?\C-\M-a ?\S-a ?\H-a ?\s-a ?\A-a 27 127 0
+                        1 32 9 13 10 -1 4194303 f1 C-f1 M-f2 S-C-return
+                        (control f1) (meta ?a) double-mouse-1 down-mouse-3
+                        mouse-movement wheel-up C-M-S-s-A-H-f1 "str" 1.5 nil t))
+
+(defun fz-keymap-form ()
+  "A keymap built in the form, then traversed or described."
+  (let* ((full (fz-chance 40))
+         (defs (let ((n (fz-int 4)) (acc nil))
+                 (while (> n 0)
+                   (push (list 'define-key 'm (fz-pick fz-keys)
+                               (list 'quote (fz-pick '(foo bar baz nil))))
+                         acc)
+                   (setq n (1- n)))
+                 acc))
+         (body (fz-pick
+                '((let (r) (map-keymap (lambda (k v) (push (cons k v) r)) m) r)
+                  (copy-keymap m)
+                  (keymap-prompt m)
+                  (accessible-keymaps m)
+                  (where-is-internal 'foo m)
+                  (where-is-internal 'foo m t)
+                  (keymap-canonicalize m)
+                  (lookup-key m "a")
+                  (lookup-key m "\C-xa")
+                  (lookup-key m [f1])
+                  (key-description (car (where-is-internal 'foo m)))
+                  m))))
+    `(let ((m ,(if full '(make-keymap) '(make-sparse-keymap))))
+       ,@(nreverse defs)
+       ,body)))
+
+(defun fz-event-form ()
+  "An event or key-description call over an event or key sequence."
+  (let ((ev (fz-pick fz-key-events)))
+    (fz-pick
+     (list (list 'single-key-description (list 'quote ev))
+           (list 'single-key-description (list 'quote ev) t)
+           (list 'event-modifiers (list 'quote ev))
+           (list 'event-basic-type (list 'quote ev))
+           (list 'event-convert-list (list 'quote (if (consp ev) ev (list ev))))
+           (list 'key-description (list 'vector (list 'quote ev)))
+           (list 'key-description (list 'vector (list 'quote ev) (list 'quote (fz-pick fz-key-events))))
+           (list 'key-description (fz-pick '("a" "\C-x" "\M-x" "\e" "ab" "\C-x\C-f")))
+           (list 'internal-event-symbol-parse-modifiers
+                 (list 'quote (fz-pick '(f1 C-f1 M-f2 S-C-return double-mouse-1 mouse-1
+                                         wheel-up up- down-mouse-3 foo A-H-s-x))))))))
+
+(defvar fz-ct-chars '(0 ?a ?z 127 128 255 4096 65535 65536 100000 4194303))
+
+(defun fz-char-table-form ()
+  "A char-table mutated by a few operations, then printed or traversed."
+  (let ((n (1+ (fz-int 4))) (ops nil))
+    (while (> n 0)
+      (push (fz-pick
+             (list (list 'aset 'ct (fz-pick fz-ct-chars) (list 'quote (fz-pick '(x y 1 nil))))
+                   (list 'set-char-table-range 'ct
+                         (list 'quote (cons (fz-pick fz-ct-chars) (fz-pick '(200 5000 70000 4194303))))
+                         (list 'quote (fz-pick '(r s 2 nil))))
+                   (list 'set-char-table-range 'ct nil (list 'quote (fz-pick '(d nil))))
+                   (list 'set-char-table-range 'ct t (list 'quote (fz-pick '(all nil))))
+                   '(optimize-char-table ct)))
+            ops)
+      (setq n (1- n)))
+    `(let ((ct (make-char-table 'fzct ,(fz-pick '(nil nil 7 (quote z)))))
+           (print-circle ,(fz-chance 50)))
+       ,@(nreverse ops)
+       ,(fz-pick '((prin1-to-string ct)
+                   (let (r) (map-char-table (lambda (k v) (push (cons (if (consp k) (cons (car k) (cdr k)) k) v) r)) ct) r)
+                   (list (aref ct 97) (aref ct 1000) (char-table-range ct nil)
+                         (char-table-range ct '(97 . 98)))
+                   (equal ct (copy-sequence ct))
+                   (prin1-to-string (copy-sequence ct)))))))
+
+(defvar fz-num-strings
+  '("0" "1" "-1" "+1" "1.5" "-1.5e3" ".5" "5." "1e5" "1E5" "1e+5" "1e-5" "0x10"
+    "1_000" " 12" "12 " "--1" "+-1" "1.2.3" "1e" "e5" "" "-" "." "1.e3" "0.0e+NaN"
+    "1.0e+INF" "-1.0e+INF" "123456789012345678901234567890" "1e400" "-1e400"
+    "1e-400" "00012" "1f" "ff" "FF" "-ff" "z" "Z" "zz" "10" "12" "٣" "1\0002"))
+
+(defun fz-string-number-form ()
+  (list 'string-to-number (fz-pick fz-num-strings)
+        (fz-pick '(nil nil nil 2 8 10 16 36 1 0 37 -1 1.5 "x"))))
+
+(defun fz-format-spec-form ()
+  (list 'format-spec
+        (fz-pick '("%a" "%a%b" "%5a|" "%-5a|" "%05a" "%<3a|" "%>3a|" "%^a" "%_a"
+                   "%%" "%z" "%a%z" "%.2a" "%10.3a|" "%0a" "% a" "%" "%a%"
+                   "%1$a" "%a %a" "[%a]"))
+        (list 'quote (fz-pick '(((?a . "xy") (?b . 2)) ((?a . "abcdefgh"))
+                                ((?a . nil)) ((?a . 12)) ((?a . "é日本"))
+                                nil ((?b . "y")))))
+        (list 'quote (fz-pick '(nil ignore delete t)))
+        (fz-pick '(nil t))))
+
+(defvar fz-textprop-ops
+  '((put-text-property 1 3 'p 1) (put-text-property 2 5 'p 1) (put-text-property 0 6 'q 2)
+    (put-text-property 3 5 'p 2) (add-text-properties 1 4 '(a 1 b 2))
+    (remove-text-properties 2 4 '(a nil)) (set-text-properties 1 3 '(z 9))
+    (set-text-properties 0 6 nil) (remove-list-of-text-properties 0 3 '(p q))
+    (add-face-text-property 1 4 'bold) (add-face-text-property 2 5 'italic t)
+    (alter-text-property 0 6 'p (lambda (v) (1+ (or v 0))))))
+
+(defun fz-text-property-form ()
+  "A string built with several property operations, then printed or inspected."
+  (let ((n (1+ (fz-int 4))) (ops nil))
+    (while (> n 0)
+      (let ((op (copy-sequence (fz-pick fz-textprop-ops))))
+        (push (append op '(s)) ops))
+      (setq n (1- n)))
+    `(let ((s (copy-sequence "abcdef")))
+       ,@(nreverse ops)
+       ,(fz-pick '(s (object-intervals s) (text-properties-at 2 s)
+                     (next-property-change 0 s) (next-single-property-change 0 'p s)
+                     (previous-single-property-change 6 'p s)
+                     (concat s s) (substring s 1 4) (format "%s" s))))))
+
+(defvar fz-classes '("alnum" "alpha" "ascii" "blank" "cntrl" "digit" "graph" "lower"
+                     "multibyte" "nonascii" "print" "punct" "space" "unibyte"
+                     "upper" "word" "xdigit"))
+(defvar fz-class-chars '("a" "A" "5" " " "\t" "\n" "é" "É" "日" "_" "-" "!" "€" "ß"
+                         "Σ" "\0" "\x7f" "ǅ" "٣" "😀"))
+
+(defun fz-regexp-class-form ()
+  (let ((c (fz-pick fz-classes)) (s (fz-pick fz-class-chars)))
+    (fz-pick
+     (list (list 'string-match (format "[[:%s:]]" c) s)
+           (list 'string-match (format "[^[:%s:]]" c) s)
+           (list 'let (list (list 'case-fold-search (fz-pick '(t nil))))
+                 (list 'string-match (format "[[:%s:]]" c) s))
+           (list 'string-match (format "\\s%c" (fz-pick '(?- ?. ?w ?_ ?\( ?\) ?\" ?\\ ?' ?< ?>))) s)
+           (list 'string-match (format "\\S%c" (fz-pick '(?- ?. ?w ?_ ?\())) s)))))
+
+(defvar fz-lib-forms
+  '((parse-time-string "2024-03-05 10:20:30") (parse-time-string "Mon, 5 Mar 2024 10:20:30 +0100")
+    (parse-time-string "12:30pm") (parse-time-string "garbage")
+    (progn (require 'iso8601) (iso8601-parse "2024-W10-2"))
+    (progn (require 'iso8601) (iso8601-parse "20240305T102030Z"))
+    (progn (require 'iso8601) (iso8601-parse-duration "P1Y2M3DT4H5M6S"))
+    (progn (require 'iso8601) (iso8601-parse-interval "2024-01-01/P1M"))
+    (char-fold-to-regexp "abc") (char-fold-to-regexp "é") (char-fold-to-regexp "f" t)
+    (format-seconds "%h:%m:%s" 3661) (format-seconds "%.2Y %D" 100000000)
+    (format-seconds "%s" 1.5) (format-seconds "%x%d" 0)
+    (seconds-to-string 100) (date-days-in-month 2024 2)
+    (progn (require 'time-date) (decoded-time-add (list 0 0 0 31 1 2024 nil -1 t) (make-decoded-time :month 1)))
+    (progn (require 'time-date) (decoded-time-period (list 1 2 3 4 5 6 nil -1 nil)))))
+
+(defun fz-lib-form ()
+  (fz-pick fz-lib-forms))
 
 ;;; ── main ─────────────────────────────────────────────────────────────────────
 

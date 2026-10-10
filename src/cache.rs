@@ -124,7 +124,11 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// buffer's local bindings the prelude built. A v15 shard replays onto buffers
 /// with no `default-directory`, so every file-name function signalled
 /// `arrayp nil` on a warm run.
-pub const SHARD_FORMAT_VERSION: u32 = 16;
+///
+/// v17: `SerObj::CharTable` stores the sub-char-table tree (`contents`, flattened,
+/// and the cached `ascii` slot) instead of a run list (`ranges`), so a char-table
+/// keeps the layout `prin1` shows across a warm run.
+pub const SHARD_FORMAT_VERSION: u32 = 17;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next
@@ -138,6 +142,9 @@ pub fn schema_key(builtin_fingerprint: u64) -> String {
     // NADVICE is a second prelude segment (loaded after PRELUDE); it defines heap
     // symbols too, so a change to it must invalidate the heap image just like PRELUDE.
     crate::prelude::NADVICE.hash(&mut hasher);
+    for segment in crate::prelude_31::SEGMENTS {
+        segment.hash(&mut hasher);
+    }
     format!("{}-{:016x}", env!("CARGO_PKG_VERSION"), hasher.finish())
 }
 

@@ -195,6 +195,11 @@ elisp cells (cons / symbol / vector / closure / macro / subr) live in the `Elisp
 | `src/builtins.rs` | The subr standard library (reached host-side from the `CALL` extension op) |
 | `src/intercepts.rs` | AOP pattern-intercept layer (glob advice across many function names) — an elisprs extension ported from `zshrs`, fired on the `call_function` join point |
 | `src/prelude.rs` | The `[DERIVED]` elisp prelude — breadth written in elisp on top of the primitives |
+| `src/prelude_31.rs` | Prelude segments loaded after the core prelude: Emacs 31.1 library files included verbatim (`time-date.el`, the `subr.el` definitions the core lacked), ports of the `keymap.c` / `keyboard.c` primitives, and the `autoload` table for the lazily bundled libraries |
+| `src/bundled.rs` · `src/lisp/` | Emacs 31.1 libraries bundled as unmodified `.el` files (`parse-time`, `iso8601`, `thunk`, `char-fold` with its generated equivalence table). `load` and `require` fall back to them after `load-path`, and an `autoload` object whose symbol is called loads its file through `autoload-do-load` |
+| `src/lisp/keymap-c.el` | Ports of the `keymap.c` / `keyboard.c` / `chartab.c` primitives written in Lisp: `map-keymap`, `copy-keymap`, `accessible-keymaps`, `where-is-internal`, `make-keymap`, `map-char-table`, `event-convert-list`, `key-description` |
+| `src/textprop.rs` | Text-property intervals: boundary bookkeeping and the `textprop.c` / `intervals.c` split rules behind every property primitive |
+| `src/strftime.rs` | `nstrftime`: `format-time-string`'s directive engine, ported from gnulib's `strftime.c` (flags, widths, `E`/`O` modifiers, bad-format recovery, signed year fields) |
 | `src/aot.rs` | `--aot` / `--aot-exe` driver: lowers a `.el` file to a `fusevm::Chunk`, emits a native object via `fusevm::aot::compile_object`, and links a standalone executable |
 | `src/aot_runtime.rs` | The AOT binary's runtime hook: rebuilds the elisp heap from the image embedded in the object, installs the subrs, extension handlers and numeric contract on the fresh VM, and reports an uncaught elisp error as the interpreter does (an error halts the VM cleanly, so without this the process exited 0 in silence) |
 | `src/lsp.rs` / `src/dap.rs` | `--lsp` (completion/hover/diagnostics/signature help) and `--dap` (breakpoints/stepping/variables) servers |

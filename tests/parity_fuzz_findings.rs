@@ -1446,37 +1446,85 @@ fn byte_compiled_functions_report_their_arity_template() {
     );
 }
 
-/// `Fmake_hash_table` (fns.c:5749-5815) does not scan its keyword list
-/// pairwise. `get_key_arg` searches the whole vector for each keyword it knows,
-/// marking the pair it consumed, and a second pass then rejects everything left
-/// over — so a stray argument, an unknown keyword, or a keyword with no value
-/// signals `(error "Invalid argument list" ARG)` instead of being ignored.
+/// `Fmake_hash_table` (GNU Emacs 31.1) reads its arguments as KEYWORD VALUE
+/// pairs: an odd count is `(error "Odd number of arguments")`; the first
+/// occurrence of `:test`/`:size`/`:weakness` wins; `:purecopy`,
+/// `:rehash-size` and `:rehash-threshold` are accepted and ignored; any other
+/// keyword — of any type — is remembered and the LAST one is reported as
+/// `(error "Invalid keyword argument" KW)`, after the whole list was scanned
+/// and before any value is validated. Values then validate in the order test
+/// (`symbolp`, then a known or declared test), size, weakness.
 #[test]
 fn make_hash_table_rejects_a_malformed_argument_list() {
     let err = |src: &str| eval(&format!("(condition-case e {src} (error e))"));
 
     assert_eq!(
         err("(make-hash-table 1)"),
-        "(error \"Invalid argument list\" 1)"
+        "(error \"Odd number of arguments\")"
     );
     assert_eq!(
         err("(make-hash-table :size)"),
-        "(error \"Invalid argument list\" :size)"
+        "(error \"Odd number of arguments\")"
+    );
+    assert_eq!(
+        err("(make-hash-table 1 2 3)"),
+        "(error \"Odd number of arguments\")"
     );
     assert_eq!(
         err("(make-hash-table 'foo 1)"),
-        "(error \"Invalid argument list\" foo)"
+        "(error \"Invalid keyword argument\" foo)"
     );
-    // `:test` is found wherever it sits, and the leftover is what is reported —
-    // a pairwise scan would have blamed `:test` instead of the stray `1`.
+    // The leftover is reported wherever `:test` sits.
     assert_eq!(
-        err("(make-hash-table 1 :test 'eq)"),
-        "(error \"Invalid argument list\" 1)"
+        err("(make-hash-table 1 2 :test 'eq)"),
+        "(error \"Invalid keyword argument\" 1)"
     );
-    // A trailing keyword has no pair, so `get_key_arg` never consumes it.
+    // The last bad keyword is the one named, not the first.
     assert_eq!(
-        err("(make-hash-table :test 'eq :size)"),
-        "(error \"Invalid argument list\" :size)"
+        err("(make-hash-table :foo 1 :bar 2)"),
+        "(error \"Invalid keyword argument\" :bar)"
+    );
+    assert_eq!(
+        err("(make-hash-table :foo 1 :test 'eq)"),
+        "(error \"Invalid keyword argument\" :foo)"
+    );
+    // A nil keyword has no datum to show.
+    assert_eq!(
+        err("(make-hash-table nil nil)"),
+        "(error \"Invalid keyword argument\")"
+    );
+    // The keyword scan comes before every value check.
+    assert_eq!(
+        err("(make-hash-table :test 'zzz :foo 1)"),
+        "(error \"Invalid keyword argument\" :foo)"
+    );
+
+    // The first `:test` wins, including a nil that selects `eql`.
+    assert_eq!(
+        eval("(make-hash-table :test 'equal :test 'eq)"),
+        "#s(hash-table test equal)"
+    );
+    assert_eq!(
+        eval("(make-hash-table :test nil :test 'equal)"),
+        "#s(hash-table)"
+    );
+    assert_eq!(
+        err("(make-hash-table :test 'eq :test 'zzz)"),
+        "#s(hash-table test eq)"
+    );
+    assert_eq!(err("(make-hash-table :size 1 :size 'a)"), "#s(hash-table)");
+    // TEST must be a symbol; that check precedes the declared-test lookup.
+    assert_eq!(
+        err("(make-hash-table :test 1)"),
+        "(wrong-type-argument symbolp 1)"
+    );
+    assert_eq!(
+        err("(make-hash-table :test 1 :test 'zzz)"),
+        "(wrong-type-argument symbolp 1)"
+    );
+    assert_eq!(
+        err("(make-hash-table :test 'zzz :size 'a)"),
+        "(error \"Invalid hash table test\" zzz)"
     );
 
     assert_eq!(
@@ -1490,6 +1538,11 @@ fn make_hash_table_rejects_a_malformed_argument_list() {
     assert_eq!(
         err("(make-hash-table :weakness 'bogus)"),
         "(error \"Invalid hash table weakness\" bogus)"
+    );
+    // Size is validated before weakness.
+    assert_eq!(
+        err("(make-hash-table :weakness 'x :size 'a)"),
+        "(error \"Invalid hash table size\" a)"
     );
 
     // The obsolete keywords are skipped along with their value, not rejected,

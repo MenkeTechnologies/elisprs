@@ -3,7 +3,8 @@
 //! helpers) will be defined in an elisp prelude on top of these.
 
 use crate::host::{
-    bigint_to_f64, num_cmp, CharTable, ElHashTable, ElispHost, MatchData, Num, Obj, Resolved,
+    bigint_to_f64, num_cmp, CharTable, CtAscii, CtSlot, ElHashTable, ElispHost, MatchData, Num,
+    Obj, Resolved,
 };
 use fusevm::Value;
 use num_bigint::BigInt;
@@ -529,6 +530,25 @@ fn el_equal(h: &ElispHost, a: &Value, b: &Value) -> bool {
                 va.len() == vb.len() && va.iter().zip(vb).all(|(x, y)| el_equal(h, x, y))
             }
             (Some(Obj::BoolVector(ba)), Some(Obj::BoolVector(bb))) => ba == bb,
+            // A char-table is a pseudovector: `equal` compares every slot, a
+            // sub-char-table included, as vectors.
+            (Some(Obj::CharTable(ta)), Some(Obj::CharTable(tb))) => {
+                el_equal(h, &ta.default, &tb.default)
+                    && el_equal(h, &ta.parent, &tb.parent)
+                    && el_equal(h, &ta.subtype, &tb.subtype)
+                    && ta.extra.len() == tb.extra.len()
+                    && ta
+                        .extra
+                        .iter()
+                        .zip(&tb.extra)
+                        .all(|(x, y)| el_equal(h, x, y))
+                    && ct_slots_equal(h, &ta.contents, &tb.contents)
+                    && match (&ta.ascii, &tb.ascii) {
+                        (CtAscii::Val(x), CtAscii::Val(y)) => el_equal(h, x, y),
+                        (CtAscii::Tree, CtAscii::Tree) => true,
+                        _ => false,
+                    }
+            }
             // Two markers are `equal` when they share a buffer and position.
             (Some(Obj::Marker(_)), Some(Obj::Marker(_))) => h.markers_equal(a, b),
             // An interpreted closure is its `#[ARGLIST BODY ENV]` structure, and
@@ -562,6 +582,20 @@ fn el_equal(h: &ElispHost, a: &Value, b: &Value) -> bool {
         _ => false,
     }
 }
+/// Slot-by-slot `equal` of two char-table (or sub-char-table) slot arrays.
+fn ct_slots_equal(h: &ElispHost, a: &[CtSlot], b: &[CtSlot]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| match (x, y) {
+            (CtSlot::Val(x), CtSlot::Val(y)) => el_equal(h, x, y),
+            (CtSlot::Sub(x), CtSlot::Sub(y)) => {
+                x.depth == y.depth
+                    && x.min_char == y.min_char
+                    && ct_slots_equal(h, &x.contents, &y.contents)
+            }
+            _ => false,
+        })
+}
+
 fn eq_fn(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(el_eq(h, &a[0], &a[1])))
 }
@@ -919,11 +953,10 @@ fn length_fn(h: &mut ElispHost, a: &[Value]) -> R {
             }
             // A bool-vector/char-table/record has a length; a symbol, a subr, a
             // buffer … do not — Emacs signals rather than answering 0.
-            Some(Obj::CharTable(_)) | Some(Obj::HashTable(_)) => Ok(Value::Int(0)),
-            _ => Err(format!(
-                "wrong-type-argument: sequencep {}",
-                h.print(&a[0], true)
-            )),
+            // `Flength` on a char-table is `MAX_CHAR + 1` (`chartab_chars[0]`
+            // slots of 64 blocks).
+            Some(Obj::CharTable(_)) => Ok(Value::Int(MAX_CHAR + 1)),
+            _ => Err(h.signal_wrong_type("sequencep", &a[0])),
         },
         _ => Err(format!(
             "wrong-type-argument: sequencep {}",
@@ -1869,7 +1902,7 @@ fn clear_string(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(make-char-table--new SUBTYPE INIT N-EXTRA)` — low-level allocator. The
 /// public `make-char-table` (prelude) reads N-EXTRA from SUBTYPE's
 /// `char-table-extra-slots' property before calling this. INIT fills every char
-/// slot; the `default` slot starts nil (Emacs `Fmake_char_table`).
+/// slot, and — as in `Fmake_char_table` — the default slot and the extras.
 fn make_char_table_new(h: &mut ElispHost, a: &[Value]) -> R {
     let n = as_num(h, &a[2])?.0;
     let n = if n < 0 { 0 } else { n as usize };
@@ -1974,7 +2007,7 @@ fn set_char_table_range(h: &mut ElispHost, a: &[Value]) -> R {
         }
         Value::Bool(true) => {
             if let Some(Obj::CharTable(t)) = h.arena.get_mut(id as usize) {
-                t.set_range(0, MAX_CHAR as u32, val);
+                t.set_all(val);
             }
         }
         Value::Int(_) => {
@@ -2004,6 +2037,74 @@ fn set_char_table_range(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(a[2].clone())
 }
+/// `(elisprs--copy-char-table TABLE)` — `copy_char_table`: a deep copy of the
+/// sub-char-table tree and the extras; the parent is shared and the cached
+/// ASCII slot is recomputed from the copy.
+fn copy_char_table(h: &mut ElispHost, a: &[Value]) -> R {
+    let copy = match h.obj(&a[0]) {
+        Some(Obj::CharTable(t)) => t.copied(),
+        _ => return Err(wrong_char_table(h, &a[0])),
+    };
+    Ok(h.alloc(Obj::CharTable(copy)))
+}
+
+/// `(elisprs--char-table-runs TABLE)` — the effective value of every character
+/// as `((START . VALUE) …)`, runs of `eq` values merged: own value, else the
+/// table's default, else the parent chain's — what `map_char_table` walks.
+fn char_table_runs(h: &mut ElispHost, a: &[Value]) -> R {
+    if !matches!(h.obj(&a[0]), Some(Obj::CharTable(_))) {
+        return Err(wrong_char_table(h, &a[0]));
+    }
+    let mut breaks: Vec<u32> = vec![0];
+    let mut cur = a[0].clone();
+    while let Some(Obj::CharTable(t)) = h.obj(&cur) {
+        breaks.extend(t.runs().iter().map(|(s, _)| *s));
+        cur = t.parent.clone();
+    }
+    breaks.sort_unstable();
+    breaks.dedup();
+    let mut runs: Vec<(u32, Value)> = Vec::new();
+    for b in breaks {
+        let v = h.char_table_ref(&a[0], b);
+        match runs.last() {
+            Some((_, last)) if h.values_eq(last, &v) => {}
+            _ => runs.push((b, v)),
+        }
+    }
+    let items = runs
+        .into_iter()
+        .map(|(s, v)| h.cons(Value::Int(i64::from(s)), v))
+        .collect();
+    Ok(h.list_from(items))
+}
+
+/// `(optimize-char-table TABLE &optional TEST)` — collapse a sub-char-table
+/// whose slots are all equal (by TEST: `equal` when nil, `eq` for `eq`) into one
+/// value, then refresh the cached ASCII slot.
+fn optimize_char_table(h: &mut ElispHost, a: &[Value]) -> R {
+    let id = match &a[0] {
+        Value::Obj(id) if matches!(h.obj(&a[0]), Some(Obj::CharTable(_))) => *id,
+        _ => return Err(wrong_char_table(h, &a[0])),
+    };
+    let use_eq = a.get(1).and_then(|t| h.sym_name(t)).as_deref() == Some("eq");
+    let mut table = match h.obj(&a[0]) {
+        Some(Obj::CharTable(t)) => t.copied_exact(),
+        _ => unreachable!(),
+    };
+    let same = |x: &Value, y: &Value| {
+        if use_eq {
+            h.values_eq(x, y)
+        } else {
+            el_equal(h, x, y)
+        }
+    };
+    table.optimize(&same);
+    if let Some(Obj::CharTable(t)) = h.arena.get_mut(id as usize) {
+        *t = table;
+    }
+    Ok(Value::Undef)
+}
+
 fn wrong_char_table(h: &ElispHost, v: &Value) -> String {
     format!("wrong-type-argument: char-table-p {}", h.print(v, true))
 }
@@ -2932,9 +3033,19 @@ fn pad(body: String, spec: &FmtSpec) -> String {
     }
 }
 
-/// One run of a formatted result and where its text properties come from:
-/// `Some(source)` at a char offset, or `None` for characters that carry none.
-type FmtPiece = (Option<std::sync::Arc<String>>, usize, usize);
+/// One directive of a format string and the output it produced: the format
+/// characters `[fbeg, fend)`, the output characters `[out_start, out_end)`
+/// (padding included), where the argument's own text starts, and — for `%s` of
+/// a string — the string whose text properties belong on it.
+struct FmtField {
+    fbeg: usize,
+    fend: usize,
+    /// Where the directive's output begins, left padding included.
+    fstart: usize,
+    text_start: usize,
+    out_end: usize,
+    carries: Option<std::sync::Arc<String>>,
+}
 
 fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
     el_format_pieces(h, a).map(|(s, _)| s)
@@ -2944,7 +3055,7 @@ fn el_format(h: &ElispHost, a: &[Value]) -> Result<String, String> {
 /// caller can carry text properties onto it. Emacs propagates two things: the
 /// properties of the format string's own literal text, and those of a `%s`
 /// argument, each onto the characters they produced. Padding carries none.
-fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>), String> {
+fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtField>), String> {
     let fmt = match h.str_text(&a[0]) {
         Some(s) => s.to_string(),
         None => {
@@ -2954,14 +3065,10 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>
             ))
         }
     };
-    // Runs of the result, in order. Everything but a `%s` argument's own
-    // characters carries no properties: the format string's literal text and
-    // the padding are `None` pieces. (Emacs also propagates the *format
-    // string's* properties onto its literal text; that half is not modelled —
-    // see BUGS.md.)
-    let mut pieces: Vec<FmtPiece> = Vec::new();
-    // How much of `out` is already accounted for by a piece.
-    let mut placed = 0usize;
+    // Every directive's span in the format string and in the result, for the
+    // text-property transfer (`format_fn`).
+    let mut fields: Vec<FmtField> = Vec::new();
+    let fmt_len = fmt.chars().count();
     let mut out = String::new();
     let mut ai = 1;
     let mut chars = fmt.chars().peekable();
@@ -2970,10 +3077,20 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>
             out.push(c);
             continue;
         }
+        let fbeg = fmt_len - chars.clone().count() - 1;
         // %% is a literal percent and takes no flags/argument.
         if chars.peek() == Some(&'%') {
             chars.next();
+            let at = out.chars().count();
             out.push('%');
+            fields.push(FmtField {
+                fbeg,
+                fend: fbeg + 2,
+                fstart: at,
+                text_start: at,
+                out_end: at + 1,
+                carries: None,
+            });
             continue;
         }
         // Optional argument field `N$` (N starts 1-9, so it can't be confused
@@ -3054,7 +3171,16 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>
             if let Some(f) = field {
                 ai = f;
             }
+            let at = out.chars().count();
             out.push('%');
+            fields.push(FmtField {
+                fbeg,
+                fend: fmt_len - chars.clone().count(),
+                fstart: at,
+                text_start: at,
+                out_end: at + 1,
+                carries: None,
+            });
             continue;
         }
         let mut spec = FmtSpec {
@@ -3224,46 +3350,104 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtPiece>
         };
         // A field number repositions the counter: `(format "%2$s %s" 1 2 3)` is "2 3".
         ai = idx + 1;
-        // Literal format-string text since the last directive carries nothing.
-        let before = out.chars().count();
-        if before > placed {
-            pieces.push((None, 0, before - placed));
-        }
+        let out_start = out.chars().count();
         let body_len = body.chars().count();
         let padded = pad(body, &spec);
         out.push_str(&padded);
-        // `pad` adds spaces on one side. Emacs puts padding that follows the
-        // argument *inside* its interval — `(format "%-10s|" (propertize "ab"
-        // 'p 1))` is propertized over all ten columns — while padding that
-        // precedes it stays outside, so only the trailing kind carries.
+        // `pad` adds spaces on one side. Padding that follows the argument is
+        // inside its interval, so the argument's text starts after the padding
+        // that precedes it.
         let pad_len = padded.chars().count() - body_len;
-        if !spec.left && pad_len > 0 {
-            pieces.push((None, 0, pad_len));
+        let text_start = if spec.left {
+            out_start
+        } else {
+            out_start + pad_len
+        };
+        fields.push(FmtField {
+            fbeg,
+            fend: fmt_len - chars.clone().count(),
+            fstart: out_start,
+            text_start,
+            out_end: out_start + body_len + pad_len,
+            carries: carries.clone(),
+        });
+    }
+    Ok((out, fields))
+}
+/// Where format character position P lands in the result: literal characters
+/// are one for one, a directive is a unit that the `%` at its start jumps over,
+/// and `%%` produces a single character (editfns.c `styled_format`'s
+/// property-translation walk).
+fn format_position(fields: &[FmtField], p: usize) -> usize {
+    let (mut out, mut fpos) = (0usize, 0usize);
+    for f in fields {
+        if p <= f.fbeg {
+            return out + (p - fpos);
         }
-        pieces.push((carries.clone(), 0, body_len));
-        if spec.left && pad_len > 0 {
-            match (&carries, body_len) {
-                // The trailing padding continues the last character's plist.
-                (Some(src), n) if n > 0 => {
-                    for _ in 0..pad_len {
-                        pieces.push((Some(std::sync::Arc::clone(src)), n - 1, 1));
-                    }
-                }
-                _ => pieces.push((None, 0, pad_len)),
+        out = f.out_end;
+        fpos = f.fend;
+        if p < f.fend {
+            return out;
+        }
+    }
+    out + (p - fpos)
+}
+
+/// Put the text properties of the format string and of its `%s` string
+/// arguments on the result.
+fn apply_format_props(
+    h: &mut ElispHost,
+    key: &std::sync::Arc<String>,
+    fmt: &Value,
+    fields: &[FmtField],
+) {
+    let replace = crate::textprop::SetType::Replace;
+    // With intervals on the FORMAT string, `styled_format` places an argument's
+    // properties from the start of its field, left padding included, instead of
+    // from its first character -- measured, GNU Emacs 31.1:
+    //   (format "%5s" (concat "a" (propertize "b" 'p 1)))            => props 4 5
+    //   (format (propertize "%5s" 'f 1) (concat "a" (propertize "b" 'p 1)))
+    //                                                       => (p f) over 1 5
+    let mut field_start = false;
+    if let Some(farc) = h.str_arc(fmt) {
+        let intervals = h.string_intervals(&farc);
+        field_start = !intervals.is_empty();
+        for (rs, re, plist) in intervals {
+            if is_nil(&plist) {
+                continue;
+            }
+            let (os, oe) = (format_position(fields, rs), format_position(fields, re));
+            if oe > os {
+                let pairs = each_prop_pair(h, &plist);
+                h.string_add_props(key, os, oe, &pairs, replace);
             }
         }
-        placed = out.chars().count();
     }
-    let total = out.chars().count();
-    if total > placed {
-        pieces.push((None, 0, total - placed));
+    for f in fields {
+        let Some(src) = &f.carries else { continue };
+        let len = src.chars().count();
+        let start = if field_start { f.fstart } else { f.text_start };
+        let new_len = f.out_end - start;
+        for (rs, re, plist) in h.string_intervals(src) {
+            if is_nil(&plist) || rs >= new_len {
+                continue;
+            }
+            // `extend_property_ranges`: an interval ending at the old end
+            // stretches over the padding; one past the new end is cut.
+            let mut end = re;
+            if (end == len && end != new_len) || end > new_len {
+                end = new_len;
+            }
+            let pairs = each_prop_pair(h, &plist);
+            h.string_add_props(key, start + rs, start + end, &pairs, replace);
+        }
     }
-    Ok((out, pieces))
 }
+
 fn format_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let (s, pieces) = el_format_pieces(h, a)?;
+    let (s, fields) = el_format_pieces(h, a)?;
     let (out, key) = h.new_string_keyed(s);
-    h.string_carry_props(&key, &pieces);
+    apply_format_props(h, &key, &a[0], &fields);
     Ok(out)
 }
 /// `(message FORMAT-STRING &rest ARGS)`. Port of `Fmessage` (`src/xdisp.c`) plus
@@ -3527,22 +3711,59 @@ fn ht_find(h: &mut ElispHost, table: &Value, key: &Value) -> Result<(u64, Option
 /// [`crate::host::call_function`] rather than here, because the declaration is
 /// kept on the symbol's `hash-table-test` property — an elisp plist, so reading
 /// it CALLS elisp, which cannot happen inside this host borrow.
-/// `get_key_arg` (fns.c:4633-4647, emacs-30.2): the first index whose
-/// PREDECESSOR is KEY and whose pair is still unconsumed, marking both as used.
-///
-/// The scan starts at 1 and returns the index of the VALUE, so a keyword in the
-/// last slot has no pair and is never found — which is exactly why
-/// `(make-hash-table :size)` reports a leftover argument instead of quietly
-/// ignoring it. C returns 0 for "absent"; `Option` says it without the sentinel.
-fn get_key_arg(h: &ElispHost, key: &str, a: &[Value], used: &mut [bool]) -> Option<usize> {
-    for i in 1..a.len() {
-        if !used[i - 1] && h.sym_name(&a[i - 1]).as_deref() == Some(key) {
-            used[i - 1] = true;
-            used[i] = true;
-            return Some(i);
+/// The keyword arguments of `make-hash-table`, after the pairwise scan of
+/// Emacs 31's `Fmake_hash_table` (fns.c).
+pub(crate) struct HashTableKeywords {
+    /// First `:test` value, if the keyword was given.
+    pub test: Option<Value>,
+    /// First `:size` value.
+    pub size: Option<Value>,
+    /// First `:weakness` value.
+    pub weakness: Option<Value>,
+}
+
+/// The argument-list half of `Fmake_hash_table` (emacs-31.1): an odd count is
+/// `(error "Odd number of arguments")`; otherwise the arguments are KEYWORD
+/// VALUE pairs in which the FIRST occurrence of `:test`/`:size`/`:weakness`
+/// wins, `:purecopy`/`:rehash-size`/`:rehash-threshold` are accepted and
+/// ignored, and any other keyword (of any type) is remembered — the LAST one is
+/// reported as `(error "Invalid keyword argument" KW)`, after the whole list was
+/// scanned and before any value is validated.
+pub(crate) fn hash_table_keywords(
+    h: &mut ElispHost,
+    a: &[Value],
+) -> Result<HashTableKeywords, String> {
+    if a.len() % 2 == 1 {
+        return Err("error: Odd number of arguments".to_string());
+    }
+    let mut kw = HashTableKeywords {
+        test: None,
+        size: None,
+        weakness: None,
+    };
+    let mut bad: Option<Value> = None;
+    for pair in a.chunks(2) {
+        let name = h.sym_name(&pair[0]);
+        let slot = match name.as_deref() {
+            Some(":test") => &mut kw.test,
+            Some(":size") => &mut kw.size,
+            Some(":weakness") => &mut kw.weakness,
+            // Accepted and ignored: elisprs has no pure space, and the rehash
+            // parameters are obsolete since Emacs 29.
+            Some(":purecopy") | Some(":rehash-size") | Some(":rehash-threshold") => continue,
+            _ => {
+                bad = Some(pair[0].clone());
+                continue;
+            }
+        };
+        if slot.is_none() {
+            *slot = Some(pair[1].clone());
         }
     }
-    None
+    if let Some(k) = bad {
+        return Err(h.signal_error_arg("Invalid keyword argument", &k));
+    }
+    Ok(kw)
 }
 
 pub(crate) fn make_hash_table_with(
@@ -3550,25 +3771,10 @@ pub(crate) fn make_hash_table_with(
     a: &[Value],
     user: Option<(Value, Value, Value)>,
 ) -> R {
-    // Port of `Fmake_hash_table' (fns.c:5749-5815, emacs-30.2). The keyword list
-    // is NOT scanned pairwise. `get_key_arg' searches the whole vector for each
-    // keyword the function knows, marking the pair it consumed, and only then
-    // does a second pass reject whatever is left over. Both halves of that are
-    // observable, and the pairwise loop this replaces had neither:
-    //
-    //   (make-hash-table 1)             (error "Invalid argument list" 1)
-    //   (make-hash-table :size)         (error "Invalid argument list" :size)
-    //   (make-hash-table :test 'eq :size)
-    //                                   (error "Invalid argument list" :size)
-    //   (make-hash-table 'foo 1)        (error "Invalid argument list" foo)
-    //
-    // where every one of them used to build a table and return it. `:size' and
-    // `:weakness' validate their values too, and the obsolete `:rehash-size' /
-    // `:rehash-threshold' are skipped WITH their value rather than rejected.
-    let mut used = vec![false; a.len()];
-    let test = match get_key_arg(h, ":test", a, &mut used) {
+    let kw = hash_table_keywords(h, a)?;
+    let test = match &kw.test {
         None => 1u8, // eql default
-        Some(i) => match h.sym_name(&a[i]).as_deref() {
+        Some(v) => match h.sym_name(v).as_deref() {
             Some("eq") => 0,
             Some("equal") => 2,
             // A name the caller resolved to a user test; anything else
@@ -3577,15 +3783,12 @@ pub(crate) fn make_hash_table_with(
             _ => 1,
         },
     };
-    // Consumed but unused: elisprs has no pure space, and a `:purecopy' left
-    // unmarked would be rejected as a stray argument.
-    let _ = get_key_arg(h, ":purecopy", a, &mut used);
     // `:size' is the initial allocation, reported back by `hash-table-size'
     // until the table outgrows it. `FIXNATP' rejects a negative or non-integer
     // size outright; nil selects the default, which is elisprs's 0.
-    let size = match get_key_arg(h, ":size", a, &mut used) {
+    let size = match &kw.size {
         None => 0usize,
-        Some(i) => match &a[i] {
+        Some(v) => match v {
             v if crate::host::el_nil(v) => 0,
             Value::Int(n) if *n >= 0 => *n as usize,
             v => {
@@ -3594,29 +3797,13 @@ pub(crate) fn make_hash_table_with(
             }
         },
     };
-    let weakness = match get_key_arg(h, ":weakness", a, &mut used) {
+    let weakness = match &kw.weakness {
         None => Value::Undef,
-        Some(i) => {
-            let w = a[i].clone();
+        Some(w) => {
+            let w = w.clone();
             hash_table_weakness_arg(h, &w)?
         }
     };
-    // "Now, all args should have been used up, or there's a problem."
-    let mut i = 0;
-    while i < a.len() {
-        if !used[i] {
-            match h.sym_name(&a[i]).as_deref() {
-                // Obsolete since Emacs 29 and ignored, along with the value that
-                // follows it (the C bumps `i' a second time inside the loop).
-                Some(":rehash-threshold") | Some(":rehash-size") => i += 1,
-                _ => {
-                    let v = a[i].clone();
-                    return Err(h.signal_error_arg("Invalid argument list", &v));
-                }
-            }
-        }
-        i += 1;
-    }
     let mut t = ElHashTable::new(test, size, weakness);
     if test == 3 {
         t.user_test = user;
@@ -5650,6 +5837,17 @@ fn recordp(h: &mut ElispHost, a: &[Value]) -> R {
 // captured env — see `ElispHost::oclosure_*`.
 
 /// `(closurep OBJECT)` — t if OBJECT is a closure.
+/// `(elisprs--prelude-closure-p OBJECT)`: OBJECT is a closure the prelude
+/// defined — Lisp that Emacs ships byte-compiled, so it answers
+/// `byte-code-function-p` and `compiled-function-p` where a user closure does
+/// not.
+fn prelude_closure_p_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let macro_cell = matches!(h.obj(&a[0]), Some(Obj::Closure { is_macro: true, .. }));
+    Ok(nil_or(
+        h.is_closure(&a[0]) && !macro_cell && h.is_prelude_object(&a[0]),
+    ))
+}
+
 fn closurep_fn(h: &mut ElispHost, a: &[Value]) -> R {
     // A macro is the cons `(macro . FN)` in Emacs, so `CLOSUREP` is false for it.
     let macro_cell = matches!(h.obj(&a[0]), Some(Obj::Closure { is_macro: true, .. }));
@@ -7337,6 +7535,17 @@ fn time_arg_secs(h: &ElispHost, v: Option<&Value>) -> Result<f64, String> {
     crate::timefns::float_seconds(h, v)
 }
 
+/// TIME as whole seconds (floored) and the nanoseconds past them (truncated),
+/// both exact — `format-time-string`'s `%s` and `%N` read these, not a double.
+fn time_arg_split(h: &ElispHost, v: Option<&Value>) -> Result<(i64, i64), String> {
+    use num_integer::Integer;
+    let t = crate::timefns::decode(h, v, false)?;
+    let (secs, frac) = t.ticks.div_mod_floor(&t.hz);
+    let secs = num_traits::ToPrimitive::to_i64(&secs).ok_or_else(crate::timefns::overflow)?;
+    let nanos = (frac * BigInt::from(1_000_000_000)).div_floor(&t.hz);
+    Ok((secs, num_traits::ToPrimitive::to_i64(&nanos).unwrap_or(0)))
+}
+
 /// A resolved ZONE argument — timefns.c `tzlookup`.
 enum TimeZone {
     /// nil and `wall`: the process's own zone.
@@ -7466,365 +7675,157 @@ struct DecodedTime {
     _zone_name: Option<std::ffi::CString>,
 }
 
-/// Decompose epoch seconds into a `struct tm` for ZONE.
-fn time_decompose(secs: f64, zone: &TimeZone) -> DecodedTime {
-    let t = secs.floor() as libc::time_t;
+/// Days since 1970-01-01 of the proleptic Gregorian date Y-M-D (M 1..=12).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The proleptic Gregorian `(year, month 1..=12, day)` of day number Z
+/// (days since 1970-01-01).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
+}
+
+/// Break UTC-relative epoch seconds into calendar fields without libc, so the
+/// range is the whole of `tm_year`'s `int` rather than the platform's
+/// `gmtime_r` window. `None` when the year does not fit `tm_year`
+/// (`time_overflow`).
+fn civil_tm(secs: i64) -> Option<libc::tm> {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = libc::c_int::try_from(y - 1900).ok()?;
+    tm.tm_mon = (m - 1) as libc::c_int;
+    tm.tm_mday = d as libc::c_int;
+    tm.tm_hour = (rem / 3600) as libc::c_int;
+    tm.tm_min = (rem % 3600 / 60) as libc::c_int;
+    tm.tm_sec = (rem % 60) as libc::c_int;
+    tm.tm_wday = (days + 4).rem_euclid(7) as libc::c_int;
+    tm.tm_yday = (days - days_from_civil(y, 1, 1)) as libc::c_int;
+    Some(tm)
+}
+
+/// Epoch seconds of a broken-down `tm` read as UTC, normalising out-of-range
+/// fields the way `timegm` does (month 13 is January of the next year).
+fn civil_secs(tm: &libc::tm) -> i64 {
+    let months = i64::from(tm.tm_year) * 12 + i64::from(tm.tm_mon);
+    let year = 1900 + months.div_euclid(12);
+    let mon = months.rem_euclid(12) + 1;
+    let days = days_from_civil(year, mon, 1) + i64::from(tm.tm_mday) - 1;
+    days * 86_400 + i64::from(tm.tm_hour) * 3600 + i64::from(tm.tm_min) * 60 + i64::from(tm.tm_sec)
+}
+
+// `tm_gmtoff` is `c_long`; `i64::from` is needed on 32-bit targets.
+#[allow(clippy::useless_conversion)]
+/// `mktime` in the zone libc currently has set. `mktime` reports failure as -1,
+/// which it also returns for dates its platform window rejects (macOS refuses
+/// everything before 1900); those are resolved by inverting `localtime_r`, which
+/// has the zone's earlier rules (local mean time) — the answer gnulib's
+/// `mktime_z` gives.
+fn zone_mktime(tm: &mut libc::tm) -> i64 {
+    let probe = *tm;
+    let r = unsafe { libc::mktime(tm) } as i64;
+    if r != -1 {
+        return r;
+    }
+    let wall = civil_secs(&probe);
+    let mut guess = wall;
+    for _ in 0..4 {
+        let mut out: libc::tm = unsafe { std::mem::zeroed() };
+        let t = guess as libc::time_t;
+        if unsafe { libc::localtime_r(&t, &mut out) }.is_null() {
+            break;
+        }
+        let next = wall - i64::from(out.tm_gmtoff);
+        if next == guess {
+            break;
+        }
+        guess = next;
+    }
+    guess
+}
+
+/// Decompose epoch seconds into a `struct tm` for ZONE; `time_overflow` when
+/// the result's year does not fit.
+fn time_decompose(secs: i64, zone: &TimeZone) -> Result<DecodedTime, String> {
+    let t = secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let mut name: Option<std::ffi::CString> = None;
     match zone {
         TimeZone::Local => {
             let _guard = TZ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            unsafe { libc::localtime_r(&t, &mut tm) };
+            if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+                return Err(crate::timefns::overflow());
+            }
         }
         TimeZone::Utc => {
-            unsafe { libc::gmtime_r(&t, &mut tm) };
-            // `gmtime_r` names the zone whatever the platform calls it: glibc
-            // says "GMT", the BSD/macOS libc says "UTC". Emacs reaches UTC by
-            // setting `TZ=UTC0`, so `%Z` there is "UTC" on every platform
-            // (measured: `emacs --batch --eval '(format-time-string "%Z" 0 t)'`).
+            tm = civil_tm(secs).ok_or_else(crate::timefns::overflow)?;
+            // Emacs reaches UTC by setting `TZ=UTC0`, so `%Z` there is "UTC" on
+            // every platform (measured: `emacs --batch --eval
+            // '(format-time-string "%Z" 0 t)'`), whatever libc's `gmtime_r`
+            // would call it.
             name = Some(std::ffi::CString::new("UTC").expect("no NUL"));
         }
         TimeZone::Fixed(off, abbr) => {
-            let shifted = t + *off as libc::time_t;
-            unsafe { libc::gmtime_r(&shifted, &mut tm) };
+            let shifted = secs
+                .checked_add(*off)
+                .ok_or_else(crate::timefns::overflow)?;
+            tm = civil_tm(shifted).ok_or_else(crate::timefns::overflow)?;
             tm.tm_gmtoff = *off as libc::c_long;
             name = Some(std::ffi::CString::new(abbr.replace('\0', "")).expect("NUL removed"));
         }
         TimeZone::Named(tz) => {
-            with_tz_env(tz, || {
-                unsafe { libc::localtime_r(&t, &mut tm) };
+            let ok = with_tz_env(tz, || {
+                if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+                    return false;
+                }
                 if !tm.tm_zone.is_null() {
                     let s = unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) };
                     name = Some(s.to_owned());
                 }
+                true
             });
+            if !ok {
+                return Err(crate::timefns::overflow());
+            }
         }
     }
     if let Some(n) = &name {
         tm.tm_zone = n.as_ptr() as *mut libc::c_char;
     }
-    DecodedTime {
+    Ok(DecodedTime {
         tm,
         _zone_name: name,
-    }
+    })
 }
 
-const WD_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const WD_FULL: [&str; 7] = [
-    "Sunday",
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-];
-const MON_ABBR: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-const MON_FULL: [&str; 12] = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-];
-
-fn fmt_time_string(fmt: &str, tm: &libc::tm, secs: f64) -> String {
-    let chars: Vec<char> = fmt.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] != '%' {
-            out.push(chars[i]);
-            i += 1;
-            continue;
-        }
-        i += 1;
-        if i >= chars.len() {
-            out.push('%');
-            break;
-        }
-        // Optional flags (-_0^#) then optional field width. `-_0` control
-        // padding and are read by `numpad`; `^`/`#` case-fold the directive's
-        // own output and are applied after it is produced.
-        let mut flag: Option<char> = None;
-        let mut case_flag: Option<char> = None;
-        while i < chars.len() && matches!(chars[i], '-' | '_' | '0' | '^' | '#') {
-            if matches!(chars[i], '-' | '_' | '0') {
-                flag = Some(chars[i]);
-            } else {
-                case_flag = Some(chars[i]);
-            }
-            i += 1;
-        }
-        let mut wbuf = String::new();
-        while i < chars.len() && chars[i].is_ascii_digit() {
-            wbuf.push(chars[i]);
-            i += 1;
-        }
-        let user_w: Option<usize> = wbuf.parse().ok();
-        if i >= chars.len() {
-            break;
-        }
-        // nstrftime: `:`, `::` and `:::` are valid only just before `z`;
-        // anything else is a bad format, copied through literally.
-        let mut colons = 0;
-        while i + colons < chars.len() && chars[i + colons] == ':' {
-            colons += 1;
-        }
-        if colons > 0 {
-            if colons > 3 || chars.get(i + colons) != Some(&'z') {
-                let start = chars[..i].iter().rposition(|&c| c == '%').unwrap_or(0);
-                out.extend(&chars[start..i + colons]);
-                i += colons;
-                continue;
-            }
-            i += colons;
-        }
-        let d = chars[i];
-        i += 1;
-        // Numeric field with default width/pad, honoring flags.
-        let numpad = |val: i64, deftw: usize, defpad: char| -> String {
-            if flag == Some('-') {
-                return val.to_string();
-            }
-            let width = user_w.unwrap_or(deftw);
-            let pad = match flag {
-                Some('_') => ' ',
-                Some('0') => '0',
-                _ => defpad,
-            };
-            let s = val.abs().to_string();
-            let body = if s.len() < width {
-                format!("{}{}", pad.to_string().repeat(width - s.len()), s)
-            } else {
-                s
-            };
-            if val < 0 {
-                format!("-{body}")
-            } else {
-                body
-            }
-        };
-        let year = tm.tm_year as i64 + 1900;
-        // Everything this directive emits, so the case flags and the field
-        // width can be applied to it afterwards.
-        let seg_start = out.len();
-        match d {
-            'Y' => out.push_str(&numpad(year, 1, '0')),
-            'y' => out.push_str(&numpad(year.rem_euclid(100), 2, '0')),
-            'm' => out.push_str(&numpad(tm.tm_mon as i64 + 1, 2, '0')),
-            'd' => out.push_str(&numpad(tm.tm_mday as i64, 2, '0')),
-            'e' => out.push_str(&numpad(tm.tm_mday as i64, 2, ' ')),
-            'H' => out.push_str(&numpad(tm.tm_hour as i64, 2, '0')),
-            'k' => out.push_str(&numpad(tm.tm_hour as i64, 2, ' ')),
-            'I' => out.push_str(&numpad(((tm.tm_hour as i64 + 11) % 12) + 1, 2, '0')),
-            'l' => out.push_str(&numpad(((tm.tm_hour as i64 + 11) % 12) + 1, 2, ' ')),
-            'M' => out.push_str(&numpad(tm.tm_min as i64, 2, '0')),
-            'S' => out.push_str(&numpad(tm.tm_sec as i64, 2, '0')),
-            'j' => out.push_str(&numpad(tm.tm_yday as i64 + 1, 3, '0')),
-            'w' => out.push_str(&numpad(tm.tm_wday as i64, 1, '0')),
-            'u' => out.push_str(&numpad(
-                if tm.tm_wday == 0 {
-                    7
-                } else {
-                    tm.tm_wday as i64
-                },
-                1,
-                '0',
-            )),
-            's' => out.push_str(&(secs.floor() as i64).to_string()),
-            // Subsecond field: nanoseconds as a fixed 9-digit number. A field
-            // width ≤ 9 keeps that many leading digits (%3N = milliseconds,
-            // %6N = microseconds); a width > 9 right-pads with zeros.
-            'N' => {
-                let frac = secs - secs.floor();
-                let nanos = (frac * 1.0e9).round().clamp(0.0, 999_999_999.0) as i64;
-                let full = format!("{nanos:09}");
-                let w = user_w.unwrap_or(9);
-                if w <= 9 {
-                    out.push_str(&full[..w]);
-                } else {
-                    out.push_str(&full);
-                    out.push_str(&"0".repeat(w - 9));
-                }
-            }
-            'p' => out.push_str(if tm.tm_hour < 12 { "AM" } else { "PM" }),
-            'P' => out.push_str(if tm.tm_hour < 12 { "am" } else { "pm" }),
-            'a' => out.push_str(WD_ABBR[(tm.tm_wday as usize) % 7]),
-            'A' => out.push_str(WD_FULL[(tm.tm_wday as usize) % 7]),
-            'b' | 'h' => out.push_str(MON_ABBR[(tm.tm_mon as usize) % 12]),
-            'B' => out.push_str(MON_FULL[(tm.tm_mon as usize) % 12]),
-            'Z' => {
-                if !tm.tm_zone.is_null() {
-                    let cs = unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) };
-                    out.push_str(&cs.to_string_lossy());
-                }
-            }
-            'z' => out.push_str(&tz_offset(tm.tm_gmtoff, colons, flag, user_w)),
-            'F' => out.push_str(&fmt_time_string("%Y-%m-%d", tm, secs)),
-            'T' => out.push_str(&fmt_time_string("%H:%M:%S", tm, secs)),
-            'R' => out.push_str(&fmt_time_string("%H:%M", tm, secs)),
-            'D' => out.push_str(&fmt_time_string("%m/%d/%y", tm, secs)),
-            'c' => out.push_str(&fmt_time_string("%a %b %e %H:%M:%S %Y", tm, secs)),
-            'n' => out.push('\n'),
-            't' => out.push('\t'),
-            '%' => out.push('%'),
-            // Century, and the ISO 8601 week-based year and week number. These
-            // are not the calendar year and week: `%G`/`%V` follow the week
-            // that contains the year's first Thursday, so 2024-01-01 (a Monday)
-            // is week 01 of 2024 while 2023-01-01 (a Sunday) is week 52 of 2022.
-            'C' => out.push_str(&numpad(year.div_euclid(100), 2, '0')),
-            'G' => out.push_str(&numpad(iso_week_year(tm).0, 1, '0')),
-            'g' => out.push_str(&numpad(iso_week_year(tm).0.rem_euclid(100), 2, '0')),
-            'V' => out.push_str(&numpad(iso_week_year(tm).1, 2, '0')),
-            // Week of the year counting from the first Sunday (`%U`) or the
-            // first Monday (`%W`); days before it are week 00.
-            'U' => out.push_str(&numpad(
-                (tm.tm_yday as i64 + 7 - tm.tm_wday as i64) / 7,
-                2,
-                '0',
-            )),
-            'W' => out.push_str(&numpad(
-                (tm.tm_yday as i64 + 7 - (tm.tm_wday as i64 + 6) % 7) / 7,
-                2,
-                '0',
-            )),
-            other => {
-                out.push('%');
-                out.push(other);
-            }
-        }
-        // `^` upcases; `#` changes case — upcase unless the text is already
-        // caseless-or-upper, in which case downcase. `(format-time-string "%#a")`
-        // is "THU" and `"%#p"` is "am".
-        if let Some(c) = case_flag {
-            let seg = out.split_off(seg_start);
-            let upcase = c == '^' || seg.chars().any(|ch| ch.is_lowercase());
-            out.push_str(&if upcase {
-                seg.to_uppercase()
-            } else {
-                seg.to_lowercase()
-            });
-        }
-        // A field width on a STRING directive right-aligns it; the numeric ones
-        // already consumed `user_w` through `numpad`.
-        if let Some(w) = user_w {
-            if matches!(d, 'p' | 'P' | 'a' | 'A' | 'b' | 'h' | 'B' | 'Z') {
-                let seg = out.split_off(seg_start);
-                let n = seg.chars().count();
-                if n < w {
-                    out.push_str(&" ".repeat(w - n));
-                }
-                out.push_str(&seg);
-            }
-        }
-    }
-    out
-}
-
-/// nstrftime's `%z` family (`do_z_conversion` / `do_tz_offset`): OFF seconds
-/// east of UTC as `+hhmm` (no colons), `+hh:mm` (`%:z`), `+hh:mm:ss` (`%::z`),
-/// or for `%:::z` the shortest of `+hh`, `+hh:mm`, `+hh:mm:ss` that is exact.
-///
-/// The sign always prints; the digits are zero-padded to the conversion's own
-/// width (5, 6, 9 or 3 counting the sign) or a user WIDTH. The `-` flag drops
-/// the padding (`%-:z` is `+1:00`), and `_` pads with spaces BEFORE the sign.
-fn tz_offset(off: i64, colons: usize, flag: Option<char>, width: Option<usize>) -> String {
-    let a = off.unsigned_abs();
-    let (hh, mm, ss) = (a / 3600, (a % 3600) / 60, a % 60);
-    let (digits, colon_mask, value) = match colons {
-        0 => (5, 0, hh * 100 + mm),
-        3 if ss == 0 && mm == 0 => (3, 0, hh),
-        1 => (6, 0o4, hh * 100 + mm),
-        3 if ss == 0 => (6, 0o4, hh * 100 + mm),
-        _ => (9, 0o24, hh * 10000 + mm * 100 + ss),
-    };
-    // `do_number_body`: digits from the right, a colon wherever the mask says,
-    // until both the value and the mask run out.
-    let (mut v, mut mask, mut num) = (value, colon_mask, Vec::new());
-    loop {
-        if mask & 1 == 1 {
-            num.push(':');
-        }
-        mask >>= 1;
-        num.push(char::from(b'0' + (v % 10) as u8));
-        v /= 10;
-        if v == 0 && mask == 0 {
-            break;
-        }
-    }
-    num.reverse();
-    let sign = if off < 0 { '-' } else { '+' };
-    // `do_number_sign_and_padding`.
-    let width = width.unwrap_or(digits);
-    let pad = width.saturating_sub(1 + num.len());
-    let mut out = String::new();
-    match flag {
-        Some('-') => out.push(sign),
-        Some('_') => {
-            out.push_str(&" ".repeat(pad));
-            out.push(sign);
-        }
-        _ => {
-            out.push(sign);
-            out.push_str(&"0".repeat(pad));
-        }
-    }
-    out.extend(num);
-    out
-}
-/// The ISO 8601 week-based year and week number for `tm`.
-///
-/// A week runs Monday to Sunday and belongs to the year containing its
-/// Thursday, so the first days of January can fall in the previous year's week
-/// 52 or 53, and the last days of December in the next year's week 01.
-fn iso_week_year(tm: &libc::tm) -> (i64, i64) {
-    let year = tm.tm_year as i64 + 1900;
-    // Monday = 1 … Sunday = 7.
-    let wday = if tm.tm_wday == 0 {
-        7
-    } else {
-        tm.tm_wday as i64
-    };
-    let yday = tm.tm_yday as i64 + 1; // 1-based day of year
-    let week = (yday - wday + 10) / 7;
-    if week < 1 {
-        (year - 1, iso_weeks_in_year(year - 1))
-    } else if week > iso_weeks_in_year(year) {
-        (year + 1, 1)
-    } else {
-        (year, week)
-    }
-}
-
-/// 52 or 53 — a year has 53 ISO weeks when it starts on a Thursday, or is a
-/// leap year starting on a Wednesday.
-fn iso_weeks_in_year(year: i64) -> i64 {
-    let leap = |y: i64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    // Day of week of 1 January, Monday = 1 … Sunday = 7 (Zeller-style).
-    let jan1 = |y: i64| {
-        let d = (y + (y - 1).div_euclid(4) - (y - 1).div_euclid(100) + (y - 1).div_euclid(400))
-            .rem_euclid(7);
-        if d == 0 {
-            7
-        } else {
-            d
-        }
-    };
-    if jan1(year) == 4 || (leap(year) && jan1(year) == 3) {
-        53
-    } else {
-        52
-    }
+/// `format_time_string`: FMT over the broken-down TM, the way `nstrftime` does.
+fn fmt_time_string(
+    h: &mut ElispHost,
+    fmt: &str,
+    tm: &libc::tm,
+    secs: i64,
+    nanos: i64,
+) -> Result<Value, String> {
+    let bytes = crate::strftime::format(fmt.as_bytes(), tm, secs, nanos)
+        .map_err(|_| crate::timefns::overflow())?;
+    Ok(h.new_string(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn float_time(h: &mut ElispHost, a: &[Value]) -> R {
@@ -7876,17 +7877,17 @@ fn build_time(h: &mut ElispHost, _a: &[Value]) -> R {
 
 fn format_time_string(h: &mut ElispHost, a: &[Value]) -> R {
     let fmt = as_string(h, &a[0])?;
-    let secs = time_arg_secs(h, a.get(1))?;
+    let (secs, nanos) = time_arg_split(h, a.get(1))?;
     let zone = time_zone_arg(h, a.get(2))?;
-    let decoded = time_decompose(secs, &zone);
-    Ok(h.new_string(fmt_time_string(&fmt, &decoded.tm, secs)))
+    let decoded = time_decompose(secs, &zone)?;
+    fmt_time_string(h, &fmt, &decoded.tm, secs, nanos)
 }
 
 fn current_time_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let secs = time_arg_secs(h, a.first())?;
+    let (secs, nanos) = time_arg_split(h, a.first())?;
     let zone = time_zone_arg(h, a.get(1))?;
-    let decoded = time_decompose(secs, &zone);
-    Ok(h.new_string(fmt_time_string("%a %b %e %H:%M:%S %Y", &decoded.tm, secs)))
+    let decoded = time_decompose(secs, &zone)?;
+    fmt_time_string(h, "%a %b %e %H:%M:%S %Y", &decoded.tm, secs, nanos)
 }
 
 // `tm_gmtoff` is `c_long`; `i64::from` is needed on 32-bit but a no-op here.
@@ -7904,7 +7905,7 @@ fn decode_time(h: &mut ElispHost, a: &[Value]) -> R {
         None => crate::timefns::seconds_argument(h, a.first())?,
     };
     let zone = time_zone_arg(h, a.get(1))?;
-    let decoded = time_decompose(secs as f64, &zone);
+    let decoded = time_decompose(secs, &zone)?;
     let tm = decoded.tm;
     let dst = match tm.tm_isdst {
         0 => Value::Undef,
@@ -8012,13 +8013,13 @@ fn encode_time(h: &mut ElispHost, a: &[Value]) -> R {
     tm.tm_isdst = isdst;
     let tz = time_zone_arg(h, Some(&zone))?;
     let value: i64 = match &tz {
-        TimeZone::Fixed(off, _) => unsafe { libc::timegm(&mut tm) as i64 - *off },
+        TimeZone::Fixed(off, _) => civil_secs(&tm) - *off,
         TimeZone::Local => {
             let _guard = TZ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            unsafe { libc::mktime(&mut tm) as i64 }
+            zone_mktime(&mut tm)
         }
-        TimeZone::Utc => unsafe { libc::timegm(&mut tm) as i64 },
-        TimeZone::Named(name) => with_tz_env(name, || unsafe { libc::mktime(&mut tm) as i64 }),
+        TimeZone::Utc => civil_secs(&tm),
+        TimeZone::Named(name) => with_tz_env(name, || zone_mktime(&mut tm)),
     };
     if t.hz == BigInt::from(1) {
         return Ok(h.list_from(vec![Value::Int(value >> 16), Value::Int(value & 0xffff)]));
@@ -8635,16 +8636,10 @@ fn insert_fn(h: &mut ElispHost, a: &[Value]) -> R {
         }
         let n = chars.len();
         h.cur_insert(chars, true);
-        // A propertized string carries its text properties into the buffer.
+        // A propertized string carries its intervals into the buffer
+        // (`graft_intervals_into_buffer`).
         if let Some(arc) = h.str_arc(v) {
-            if let Some(plists) = h.string_props_vec(&arc) {
-                let plists = h.copy_plist_runs(plists);
-                for (i, pl) in plists.into_iter().enumerate().take(n) {
-                    if !is_nil(&pl) {
-                        h.buffer_set_plist_at(start - 1 + i, pl);
-                    }
-                }
-            }
+            h.buffer_graft_string_props(&arc, start - 1, n);
         }
     }
     Ok(Value::Undef)
@@ -8668,19 +8663,7 @@ fn buffer_string(h: &mut ElispHost, _a: &[Value]) -> R {
     };
     let text: String = h.cur_buf_ref().text[(begv - 1)..(zv - 1)].iter().collect();
     let (out, arc) = h.new_string_keyed(text);
-    let plists: Vec<Value> = (begv - 1..zv - 1)
-        .map(|i| {
-            h.cur_buf_ref()
-                .props
-                .get(i)
-                .cloned()
-                .unwrap_or(Value::Undef)
-        })
-        .collect();
-    if plists.iter().any(|p| !is_nil(p)) {
-        let plists = h.copy_plist_runs(plists);
-        h.string_set_props_vec(&arc, plists);
-    }
+    h.string_from_buffer_props(&arc, begv - 1, zv - 1);
     Ok(out)
 }
 fn buffer_size(h: &mut ElispHost, _a: &[Value]) -> R {
@@ -9081,16 +9064,30 @@ fn text_properties_at_fn(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// Convert a text-property START/END pair to `(lo0, hi0)` character indices
 /// (0-based, half-open) for OBJECT: strings index from 0, buffers from `begv`.
-fn prop_range(obj: &PropObj, start: i64, end: i64, h: &ElispHost) -> (usize, usize) {
-    let base = match obj {
-        PropObj::Str(_) => 0,
-        PropObj::Buf(_) => 1,
+fn prop_range(
+    obj: &PropObj,
+    start: i64,
+    end: i64,
+    h: &ElispHost,
+) -> Result<(usize, usize), String> {
+    // validate_interval_range: START and END are swapped into order first, and
+    // the error names them in that order.
+    let (lo, hi) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
     };
-    let s = (start - base).max(0);
-    let e = (end - base).max(0);
-    let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
-    let _ = h;
-    (lo as usize, hi as usize)
+    let (min, max, base) = match obj {
+        PropObj::Str(s) => (0, s.chars().count() as i64, 0),
+        PropObj::Buf(bi) => {
+            let (begv, zv) = h.buffer_begv_zv(*bi);
+            (begv as i64, zv as i64, 1)
+        }
+    };
+    if lo < min || hi > max {
+        return Err(format!("args-out-of-range: {lo} {hi}"));
+    }
+    Ok(((lo - base) as usize, (hi - base) as usize))
 }
 /// Run `f` with the current buffer temporarily set to `bi` (restored after).
 fn with_buffer<T>(h: &mut ElispHost, bi: usize, f: impl FnOnce(&mut ElispHost) -> T) -> T {
@@ -9105,7 +9102,7 @@ fn put_text_property_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let end = as_int(h, &a[1])?;
     let (prop, val) = (a[2].clone(), a[3].clone());
     let obj = prop_object(h, a.get(4))?;
-    let (lo, hi) = prop_range(&obj, start, end, h);
+    let (lo, hi) = prop_range(&obj, start, end, h)?;
     let changed = props_would_change(h, &obj, lo, hi, &[(prop.clone(), val.clone())], true);
     match obj {
         PropObj::Str(s) => h.string_put_prop(&s, lo, hi, &prop, &val),
@@ -9123,7 +9120,7 @@ fn set_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let end = as_int(h, &a[1])?;
     let plist = a[2].clone();
     let obj = prop_object(h, a.get(3))?;
-    let (lo, hi) = prop_range(&obj, start, end, h);
+    let (lo, hi) = prop_range(&obj, start, end, h)?;
     // textprop.c `set_text_properties`: an empty range, or an object with no
     // intervals at all and nil PROPERTIES, returns nil without touching
     // anything; otherwise t. A buffer keeps its interval tree after its
@@ -9213,16 +9210,18 @@ fn add_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let start = as_int(h, &a[0])?;
     let end = as_int(h, &a[1])?;
     let obj = prop_object(h, a.get(3))?;
-    let (lo, hi) = prop_range(&obj, start, end, h);
+    let (lo, hi) = prop_range(&obj, start, end, h)?;
     let pairs = each_prop_pair(h, &a[2]);
     let changed = props_would_change(h, &obj, lo, hi, &pairs, true);
-    for (prop, val) in pairs {
-        match &obj {
-            PropObj::Str(s) => h.string_put_prop(s, lo, hi, &prop, &val),
-            PropObj::Buf(bi) => {
-                let bi = *bi;
-                with_buffer(h, bi, |h| h.buffer_put_prop(lo, hi, &prop, &val));
-            }
+    match &obj {
+        PropObj::Str(s) => {
+            h.string_add_props(s, lo, hi, &pairs, crate::textprop::SetType::Replace);
+        }
+        PropObj::Buf(bi) => {
+            let bi = *bi;
+            with_buffer(h, bi, |h| {
+                h.buffer_add_props(lo, hi, &pairs, crate::textprop::SetType::Replace)
+            });
         }
     }
     if let (true, PropObj::Buf(bi)) = (changed, &obj) {
@@ -9234,16 +9233,18 @@ fn remove_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let start = as_int(h, &a[0])?;
     let end = as_int(h, &a[1])?;
     let obj = prop_object(h, a.get(3))?;
-    let (lo, hi) = prop_range(&obj, start, end, h);
+    let (lo, hi) = prop_range(&obj, start, end, h)?;
     let pairs = each_prop_pair(h, &a[2]);
     let changed = props_would_change(h, &obj, lo, hi, &pairs, false);
-    for (prop, _) in pairs {
-        match &obj {
-            PropObj::Str(s) => h.string_remove_prop(s, lo, hi, &prop),
-            PropObj::Buf(bi) => {
-                let bi = *bi;
-                with_buffer(h, bi, |h| h.buffer_remove_prop(lo, hi, &prop));
-            }
+    match &obj {
+        PropObj::Str(s) => {
+            let names: Vec<Value> = pairs.iter().map(|(k, _)| k.clone()).collect();
+            h.string_remove_props(s, lo, hi, &names);
+        }
+        PropObj::Buf(bi) => {
+            let bi = *bi;
+            let names: Vec<Value> = pairs.iter().map(|(k, _)| k.clone()).collect();
+            with_buffer(h, bi, |h| h.buffer_remove_props(lo, hi, &names));
         }
     }
     if let (true, PropObj::Buf(bi)) = (changed, &obj) {
@@ -9292,19 +9293,27 @@ fn carry_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
 
 /// `(propertize STRING &rest PROPS)` — a fresh copy of STRING carrying PROPS.
 fn propertize_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    // Fpropertize: STRING plus PROP VALUE pairs; an even count is a stray PROP.
+    if a.len().is_multiple_of(2) {
+        let name = h.intern("propertize");
+        return Err(h.signal_wrong_nargs_subject(name, a.len()));
+    }
     let base = as_string(h, &a[0])?;
     let len = base.chars().count();
     let (out, arc) = h.new_string_keyed(base);
-    // Build the plist from the trailing PROP VALUE pairs (in given order).
-    let mut flat: Vec<Value> = Vec::new();
-    let mut i = 1;
-    while i + 1 < a.len() {
-        flat.push(a[i].clone());
-        flat.push(a[i + 1].clone());
-        i += 2;
+    // The plist is consed pair by pair from the last argument to the first, and
+    // a property named twice keeps its first position with the earlier-in-the-
+    // call value (`add_properties` overwrites in place).
+    let mut flat: Vec<(Value, Value)> = Vec::new();
+    for pair in a[1..].chunks(2).rev() {
+        match flat.iter_mut().find(|(k, _)| el_eq(h, k, &pair[0])) {
+            Some(slot) => slot.1 = pair[1].clone(),
+            None => flat.insert(0, (pair[0].clone(), pair[1].clone())),
+        }
     }
     if !flat.is_empty() {
-        let plist = h.list_from(flat);
+        let items = flat.into_iter().flat_map(|(k, v)| [k, v]).collect();
+        let plist = h.list_from(items);
         h.string_set_props(&arc, 0, len, &plist);
     }
     Ok(out)
@@ -9901,7 +9910,59 @@ fn replace_match(h: &mut ElispHost, a: &[Value]) -> R {
         let mut out: String = subject[..b].iter().collect();
         out.push_str(&rep);
         out.extend(&subject[e..]);
-        return Ok(h.new_string(out));
+        let rep_len = rep.chars().count();
+        // The result is SUBJECT before and after the match plus NEWTEXT, whose
+        // `\&` / `\N` pieces are substrings of SUBJECT: each piece keeps the
+        // text properties of the string it was cut from.
+        let (new_arc, subj_arc) = (h.str_arc(&a[0]), a.get(3).and_then(|v| h.str_arc(v)));
+        let (res, key) = h.new_string_keyed(out);
+        if new_arc.is_some() || subj_arc.is_some() {
+            let mut pieces: Vec<(Option<std::sync::Arc<String>>, usize, usize)> = Vec::new();
+            pieces.push((subj_arc.clone(), 0, b));
+            let mut produced = 0;
+            if literal {
+                pieces.push((new_arc.clone(), 0, rep_len));
+                produced = rep_len;
+            } else if let Some(na) = &new_arc {
+                let nc: Vec<char> = na.chars().collect();
+                let mut i = 0;
+                while i < nc.len() {
+                    if nc[i] == '\\' && i + 1 < nc.len() {
+                        let c = nc[i + 1];
+                        let group = match c {
+                            '&' => Some(0),
+                            '0'..='9' => Some(c as usize - '0' as usize),
+                            _ => None,
+                        };
+                        match group {
+                            Some(g) => {
+                                if let Some((gb, ge)) = spans.get(g).copied().flatten() {
+                                    if ge <= subject.len() && gb <= ge {
+                                        pieces.push((subj_arc.clone(), gb, ge - gb));
+                                        produced += ge - gb;
+                                    }
+                                }
+                            }
+                            None => {
+                                let len = if c == '?' { 2 } else { 1 };
+                                pieces.push((Some(na.clone()), i + 2 - len, len));
+                                produced += len;
+                            }
+                        }
+                        i += 2;
+                    } else {
+                        pieces.push((Some(na.clone()), i, 1));
+                        produced += 1;
+                        i += 1;
+                    }
+                }
+            }
+            pieces.push((subj_arc, e, subject.len() - e));
+            if produced == rep_len {
+                h.string_carry_props(&key, &pieces);
+            }
+        }
+        return Ok(res);
     }
     let text: Vec<char> = h.cur_buf().text.clone();
     let (begv, zv) = (h.cur_buf().begv, h.cur_buf().zv);
@@ -10854,6 +10915,9 @@ pub fn install(h: &mut ElispHost) {
     s("clear-string", 1, Some(1), clear_string);
     s("fillarray", 2, Some(2), fillarray);
     s("make-char-table--new", 3, Some(3), make_char_table_new);
+    s("elisprs--copy-char-table", 1, Some(1), copy_char_table);
+    s("elisprs--char-table-runs", 1, Some(1), char_table_runs);
+    s("optimize-char-table", 1, Some(2), optimize_char_table);
     s("char-table-p", 1, Some(1), char_table_p);
     s("char-table-subtype", 1, Some(1), char_table_subtype);
     s("char-table-parent", 1, Some(1), char_table_parent);
@@ -11134,6 +11198,39 @@ pub fn install(h: &mut ElispHost) {
     s("move-marker", 2, Some(3), set_marker_fn);
     s("copy-marker", 0, Some(2), copy_marker_fn);
     // text properties
+    s("next-property-change", 1, Some(3), next_property_change_fn);
+    s(
+        "next-single-property-change",
+        2,
+        Some(4),
+        next_single_property_change_fn,
+    );
+    s(
+        "previous-property-change",
+        1,
+        Some(3),
+        previous_property_change_fn,
+    );
+    s(
+        "previous-single-property-change",
+        2,
+        Some(4),
+        previous_single_property_change_fn,
+    );
+    s("object-intervals", 1, Some(1), object_intervals_fn);
+    s(
+        "elisprs--inside-interval-p",
+        1,
+        Some(1),
+        inside_interval_p_fn,
+    );
+    s("elisprs--inherit-props", 5, Some(6), inherit_props_fn);
+    s(
+        "add-face-text-property",
+        3,
+        Some(5),
+        add_face_text_property_fn,
+    );
     s("get-text-property", 2, Some(3), get_text_property_fn);
     s("text-properties-at", 1, Some(2), text_properties_at_fn);
     s("put-text-property", 4, Some(5), put_text_property_fn);
@@ -11306,6 +11403,12 @@ pub fn install(h: &mut ElispHost) {
     s("type-of", 1, Some(1), type_of);
     s("recordp", 1, Some(1), recordp);
     s("closurep", 1, Some(1), closurep_fn);
+    s(
+        "elisprs--prelude-closure-p",
+        1,
+        Some(1),
+        prelude_closure_p_fn,
+    );
     s("oclosure--fix-type", 4, Some(4), oclosure_fix_type);
     s("oclosure-type", 1, Some(1), oclosure_type_fn);
     s("oclosure--get", 3, Some(3), oclosure_get_fn);
@@ -11420,6 +11523,337 @@ fn install_special_form_cells(h: &mut ElispHost) {
         let sym = h.intern(name);
         h.set_intrinsic_macro_cell(&sym, subr);
     }
+}
+
+// ── text-property queries over intervals (textprop.c) ──────────────────────
+/// The intervals of a text-property OBJECT as `(START, END, PLIST)` in the
+/// object's own coordinates (strings count from 0, buffers from 1), or `None`
+/// when it has none.
+fn object_runs(h: &ElispHost, obj: &PropObj) -> Option<Vec<(i64, i64, Value)>> {
+    match obj {
+        PropObj::Str(s) => {
+            let runs = h.string_intervals(s);
+            if runs.is_empty() {
+                None
+            } else {
+                Some(
+                    runs.into_iter()
+                        .map(|(a, b, p)| (a as i64, b as i64, p))
+                        .collect(),
+                )
+            }
+        }
+        PropObj::Buf(bi) => {
+            let b = &h.buffers[*bi];
+            if !b.has_intervals || b.props.is_empty() {
+                return None;
+            }
+            Some(
+                h.tp_runs(&b.props, &b.prop_bounds)
+                    .into_iter()
+                    .map(|(a, e)| (a as i64 + 1, e as i64 + 1, b.props[a].clone()))
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// `validate_interval_range` for a single POSITION: the position, as an
+/// integer, checked against the object's accessible range.
+fn single_position(h: &ElispHost, obj: &PropObj, pos: &Value) -> Result<i64, String> {
+    let p = match h.marker_position(pos) {
+        Some(p) => p as i64,
+        None => match pos {
+            Value::Int(n) => *n,
+            other => {
+                return Err(format!(
+                    "wrong-type-argument: integer-or-marker-p {}",
+                    h.print(other, true)
+                ))
+            }
+        },
+    };
+    let (min, max) = match obj {
+        PropObj::Str(s) => (0, s.chars().count() as i64),
+        PropObj::Buf(bi) => {
+            let (begv, zv) = h.buffer_begv_zv(*bi);
+            (begv as i64, zv as i64)
+        }
+    };
+    if p < min || p > max {
+        return Err(format!("args-out-of-range: {p} {p}"));
+    }
+    Ok(p)
+}
+
+/// `textget`: PROP in PLIST, falling back to the `category` symbol's plist.
+fn textget(h: &mut ElispHost, plist: &Value, prop: &Value) -> Value {
+    if let Some(v) = h.plist_lookup(plist, prop) {
+        return v;
+    }
+    let category = h.intern("category");
+    match h.plist_lookup(plist, &category) {
+        Some(cat) if h.sym_name(&cat).is_some() => {
+            let table_sym = h.intern("symbol-plist--table");
+            match h.get_dynamic_value(&table_sym) {
+                Ok(table) => {
+                    let plist = gethash(h, &[cat, table]).unwrap_or(Value::Undef);
+                    h.plist_get_eq(&plist, prop)
+                }
+                Err(_) => Value::Undef,
+            }
+        }
+        _ => Value::Undef,
+    }
+}
+
+/// Where the text properties of OBJECT end: its length or `zv`.
+fn object_end(h: &ElispHost, obj: &PropObj) -> i64 {
+    match obj {
+        PropObj::Str(s) => s.chars().count() as i64,
+        PropObj::Buf(bi) => h.buffer_begv_zv(*bi).1 as i64,
+    }
+}
+fn object_begin(h: &ElispHost, obj: &PropObj) -> i64 {
+    match obj {
+        PropObj::Str(_) => 0,
+        PropObj::Buf(bi) => h.buffer_begv_zv(*bi).0 as i64,
+    }
+}
+
+/// The LIMIT argument: nil, `t`, or an integer/marker.
+fn limit_arg(h: &ElispHost, v: Option<&Value>) -> Result<Value, String> {
+    match v {
+        None => Ok(Value::Undef),
+        Some(v) if is_nil(v) || matches!(v, Value::Bool(true)) => Ok(v.clone()),
+        Some(v) => match h.marker_position(v) {
+            Some(p) => Ok(Value::Int(p as i64)),
+            None => match v {
+                Value::Int(_) => Ok(v.clone()),
+                other => Err(format!(
+                    "wrong-type-argument: integer-or-marker-p {}",
+                    h.print(other, true)
+                )),
+            },
+        },
+    }
+}
+
+fn limit_int(limit: &Value) -> Option<i64> {
+    match limit {
+        Value::Int(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// `(next-property-change POSITION &optional OBJECT LIMIT)`.
+fn next_property_change_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let obj = prop_object(h, a.get(1))?;
+    let limit = limit_arg(h, a.get(2))?;
+    let pos = single_position(h, &obj, &a[0])?;
+    let runs = object_runs(h, &obj);
+    let end = object_end(h, &obj);
+    let Some(runs) = runs else {
+        return Ok(limit);
+    };
+    let i = runs
+        .iter()
+        .position(|&(s, e, _)| s <= pos && pos < e)
+        .unwrap_or(runs.len() - 1);
+    if matches!(limit, Value::Bool(true)) {
+        return Ok(Value::Int(runs.get(i + 1).map_or(end, |r| r.0)));
+    }
+    let lim = limit_int(&limit);
+    let mut next = i + 1;
+    while next < runs.len()
+        && h.plist_struct_eq(&runs[i].2, &runs[next].2)
+        && lim.is_none_or(|l| runs[next].0 < l)
+    {
+        next += 1;
+    }
+    match runs.get(next) {
+        Some(r) if r.0 < lim.unwrap_or(end) => Ok(Value::Int(r.0)),
+        _ => Ok(limit),
+    }
+}
+
+/// `(next-single-property-change POSITION PROP &optional OBJECT LIMIT)`.
+fn next_single_property_change_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let obj = prop_object(h, a.get(2))?;
+    let limit = limit_arg(h, a.get(3))?;
+    if matches!(limit, Value::Bool(true)) {
+        // The C code only does CHECK_FIXNUM_COERCE_MARKER on LIMIT.
+        return Err(format!(
+            "wrong-type-argument: integer-or-marker-p {}",
+            h.print(&limit, true)
+        ));
+    }
+    let pos = single_position(h, &obj, &a[0])?;
+    let end = object_end(h, &obj);
+    let Some(runs) = object_runs(h, &obj) else {
+        return Ok(limit);
+    };
+    let i = runs
+        .iter()
+        .position(|&(s, e, _)| s <= pos && pos < e)
+        .unwrap_or(runs.len() - 1);
+    let here = textget(h, &runs[i].2, &a[1]);
+    let lim = limit_int(&limit);
+    let mut next = i + 1;
+    while next < runs.len()
+        && {
+            let v = textget(h, &runs[next].2, &a[1]);
+            h.values_eq(&here, &v)
+        }
+        && lim.is_none_or(|l| runs[next].0 < l)
+    {
+        next += 1;
+    }
+    match runs.get(next) {
+        Some(r) if r.0 < lim.unwrap_or(end) => Ok(Value::Int(r.0)),
+        _ => Ok(limit),
+    }
+}
+
+/// `(previous-property-change POSITION &optional OBJECT LIMIT)`.
+fn previous_property_change_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let obj = prop_object(h, a.get(1))?;
+    let limit = limit_arg(h, a.get(2))?;
+    let pos = single_position(h, &obj, &a[0])?;
+    let begin = object_begin(h, &obj);
+    let Some(runs) = object_runs(h, &obj) else {
+        return Ok(limit);
+    };
+    let mut i = runs
+        .iter()
+        .position(|&(s, e, _)| s <= pos && pos < e)
+        .unwrap_or(runs.len() - 1);
+    // Start with the interval containing the char before POSITION.
+    if runs[i].0 == pos {
+        if i == 0 {
+            return Ok(limit);
+        }
+        i -= 1;
+    }
+    let lim = limit_int(&limit);
+    let mut prev = i as i64 - 1;
+    while prev >= 0
+        && h.plist_struct_eq(&runs[prev as usize].2, &runs[i].2)
+        && lim.is_none_or(|l| runs[prev as usize].1 > l)
+    {
+        prev -= 1;
+    }
+    if prev < 0 || runs[prev as usize].1 <= lim.unwrap_or(begin) {
+        return Ok(limit);
+    }
+    Ok(Value::Int(runs[prev as usize].1))
+}
+
+/// `(previous-single-property-change POSITION PROP &optional OBJECT LIMIT)`.
+fn previous_single_property_change_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let obj = prop_object(h, a.get(2))?;
+    let limit = limit_arg(h, a.get(3))?;
+    let pos = single_position(h, &obj, &a[0])?;
+    let begin = object_begin(h, &obj);
+    let Some(runs) = object_runs(h, &obj) else {
+        return Ok(limit);
+    };
+    let mut i = runs
+        .iter()
+        .position(|&(s, e, _)| s <= pos && pos < e)
+        .unwrap_or(runs.len() - 1);
+    if runs[i].0 == pos {
+        if i == 0 {
+            return Ok(limit);
+        }
+        i -= 1;
+    }
+    let here = textget(h, &runs[i].2, &a[1]);
+    let lim = limit_int(&limit);
+    let mut prev = i as i64 - 1;
+    while prev >= 0
+        && {
+            let v = textget(h, &runs[prev as usize].2, &a[1]);
+            h.values_eq(&here, &v)
+        }
+        && lim.is_none_or(|l| runs[prev as usize].1 > l)
+    {
+        prev -= 1;
+    }
+    if prev < 0 || runs[prev as usize].1 <= lim.unwrap_or(begin) {
+        return Ok(limit);
+    }
+    Ok(Value::Int(runs[prev as usize].1))
+}
+
+/// `(object-intervals OBJECT)`: `((BEG END PLIST) …)`, 0-based, nil intervals
+/// included.
+fn object_intervals_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let obj = match &a[0] {
+        v if h.is_string(v) => PropObj::Str(h.str_arc(v).expect("checked stringp")),
+        v => match h.resolve_buffer(v) {
+            Some(bi) if matches!(h.obj(v), Some(Obj::Buffer(_))) => PropObj::Buf(bi),
+            _ => {
+                return Err(format!(
+                    "wrong-type-argument: buffer-or-string-p {}",
+                    h.print(v, true)
+                ))
+            }
+        },
+    };
+    let base = if matches!(obj, PropObj::Buf(_)) { 1 } else { 0 };
+    let runs = object_runs(h, &obj).unwrap_or_default();
+    let items = runs
+        .into_iter()
+        .map(|(s, e, p)| h.list_from(vec![Value::Int(s - base), Value::Int(e - base), p]))
+        .collect();
+    Ok(h.list_from(items))
+}
+
+/// `(add-face-text-property START END FACE &optional APPENDP OBJECT)`.
+fn add_face_text_property_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let start = as_int(h, &a[0])?;
+    let end = as_int(h, &a[1])?;
+    let append = a.get(3).is_some_and(|v| !is_nil(v));
+    let obj = prop_object(h, a.get(4))?;
+    let (lo, hi) = prop_range(&obj, start, end, h)?;
+    let face = h.intern("face");
+    let pairs = [(face, a[2].clone())];
+    let set_type = if append {
+        crate::textprop::SetType::Append
+    } else {
+        crate::textprop::SetType::Prepend
+    };
+    match &obj {
+        PropObj::Str(s) => {
+            h.string_add_props(s, lo, hi, &pairs, set_type);
+        }
+        PropObj::Buf(bi) => {
+            let bi = *bi;
+            let changed = with_buffer(h, bi, |h| h.buffer_add_props(lo, hi, &pairs, set_type));
+            if changed {
+                h.note_prop_change(bi);
+            }
+        }
+    }
+    Ok(Value::Undef)
+}
+
+/// `(elisprs--inside-interval-p POS)`: the characters around buffer position
+/// POS belong to one interval.
+fn inside_interval_p_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let pos = as_int(h, &a[0])?.max(0) as usize;
+    Ok(nil_or(h.buffer_inside_interval(pos)))
+}
+
+/// `(elisprs--inherit-props START END PLIST PLEFT PRIGHT INSIDE)`: see
+/// [`ElispHost::buffer_inherit_props`].
+fn inherit_props_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let start = as_int(h, &a[0])?.max(1) as usize;
+    let end = as_int(h, &a[1])?.max(1) as usize;
+    let inside = a.get(5).is_some_and(|v| !is_nil(v));
+    h.buffer_inherit_props(start, end, &a[2], inside);
+    Ok(Value::Undef)
 }
 
 #[cfg(test)]

@@ -6491,6 +6491,144 @@ ignored), a string is a TZ string resolved by libc (`"America/New_York"`,
   `condition-case` is not caught when the form is run through `-e` (a `load`
   walk, which is also what `emacs -l` does); `eval` is lazy and agrees.
 
+## Round 39 — verbatim libraries on demand, `nstrftime`, time range, keymap traversal, `make-hash-table`
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch`; run the fuzzer with
+`EMACS_VERSION_EXPECT=31.1`). Found by differential probes written per area
+(time formatting, keymaps and events, `map.el`, text properties, printing) and
+run against the oracle in fresh processes. Expectations are in
+`tests/parity_time_ranges_and_strftime.rs`, `tests/parity_bundled_libraries.rs`,
+`tests/parity_keymap_events_31.rs`, `tests/parity_map_generic_31.rs` and
+`tests/parity_fuzz_findings.rs`.
+
+### R39-A. ✅ FIXED — libraries Emacs loads on demand are bundled, verbatim
+
+`parse-time-string`, `iso8601-parse` & co., `thunk`, and `char-fold-to-regexp`
+did not exist. They are now the Emacs 31.1 files (`src/lisp/`, listed in
+`src/bundled.rs`), reached the way Emacs reaches them: `load` / `require` fall
+back to the bundled table after `load-path`, and `(autoload SYM FILE)` objects
+load their file when the symbol is called (`autoload-do-load`; the call path
+used to signal `invalid-function` on any autoload object). Only the
+`;;;###autoload` functions are bound at startup (`parse-time-string`,
+`char-fold-to-regexp`); `iso8601-parse` is void until `(require 'iso8601)`, as
+in a stock `emacs -Q`. `time-date.el` is preloaded verbatim, which also brought
+`decoded-time-add`, `make-decoded-time`, `decoded-time-set-defaults`,
+`decoded-time-period`, `date-to-day`, `days-between`, `seconds-to-string` and
+`safe-date-to-time`, and replaced a condensed `format-seconds` whose rounding
+differed (`(format-seconds "%s" 1.5)` is `"1"`).
+
+`char-fold` is the one modified file: `char-fold--make-table` derives its table
+from the Unicode decomposition database, which elisprs does not carry, so the
+table Emacs 31.1 builds is bundled as data (`src/lisp/char-fold-data.el`) and
+`char-fold-table` is initialised from it.
+
+### R39-B. ✅ FIXED — `format-time-string` is gnulib's `nstrftime`
+
+The hand-written directive loop gave way to a port of `strftime.c` (`src/strftime.rs`):
+flags `_-+0^#`, widths, the `E`/`O` modifiers, `%q`, `%F` with a signed year
+past 9999, `%N` width and trailing-zero rules, and bad-format recovery
+(`%5%` is `"   %5%"`: the first `%5` is copied with padding, the lone `%` that
+follows is its own conversion). Year-like fields count the sign toward the
+width: `%Y` of year -1 is `-001`, `%C` is `-0`, `%y` is `01`, `%G` follows the
+ISO year. `%a %A %b %B %h %c %x %X %p` come from libc's `strftime` under the
+environment's `LC_TIME`, as in an Emacs without `_NL_CURRENT`.
+
+### R39-C. ✅ FIXED — time values outside 1900–2038 and past `tm_year`
+
+`encode-time` answered `(-1 65535)` for every date before 1900 on macOS
+(`mktime`/`timegm` refuse them), and `decode-time` / `format-time-string`
+wrapped on a year past `tm_year` instead of signalling
+`(error "Specified time is not representable")`. UTC and fixed-offset zones are
+now proleptic Gregorian arithmetic on `i64`; a named zone falls back to
+inverting `localtime_r` when `mktime` fails, which yields the zone's local mean
+time exactly as gnulib's `mktime_z` does.
+
+### R39-D. ✅ FIXED — `make-hash-table` argument list (31.1)
+
+Odd argument counts are `(error "Odd number of arguments")`; the first
+`:test`/`:size`/`:weakness` wins; the last unknown keyword is the one named
+(`(make-hash-table :foo 1 :bar 2)` → `:bar`), after the whole list was scanned
+and before any value check; a non-symbol `:test` is
+`(wrong-type-argument symbolp V)`.
+
+### R39-E. ✅ FIXED — keymap traversal and event symbols
+
+`map-keymap`, `map-keymap-internal`, `map-keymap-sorted`, `copy-keymap`,
+`keymap-prompt`, `keymap-canonicalize`, `event-convert-list`,
+`internal-event-symbol-parse-modifiers`, `event-modifiers`, `event-basic-type`,
+`event-apply-modifier` and `listify-key-sequence` are keymap.c / keyboard.c /
+subr.el. `key-description` and `single-key-description` are `push_key_description`:
+list events (`(control f2)`), the `NO-ANGLES` argument, `[N]` for a non-character,
+and `C-j` where the old code said `LFD`.
+
+### R39-F. ✅ FIXED — smaller items
+
+`map.el`'s generics are reproduced per method (`map-copy`, `map-insert` and
+`map-delete` on arrays, the `plist` type of `map-into` / `map-merge`,
+`map-put!` returning the value, `(setf (map-elt …))` through `map-put!` then
+`map-insert`); `(setf (alist-get K AL nil t #'equal) nil)` compares the new value
+with DEFAULT by `eql`, not TESTFN; `seq-remove-at-position` is seq.el's;
+`(and-let* ())` is `t`; `propertize` signals `wrong-number-of-arguments` for a
+stray property and keeps a repeated property's first position; a marker whose
+insertion type is `t` prints `(moves after insertion)`; `\M-X` in a string sets
+bit 7; `byte-code-function-p` / `compiled-function-p` are true for a function the
+prelude defines (Lisp that Emacs ships compiled) and `interpreted-function-p` is
+its complement; `add-display-text-property` / `remove-display-text-property`.
+
+### R39-G. ✅ FIXED — char-tables are `chartab.c`'s tree
+
+A char-table was a sorted run list, so `prin1` printed three header slots and
+dropped the rest. It is now the tree Emacs builds — 64 top-level slots of 65536
+characters, sub-char-tables of 16, 32 and 128 slots — with `char_table_set`,
+`char_table_set_range` and the cached ASCII slot ported step for step, because
+the layout is observable: one character stores a chain of sub-tables while a
+range covering a whole block stores a value. Under `print-circle` the ASCII
+slot and the tree's `[0][0][0]` are one object and print as `#N=` / `#N#`.
+`make-char-table` fills the default slot and the extra slots with INIT, as
+`Fmake_char_table` does; `length` of a char-table is `MAX_CHAR + 1`, `equal`
+descends into it, `copy-sequence` deep-copies it, and `map-char-table`,
+`optimize-char-table`, `make-keymap` (and `define-key` / `lookup-key` /
+`map-keymap` over its table), `accessible-keymaps` and `where-is-internal`
+exist.
+
+### R39-H. ✅ FIXED — text-property intervals
+
+Properties are stored per character, which cannot say where Emacs's intervals
+split. Each string and buffer now also records its interval boundaries
+(`src/textprop.rs`), and `put-text-property`, `add-text-properties`,
+`remove-text-properties`, `set-text-properties` and `add-face-text-property`
+split where `textprop.c` does and nowhere else: an interval that merely became
+equal to its neighbour stays apart (`#("abcdef" 1 3 (p 1) 3 5 (p 1))`), a new
+piece after a split holds its own copy of the plist (no `#1=` where Emacs has
+two lists), and `set-text-properties` merges its range into one interval.
+`concat`, `substring`, `buffer-substring` and `insert` carry the boundaries of
+the propertized source intervals. `format` transfers the properties of the
+template through its directives (a directive is one unit) and of `%s` arguments
+(extended over right padding; from the start of the field when the template has
+intervals), and `replace-match` keeps the properties of NEWTEXT and of the
+subject. `next-property-change`, `next-single-property-change`,
+`previous-property-change`, `previous-single-property-change` and
+`object-intervals` walk the intervals; the `*-char-property-change`,
+`get-pos-property` and `get-char-property-and-overlay` functions are
+textprop.c's (overlays included for the latter), and `insert-and-inherit` is
+`merge_properties_sticky`. Out-of-range START/END signal
+`(args-out-of-range START END)`. `define-key` signals
+`Key sequence K starts with non-prefix key P`.
+
+### Not followed, and why
+
+- **`eq` on floats.** Emacs boxes floats, so `(let ((x 1.0)) (eq x x))` is `t`
+  while `(eq 1.0 1.0)` is `nil`. elisprs floats are `fusevm::Value::Float`
+  immediates whose arithmetic the VM compiles natively; giving them identity
+  would box every float result.
+- **`print-unreadable-function`** (and so `readablep`): the printer runs under a
+  host borrow and cannot call back into Lisp.
+- **Intervals of an inherited insertion into a buffer**, `sxhash-equal-including-properties`,
+  `string-fill` over properties (it runs `fill-region` in a buffer) and
+  `intern` keeping a name's properties are not modelled.
+- **Unibyte strings.** A string is a Rust `String`, so `"\M-a"` is one character
+  with code 225 and `(multibyte-string-p "\M-a")` is `t`.
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the
