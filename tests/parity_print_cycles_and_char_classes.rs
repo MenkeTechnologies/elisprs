@@ -232,12 +232,13 @@ fn nthcdr_accepts_bignum_indices_and_terminates_on_cycles() {
 
 /// subr.el's `split-string` applies TRIM as a regexp at both ends of every
 /// substring, and its default SEPARATORS are six ASCII characters — not
-/// "whitespace" in the Unicode sense. TRIM was previously ignored outright.
+/// "whitespace" in the Unicode sense. TRIM is type-checked by `concat`, so a
+/// non-sequence is `sequencep`, not `stringp` (emacs-31.1).
 #[test]
 fn split_string_applies_and_type_checks_trim() {
     assert_eq!(
         eval("(condition-case e (split-string \"abc\" \"b\" nil 97) (error e))"),
-        "(wrong-type-argument stringp 97)"
+        "(wrong-type-argument sequencep 97)"
     );
     assert_eq!(
         eval("(split-string \"  a  b  \" \",\" nil \" +\")"),
@@ -250,11 +251,13 @@ fn split_string_applies_and_type_checks_trim() {
         "(\"\" \"\")"
     );
     assert_eq!(eval("(split-string \"xx,xx\" \",\" t \"x+\")"), "nil");
-    // A leading TRIM that runs past the end of the segment leaves
-    // this-start > this-end, and `substring` signals rather than yielding "".
+    // emacs-31.1 trims with anchored regexps (`\\`\\(?:TRIM\\)`, `\\(?:TRIM\\)\\'`),
+    // so a leading TRIM cannot overrun the segment and `substring` never signals.
+    assert_eq!(eval("(split-string \"aXb\" \"X\" nil \"a.\")"), "(\"a\" \"b\")");
+    // TRIM goes through `concat`, so any sequence of characters is a regexp.
     assert_eq!(
-        eval("(condition-case e (split-string \"aXb\" \"X\" nil \"a.\") (error e))"),
-        "(args-out-of-range \"aXb\" 2 1)"
+        eval("(split-string \"abc\" \"b\" nil (list ?a))"),
+        "(\"\" \"c\")"
     );
     // A no-break space is not one of the default separators.
     assert_eq!(eval("(split-string \"a\u{a0}b\")"), "(\"a\u{a0}b\")");

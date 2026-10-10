@@ -3918,132 +3918,113 @@ fn substring(h: &mut ElispHost, a: &[Value]) -> R {
 /// element, because a no-break space is not in this class.
 pub(crate) const SPLIT_STRING_DEFAULT_SEPARATORS: &str = "[ \u{c}\t\n\r\u{b}]+";
 
-/// subr.el `split-string`, ported including its `push-one` closure.
+/// `(match-end 0)` right after a successful `string-match`.
+fn match_end_0(h: &mut ElispHost) -> Result<i64, String> {
+    let end = match_end(h, &[Value::Int(0)])?;
+    as_int(h, &end)
+}
+
+/// subr.el `split-string` (emacs-31.1), ported statement for statement. 31.1
+/// replaced the 30.x `push-one` walk with an index walk that advances `next` by
+/// at least one past each search, so an empty-matching separator splits between
+/// every character and a trailing empty match is kept under `keep-empty`.
 ///
-/// The previous implementation split with `Regex::split` and dropped TRIM on the
-/// floor, which is three separate divergences: TRIM was never applied, never
-/// type-checked (`(split-string "abc" "b" nil 97)` must be
-/// `(wrong-type-argument stringp 97)`), and the default-separator path used
-/// Rust's Unicode-aware `split_whitespace` instead of the ASCII-only regexp
-/// above. Reproducing subr.el's index walk also reproduces its one sharp edge: a
-/// leading TRIM whose match runs past the end of the segment leaves
-/// `this-start > this-end`, and `substring` then signals
-/// `(args-out-of-range "aXb" 2 1)` rather than silently yielding "".
+/// Every step goes through the real `string-match` / `string-match-p` /
+/// `substring` builtins, so the match data left behind, the argument checks and
+/// their order (`length` of STRING, then `concat` of TRIM, then the first
+/// `string-match`) are the Lisp definition's own.
 fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
-    // `(keep-nulls (not (if separators omit-nulls t)))` — with the default
-    // separators OMIT-NULLS is implicitly on; with an explicit SEPARATORS it is
-    // off unless the 3rd argument says otherwise.
-    let has_seps = a.len() > 1 && !is_nil(&a[1]);
-    let keep_nulls = has_seps && a.get(2).is_none_or(is_nil);
-    // `(rexp (or separators split-string-default-separators))`. `string-match`
-    // type-checks the regexp before the string, so a bad SEPARATORS is reported
-    // before a bad STRING: (split-string [1 2] 97) is `stringp 97`.
-    let rexp = if has_seps {
-        as_string(h, &a[1])?
+    let nil = Value::Undef;
+    let arg = |i: usize| a.get(i).cloned().unwrap_or(Value::Undef);
+    let string = arg(0);
+    let separators = arg(1);
+    let trim = arg(3);
+    let keep_empty = !is_nil(&separators) && is_nil(&arg(2));
+    let len = emacs_length(h, &string)?;
+    // `(trim-left-re (and trim (concat "\\`\\(?:" trim "\\)")))` and the right-
+    // anchored twin: `concat` accepts any sequence of characters, not only a
+    // string, and signals `sequencep` for anything else.
+    let anchored = |h: &mut ElispHost, head: &str, tail: &str| -> R {
+        concat_fn(h, &[Value::str(head.to_string()), trim.clone(), Value::str(tail.to_string())])
+    };
+    let (trim_left_re, trim_right_re) = if is_nil(&trim) {
+        (nil.clone(), nil.clone())
     } else {
-        SPLIT_STRING_DEFAULT_SEPARATORS.to_string()
+        (
+            anchored(h, "\\`\\(?:", "\\)")?,
+            anchored(h, "\\(?:", "\\)\\'")?,
+        )
     };
-    let string = as_string(h, &a[0])?;
-    let cf = case_fold_search(h);
-    let re = compile_cf(h, &rexp, cf)?;
-    // TRIM is only ever touched inside `push-one`, i.e. after STRING and
-    // SEPARATORS have both been accepted.
-    let trim = match a.get(3) {
-        Some(v) if !is_nil(v) => Some(as_string(h, v)?),
-        _ => None,
-    };
-    let trim_re = match &trim {
-        Some(t) => Some((
-            compile_cf(h, t, cf)?,
-            // `(concat trim "\\'")` — anchored at the end of the SUBSTRING.
-            compile_cf(h, &format!("{t}\\'"), cf)?,
-        )),
-        None => None,
-    };
-
-    let chars: Vec<char> = string.chars().collect();
-    let len = chars.len();
-    let mut out: Vec<String> = Vec::new();
-    // `substring`'s args-out-of-range names the string itself; render it now, as
-    // `push-one` below borrows `out` and cannot also hold the host.
-    let string_readable = h.print(&Value::str(string.clone()), true);
-
-    // `push-one`: trim both ends of [this_start, this_end) and keep what is left.
-    let mut push_one = |this_start: usize, this_end: usize| -> Result<(), String> {
-        let mut this_start = this_start;
-        if let Some((head_re, tail_re)) = &trim_re {
-            // "Discard the trim from start of this substring." The match is taken
-            // against the WHOLE string from this-start, and only counts when it
-            // begins exactly there — so a context-sensitive TRIM like "\\<a\\>"
-            // sees the characters before the segment, as in Emacs.
-            if let Some(sp) = run_match(head_re, &string, this_start) {
-                if let Some((b, e)) = sp[0] {
-                    if b == this_start {
-                        this_start = e;
-                    }
-                }
-            }
-            if keep_nulls || this_start < this_end {
-                if this_start > this_end {
-                    return Err(format!(
-                        "args-out-of-range: {} {this_start} {this_end}",
-                        string_readable
-                    ));
-                }
-                let mut this: String = chars[this_start..this_end].iter().collect();
-                // "Discard the trim from end of this substring."
-                if let Some(sp) = run_match(tail_re, &this, 0) {
-                    if let Some((b, _)) = sp[0] {
-                        let n = this.chars().count();
-                        if b < n {
-                            this = this.chars().take(b).collect();
-                        }
-                    }
-                }
-                // "Trimming could make it empty; check again."
-                if keep_nulls || !this.is_empty() {
-                    out.push(this);
-                }
-            }
-            return Ok(());
+    let sep_re = if is_nil(&separators) {
+        match h.find_symbol("split-string-default-separators").and_then(|s| h.get_value(&s).ok()) {
+            Some(v) if !is_nil(&v) => v,
+            _ => Value::str(SPLIT_STRING_DEFAULT_SEPARATORS.to_string()),
         }
-        if keep_nulls || this_start < this_end {
-            out.push(chars[this_start..this_end].iter().collect());
-        }
-        Ok(())
+    } else {
+        separators
     };
 
-    let mut start = 0usize;
-    let mut notfirst = false;
-    let mut match_begin = 0usize;
-    loop {
-        // `(if (and notfirst (= start (match-beginning 0)) (< start (length string)))
-        //      (1+ start) start)` — step past a zero-width separator match.
-        let from = if notfirst && start == match_begin && start < len {
-            start + 1
+    // Trim both ends of ITEM: `(string-match LEFT ITEM 0)` then `(match-end 0)`,
+    // the right edge via `string-match-p`. Returns the (possibly shortened) item
+    // and the final BEG and END, which `keep-empty` reads.
+    let trim_item = |h: &mut ElispHost, item: Value| -> Result<(Value, i64, i64), String> {
+        let hit = string_match(h, &[trim_left_re.clone(), item.clone(), Value::Int(0)])?;
+        let beg = if is_nil(&hit) {
+            0
         } else {
-            start
+            match_end_0(h)?
         };
-        let Some(spans) = run_match(&re, &string, from) else {
-            break;
+        let item_len = emacs_length(h, &item)?;
+        let end = match string_match_p(h, &[trim_right_re.clone(), item.clone(), Value::Int(beg)])? {
+            Value::Int(n) => n,
+            _ => item_len,
         };
-        let Some((mb, me)) = spans[0] else { break };
-        // `string-match` has already run (and set the match data) before the
-        // `(< start (length string))` conjunct is tested, so MATCH_BEGIN updates
-        // even on the iteration that ends the loop.
-        match_begin = mb;
+        if beg > 0 || end < item_len {
+            let item = substring(h, &[item, Value::Int(beg), Value::Int(end)])?;
+            return Ok((item, beg, end));
+        }
+        Ok((item, beg, end))
+    };
+
+    let mut acc: Vec<Value> = Vec::new();
+    let (mut next, mut start) = (0i64, 0i64);
+    loop {
+        let sep = string_match(h, &[sep_re.clone(), string.clone(), Value::Int(next)])?;
+        let Value::Int(sep) = sep else { break };
+        let sep_end = match_end_0(h)?;
+        if keep_empty || start < sep {
+            let item = substring(h, &[string.clone(), Value::Int(start), Value::Int(sep)])?;
+            if is_nil(&trim) {
+                acc.push(item);
+            } else {
+                let (item, beg, end) = trim_item(h, item)?;
+                if keep_empty || beg < end {
+                    acc.push(item);
+                }
+            }
+        }
+        next = (next + 1).max(sep_end);
+        start = sep_end;
         if start >= len {
             break;
         }
-        notfirst = true;
-        let (this_start, this_end) = (start, mb);
-        start = me;
-        push_one(this_start, this_end)?;
     }
-    // "Handle the substring at the end of STRING."
-    push_one(start, len)?;
-    Ok(h.list_from(out.into_iter().map(Value::str).collect()))
+    // The text after the last separator. `start` 0 means no separator matched,
+    // and the whole STRING is the item as-is (the very same object).
+    let mut item = if start == 0 {
+        string
+    } else {
+        substring(h, &[string, Value::Int(start)])?
+    };
+    if !is_nil(&trim) {
+        item = trim_item(h, item)?.0;
+    }
+    if keep_empty || !el_equal(h, &item, &Value::str(String::new())) {
+        acc.push(item);
+    }
+    Ok(h.list_from(acc))
 }
+
 /// The `(length V)` the Lisp definitions of `string-prefix-p`/`string-suffix-p`
 /// take before any string check — with `length`'s own `sequencep`/`listp`
 /// signals for a non-sequence or an improper list.

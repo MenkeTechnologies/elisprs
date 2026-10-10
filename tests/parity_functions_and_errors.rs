@@ -164,14 +164,15 @@ fn type_contracts() {
 }
 
 /// An empty separator regexp matches at every position, including before the
-/// first character and after the last.
+/// first character and after the last (emacs-31.1 subr.el: the empty string
+/// splits into two empty items).
 #[test]
 fn split_string_with_an_empty_separator() {
     assert_eq!(
         eval("(split-string \"a1b\" \"\")"),
         "(\"\" \"a\" \"1\" \"b\" \"\")"
     );
-    assert_eq!(eval("(split-string \"\" \"\")"), "(\"\")");
+    assert_eq!(eval("(split-string \"\" \"\")"), "(\"\" \"\")");
     assert_eq!(eval("(split-string \"123\" \"\" t)"), "(\"1\" \"2\" \"3\")");
 }
 
