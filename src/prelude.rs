@@ -407,100 +407,7 @@ pub const PRELUDE: &str = r#"
 (defun cl-second (l) (cadr l))
 (defun cl-third (l) (caddr l))
 (defun cl-rest (l) (cdr l))
-(defun cl-remove-if (pred seq &rest keys)
-  ;; Honors :key, :count, :start, :end and :from-end (the latter removes the
-  ;; LAST COUNT matches). cl-seq.el routes through (cl-remove nil SEQ :if
-  ;; PRED ...), and with a nil PRED cl--check-test falls back to matching the
-  ;; ITEM (nil) with `eql' -- so (cl-remove-if nil '(nil 2 nil)) => (2).
-  (let ((count (cl--getkey keys :count nil))
-        (key (cl--getkey keys :key 'identity))
-        (from-end (cl--getkey keys :from-end nil))
-        (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil)))
-    (cl--remove-by (lambda (x) (cl--if-test pred (funcall key x)))
-                   seq start end count from-end)))
-(defun cl-remove-if-not (pred seq &rest keys)
-  ;; A nil PRED takes the same cl--check-test item-eql fallback as
-  ;; cl-remove-if -- the NOT is dropped, so nils are removed here too.
-  (if pred (apply 'cl-remove-if (lambda (x) (not (funcall pred x))) seq keys)
-    (apply 'cl-remove-if nil seq keys)))
-(defun cl-delete-if (pred seq &rest keys) (apply (function cl-remove-if) pred seq keys))
-(defun cl-delete-if-not (pred seq &rest keys) (apply (function cl-remove-if-not) pred seq keys))
-;; The sequence a short-circuiting cl-seq search walks. A list is walked IN
-;; PLACE, never copied through `append': cl--position stops the moment it
-;; matches and so never looks at an improper tail, which is why
-;; `(cl-position 1 (cons 1 t))' is 0 in Emacs while `(append '(1 . t) nil)'
-;; signals `(wrong-type-argument listp t)' up front. Walking in place also keeps
-;; the signal for the searches that DO run off the end — `(cl-find 9 (cons 1 t))'
-;; still signals, because `(car t)' does. Vectors and strings still convert.
-(defun cl--search-seq (seq) (if (listp seq) seq (append seq nil)))
 
-;; The predicate test every cl-seq `*-if' entry point performs.
-;;
-;; cl-seq.el has no `*-if' loop of its own: `cl-find-if' is
-;; `(apply #'cl-find nil SEQ :if PRED KEYS)', and the loop then runs
-;; `cl--check-test-nokey', whose cond is
-;;
-;;   (cond (cl-test  (eq (not (funcall cl-test ITEM X)) cl-test-not))
-;;         (cl-if    (eq (not (funcall cl-if X)) cl-if-not))
-;;         (t        (eql ITEM X)))
-;;
-;; With a nil PRED the `cl-if' clause is not taken, so the cond falls through to
-;; `(eql ITEM X)' — and ITEM is the nil the `*-if' wrapper passed.  Every `*-if'
-;; function therefore degenerates to "match the nil elements" rather than
-;; calling nil: `(cl-position-if nil '(1 nil 2))' is 1, not `void-function nil'.
-;; `:if-not' takes the same route (cl--parsing-keywords moves its value into
-;; `cl-if', so a nil there also leaves both unset).
-(defun cl--if-test (pred x) (if pred (funcall pred x) (null x)))
-
-;; The same cond for the keyword entry points, built once per call from KEYS the
-;; way cl--parsing-keywords binds its variables: `:test-not' moves its function
-;; into `cl-test' and sets `cl-test-not', and `:if-not' does the same to `cl-if',
-;; so the negated keyword wins when both spellings are given. `cl-member',
-;; `cl-assoc', `cl-rassoc', `cl-position', `cl-count', `cl-find', `cl-remove',
-;; `cl-substitute' and `cl-sublis' all parse `:if'/`:if-not', so
-;; `(cl-member 1 (quote (1 2)) :if (function cl-evenp))' is `(2)', not `(1 2)'.
-;; The result is called (funcall MATCH ITEM X) — item first, element second.
-(defun cl--test-fn (keys)
-  (let* ((test (cl--getkey keys :test nil))
-         (test-not-fn (cl--getkey keys :test-not nil))
-         (test-not (and test-not-fn (setq test test-not-fn) t))
-         (if-fn (cl--getkey keys :if nil))
-         (if-not-fn (cl--getkey keys :if-not nil))
-         (if-not (and if-not-fn (setq if-fn if-not-fn) t)))
-    (cond (test (lambda (item x) (eq (not (funcall test item x)) test-not)))
-          (if-fn (lambda (_item x) (eq (not (funcall if-fn x)) if-not)))
-          (t (function eql)))))
-
-(defun cl-find-if (pred seq &rest keys)
-  (let ((key (cl--getkey keys :key 'identity))
-        (from-end (cl--getkey keys :from-end nil))
-        (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
-        (lst (cl--search-seq seq)) (i 0) (r nil) (found nil))
-    (while (and lst (or from-end (not found)))
-      (when (and (cl--in-bounds i start end) (cl--if-test pred (funcall key (car lst))))
-        (setq r (car lst) found t))
-      (setq i (1+ i) lst (cdr lst)))
-    r))
-(defun cl-find-if-not (pred seq &rest keys)
-  (if pred (apply 'cl-find-if (lambda (x) (not (funcall pred x))) seq keys)
-    (apply 'cl-find-if nil seq keys)))
-(defun cl-sort (seq pred &rest keys)
-  ;; Faithful cl-seq.el: a non-list SEQ is sorted as a list and written back
-  ;; (cl-replace); a string round-trips through vconcat/concat. The
-  ;; (append SEQ nil) coercion is what makes a non-sequence signal `sequencep'
-  ;; -- (cl-sort -1 #'1+) => (wrong-type-argument sequencep -1) -- where bare
-  ;; `sort' says list-or-vector-p.
-  (if (nlistp seq)
-      (if (stringp seq)
-          (concat (apply #'cl-sort (vconcat seq) pred keys))
-        (let ((sorted (apply #'cl-sort (append seq nil) pred keys)) (i 0))
-          (while (consp sorted)
-            (aset seq i (car sorted))
-            (setq i (1+ i) sorted (cdr sorted)))
-          seq))
-    (let ((key (cl--getkey keys :key nil)))
-      (if key (sort seq (lambda (a b) (funcall pred (funcall key a) (funcall key b))))
-        (sort seq pred)))))
 ;; data.c `Finteractive_form' and eval.c `Fcommandp'.  A macro's function cell
 ;; is `(macro . FN)' in Emacs, a cons whose car is not `lambda', so neither
 ;; treats one as a command.  A primitive's `intspec' is recorded by
@@ -604,8 +511,6 @@ pub const PRELUDE: &str = r#"
     (null seq)))
 (defun cl-notany (pred seq &rest rest) (not (apply (function cl-some) pred seq rest)))
 (defun cl-notevery (pred seq &rest rest) (not (apply (function cl-every) pred seq rest)))
-;; cl- list utilities.
-(defun cl-list-length (l) (length l))
 (defun cl-copy-list (list)
   (if (consp list)
       (let ((res nil))
@@ -615,63 +520,6 @@ pub const PRELUDE: &str = r#"
 (defun cl-revappend (l tail) (append (reverse l) tail))
 (defun cl-nreconc (l tail) (nconc (nreverse l) tail))
 (defmacro cl-nth-value (n form) (list 'nth n form))
-(defun cl-search (seq1 seq2 &rest keys)
-  ;; Index in SEQ2 where SEQ1 occurs as a contiguous subsequence, else nil.
-  ;; Honors :test, :key and :from-end (rightmost match). Faithful to cl-seq.el.
-  (let* ((test (cl--getkey keys :test 'eql)) (key (cl--getkey keys :key 'identity))
-         (from-end (cl--getkey keys :from-end nil))
-         (l1 (append seq1 nil)) (l2 (append seq2 nil))
-         (len1 (length l1)) (len2 (length l2)) (i 0) (res nil))
-    (if (= len1 0) (if from-end len2 0)
-      (while (<= i (- len2 len1))
-        (let ((a l1) (b (nthcdr i l2)) (ok t))
-          (while (and ok a)
-            (if (funcall test (funcall key (car a)) (funcall key (car b)))
-                (setq a (cdr a) b (cdr b)) (setq ok nil)))
-          (when ok (setq res i)))
-        (if (and res (not from-end)) (setq i (1+ (- len2 len1))) (setq i (1+ i))))
-      res)))
-(defun cl-mismatch (seq1 seq2 &rest keys)
-  ;; Index of first mismatch between SEQ1 and SEQ2, nil if they match.
-  ;; Honors :test, :key and :from-end. Faithful to cl-seq.el.
-  (let* ((test (cl--getkey keys :test 'eql)) (key (cl--getkey keys :key 'identity))
-         (from-end (cl--getkey keys :from-end nil))
-         (v1 (vconcat seq1)) (v2 (vconcat seq2))
-         (end1 (length v1)) (end2 (length v2)) (start1 0) (start2 0))
-    (if from-end
-        (progn
-          (while (and (< start1 end1) (< start2 end2)
-                      (funcall test (funcall key (aref v1 (1- end1)))
-                               (funcall key (aref v2 (1- end2)))))
-            (setq end1 (1- end1) end2 (1- end2)))
-          (and (or (< start1 end1) (< start2 end2)) (1- end1)))
-      (while (and (< start1 end1) (< start2 end2)
-                  (funcall test (funcall key (aref v1 start1))
-                           (funcall key (aref v2 start2))))
-        (setq start1 (1+ start1) start2 (1+ start2)))
-      (and (or (< start1 end1) (< start2 end2)) start1))))
-(defun cl-set-exclusive-or (a b &rest keys)
-  (append (apply (function cl-set-difference) a b keys)
-          (apply (function cl-set-difference) b a keys)))
-(defun cl-nset-exclusive-or (a b &rest keys) (apply (function cl-set-exclusive-or) a b keys))
-(defun cl-reduce (f seq &rest keys)
-  ;; Supports :initial-value, :key and :from-end. With no initial value and an
-  ;; empty SEQ, calls (funcall f) for the identity element.
-  (let* ((l (append seq nil))
-         (key (plist-get keys :key))
-         (has-init (plist-member keys :initial-value))
-         (init (plist-get keys :initial-value)))
-    (when key (setq l (mapcar (lambda (x) (funcall key x)) l)))
-    (if (plist-get keys :from-end)
-        (let ((rl (reverse l)) (acc nil))
-          (cond (has-init (setq acc init))
-                ((null rl) (setq acc (funcall f) rl nil))
-                (t (setq acc (car rl) rl (cdr rl))))
-          (while rl (setq acc (funcall f (car rl) acc) rl (cdr rl)))
-          acc)
-      (if has-init (seq-reduce f l init)
-        (if (null l) (funcall f) (seq-reduce f (cdr l) (car l)))))))
-(defun cl-endp (x) (null x))
 (defun cl-subst (new old tree &rest keys)
   ;; With no keywords, substitute OLD (matched by `eql') throughout TREE. When
   ;; :test/:test-not/:key are given, defer to `cl-sublis' exactly like Emacs, so
@@ -681,39 +529,6 @@ pub const PRELUDE: &str = r#"
     (cond ((eql tree old) new)
           ((consp tree) (cons (cl-subst new old (car tree)) (cl-subst new old (cdr tree))))
           (t tree))))
-(defun cl-sublis (alist tree &rest keys)
-  ;; Substitute per ALIST of (OLD . NEW) throughout TREE, honoring :test,
-  ;; :test-not, :if, :if-not and :key against each node (including cons cells).
-  ;; `:if'/`:if-not' are how `cl-subst-if' and `cl-subst-if-not' reach here.
-  (cl--sublis-rec alist tree (cl--test-fn keys) (cl--getkey keys :key (quote identity))))
-(defun cl--sublis-rec (alist tree match key)
-  (let ((keyed (funcall key tree)) (p alist) (hit nil))
-    (while (and p (not hit))
-      (if (funcall match (car (car p)) keyed)
-          (setq hit p)
-        (setq p (cdr p))))
-    (if hit (cdr (car hit))
-      (if (consp tree)
-          (cons (cl--sublis-rec alist (car tree) match key)
-                (cl--sublis-rec alist (cdr tree) match key))
-        tree))))
-(defun cl-nsublis (alist tree &rest keys)
-  ;; elisprs rebuilds the tree rather than mutating it; the return value is
-  ;; what callers rely on, and cl-seq.el's destructive form returns the same.
-  (apply 'cl-sublis alist tree keys))
-;; cl-subst-if / cl-subst-if-not (cl-seq.el): substitute NEW for every TREE node
-;; the predicate accepts.  Both route through `cl-sublis' with the one-entry
-;; alist ((nil . NEW)) — which is why a nil PREDICATE replaces the nil nodes,
-;; the list's own terminating nil included: `(cl-subst-if 9 nil '(1 nil 2))' is
-;; `(1 9 2 . 9)'.
-(defun cl-subst-if (new pred tree &rest keys)
-  (apply 'cl-sublis (list (cons nil new)) tree :if pred keys))
-(defun cl-subst-if-not (new pred tree &rest keys)
-  (apply 'cl-sublis (list (cons nil new)) tree :if-not pred keys))
-(defun cl-nsubst-if (new pred tree &rest keys)
-  (apply 'cl-nsublis (list (cons nil new)) tree :if pred keys))
-(defun cl-nsubst-if-not (new pred tree &rest keys)
-  (apply 'cl-nsublis (list (cons nil new)) tree :if-not pred keys))
 ;; NOTE: `push'/`dolist' are defined later in this file, so these helpers use
 ;; explicit `while'/`setq'/`cons' loops to stay valid at load time.
 ;; cl-extra.el's `cl-maplist' / `cl-mapl' / `cl-mapcon' / `cl-mapc', verbatim
@@ -757,41 +572,6 @@ pub const PRELUDE: &str = r#"
             (setq x (cdr x) y (cdr y)))
           seq))
     (mapc func seq)))
-;; cl-seq.el: the destructive set operations delegate to their copying forms
-;; after the same empty-list shortcuts. elisprs never shares structure it was
-;; not asked to, so the result is the same list Emacs returns.
-(defun cl-nunion (list1 list2 &rest cl-keys)
-  (cond ((null list1) list2) ((null list2) list1)
-        (t (apply (function cl-union) list1 list2 cl-keys))))
-(defun cl-nintersection (list1 list2 &rest cl-keys)
-  (and list1 list2 (apply (function cl-intersection) list1 list2 cl-keys)))
-(defun cl-nset-difference (list1 list2 &rest cl-keys)
-  (if (or (null list1) (null list2)) list1
-    (apply (function cl-set-difference) list1 list2 cl-keys)))
-(defun cl-nsubst (new old tree &rest cl-keys)
-  (apply (function cl-nsublis) (list (cons old new)) tree cl-keys))
-;; cl-seq.el's `cl-tree-equal': conses are walked, leaves go through
-;; `cl--check-match' — :key applied to BOTH sides, :test (default `eql') or
-;; :test-not negated — and `cl--parsing-keywords' rejects any other keyword.
-(defun cl-tree-equal (x y &rest cl-keys)
-  (let* ((test (car (cdr (memq :test cl-keys))))
-         (test-not-fn (car (cdr (memq :test-not cl-keys))))
-         (test-not (and test-not-fn (setq test test-not-fn) t))
-         (key (car (cdr (memq :key cl-keys))))
-         (rest cl-keys))
-    (while rest
-      (or (memq (car rest) (quote (:test :test-not :key)))
-          (car (cdr (memq :allow-other-keys cl-keys)))
-          (error "Bad keyword argument %s" (car rest)))
-      (setq rest (cdr (cdr rest))))
-    (cl--tree-equal-rec x y test test-not key)))
-(defun cl--tree-equal-rec (x y test test-not key)
-  (while (and (consp x) (consp y)
-              (cl--tree-equal-rec (car x) (car y) test test-not key))
-    (setq x (cdr x) y (cdr y)))
-  (and (not (consp x)) (not (consp y))
-       (let ((x (if key (funcall key x) x)) (y (if key (funcall key y) y)))
-         (if test (eq (not (funcall test x y)) test-not) (eql x y)))))
 ;; cl-lib.el aliases and one-liners (`defalias' is defined further down, and
 ;; is `fset' here).
 (fset (quote cl-copy-seq) (function copy-sequence))
@@ -802,8 +582,6 @@ pub const PRELUDE: &str = r#"
 ;; cl-extra.el: the property is read through `cl-getf' so DEF is honoured;
 ;; setf on it is `put' (its gv-setter declaration).
 (defun cl-get (sym tag &optional def) (cl-getf (symbol-plist sym) tag def))
-(defun cl-stable-sort (seq pred &rest keys) (apply 'cl-sort seq pred keys))
-(defun cl-delete-duplicates (seq &rest keys) (apply 'cl-remove-duplicates seq keys))
 ;; cl-lib.el's `cl-adjoin', verbatim. The two fast paths are not an
 ;; optimization detail — they are the contract, because `memq'/`member' walk the
 ;; list themselves: with no keys and a non-numeric ITEM the walk is `memq', so
@@ -816,69 +594,6 @@ pub const PRELUDE: &str = r#"
         ((or (equal cl-keys '(:test equal)) (null cl-keys))
          (if (member cl-item cl-list) cl-list (cons cl-item cl-list)))
         (t (apply 'cl--adjoin cl-item cl-list cl-keys))))
-;; cl-seq.el: the keyword path runs the ITEM through :key, then `cl-member'.
-(defun cl--adjoin (cl-item cl-list &rest cl-keys)
-  (let ((key (cl--getkey cl-keys :key 'identity)))
-    (if (apply 'cl-member (funcall key cl-item) cl-list cl-keys)
-        cl-list
-      (cons cl-item cl-list))))
-;; Faithful ports of Emacs `cl-union'/`cl-intersection'/`cl-set-difference'
-;; (cl-seq.el). They honor :test (default `eql') and :key, and reproduce the
-;; length-swap + memq/numberp fast path that determines element order. Without
-;; keys, non-numeric elements are compared with `memq' (eq), exactly like Emacs.
-(defun cl-union (l1 l2 &rest keys)
-  (cond ((null l1) l2)
-        ((null l2) l1)
-        ((and (not keys) (equal l1 l2)) l1)
-        (t
-         (unless (>= (length l1) (length l2))
-           (let ((tmp l1)) (setq l1 l2 l2 tmp)))
-         (while l2
-           (if (or keys (numberp (car l2)))
-               (setq l1 (apply 'cl-adjoin (car l2) l1 keys))
-             (or (memq (car l2) l1) (setq l1 (cons (car l2) l1))))
-           (setq l2 (cdr l2)))
-         l1)))
-(defun cl-intersection (l1 l2 &rest keys)
-  (and l1 l2
-       (if (equal l1 l2) l1
-         (let ((key (cl--getkey keys :key 'identity)) (res nil))
-           (unless (>= (length l1) (length l2))
-             (let ((tmp l1)) (setq l1 l2 l2 tmp)))
-           (while l2
-             (when (if (or keys (numberp (car l2)))
-                       (apply 'cl-member (funcall key (car l2)) l1 keys)
-                     (memq (car l2) l1))
-               (setq res (cons (car l2) res)))
-             (setq l2 (cdr l2)))
-           res))))
-(defun cl-set-difference (l1 l2 &rest keys)
-  (if (or (null l1) (null l2)) l1
-    (let ((key (cl--getkey keys :key 'identity)) (res nil))
-      (while l1
-        (unless (if (or keys (numberp (car l1)))
-                    (apply 'cl-member (funcall key (car l1)) l2 keys)
-                  (memq (car l1) l2))
-          (setq res (cons (car l1) res)))
-        (setq l1 (cdr l1)))
-      (nreverse res))))
-(defun cl-subsetp (l1 l2 &rest keys)
-  ;; t when every element of L1 appears in L2 (under :test, with :key applied to
-  ;; elements of both lists).
-  (let ((test (cl--getkey keys :test 'eql)) (key (cl--getkey keys :key nil)) (a l1) (ok t))
-    (while (and a ok)
-      (let ((x (if key (funcall key (car a)) (car a))))
-        (unless (seq-some (lambda (y) (funcall test x (if key (funcall key y) y))) l2)
-          (setq ok nil)))
-      (setq a (cdr a)))
-    ok))
-(defun cl-merge (type l1 l2 pred &rest _keys)
-  (let ((a (append l1 nil)) (b (append l2 nil)) (r nil))
-    (while (and a b)
-      (if (funcall pred (car b) (car a)) (setq r (cons (car b) r) b (cdr b))
-        (setq r (cons (car a) r) a (cdr a))))
-    (setq r (nconc (nreverse r) a b))
-    (cond ((eq type 'vector) (vconcat r)) ((eq type 'string) (concat r)) (t r))))
 
 ;;; ---- misc functions ----
 (defun ignore (&rest _args) nil)
@@ -1448,8 +1163,6 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
       (dolist (b args)
         (setq a (* (/ a (cl-gcd a b)) b)))
       (abs a))))
-(defun cl-parse-integer (string &rest keys)
-  (string-to-number (string-trim string) (or (plist-get keys :radix) 10)))
 ;; cl-extra.el `cl-coerce'.
 (defun cl-coerce (x type)
   (cond ((eq type 'list) (if (listp x) x (append x nil)))
@@ -2074,85 +1787,6 @@ TYPE nil maps for side effects only and returns nil."
   (let ((result (apply (function cl-mapcar) fn seqs)))
     (if (null type) nil (cl-coerce result type))))
 (defun cl-subseq (seq start &optional end) (seq-subseq seq start end))
-(defun cl--in-bounds (i start end) (and (>= i start) (or (null end) (< i end))))
-(defun cl-position (item seq &rest keys)
-  (let ((match (cl--test-fn keys))
-        (key (cl--getkey keys :key 'identity))
-        (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
-        (from-end (cl--getkey keys :from-end nil))
-        (lst (cl--search-seq seq)) (i 0) (r nil))
-    ;; With :from-end, keep scanning so R ends up the last match.
-    (while (and lst (or from-end (not r)))
-      (when (and (cl--in-bounds i start end)
-                 (funcall match item (funcall key (car lst))))
-        (setq r i))
-      (setq i (1+ i) lst (cdr lst)))
-    r))
-(defun cl-count (item seq &rest keys)
-  (let ((match (cl--test-fn keys))
-        (key (cl--getkey keys :key 'identity))
-        (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
-        (lst (append seq nil)) (i 0) (n 0))
-    (while lst
-      (when (and (cl--in-bounds i start end)
-                 (funcall match item (funcall key (car lst))))
-        (setq n (1+ n)))
-      (setq i (1+ i) lst (cdr lst)))
-    n))
-(defun cl-count-if (pred seq &rest keys)
-  (let ((key (cl--getkey keys :key 'identity))
-        (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
-        (lst (append seq nil)) (i 0) (n 0))
-    (while lst
-      (when (and (cl--in-bounds i start end) (cl--if-test pred (funcall key (car lst))))
-        (setq n (1+ n)))
-      (setq i (1+ i) lst (cdr lst)))
-    n))
-(defun cl-count-if-not (pred seq &rest keys)
-  (if pred (apply 'cl-count-if (lambda (x) (not (funcall pred x))) seq keys)
-    (apply 'cl-count-if nil seq keys)))
-(defun cl-position-if (pred seq &rest keys)
-  (let ((key (cl--getkey keys :key 'identity))
-        (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
-        (from-end (cl--getkey keys :from-end nil))
-        (lst (cl--search-seq seq)) (i 0) (r nil))
-    (while (and lst (or from-end (not r)))
-      (when (and (cl--in-bounds i start end) (cl--if-test pred (funcall key (car lst))))
-        (setq r i))
-      (setq i (1+ i) lst (cdr lst)))
-    r))
-(defun cl-position-if-not (pred seq &rest keys)
-  (if pred (apply 'cl-position-if (lambda (x) (not (funcall pred x))) seq keys)
-    (apply 'cl-position-if nil seq keys)))
-(defun cl-find (item seq &rest keys)
-  (let ((match (cl--test-fn keys))
-        (key (cl--getkey keys :key 'identity)) (from-end (cl--getkey keys :from-end nil))
-        (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil))
-        (lst (cl--search-seq seq)) (i 0) (r nil) (found nil))
-    (while (and lst (or from-end (not found)))
-      (when (and (cl--in-bounds i start end)
-                 (funcall match item (funcall key (car lst))))
-        (setq r (car lst) found t))
-      (setq i (1+ i) lst (cdr lst)))
-    r))
-(defun cl-remove-duplicates (seq &rest keys)
-  ;; Return a copy of SEQ with duplicates removed. Elements are compared with
-  ;; :test (default `eql') applied to the value returned by :key (default
-  ;; `identity'). Default keeps the LAST occurrence of each element; with
-  ;; :from-end non-nil, keeps the FIRST. Keeping the LAST occurrence in order is
-  ;; the same as keeping the FIRST occurrence of the reversed list.
-  (let* ((test (cl--getkey keys :test 'eql))
-         (key (cl--getkey keys :key 'identity))
-         (from-end (cl--getkey keys :from-end nil))
-         (items (if from-end (append seq nil) (reverse (append seq nil))))
-         (seen nil) (res nil))
-    (dolist (x items)
-      (let ((k (funcall key x)) (dup nil) (s seen))
-        (while (and s (not dup))
-          (when (funcall test k (car s)) (setq dup t))
-          (setq s (cdr s)))
-        (unless dup (setq seen (cons k seen) res (cons x res)))))
-    (cl--like (if from-end (nreverse res) res) seq)))
 (defun cl-pairlis (the-keys the-values &optional alist)
   ;; Pair KEYS with VALUES (stopping at the shorter list), prepended to ALIST.
   (nconc (cl-mapcar 'cons the-keys the-values) alist))
@@ -2847,201 +2481,6 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 (defun cl-eighth (x) (nth 7 x))
 (defun cl-ninth (x) (nth 8 x))
 (defun cl-tenth (x) (nth 9 x))
-;; cl-lib sequence functions with :test / :key / :count keyword args.
-(defun cl--getkey (keys kw default)
-  (let ((m (plist-member keys kw))) (if m (car (cdr m)) default)))
-(defun cl--like (lst seq)
-  ;; Coerce a result list back to SEQ's type (string / vector / list).
-  (cond ((stringp seq) (apply (function string) lst))
-        ((vectorp seq) (vconcat lst))
-        (t lst)))
-;; cl-seq.el: with NO keywords at all, `cl-member' IS `memql' — the lisp walk
-;; below only runs for the keyword path. That is not a shortcut, it is the
-;; contract, because `memql' walks the list in C and `CHECK_LIST_END' names the
-;; WHOLE list in its error data: `(cl-member 1 (quote (2 . 3)))' is
-;; `(wrong-type-argument listp (2 . 3))', where the walk stopped on the non-nil
-;; tail and reported `3'. `cl-set-difference' and `cl--adjoin' route a numeric
-;; element's comparison through here, so they reported the tail too.
-(defun cl-member (item lst &rest keys)
-  (if keys
-      (let ((match (cl--test-fn keys))
-            (key (cl--getkey keys :key 'identity)) (r nil))
-        (while (and lst (not r))
-          (if (funcall match item (funcall key (car lst)))
-              (setq r lst) (setq lst (cdr lst))))
-        r)
-    (memql item lst)))
-(defun cl-assoc (item alist &rest keys)
-  (let ((match (cl--test-fn keys))
-        (key (cl--getkey keys :key 'identity)) (r nil))
-    (while (and alist (not r))
-      (let ((pair (car alist)))
-        (if (and (consp pair) (funcall match item (funcall key (car pair))))
-            (setq r pair) (setq alist (cdr alist)))))
-    r))
-(defun cl-member-if (pred lst &rest keys)
-  (let ((key (cl--getkey keys :key 'identity)) (r nil))
-    (while (and lst (not r))
-      (if (cl--if-test pred (funcall key (car lst))) (setq r lst) (setq lst (cdr lst))))
-    r))
-(defun cl-member-if-not (pred lst &rest keys)
-  (if pred (apply 'cl-member-if (lambda (x) (not (funcall pred x))) lst keys)
-    (apply 'cl-member-if nil lst keys)))
-(defun cl-assoc-if (pred alist &rest keys)
-  (let ((key (cl--getkey keys :key 'identity)) (r nil))
-    (while (and alist (not r))
-      (let ((pair (car alist)))
-        (if (and (consp pair) (cl--if-test pred (funcall key (car pair))))
-            (setq r pair) (setq alist (cdr alist)))))
-    r))
-(defun cl-assoc-if-not (pred alist &rest keys)
-  (if pred (apply 'cl-assoc-if (lambda (x) (not (funcall pred x))) alist keys)
-    (apply 'cl-assoc-if nil alist keys)))
-(defun cl-rassoc (item alist &rest keys)
-  (let ((match (cl--test-fn keys))
-        (key (cl--getkey keys :key 'identity)) (r nil))
-    (while (and alist (not r))
-      (let ((pair (car alist)))
-        (if (and (consp pair) (funcall match item (funcall key (cdr pair))))
-            (setq r pair) (setq alist (cdr alist)))))
-    r))
-(defun cl-rassoc-if (pred alist &rest keys)
-  (let ((key (cl--getkey keys :key 'identity)) (r nil))
-    (while (and alist (not r))
-      (let ((pair (car alist)))
-        (if (and (consp pair) (cl--if-test pred (funcall key (cdr pair))))
-            (setq r pair) (setq alist (cdr alist)))))
-    r))
-(defun cl-rassoc-if-not (pred alist &rest keys)
-  (if pred (apply 'cl-rassoc-if (lambda (x) (not (funcall pred x))) alist keys)
-    (apply 'cl-rassoc-if nil alist keys)))
-;; Ascending list of indices in LST to act on: those within [START,END) for
-;; which (funcall matchp ELT) is non-nil, limited to COUNT taken from the front,
-;; or from the back when FROM-END is non-nil.
-(defun cl--act-indices (matchp lst start end count from-end)
-  (let ((hits nil) (i 0))
-    (dolist (x lst)
-      (when (and (cl--in-bounds i start end) (funcall matchp x)) (setq hits (cons i hits)))
-      (setq i (1+ i)))
-    (setq hits (nreverse hits))
-    (if (null count) hits
-      (if from-end (nthcdr (max 0 (- (length hits) count)) hits) (take count hits)))))
-;; Rebuild SEQ dropping the elements whose index is selected by cl--act-indices.
-(defun cl--remove-by (matchp seq start end count from-end)
-  (let ((lst (append seq nil)) (acts nil) (out nil) (i 0))
-    (setq acts (cl--act-indices matchp lst start end count from-end))
-    (dolist (x lst)
-      (unless (memql i acts) (setq out (cons x out)))
-      (setq i (1+ i)))
-    (cl--like (nreverse out) seq)))
-;; Rebuild SEQ replacing the selected elements with NEW (others unchanged).
-(defun cl--subst-by (matchp new seq start end count from-end)
-  (let ((lst (append seq nil)) (acts nil) (out nil) (i 0))
-    (setq acts (cl--act-indices matchp lst start end count from-end))
-    (dolist (x lst)
-      (setq out (cons (if (memql i acts) new x) out))
-      (setq i (1+ i)))
-    (cl--like (nreverse out) seq)))
-(defun cl-remove (item seq &rest keys)
-  ;; :test/:test-not/:key/:count/:start/:end/:from-end (cl-seq.el semantics).
-  (let ((match (cl--test-fn keys))
-        (key (cl--getkey keys :key 'identity)) (count (cl--getkey keys :count nil))
-        (from-end (cl--getkey keys :from-end nil))
-        (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil)))
-    (cl--remove-by (lambda (x) (funcall match item (funcall key x)))
-                   seq start end count from-end)))
-(defun cl-delete (item seq &rest keys) (apply (function cl-remove) item seq keys))
-(defun cl-substitute (new old seq &rest keys)
-  (let ((match (cl--test-fn keys))
-        (key (cl--getkey keys :key 'identity)) (count (cl--getkey keys :count nil))
-        (from-end (cl--getkey keys :from-end nil))
-        (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil)))
-    (cl--subst-by (lambda (x) (funcall match old (funcall key x)))
-                  new seq start end count from-end)))
-(defun cl-substitute-if (new pred seq &rest keys)
-  (let ((key (cl--getkey keys :key 'identity)) (count (cl--getkey keys :count nil))
-        (from-end (cl--getkey keys :from-end nil))
-        (start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil)))
-    (cl--subst-by (lambda (x) (cl--if-test pred (funcall key x)))
-                  new seq start end count from-end)))
-(defun cl-substitute-if-not (new pred seq &rest keys)
-  (if pred (apply 'cl-substitute-if new (lambda (x) (not (funcall pred x))) seq keys)
-    (apply 'cl-substitute-if new nil seq keys)))
-;; Destructive substitution: elisprs rebuilds the sequence, so these match the
-;; non-destructive forms (the return value is what callers rely on).
-(defun cl-nsubstitute (new old seq &rest keys) (apply 'cl-substitute new old seq keys))
-(defun cl-nsubstitute-if (new pred seq &rest keys) (apply 'cl-substitute-if new pred seq keys))
-(defun cl-nsubstitute-if-not (new pred seq &rest keys)
-  (apply 'cl-substitute-if-not new pred seq keys))
-(defun cl-fill (seq item &rest keys)
-  "Fill the elements of SEQ with ITEM, destructively; keywords :start :end.
-Port of cl-fill from cl-seq.el (mutates SEQ in place, returns SEQ)."
-  (let ((start (cl--getkey keys :start 0)) (end (cl--getkey keys :end nil)))
-    (if (listp seq)
-        (let ((p (nthcdr start seq)) (n (and end (- end start))))
-          (while (and p (or (null n) (>= (cl-decf n) 0)))
-            (setcar p item)
-            (setq p (cdr p))))
-      (or end (setq end (length seq)))
-      (if (and (= start 0) (= end (length seq)))
-          (fillarray seq item)
-        (while (< start end)
-          (aset seq start item)
-          (setq start (1+ start)))))
-    seq))
-(defun cl-replace (seq1 seq2 &rest keys)
-  "Replace the elements of SEQ1 with those of SEQ2, destructively; returns SEQ1.
-Port of cl-replace from cl-seq.el; keywords :start1 :end1 :start2 :end2."
-  (if (stringp seq1)
-      ;; Immutable-string model: return a fresh modified string. The return value
-      ;; is faithful to emacs cl-replace; in-place string aliasing is unsupported.
-      (let* ((start1 (cl--getkey keys :start1 0)) (end1 (cl--getkey keys :end1 nil))
-             (start2 (cl--getkey keys :start2 0)) (end2 (cl--getkey keys :end2 nil))
-             (l1 (append seq1 nil)) (l2 (append seq2 nil))
-             (e1 (min (or end1 (length l1)) (length l1)))
-             (e2 (min (or end2 (length l2)) (length l2)))
-             (p1 (nthcdr start1 l1)) (p2 (nthcdr start2 l2)))
-        (while (and p1 p2 (< start1 e1) (< start2 e2))
-          (setcar p1 (car p2))
-          (setq p1 (cdr p1) p2 (cdr p2) start1 (1+ start1) start2 (1+ start2)))
-        (apply #'string l1))
-    (let ((start1 (cl--getkey keys :start1 0)) (end1 (cl--getkey keys :end1 nil))
-        (start2 (cl--getkey keys :start2 0)) (end2 (cl--getkey keys :end2 nil)))
-    (if (and (eq seq1 seq2) (<= start2 start1))
-        (or (= start1 start2)
-            (let* ((len (length seq1))
-                   (n (min (- (or end1 len) start1) (- (or end2 len) start2))))
-              (while (>= (setq n (1- n)) 0)
-                (if (listp seq1)
-                    (setcar (nthcdr (+ start1 n) seq1) (elt seq2 (+ start2 n)))
-                  (aset seq1 (+ start1 n) (elt seq2 (+ start2 n)))))))
-      (if (listp seq1)
-          (let ((p1 (nthcdr start1 seq1)) (n1 (and end1 (- end1 start1))))
-            (if (listp seq2)
-                (let ((p2 (nthcdr start2 seq2))
-                      (n (cond ((and n1 end2) (min n1 (- end2 start2)))
-                               ((and n1 (null end2)) n1)
-                               ((and (null n1) end2) (- end2 start2)))))
-                  (while (and p1 p2 (or (null n) (>= (cl-decf n) 0)))
-                    (setcar p1 (car p2))
-                    (setq p1 (cdr p1) p2 (cdr p2))))
-              (setq end2 (if (null n1)
-                             (or end2 (length seq2))
-                           (min (or end2 (length seq2)) (+ start2 n1))))
-              (while (and p1 (< start2 end2))
-                (setcar p1 (aref seq2 start2))
-                (setq p1 (cdr p1) start2 (1+ start2)))))
-        (setq end1 (min (or end1 (length seq1))
-                        (+ start1 (- (or end2 (length seq2)) start2))))
-        (if (listp seq2)
-            (let ((p2 (nthcdr start2 seq2)))
-              (while (< start1 end1)
-                (aset seq1 start1 (car p2))
-                (setq p2 (cdr p2) start1 (1+ start1))))
-          (while (< start1 end1)
-            (aset seq1 start1 (aref seq2 start2))
-            (setq start2 (1+ start2) start1 (1+ start1))))))
-    seq1)))
 (defun cl-mapcan (fn &rest seqs) (apply 'nconc (apply 'cl-mapcar fn seqs)))
 (defun cl-acons (key val alist) (cons (cons key val) alist))
 (defun cl-list* (&rest args)
@@ -5930,375 +5369,6 @@ PAREN controls the surrounding group: a string is used as the opening bracket,
   (let ((var (car (car binding))) (val (car (cdr (car binding)))))
     `(let ((,var ,val)) (while ,var ,@body (setq ,var ,val)))))
 
-(defmacro cl-case (expr &rest clauses)
-  `(let ((--cl-case-v-- ,expr))
-     (cond ,@(mapcar
-              (lambda (clause)
-                (let ((key (car clause)) (body (cdr clause)))
-                  (cond ((memq key '(t otherwise)) (cons t body))
-                        ((listp key) (cons (list 'memq '--cl-case-v-- (list 'quote key)) body))
-                        (t (cons (list 'eql '--cl-case-v-- (list 'quote key)) body)))))
-              clauses))))
-;; ---- cl-loop (common subset) ----
-;; Supported: `for V from A to/below/downto/above B [by S]`, `for V in LIST`,
-;; `for V on LIST`, `repeat N`, `while`/`until COND`; accumulation `collect`,
-;; `append`, `nconc`, `sum`, `count`, `maximize`, `minimize`; side effects `do
-;; FORMS`; and `finally [return EXPR | do FORMS]` / `return EXPR`. Not supported
-;; yet: parallel `for` clauses, `across`, `with`, `into`, `when`/`unless`/`if`
-;; conditionals, destructuring.
-(defun cl-loop--kw (x) (and (symbolp x) (symbol-name x)))
-(defun cl-loop--hash-pairs (h)
-  "The (KEY . VALUE) pairs of hash table H, in the table's own slot order.
-Built with `maphash' rather than `hash-table-keys' so it depends only on a
-subr, and so the order is the one `maphash' walks -- which is the order Emacs
-reports and the one a hash table's slots are observable in."
-  (let ((acc nil))
-    (maphash (lambda (k v) (setq acc (cons (cons k v) acc))) h)
-    (nreverse acc)))
-(defun cl-loop--clause-p (x)
-  (member (cl-loop--kw x)
-          '("for" "as" "repeat" "while" "until" "with" "collect" "collecting"
-            "append" "appending" "nconc" "nconcing" "sum" "summing" "count"
-            "counting" "maximize" "maximizing" "minimize" "minimizing" "do"
-            "doing" "finally" "return" "when" "unless" "if" "else" "end"
-            "always" "never" "thereis" "and" "into")))
-;; True when X names a clause `cl-loop--accum' can parse (accumulators + do/return).
-(defun cl-loop--accum-kw-p (x)
-  (member (cl-loop--kw x)
-          '("collect" "collecting" "append" "appending" "nconc" "nconcing"
-            "sum" "summing" "count" "counting" "maximize" "maximizing"
-            "minimize" "minimizing" "vconcat" "vconcating" "concat" "concating"
-            "do" "doing" "return")))
-;; Parse ONE accumulation or `do' clause at C. Return (FORM REST KIND VAR INIT):
-;; FORM targets VAR (or `--clacc--' when VAR is nil), KIND is the accumulator
-;; kind (nil for `do'), INIT its initial value.
-(defun cl-loop--accum (c)
-  (let* ((kw (cl-loop--kw (car c))) (expr (nth 1 c)) (rr (nthcdr 2 c))
-         (var nil) (kind nil) (init nil) (form nil))
-    (cond
-     ((member kw '("collect" "collecting" "append" "appending" "nconc" "nconcing"))
-      (when (equal (cl-loop--kw (car rr)) "into") (setq var (nth 1 rr) rr (nthcdr 2 rr)))
-      (setq kind 'list)
-      (let ((tgt (or var '--clacc--)))
-        (setq form (cond ((member kw '("collect" "collecting")) (list 'setq tgt (list 'nconc tgt (list 'list expr))))
-                         ((member kw '("append" "appending")) (list 'setq tgt (list 'append tgt expr)))
-                         (t (list 'setq tgt (list 'nconc tgt expr)))))))
-     ((member kw '("sum" "summing" "count" "counting"))
-      (when (equal (cl-loop--kw (car rr)) "into") (setq var (nth 1 rr) rr (nthcdr 2 rr)))
-      (setq kind 'num init 0)
-      (let ((tgt (or var '--clacc--)) (d (if (member kw '("count" "counting")) (list 'if expr 1 0) expr)))
-        (setq form (list 'setq tgt (list '+ tgt d)))))
-     ((member kw '("maximize" "maximizing" "minimize" "minimizing"))
-      (when (equal (cl-loop--kw (car rr)) "into") (setq var (nth 1 rr) rr (nthcdr 2 rr)))
-      (setq kind 'ext)
-      (let ((tgt (or var '--clacc--)) (fn (if (member kw '("maximize" "maximizing")) 'max 'min)))
-        (setq form (list 'setq tgt (list 'if tgt (list fn tgt expr) expr)))))
-     ((member kw '("vconcat" "vconcating" "concat" "concating"))
-      (when (equal (cl-loop--kw (car rr)) "into") (setq var (nth 1 rr) rr (nthcdr 2 rr)))
-      (let ((tgt (or var '--clacc--)))
-        (if (member kw '("concat" "concating"))
-            (setq kind 'str init "" form (list 'setq tgt (list 'concat tgt expr)))
-          (setq kind 'vec init [] form (list 'setq tgt (list 'vconcat tgt expr))))))
-     ((member kw '("do" "doing"))
-      (let ((forms nil) (r (cdr c)))
-        (while (and r (not (cl-loop--clause-p (car r)))) (setq forms (cons (car r) forms) r (cdr r)))
-        (setq form (cons 'progn (reverse forms)) rr r)))
-     ((equal kw "return")
-      (setq form (list 'throw (list 'quote '--cl-loop--) expr) rr (nthcdr 2 c)))
-     (t (error "cl-loop: expected an accumulation clause, got %S" (car c))))
-    (list form rr kind var init)))
-(defmacro cl-loop (&rest clauses)
-  (let ((binds nil) (test t) (pre nil) (steps nil) (body nil)
-        (acc-kind nil) (bool-result nil) (finally nil) (initial nil) (loop-name nil) (c clauses))
-    (while c
-      (let ((kw (cl-loop--kw (car c))))
-        (cond
-         ;; named NAME — wrap the loop in `(cl-block NAME …)` so `cl-return-from
-         ;; NAME` can exit it (Emacs names the implicit block with this name).
-         ((equal kw "named") (setq loop-name (nth 1 c) c (nthcdr 2 c)))
-         ;; `and' joins the next clause into the SAME iteration step. When it
-         ;; joins an accumulation / conditional / do clause, drop `and' and let
-         ;; that clause parse normally (its body already runs each pass). When it
-         ;; joins a binding clause the leading `for' is omitted, so re-insert it.
-         ((equal kw "and")
-          (if (member (cl-loop--kw (nth 1 c))
-                      '("collect" "collecting" "append" "appending" "nconc" "nconcing"
-                        "sum" "summing" "count" "counting" "maximize" "maximizing"
-                        "minimize" "minimizing" "vconcat" "vconcating" "concat" "concating"
-                        "do" "doing" "when" "unless" "if" "return"))
-              (setq c (cdr c))
-            (setq c (cons 'for (cdr c)))))
-         ;; for V across SEQ — iterate the elements of a string/vector/list.
-         ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "across"))
-          (let ((var (nth 1 c)) (tv (make-symbol "tail")))
-            (setq binds (cons (list tv (list 'append (nth 3 c) nil)) (cons (list var nil) binds)))
-            (setq test (if (eq test t) tv (list 'and test tv)))
-            (setq pre (cons (list 'setq var (list 'car tv)) pre))
-            (setq steps (cons (list 'setq tv (list 'cdr tv)) steps))
-            (setq c (nthcdr 4 c))))
-         ;; for V being [the|each] KIND of SOURCE  (elements / hash-keys / hash-values)
-         ;; (`cl-loop--hash-pairs' is defined below, next to the other helpers.)
-         ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "being"))
-          (let ((var (nth 1 c)) (tv (make-symbol "tail")) (ht (make-symbol "ht")) (r (nthcdr 3 c)))
-            (when (member (cl-loop--kw (car r)) '("the" "each")) (setq r (cdr r)))
-            (let ((kind (cl-loop--kw (car r))))
-              (setq r (cdr r))
-              (when (member (cl-loop--kw (car r)) '("of" "in")) (setq r (cdr r)))
-              (let* ((source (car r))
-                     (hashp (member kind '("hash-keys" "hash-key" "hash-values" "hash-value")))
-                     (keysp (member kind '("hash-keys" "hash-key")))
-                     ;; Walk (KEY . VALUE) PAIRS, whichever of the two is the
-                     ;; loop variable: `using (hash-keys K)' on a value
-                     ;; iteration has to reach the key, and a key cannot be
-                     ;; recovered from a value the way `gethash' recovers a
-                     ;; value from a key.
-                     (listform (cond (hashp (list 'cl-loop--hash-pairs ht))
-                                     (t (list 'append source nil))))
-                     (usevar nil) (usekind nil))
-                (setq r (cdr r))
-                ;; using (hash-values V) / (hash-keys V): bind the companion var.
-                (when (equal (cl-loop--kw (car r)) "using")
-                  (let ((u (nth 1 r))) (setq usekind (cl-loop--kw (car u)) usevar (nth 1 u)))
-                  (setq r (nthcdr 2 r)))
-                (when hashp (setq binds (cons (list ht source) binds)))
-                (setq binds (cons (list tv listform) (cons (list var nil) binds)))
-                (when usevar
-                  (setq binds (cons (list usevar (if (equal usekind "index") 0 nil)) binds)))
-                (setq test (if (eq test t) tv (list 'and test tv)))
-                (setq pre
-                      (cons (list 'setq var
-                                  (cond ((not hashp) (list 'car tv))
-                                        (keysp (list 'car (list 'car tv)))
-                                        (t (list 'cdr (list 'car tv)))))
-                            pre))
-                ;; companion: the OTHER half of the pair, in either direction.
-                (when (and usevar hashp)
-                  (cond
-                   ((and keysp (member usekind '("hash-values" "hash-value")))
-                    (setq pre (cons (list 'setq usevar (list 'cdr (list 'car tv))) pre)))
-                   ((and (not keysp) (member usekind '("hash-keys" "hash-key")))
-                    (setq pre (cons (list 'setq usevar (list 'car (list 'car tv))) pre)))))
-                ;; using (index V): V counts iterations from 0.
-                (when (and usevar (equal usekind "index"))
-                  (setq steps (cons (list 'setq usevar (list '1+ usevar)) steps)))
-                (setq steps (cons (list 'setq tv (list 'cdr tv)) steps))
-                (setq c r)))))
-         ;; for V = INIT [then STEP] -- cl-macs.el sets V at the top of every
-         ;; iteration, in clause order with the other `for' clauses (so INIT can
-         ;; read a variable an earlier `for ... in' just stepped): to INIT on the
-         ;; first pass and STEP after it, or to INIT every pass without `then'.
-         ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "="))
-          (let ((var (nth 1 c)) (initv (nth 3 c)) (r (nthcdr 4 c)))
-            (setq binds (cons (list var nil) binds))
-            (if (equal (cl-loop--kw (car r)) "then")
-                (let ((first (make-symbol "--cl-var--")))
-                  (setq binds (cons (list first t) binds))
-                  (setq pre (cons (list 'setq var (list 'if first initv (nth 1 r))) pre))
-                  (setq steps (cons (list 'setq first nil) steps))
-                  (setq r (nthcdr 2 r)))
-              (setq pre (cons (list 'setq var initv) pre)))
-            (setq c r)))
-         ;; for V [from A] [to/below/downto/above B] [by S]  (from defaults to 0)
-         ((and (member kw '("for" "as"))
-               (member (cl-loop--kw (nth 2 c))
-                       '("from" "upfrom" "downfrom" "to" "upto" "below" "downto" "above")))
-          (let* ((var (nth 1 c)) (has-from (member (cl-loop--kw (nth 2 c)) '("from" "upfrom" "downfrom")))
-                 (sub (if has-from (cl-loop--kw (nth 2 c)) "from"))
-                 (start (if has-from (nth 3 c) 0)) (r (if has-from (nthcdr 4 c) (nthcdr 2 c)))
-                 (limk nil) (lim nil) (step 1) (down nil))
-            (while (member (cl-loop--kw (car r))
-                           '("to" "upto" "below" "downto" "above" "by"))
-              (if (equal (cl-loop--kw (car r)) "by")
-                  (setq step (nth 1 r) r (nthcdr 2 r))
-                (setq limk (cl-loop--kw (car r)) lim (nth 1 r) r (nthcdr 2 r))))
-            ;; Count down for `downfrom', or when the limit is `downto'/`above'.
-            (setq down (or (equal sub "downfrom") (member limk '("downto" "above"))))
-            (setq binds (cons (list var start) binds))
-            (when limk
-              ;; `to' takes its direction from the iteration, so `downfrom 3 to 1'
-              ;; terminates at `(>= var 1)'. Testing `(<= 3 1)' made the loop body
-              ;; never run and the whole form answer nil. `upto'/`below' are
-              ;; explicitly upward and `downto'/`above' explicitly downward, so only
-              ;; the neutral `to' consults DOWN.
-              (let ((cnd (cond ((equal limk "to") (if down (list '>= var lim) (list '<= var lim)))
-                               ((equal limk "upto") (list '<= var lim))
-                               ((equal limk "below") (list '< var lim))
-                               ((equal limk "downto") (list '>= var lim))
-                               ((equal limk "above") (list '> var lim)))))
-                (setq test (if (eq test t) cnd (list 'and test cnd)))))
-            (setq steps (cons (list 'setq var (list (if down '- '+) var step)) steps))
-            (setq c r)))
-         ;; for (A B ...) in LIST  — destructure each element
-         ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "in")
-               (consp (nth 1 c)))
-          (let* ((pat (nth 1 c)) (tv (make-symbol "tail")) (ev (make-symbol "el"))
-                 (dbs (cl-db--binds pat ev)) (setqs nil) (r (nthcdr 4 c)) (stepfn nil))
-            (when (equal (cl-loop--kw (car r)) "by")
-              (setq stepfn (nth 1 r) r (nthcdr 2 r)))
-            (setq binds (cons (list tv (nth 3 c)) (cons (list ev nil) binds)))
-            (dolist (b dbs) (setq binds (cons (list (car b) nil) binds)))
-            (setq test (if (eq test t) tv (list 'and test tv)))
-            (setq setqs (cons (list 'setq ev (list 'car tv)) nil))
-            (dolist (b dbs) (setq setqs (cons (list 'setq (car b) (car (cdr b))) setqs)))
-            (setq pre (cons (cons 'progn (reverse setqs)) pre))
-            (setq steps (cons (list 'setq tv (if stepfn (list 'funcall stepfn tv) (list 'cdr tv))) steps))
-            (setq c r)))
-         ;; for V in LIST [by STEP-FN]
-         ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "in"))
-          (let ((var (nth 1 c)) (tv (make-symbol "tail")) (r (nthcdr 4 c)) (stepfn nil))
-            (when (equal (cl-loop--kw (car r)) "by")
-              (setq stepfn (nth 1 r) r (nthcdr 2 r)))
-            (setq binds (cons (list tv (nth 3 c)) (cons (list var nil) binds)))
-            (setq test (if (eq test t) tv (list 'and test tv)))
-            (setq pre (cons (list 'setq var (list 'car tv)) pre))
-            (setq steps (cons (list 'setq tv (if stepfn (list 'funcall stepfn tv) (list 'cdr tv))) steps))
-            (setq c r)))
-         ;; for V on LIST
-         ((and (member kw '("for" "as")) (equal (cl-loop--kw (nth 2 c)) "on"))
-          (let ((pat (nth 1 c)) (r (nthcdr 4 c)) (stepfn nil))
-            (when (equal (cl-loop--kw (car r)) "by")
-              (setq stepfn (nth 1 r) r (nthcdr 2 r)))
-            (if (consp pat)
-                ;; Destructure the current tail's leading elements each iteration.
-                (let* ((tv (make-symbol "tail")) (dbs (cl-db--binds pat tv)) (setqs nil))
-                  (setq binds (cons (list tv (nth 3 c)) binds))
-                  (dolist (b dbs) (setq binds (cons (list (car b) nil) binds)))
-                  (setq test (if (eq test t) tv (list 'and test tv)))
-                  (dolist (b dbs) (setq setqs (cons (list 'setq (car b) (car (cdr b))) setqs)))
-                  (setq pre (cons (cons 'progn (reverse setqs)) pre))
-                  (setq steps (cons (list 'setq tv (if stepfn (list 'funcall stepfn tv) (list 'cdr tv))) steps)))
-              (setq binds (cons (list pat (nth 3 c)) binds))
-              (setq test (if (eq test t) pat (list 'and test pat)))
-              (setq steps (cons (list 'setq pat (if stepfn (list 'funcall stepfn pat) (list 'cdr pat))) steps)))
-            (setq c r)))
-         ;; repeat N
-         ((equal kw "repeat")
-          (let ((rv (make-symbol "n")))
-            (setq binds (cons (list rv (nth 1 c)) binds))
-            (let ((cnd (list '> rv 0)))
-              (setq test (if (eq test t) cnd (list 'and test cnd))))
-            (setq steps (cons (list 'setq rv (list '1- rv)) steps))
-            (setq c (nthcdr 2 c))))
-         ;; while/until terminate the loop AT THE POINT THEY APPEAR, not at the top
-         ;; of the next iteration. Folding them into TEST (which runs before the
-         ;; `for' clause has stepped its variable) tested the PREVIOUS iteration's
-         ;; value — and on the very first pass the variable is still nil, so
-         ;; `(cl-loop for i in '(1 2 3) while (< i 3) collect i)' signalled
-         ;; `wrong-type-argument number-or-marker-p nil' instead of answering (1 2).
-         ;;
-         ;; They go into `pre' instead, in clause order, so they see the value the
-         ;; preceding `for' just installed. The exit throws to the inner
-         ;; `--cl-loop-end--' tag rather than the outer `--cl-loop--' one because a
-         ;; while/until exit is a NORMAL termination: `finally' and the accumulator
-         ;; result still have to be produced (Emacs answers (:fin) for
-         ;; `... while (< i 3) collect i finally return (list :fin)').
-         ((member kw '("while" "until"))
-          (let ((cnd (if (equal kw "while") (nth 1 c) (list 'not (nth 1 c)))))
-            (setq pre (cons (list 'unless cnd (list 'throw ''--cl-loop-end-- nil)) pre)))
-          (setq c (nthcdr 2 c)))
-         ;; with VAR = VAL [and VAR2 = VAL2 ...]
-         ((equal kw "with")
-          (let ((r (cdr c)) (more t))
-            (while more
-              (let ((wv (car r)))
-                (if (equal (cl-loop--kw (nth 1 r)) "=")
-                    (setq binds (cons (list wv (nth 2 r)) binds) r (nthcdr 3 r))
-                  (setq binds (cons (list wv nil) binds) r (cdr r)))
-                (if (equal (cl-loop--kw (car r)) "and") (setq r (cdr r)) (setq more nil))))
-            (setq c r)))
-         ;; when/unless/if COND <accum> [and <accum>...] [else <accum> [and ...]] [end]
-         ;; `and'-joined accumulators all share the branch condition (emacs 30.2:
-         ;; `when C collect X and collect Y' gates BOTH collects on C).
-         ((member kw '("when" "unless" "if"))
-          (let* ((cnd (nth 1 c)) (r (nthcdr 2 c)) (neg (equal kw "unless"))
-                 (a (cl-loop--accum r)) (cforms (list (nth 0 a))) (aforms nil))
-            (setq r (nth 1 a))
-            (if (nth 3 a) (setq binds (cons (list (nth 3 a) (nth 4 a)) binds))
-              (when (nth 2 a) (setq acc-kind (nth 2 a))))
-            (while (and (equal (cl-loop--kw (car r)) "and") (cl-loop--accum-kw-p (nth 1 r)))
-              (let ((a2 (cl-loop--accum (cdr r))))
-                (setq cforms (cons (nth 0 a2) cforms) r (nth 1 a2))
-                (if (nth 3 a2) (setq binds (cons (list (nth 3 a2) (nth 4 a2)) binds))
-                  (when (nth 2 a2) (setq acc-kind (nth 2 a2))))))
-            (when (equal (cl-loop--kw (car r)) "else")
-              (let ((b (cl-loop--accum (cdr r))))
-                (setq aforms (list (nth 0 b)) r (nth 1 b))
-                (if (nth 3 b) (setq binds (cons (list (nth 3 b) (nth 4 b)) binds))
-                  (when (nth 2 b) (setq acc-kind (nth 2 b))))
-                (while (and (equal (cl-loop--kw (car r)) "and") (cl-loop--accum-kw-p (nth 1 r)))
-                  (let ((b2 (cl-loop--accum (cdr r))))
-                    (setq aforms (cons (nth 0 b2) aforms) r (nth 1 b2))
-                    (if (nth 3 b2) (setq binds (cons (list (nth 3 b2) (nth 4 b2)) binds))
-                      (when (nth 2 b2) (setq acc-kind (nth 2 b2))))))))
-            (when (equal (cl-loop--kw (car r)) "end") (setq r (cdr r)))
-            (let ((cform (if (cdr cforms) (cons 'progn (reverse cforms)) (car cforms)))
-                  (aform (cond ((null aforms) nil)
-                               ((cdr aforms) (cons 'progn (reverse aforms)))
-                               (t (car aforms)))))
-              (setq body (cons (if neg (list 'if cnd aform cform) (list 'if cnd cform aform)) body)))
-            (setq c r)))
-         ;; boolean termination clauses
-         ((equal kw "always")
-          (setq bool-result t)
-          (setq body (cons (list 'unless (nth 1 c) (list 'throw ''--cl-loop-- nil)) body))
-          (setq c (nthcdr 2 c)))
-         ((equal kw "never")
-          (setq bool-result t)
-          (setq body (cons (list 'when (nth 1 c) (list 'throw ''--cl-loop-- nil)) body))
-          (setq c (nthcdr 2 c)))
-         ((equal kw "thereis")
-          (let ((tv (make-symbol "v")))
-            (setq body (cons (list 'let (list (list tv (nth 1 c)))
-                                   (list 'when tv (list 'throw ''--cl-loop-- tv))) body)))
-          (setq c (nthcdr 2 c)))
-         ;; direct accumulation / do
-         ((member kw '("collect" "collecting" "append" "appending" "nconc" "nconcing"
-                       "sum" "summing" "count" "counting" "maximize" "maximizing"
-                       "minimize" "minimizing" "vconcat" "vconcating" "concat" "concating"
-                       "do" "doing"))
-          (let ((a (cl-loop--accum c)))
-            (if (nth 3 a) (setq binds (cons (list (nth 3 a) (nth 4 a)) binds))
-              (when (nth 2 a) (setq acc-kind (nth 2 a))))
-            (setq body (cons (nth 0 a) body))
-            (setq c (nth 1 a))))
-         ((equal kw "return")
-          (setq body (cons (list 'throw ''--cl-loop-- (nth 1 c)) body))
-          (setq c (nthcdr 2 c)))
-         ((equal kw "initially")
-          (setq c (cdr c))
-          (when (member (cl-loop--kw (car c)) '("do" "doing")) (setq c (cdr c)))
-          (let ((fs nil))
-            (while (and c (not (cl-loop--clause-p (car c)))) (setq fs (cons (car c) fs)) (setq c (cdr c)))
-            (setq initial (append initial (reverse fs)))))
-         ((equal kw "finally")
-          (setq c (cdr c))
-          (if (equal (cl-loop--kw (car c)) "return")
-              (progn (setq finally (list (nth 1 c))) (setq c (nthcdr 2 c)))
-            (when (member (cl-loop--kw (car c)) '("do" "doing")) (setq c (cdr c)))
-            (let ((fs nil))
-              (while (and c (not (cl-loop--clause-p (car c)))) (setq fs (cons (car c) fs)) (setq c (cdr c)))
-              (setq finally (reverse fs)))))
-         (t (error "cl-loop: unsupported clause %S" (car c))))))
-    (let ((init (cond ((eq acc-kind 'num) 0) ((eq acc-kind 'str) "") ((eq acc-kind 'vec) []) (t nil)))
-          (result (cond (finally (cons 'progn finally))
-                        (acc-kind '--clacc--)
-                        (bool-result t)
-                        (t nil))))
-      ;; Wrap in `(cl-block NAME …)` (NAME defaults to nil) so `cl-return`/
-      ;; `cl-return-from NAME` exit the loop.
-      `(cl-block ,loop-name
-         (let* (,@(reverse binds) (--clacc-- ,init))
-           ,@initial
-           ;; Two tags, two meanings: `--cl-loop--' is an ABNORMAL exit
-           ;; (return/always/never/thereis) whose thrown value IS the loop's value,
-           ;; so it skips RESULT; `--cl-loop-end--' is the NORMAL termination a
-           ;; while/until clause performs, so it lands just before RESULT and the
-           ;; accumulator / `finally' forms still run.
-           (catch '--cl-loop--
-             (catch '--cl-loop-end--
-               (while ,test ,@(reverse pre) ,@(reverse body) ,@(reverse steps)))
-             ,result))))))
-
 ;; cl-macs.el `cl-deftype': the expander is `(cl-function (lambda (&cl-defs
 ;; ('*) ,@ARGLIST) ...))', so an omitted &optional or &key argument defaults to
 ;; `*'; calling it with no arguments at definition time computes the atomic
@@ -6551,16 +5621,6 @@ reports and the one a hash table's slots are observable in."
      (list (list 'defun name '(&rest --args--)
                  (list 'cl--generic-dispatch (list 'quote name) '--args--))
            nil))))
-(defmacro cl-typecase (expr &rest clauses)
-  `(let ((--ct-v-- ,expr))
-     (cond ,@(mapcar
-              (lambda (clause)
-                (let ((type (car clause)) (body (cdr clause)))
-                  (if (memq type '(t otherwise))
-                      (cons t body)
-                    ;; Route through cl-typep so compound type specs work too.
-                    (cons (list 'cl-typep '--ct-v-- (list 'quote type)) body))))
-              clauses))))
 (defmacro cl-the (_type form) form)
 (defmacro cl-assert (form &optional _show-args string &rest args)
   ;; With a STRING, signal a plain `error' with the formatted message; otherwise
@@ -6578,26 +5638,6 @@ reports and the one a hash table's slots are observable in."
                                    (list ,(or string `',type) ,temp ',form)))
                        nil)))
     (if (eq temp form) body `(let ((,temp ,form)) ,body))))
-;; cl-macs.el (Emacs 31.1): the `cl--ecase-error-flag' clause reports the value
-;; and the keys `cl-case' collected -- a list KEYLIST is prepended whole, an
-;; atom pushed, and the result reversed -- or the types in clause order.
-(defun cl--ecase-keys (clauses)
-  (let ((head-list nil))
-    (dolist (c clauses)
-      (cond ((memq (car c) '(t otherwise)))
-            ((listp (car c)) (setq head-list (append (car c) head-list)))
-            (t (push (car c) head-list))))
-    (reverse head-list)))
-(defmacro cl-etypecase (expr &rest clauses)
-  (let ((temp (make-symbol "temp")))
-    `(let ((,temp ,expr))
-       (cl-typecase ,temp ,@clauses
-         (t (error "cl-etypecase failed: %s, %s" ,temp ',(mapcar #'car clauses)))))))
-(defmacro cl-ecase (expr &rest clauses)
-  (let ((temp (make-symbol "temp")))
-    `(let ((,temp ,expr))
-       (cl-case ,temp ,@clauses
-         (t (error "cl-ecase failed: %s, %s" ,temp ',(cl--ecase-keys clauses)))))))
 ;; (cl-do ((VAR INIT [STEP])...) (END RESULT...) BODY...): like CL `do', with
 ;; the steps computed from the previous iteration's values (parallel assignment).
 (defmacro cl-do (specs endclause &rest body)
@@ -7947,6 +6987,10 @@ When SECTION is \\='usage or \\='doc, return only that part."
         ((eq 'let* (car-safe exp))
          (append (list 'let* (append bindings (car (cdr exp)))) (cdr (cdr exp))))
         (t (list 'let* bindings exp))))
+;; The final test is `eql', where macroexp.el has `eq': a float is an immediate
+;; here with no object identity, so `(eq 1.5 1.5)' on the SAME value is nil and
+;; a copyable float EXP would be bound as a variable named `1.5'. `eql' answers
+;; the same for every other value (SYM is either EXP itself or a fresh symbol).
 (defmacro macroexp-let2 (test sym exp &rest body)
   (declare (indent 3))
   (let ((bodysym (make-symbol "body"))
@@ -7955,7 +6999,7 @@ When SECTION is \\='usage or \\='doc, return only that part."
             (,sym (if (funcall #',(or test 'macroexp-const-p) ,expsym)
                       ,expsym (make-symbol ,(symbol-name sym))))
             (,bodysym ,(macroexp-progn body)))
-       (if (eq ,sym ,expsym) ,bodysym
+       (if (eql ,sym ,expsym) ,bodysym
          (macroexp-let* (list (list ,sym ,expsym)) ,bodysym)))))
 ;; macroexp-small-p (macroexp.el:678): is EXP small enough to duplicate?  gv's
 ;; `if'/`cond' expanders consult it (after `lexical-binding') to decide between
@@ -14907,6 +13951,2190 @@ and if a matching region is found, place point at the start of the region."
     (setq predicate (lambda (val p-val)
                       (not (equal val p-val))))))
   (funcall predicate value prop-value))
+
+;; ---- cl-case / cl-typecase / cl-parse-integer / cl-list-length ----
+;; cl-macs.el and cl-extra.el (emacs-31.1), verbatim.
+(defmacro cl-case (expr &rest clauses)
+  "Eval EXPR and choose among clauses on that value.
+Each clause looks like (KEYLIST BODY...).  EXPR is evaluated and
+compared against each key in each KEYLIST; the corresponding BODY
+is evaluated.  If no clause succeeds, this macro returns nil.  A
+single non-nil atom may be used in place of a KEYLIST of one
+atom.  A KEYLIST of t or `otherwise' is allowed only in the final
+clause, and matches if no other keys match.  Key values are
+compared by `eql'.
+
+\(fn EXPR (KEYLIST BODY...)...)"
+  (declare (indent 1) (debug (form &rest (sexp body))))
+  (macroexp-let2 macroexp-copyable-p temp expr
+    (let* ((head-list nil)
+           (has-otherwise nil))
+      `(cond
+        ,@(mapcar
+           (lambda (c)
+             (cons (cond (has-otherwise
+                          (error "Misplaced t or `otherwise' clause"))
+                         ((memq (car c) '(t otherwise))
+                          (setq has-otherwise t)
+                          t)
+                         ((eq (car c) 'cl--ecase-error-flag)
+                          `(error "cl-ecase failed: %s, %s"
+                                  ,temp ',(reverse head-list)))
+                         ((null (car c))
+                          (macroexp-warn-and-return
+                           "Case nil will never match"
+                           nil 'suspicious))
+                         ((and (consp (car c)) (cdar c) (not (cddar c))
+                               (memq (caar c) '(quote function)))
+                          (macroexp-warn-and-return
+                           (format-message
+                            (concat "Case %s will match `%s'.  If "
+                                    "that's intended, write %s "
+                                    "instead.  Otherwise, don't "
+                                    "quote `%s'.")
+                            (car c) (caar c) (list (cadar c) (caar c))
+                            (cadar c))
+                           `(cl-member ,temp ',(car c)) 'suspicious))
+                         ((listp (car c))
+                          (setq head-list (append (car c) head-list))
+                          `(cl-member ,temp ',(car c)))
+                         (t
+                          (if (memq (car c) head-list)
+                              (error "Duplicate key in case: %s"
+                                     (car c)))
+                          (push (car c) head-list)
+                          `(eql ,temp ',(car c))))
+                   (or (cdr c) '(nil))))
+           clauses)))))
+
+(defmacro cl-ecase (expr &rest clauses)
+  "Like `cl-case', but error if no case fits.
+`otherwise'-clauses are not allowed.
+\n(fn EXPR (KEYLIST BODY...)...)"
+  (declare (indent 1) (debug cl-case))
+  `(cl-case ,expr ,@clauses (cl--ecase-error-flag)))
+
+(defmacro cl-typecase (expr &rest clauses)
+  "Eval EXPR and choose among clauses on that value.
+Each clause looks like (TYPE BODY...).  EXPR is evaluated and, if it
+satisfies TYPE, the corresponding BODY is evaluated.  If no clause succeeds,
+this macro returns nil.  A TYPE of t or `otherwise' is allowed only in the
+final clause, and matches if no other keys match.
+\n(fn EXPR (TYPE BODY...)...)"
+  (declare (indent 1)
+           (debug (form &rest ([&or cl-type-spec "otherwise"] body))))
+  (macroexp-let2 macroexp-copyable-p temp expr
+    (let* ((type-list nil))
+      (cons
+       'cond
+       (mapcar
+        (lambda (c)
+          (cons (cond ((eq (car c) 'otherwise) t)
+                      ((eq (car c) 'cl--ecase-error-flag)
+                       `(error "cl-etypecase failed: %s, %s"
+                               ,temp ',(reverse type-list)))
+                      (t
+                       (push (car c) type-list)
+                       `(cl-typep ,temp ',(car c))))
+                (or (cdr c) '(nil))))
+        clauses)))))
+
+(defmacro cl-etypecase (expr &rest clauses)
+  "Like `cl-typecase', but error if no case fits.
+`otherwise'-clauses are not allowed.
+\n(fn EXPR (TYPE BODY...)...)"
+  (declare (indent 1) (debug cl-typecase))
+  `(cl-typecase ,expr ,@clauses (cl--ecase-error-flag)))
+
+(defun cl-list-length (x)
+  "Return the length of list X.  Return nil if list is circular."
+  (declare (side-effect-free t))
+  (cl-check-type x list)
+  (condition-case nil
+      (length x)
+    (circular-list)))
+
+(cl-defun cl-parse-integer (string &key start end radix junk-allowed)
+  "Parse integer from the substring of STRING from START to END.
+STRING may be surrounded by whitespace chars (chars with syntax ` ').
+Other non-digit chars are considered junk.
+RADIX is an integer between 2 and 36, the default is 10.  Signal
+an error if the substring between START and END cannot be parsed
+as an integer unless JUNK-ALLOWED is non-nil."
+  (declare (side-effect-free t))
+  (cl-check-type string string)
+  (let* ((start (or start 0))
+	 (len	(length string))
+	 (end   (or end len))
+	 (radix (or radix 10)))
+    (or (<= start end len)
+	(error "Bad interval: [%d, %d)" start end))
+    (cl-flet ((skip-whitespace ()
+		(while (and (< start end)
+			    (= 32 (char-syntax (aref string start))))
+		  (setq start (1+ start)))))
+      (skip-whitespace)
+      (let ((sign (cl-case (and (< start end) (aref string start))
+                    (?+ (incf start) +1)
+                    (?- (incf start) -1)
+		    (t  +1)))
+	    digit sum)
+	(while (and (< start end)
+		    (setq digit (cl-digit-char-p (aref string start) radix)))
+	  (setq sum (+ (* (or sum 0) radix) digit)
+		start (1+ start)))
+	(skip-whitespace)
+	(cond ((and junk-allowed (null sum)) sum)
+	      (junk-allowed (* sign sum))
+	      ((or (/= start end) (null sum))
+	       (error "Not an integer string: `%s'" string))
+	      (t (* sign sum)))))))
+
+
+;; ---- cl-seq ----
+;; cl-seq.el (emacs-31.1), verbatim, with the two compiler macros its
+;; `declare' forms name (cl-macs.el).
+
+;; Keyword parsing.
+;; This is special-cased here so that we can compile
+;; this file independent from cl-macs.
+
+(defmacro cl--parsing-keywords (keywords other-keys &rest body)
+  (declare (indent 2) (debug (sexp sexp &rest form)))
+  `(let* ,(mapcar
+           (lambda (x)
+             (let* ((var (if (consp x) (car x) x))
+                    (mem `(car (cdr (memq ',var cl-keys)))))
+               (if (eq var :test-not)
+                   (setq mem `(and ,mem (setq cl-test ,mem) t)))
+               (if (eq var :if-not)
+                   (setq mem `(and ,mem (setq cl-if ,mem) t)))
+               (list (intern
+                      (format "cl-%s" (substring (symbol-name var) 1)))
+                     (if (consp x) `(or ,mem ,(cadr x)) mem))))
+           keywords)
+     ,@(append
+        (and (not (eq other-keys t))
+             `((let ((cl-keys-temp cl-keys))
+                 (while cl-keys-temp
+                   (or (memq (car cl-keys-temp)
+                             (quote ,(mapcar
+                                      (lambda (x)
+                                        (if (consp x)
+                                            (car x) x))
+                                      (append keywords other-keys))))
+                       (cadr (memq :allow-other-keys cl-keys))
+                       (error "Bad keyword argument %s"
+                              (car cl-keys-temp)))
+                   (setq cl-keys-temp (cddr cl-keys-temp))))))
+        body)))
+
+(defmacro cl--check-key (x)     ;Expects `cl-key' in context of generated code.
+  (declare (debug edebug-forms))
+  `(if cl-key (funcall cl-key ,x) ,x))
+
+(defmacro cl--check-test-nokey (item x) ;cl-test cl-if cl-test-not cl-if-not.
+  (declare (debug edebug-forms))
+  `(cond
+    (cl-test (eq (not (funcall cl-test ,item ,x))
+                 cl-test-not))
+    (cl-if (eq (not (funcall cl-if ,x)) cl-if-not))
+    (t (eql ,item ,x))))
+
+(defmacro cl--check-test (item x)       ;all of the above.
+  (declare (debug edebug-forms))
+  `(cl--check-test-nokey ,item (cl--check-key ,x)))
+
+(defmacro cl--check-match (x y)         ;cl-key cl-test cl-test-not
+  (declare (debug edebug-forms))
+  (setq x `(cl--check-key ,x) y `(cl--check-key ,y))
+  `(if cl-test
+       (eq (not (funcall cl-test ,x ,y)) cl-test-not)
+     (eql ,x ,y)))
+
+;; Yuck!  These vars are set/bound by cl--parsing-keywords to match :if :test
+;; and :key keyword args, and they are also accessed (sometimes) via dynamic
+;; scoping (and some of those accesses are from macro-expanded code).
+(defvar cl-test) (defvar cl-test-not)
+(defvar cl-if) (defvar cl-if-not)
+(defvar cl-key)
+
+;;;###autoload
+(defun cl-endp (x)
+  "Return true if X is the empty list; false if it is a cons.
+Signal an error if X is not a list."
+  (declare (side-effect-free t))
+  (cl-check-type x list)
+  (null x))
+
+;;;###autoload
+(defun cl-reduce (func seq &rest cl-keys)
+  "Reduce two-argument FUNCTION across SEQ.
+\nKeywords supported:  :start :end :from-end :initial-value :key
+
+Return the result of calling FUNCTION with the first and the
+second element of SEQ, then calling FUNCTION with that result and
+the third element of SEQ, then with that result and the fourth
+element of SEQ, etc.
+
+If :INITIAL-VALUE is specified, it is logically added to the
+front of SEQ (or the back if :FROM-END is non-nil).  If SEQ is
+empty, return :INITIAL-VALUE and FUNCTION is not called.
+
+If SEQ is empty and no :INITIAL-VALUE is specified, then return
+the result of calling FUNCTION with zero arguments.  This is the
+only case where FUNCTION is called with fewer than two arguments.
+
+If SEQ contains exactly one element and no :INITIAL-VALUE is
+specified, then just return that element without calling FUNCTION.
+
+If :FROM-END is non-nil, the reduction occurs from the back of
+the SEQ moving forward, and the order of arguments to the
+FUNCTION is also reversed.
+
+\n(fn FUNCTION SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--parsing-keywords (:from-end (:start 0) :end :initial-value :key) ()
+    (or (listp seq) (setq seq (append seq nil)))
+    (setq seq (cl-subseq seq cl-start cl-end))
+    (if cl-from-end (setq seq (nreverse seq)))
+    (let ((accum (cond ((memq :initial-value cl-keys) cl-initial-value)
+                       (seq (cl--check-key (pop seq)))
+                       (t (funcall func)))))
+      (if cl-from-end
+          (while seq
+            (setq accum (funcall func (cl--check-key (pop seq))
+                                 accum)))
+        (while seq
+          (setq accum (funcall func accum
+                               (cl--check-key (pop seq))))))
+      accum)))
+
+;;;###autoload
+(defun cl-fill (seq item &rest cl-keys)
+  "Fill the elements of SEQ with ITEM.
+\nKeywords supported:  :start :end
+\n(fn SEQ ITEM [KEYWORD VALUE]...)"
+  (cl--parsing-keywords ((:start 0) :end) ()
+    (if (listp seq)
+        (let ((p (nthcdr cl-start seq))
+	      (n (and cl-end (- cl-end cl-start))))
+          (while (and p (or (null n) (>= (decf n) 0)))
+            (setcar p item)
+	    (setq p (cdr p))))
+      (or cl-end (setq cl-end (length seq)))
+      (if (and (= cl-start 0) (= cl-end (length seq)))
+          (fillarray seq item)
+	(while (< cl-start cl-end)
+          (aset seq cl-start item)
+	  (setq cl-start (1+ cl-start)))))
+    seq))
+
+;;;###autoload
+(defun cl-replace (seq1 seq2 &rest cl-keys)
+  "Replace the elements of SEQ1 with the elements of SEQ2.
+SEQ1 is destructively modified, then returned.
+\nKeywords supported:  :start1 :end1 :start2 :end2
+\n(fn SEQ1 SEQ2 [KEYWORD VALUE]...)"
+  (cl--parsing-keywords ((:start1 0) :end1 (:start2 0) :end2) ()
+    (if (and (eq seq1 seq2) (<= cl-start2 cl-start1))
+	(or (= cl-start1 cl-start2)
+            (let* ((len (length seq1))
+                   (n (min (- (or cl-end1 len) cl-start1)
+                           (- (or cl-end2 len) cl-start2))))
+              (while (>= (setq n (1- n)) 0)
+                (setf (elt seq1 (+ cl-start1 n))
+                      (elt seq2 (+ cl-start2 n))))))
+      (if (listp seq1)
+          (let ((p1 (nthcdr cl-start1 seq1))
+                (n1 (and cl-end1 (- cl-end1 cl-start1))))
+            (if (listp seq2)
+                (let ((p2 (nthcdr cl-start2 seq2))
+                      (n (cond ((and n1 cl-end2)
+                                (min n1 (- cl-end2 cl-start2)))
+                               ((and n1 (null cl-end2)) n1)
+                               ((and (null n1) cl-end2) (- cl-end2 cl-start2)))))
+                  (while (and p1 p2 (or (null n) (>= (decf n) 0)))
+                    (setcar p1 (car p2))
+                    (setq p1 (cdr p1) p2 (cdr p2))))
+              (setq cl-end2 (if (null n1)
+                                (or cl-end2 (length seq2))
+                              (min (or cl-end2 (length seq2))
+                                   (+ cl-start2 n1))))
+              (while (and p1 (< cl-start2 cl-end2))
+                (setcar p1 (aref seq2 cl-start2))
+                (setq p1 (cdr p1) cl-start2 (1+ cl-start2)))))
+        (setq cl-end1 (min (or cl-end1 (length seq1))
+                           (+ cl-start1 (- (or cl-end2 (length seq2))
+					   cl-start2))))
+        (if (listp seq2)
+            (let ((p2 (nthcdr cl-start2 seq2)))
+	      (while (< cl-start1 cl-end1)
+                (aset seq1 cl-start1 (car p2))
+                (setq p2 (cdr p2) cl-start1 (1+ cl-start1))))
+	  (while (< cl-start1 cl-end1)
+            (aset seq1 cl-start1 (aref seq2 cl-start2))
+	    (setq cl-start2 (1+ cl-start2) cl-start1 (1+ cl-start1))))))
+    seq1))
+
+;;;###autoload
+(defun cl-remove (item seq &rest cl-keys)
+  "Remove all occurrences of ITEM in SEQ.
+This is a non-destructive function; it makes a copy of SEQ if necessary
+to avoid corrupting the original SEQ.
+\nKeywords supported:  :test :test-not :key :count :start :end :from-end
+\n(fn ITEM SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--parsing-keywords ( :test :test-not :key :if :if-not :count :from-end
+                          (:start 0) :end) ()
+    (let ((len (length seq)))
+      (if (<= (or cl-count (setq cl-count len)) 0)
+          seq
+        (if (or (nlistp seq) (and cl-from-end (< cl-count (/ len 2))))
+            (let ((i (cl--position item seq cl-start cl-end
+                                   cl-from-end)))
+              (if i
+                  (let ((res (apply #'cl-delete item (append seq nil)
+                                    (append (if cl-from-end
+                                                (list :end (1+ i))
+                                              (list :start i))
+                                            cl-keys))))
+                    (if (listp seq) res
+                      (if (stringp seq) (concat res) (vconcat res))))
+                seq))
+	  (setq cl-end (- (or cl-end len) cl-start))
+          (if (= cl-start 0)
+              (while (and seq (> cl-end 0)
+                          (cl--check-test item (car seq))
+                          (setq cl-end (1- cl-end) seq (cdr seq))
+                          (> (setq cl-count (1- cl-count)) 0))))
+          (if (and (> cl-count 0) (> cl-end 0))
+              (let ((p (if (> cl-start 0) (nthcdr cl-start seq)
+                         (setq cl-end (1- cl-end)) (cdr seq))))
+                (while (and p (> cl-end 0)
+                            (not (cl--check-test item (car p))))
+                  (setq p (cdr p) cl-end (1- cl-end)))
+                (if (and p (> cl-end 0))
+                    (nconc (cl-ldiff seq p)
+                           (if (= cl-count 1) (cdr p)
+                             (and (cdr p)
+                                  (apply #'cl-delete item
+                                         (copy-sequence (cdr p))
+                                         :start 0 :end (1- cl-end)
+                                         :count (1- cl-count) cl-keys))))
+                  seq))
+            seq))))))
+
+;;;###autoload
+(defun cl-remove-if (pred list &rest cl-keys)
+  "Remove all items satisfying PREDICATE in SEQ.
+This is a non-destructive function; it makes a copy of SEQ if necessary
+to avoid corrupting the original SEQ.
+\nKeywords supported:  :key :count :start :end :from-end
+\n(fn PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-remove pred list :test #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-remove-if-not (pred list &rest cl-keys)
+  "Remove all items not satisfying PREDICATE in SEQ.
+This is a non-destructive function; it makes a copy of SEQ if necessary
+to avoid corrupting the original SEQ.
+\nKeywords supported:  :key :count :start :end :from-end
+\n(fn PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-remove pred list :test-not #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-delete (item seq &rest cl-keys)
+  "Remove all occurrences of ITEM in SEQ.
+This is a destructive function; it reuses the storage of SEQ whenever possible.
+\nKeywords supported:  :test :test-not :key :count :start :end :from-end
+\n(fn ITEM SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--parsing-keywords ( :test :test-not :key :if :if-not :count :from-end
+                          (:start 0) :end) ()
+    (let ((len (length seq)))
+      (if (<= (or cl-count (setq cl-count len)) 0)
+          seq
+        (if (listp seq)
+            (if (and cl-from-end (< cl-count (/ len 2)))
+                (let (i)
+                  (while (and (>= (setq cl-count (1- cl-count)) 0)
+                              (setq i (cl--position item seq cl-start
+                                                    cl-end cl-from-end)))
+                    (if (= i 0) (setq seq (cdr seq))
+                      (let ((tail (nthcdr (1- i) seq)))
+                        (setcdr tail (cdr (cdr tail)))))
+                    (setq cl-end i))
+                  seq)
+              (setq cl-end (- (or cl-end len) cl-start))
+              (if (= cl-start 0)
+                  (progn
+                    (while (and seq
+                                (> cl-end 0)
+                                (cl--check-test item (car seq))
+                                (setq cl-end (1- cl-end) seq (cdr seq))
+                                (> (setq cl-count (1- cl-count)) 0)))
+                    (setq cl-end (1- cl-end)))
+                (setq cl-start (1- cl-start)))
+              (if (and (> cl-count 0) (> cl-end 0))
+                  (let ((p (nthcdr cl-start seq)))
+                    (while (and (cdr p) (> cl-end 0))
+                      (if (cl--check-test item (car (cdr p)))
+                          (progn
+                            (setcdr p (cdr (cdr p)))
+                            (if (= (setq cl-count (1- cl-count)) 0)
+                                (setq cl-end 1)))
+                        (setq p (cdr p)))
+                      (setq cl-end (1- cl-end)))))
+              seq)
+          (apply #'cl-remove item seq cl-keys))))))
+
+;;;###autoload
+(defun cl-delete-if (pred list &rest cl-keys)
+  "Remove all items satisfying PREDICATE in SEQ.
+This is a destructive function; it reuses the storage of SEQ whenever possible.
+\nKeywords supported:  :key :count :start :end :from-end
+\n(fn PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-delete pred list :test #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-delete-if-not (pred list &rest cl-keys)
+  "Remove all items not satisfying PREDICATE in SEQ.
+This is a destructive function; it reuses the storage of SEQ whenever possible.
+\nKeywords supported:  :key :count :start :end :from-end
+\n(fn PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-delete pred list :test-not #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-remove-duplicates (seq &rest cl-keys)
+  "Return a copy of SEQ with all duplicate elements removed.
+\nKeywords supported:  :test :test-not :key :start :end :from-end
+\n(fn SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--delete-duplicates seq cl-keys t))
+
+;;;###autoload
+(defun cl-delete-duplicates (seq &rest cl-keys)
+  "Remove all duplicate elements from SEQ (destructively).
+\nKeywords supported:  :test :test-not :key :start :end :from-end
+\n(fn SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--delete-duplicates seq cl-keys nil))
+
+(defun cl--delete-duplicates (seq cl-keys copy)
+  (if (listp seq)
+      (cl--parsing-keywords
+          ;; We need to parse :if, otherwise `cl-if' is unbound.
+          (:test :test-not :key (:start 0) :end :from-end :if)
+	  ()
+	(if cl-from-end
+            (let ((p (nthcdr cl-start seq)) i)
+              (setq cl-end (- (or cl-end (length seq)) cl-start))
+	      (while (> cl-end 1)
+                (setq i 0)
+                (while (setq i (cl--position (cl--check-key (car p))
+                                             (cdr p) i (1- cl-end)))
+                  (if copy (setq seq (copy-sequence seq)
+                                 p (nthcdr cl-start seq) copy nil))
+                  (let ((tail (nthcdr i p)))
+                    (setcdr tail (cdr (cdr tail))))
+		  (setq cl-end (1- cl-end)))
+                (setq p (cdr p) cl-end (1- cl-end)
+		      cl-start (1+ cl-start)))
+              seq)
+          (setq cl-end (- (or cl-end (length seq)) cl-start))
+          (while (and (cdr seq) (= cl-start 0) (> cl-end 1)
+                      (cl--position (cl--check-key (car seq))
+                                    (cdr seq) 0 (1- cl-end)))
+            (setq seq (cdr seq) cl-end (1- cl-end)))
+          (let ((p (if (> cl-start 0) (nthcdr (1- cl-start) seq)
+                     (setq cl-end (1- cl-end) cl-start 1) seq)))
+            (while (and (cdr (cdr p)) (> cl-end 1))
+              (if (cl--position (cl--check-key (car (cdr p)))
+                                (cdr (cdr p)) 0 (1- cl-end))
+		  (progn
+                    (if copy (setq seq (copy-sequence seq)
+                                   p (nthcdr (1- cl-start) seq)
+                                   copy nil))
+                    (setcdr p (cdr (cdr p))))
+                (setq p (cdr p)))
+	      (setq cl-end (1- cl-end) cl-start (1+ cl-start)))
+            seq)))
+    (let ((res (cl--delete-duplicates (append seq nil) cl-keys nil)))
+      (if (stringp seq) (concat res) (vconcat res)))))
+
+;;;###autoload
+(defun cl-substitute (new old seq &rest cl-keys)
+  "Substitute NEW for OLD in SEQ.
+This is a non-destructive function; it makes a copy of SEQ if necessary
+to avoid corrupting the original SEQ.
+\nKeywords supported:  :test :test-not :key :count :start :end :from-end
+\n(fn NEW OLD SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--parsing-keywords ( :test :test-not :key :if :if-not :count
+                          (:start 0) :end :from-end) ()
+    (if (or (eq old new)
+	    (<= (or cl-count (setq cl-from-end nil
+                                   cl-count (length seq))) 0))
+        seq
+      (let ((i (cl--position old seq cl-start cl-end)))
+        (if (not i)
+            seq
+          (setq seq (copy-sequence seq))
+	  (unless cl-from-end
+            (setf (elt seq i) new)
+            (incf i)
+	    (decf cl-count))
+          (apply #'cl-nsubstitute new old seq :count cl-count
+                 :start i cl-keys))))))
+
+;;;###autoload
+(defun cl-substitute-if (new pred seq &rest cl-keys)
+  "Substitute NEW for all items satisfying PREDICATE in SEQ.
+This is a non-destructive function; it makes a copy of SEQ if necessary
+to avoid corrupting the original SEQ.
+\nKeywords supported:  :key :count :start :end :from-end
+\n(fn NEW PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-substitute new pred seq :test #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-substitute-if-not (new pred seq &rest cl-keys)
+  "Substitute NEW for all items not satisfying PREDICATE in SEQ.
+This is a non-destructive function; it makes a copy of SEQ if necessary
+to avoid corrupting the original SEQ.
+\nKeywords supported:  :key :count :start :end :from-end
+\n(fn NEW PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-substitute new pred seq :test-not #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-nsubstitute (new old seq &rest cl-keys)
+  "Substitute NEW for OLD in SEQ.
+This is a destructive function; it reuses the storage of SEQ whenever possible.
+\nKeywords supported:  :test :test-not :key :count :start :end :from-end
+\n(fn NEW OLD SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--parsing-keywords ( :test :test-not :key :if :if-not :count
+                          (:start 0) :end :from-end) ()
+    (let* ((stringp (stringp seq))
+           (seq (if (stringp seq) (string-to-vector seq) seq))
+           (len (length seq)))
+      (or (eq old new) (<= (or cl-count (setq cl-count len)) 0)
+          (if (and (listp seq) (or (not cl-from-end) (> cl-count (/ len 2))))
+              (let ((p (nthcdr cl-start seq)))
+                (setq cl-end (- (or cl-end len) cl-start))
+                (while (and p (> cl-end 0) (> cl-count 0))
+                  (if (cl--check-test old (car p))
+                      (progn
+                        (setcar p new)
+                        (setq cl-count (1- cl-count))))
+                  (setq p (cdr p) cl-end (1- cl-end))))
+	    (or cl-end (setq cl-end len))
+            (if cl-from-end
+                (while (and (< cl-start cl-end) (> cl-count 0))
+                  (setq cl-end (1- cl-end))
+                  (if (cl--check-test old (elt seq cl-end))
+                      (progn
+                        (setf (elt seq cl-end) new)
+                        (setq cl-count (1- cl-count)))))
+              (while (and (< cl-start cl-end) (> cl-count 0))
+                (if (cl--check-test old (aref seq cl-start))
+                    (progn
+                      (aset seq cl-start new)
+                      (setq cl-count (1- cl-count))))
+                (setq cl-start (1+ cl-start))))))
+      (if stringp (concat seq) seq))))
+
+;;;###autoload
+(defun cl-nsubstitute-if (new pred list &rest cl-keys)
+  "Substitute NEW for all items satisfying PREDICATE in SEQ.
+This is a destructive function; it reuses the storage of SEQ whenever possible.
+\nKeywords supported:  :key :count :start :end :from-end
+\n(fn NEW PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-nsubstitute new pred list :test #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-nsubstitute-if-not (new pred list &rest cl-keys)
+  "Substitute NEW for all items not satisfying PREDICATE in SEQ.
+This is a destructive function; it reuses the storage of SEQ whenever possible.
+\nKeywords supported:  :key :count :start :end :from-end
+\n(fn NEW PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-nsubstitute new pred list :test-not #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-find (item seq &rest cl-keys)
+  "Find the first occurrence of ITEM in SEQ.
+Return the matching ITEM, or nil if not found.
+\nKeywords supported:  :test :test-not :key :start :end :from-end
+\n(fn ITEM SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (let ((pos (apply #'cl-position item seq cl-keys)))
+    (and pos (elt seq pos))))
+
+;;;###autoload
+(defun cl-find-if (pred list &rest cl-keys)
+  "Find the first item satisfying PREDICATE in SEQ.
+Return the matching item, or nil if not found.
+\nKeywords supported:  :key :start :end :from-end
+\n(fn PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-find pred list :test #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-find-if-not (pred list &rest cl-keys)
+  "Find the first item not satisfying PREDICATE in SEQ.
+Return the matching item, or nil if not found.
+\nKeywords supported:  :key :start :end :from-end
+\n(fn PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-find pred list :test-not #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-position (item seq &rest cl-keys)
+  "Find the first occurrence of ITEM in SEQ.
+Return the index of the matching item, or nil if not found.
+\nKeywords supported:  :test :test-not :key :start :end :from-end
+\n(fn ITEM SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--parsing-keywords ( :test :test-not :key :if :if-not
+                          (:start 0) :end :from-end) ()
+    (cl--position item seq cl-start cl-end cl-from-end)))
+
+(defun cl--position (item seq start &optional end from-end)
+  (if (listp seq)
+      (let ((p (nthcdr start seq))
+            res)
+        (while (and p (or (null end) (< start end)) (or (null res) from-end))
+          (if (cl--check-test item (car p))
+              (setq res start))
+          (setq p (cdr p) start (1+ start)))
+        res)
+    (or end (setq end (length seq)))
+    (if from-end
+	(progn
+          (while (and (>= (setq end (1- end)) start)
+                      (not (cl--check-test item (aref seq end)))))
+          (and (>= end start) end))
+      (while (and (< start end)
+                  (not (cl--check-test item (aref seq start))))
+        (setq start (1+ start)))
+      (and (< start end) start))))
+
+;;;###autoload
+(defun cl-position-if (pred list &rest cl-keys)
+  "Find the first item satisfying PREDICATE in SEQ.
+Return the index of the matching item, or nil if not found.
+\nKeywords supported:  :key :start :end :from-end
+\n(fn PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-position pred list :test #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-position-if-not (pred list &rest cl-keys)
+  "Find the first item not satisfying PREDICATE in SEQ.
+Return the index of the matching item, or nil if not found.
+\nKeywords supported:  :key :start :end :from-end
+\n(fn PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-position pred list :test-not #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-count (item seq &rest cl-keys)
+  "Count the number of occurrences of ITEM in SEQ.
+\nKeywords supported:  :test :test-not :key :start :end
+\n(fn ITEM SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--parsing-keywords (:test :test-not :key :if :if-not (:start 0) :end) ()
+    (let ((count 0) x)
+      (or cl-end (setq cl-end (length seq)))
+      (if (consp seq) (setq seq (nthcdr cl-start seq)))
+      (while (< cl-start cl-end)
+        (setq x (if (consp seq) (pop seq) (aref seq cl-start)))
+        (if (cl--check-test item x) (incf count))
+	(setq cl-start (1+ cl-start)))
+      count)))
+
+;;;###autoload
+(defun cl-count-if (pred list &rest cl-keys)
+  "Count the number of items satisfying PREDICATE in SEQ.
+\nKeywords supported:  :key :start :end
+\n(fn PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-count pred list :test #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-count-if-not (pred list &rest cl-keys)
+  "Count the number of items not satisfying PREDICATE in SEQ.
+\nKeywords supported:  :key :start :end
+\n(fn PREDICATE SEQ [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-count pred list :test-not #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-mismatch (seq1 seq2 &rest cl-keys)
+  "Compare SEQ1 with SEQ2, return index of first mismatching element.
+Return nil if the sequences match.  If one sequence is a prefix of the
+other, the return value indicates the end of the shorter sequence.
+\nKeywords supported:  :test :test-not :key :start1 :end1 :start2 :end2 :from-end
+\n(fn SEQ1 SEQ2 [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--parsing-keywords ( :test :test-not :key :from-end
+                          (:start1 0) :end1 (:start2 0) :end2) ()
+    (or cl-end1 (setq cl-end1 (length seq1)))
+    (or cl-end2 (setq cl-end2 (length seq2)))
+    (if cl-from-end
+	(progn
+	  (while (and (< cl-start1 cl-end1) (< cl-start2 cl-end2)
+                      (cl--check-match (elt seq1 (1- cl-end1))
+                                       (elt seq2 (1- cl-end2))))
+	    (setq cl-end1 (1- cl-end1) cl-end2 (1- cl-end2)))
+	  (and (or (< cl-start1 cl-end1) (< cl-start2 cl-end2))
+	       (1- cl-end1)))
+      (let ((p1 (and (listp seq1) (nthcdr cl-start1 seq1)))
+            (p2 (and (listp seq2) (nthcdr cl-start2 seq2))))
+	(while (and (< cl-start1 cl-end1) (< cl-start2 cl-end2)
+                    (cl--check-match (if p1 (car p1)
+                                       (aref seq1 cl-start1))
+                                     (if p2 (car p2)
+                                       (aref seq2 cl-start2))))
+          (setq p1 (cdr p1) p2 (cdr p2)
+		cl-start1 (1+ cl-start1) cl-start2 (1+ cl-start2)))
+	(and (or (< cl-start1 cl-end1) (< cl-start2 cl-end2))
+	     cl-start1)))))
+
+;;;###autoload
+(defun cl-search (seq1 seq2 &rest cl-keys)
+  "Search for SEQ1 as a subsequence of SEQ2.
+Return the index of the leftmost element of the first match found;
+return nil if there are no matches.
+\nKeywords supported:  :test :test-not :key :start1 :end1 :start2 :end2 :from-end
+\n(fn SEQ1 SEQ2 [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--parsing-keywords ( :test :test-not :key :from-end
+                          (:start1 0) :end1 (:start2 0) :end2) ()
+    (or cl-end1 (setq cl-end1 (length seq1)))
+    (or cl-end2 (setq cl-end2 (length seq2)))
+    (if (>= cl-start1 cl-end1)
+	(if cl-from-end cl-end2 cl-start2)
+      (let* ((len (- cl-end1 cl-start1))
+             (first (cl--check-key (elt seq1 cl-start1)))
+             (cl-if nil) pos)
+        (setq cl-end2 (- cl-end2 (1- len)))
+	(while (and (< cl-start2 cl-end2)
+                    (setq pos (cl--position first seq2
+                                            cl-start2 cl-end2 cl-from-end))
+                    (apply #'cl-mismatch seq1 seq2
+			   :start1 (1+ cl-start1) :end1 cl-end1
+                           :start2 (1+ pos) :end2 (+ pos len)
+			   :from-end nil cl-keys))
+          (if cl-from-end (setq cl-end2 pos) (setq cl-start2 (1+ pos))))
+        (and (< cl-start2 cl-end2) pos)))))
+
+;;;###autoload
+(defun cl-sort (seq pred &rest cl-keys)
+  "Sort the argument SEQ according to PREDICATE.
+This is a destructive function; it reuses the storage of SEQ if possible.
+\nKeywords supported:  :key
+\n(fn SEQ PREDICATE [KEYWORD VALUE]...)"
+  ;; It's safe to ignore the return value when used on arrays,
+  ;; but most calls pass lists.
+  (declare (important-return-value t))
+  (if (nlistp seq)
+      (if (stringp seq)
+          (concat (apply #'cl-sort (vconcat seq) pred cl-keys))
+        (cl-replace seq
+                    (apply #'cl-sort (append seq nil) pred cl-keys)))
+    (cl--parsing-keywords (:key) ()
+      (if (memq cl-key '(nil identity))
+          (sort seq pred)
+        (sort seq (lambda (x y)
+                    (funcall pred (funcall cl-key x)
+                             (funcall cl-key y))))))))
+
+;;;###autoload
+(defun cl-stable-sort (seq pred &rest cl-keys)
+  "Sort the argument SEQ stably according to PREDICATE.
+This is a destructive function; it reuses the storage of SEQ if possible.
+\nKeywords supported:  :key
+\n(fn SEQ PREDICATE [KEYWORD VALUE]...)"
+  ;; It's safe to ignore the return value when used on arrays,
+  ;; but most calls pass lists.
+  (declare (important-return-value t))
+  (apply #'cl-sort seq pred cl-keys))
+
+;;;###autoload
+(defun cl-merge (type seq1 seq2 pred &rest cl-keys)
+  "Destructively merge the two sequences to produce a new sequence.
+TYPE is the sequence type to return, SEQ1 and SEQ2 are the two argument
+sequences, and PREDICATE is a `less-than' predicate on the elements.
+\nKeywords supported:  :key
+\n(fn TYPE SEQ1 SEQ2 PREDICATE [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (or (listp seq1) (setq seq1 (append seq1 nil)))
+  (or (listp seq2) (setq seq2 (append seq2 nil)))
+  (cl--parsing-keywords (:key) ()
+    (let ((res nil))
+      (while (and seq1 seq2)
+        (if (funcall pred (cl--check-key (car seq2))
+                     (cl--check-key (car seq1)))
+            (push (pop seq2) res)
+          (push (pop seq1) res)))
+      (cl-coerce (nconc (nreverse res) seq1 seq2) type))))
+
+;;;###autoload
+(defun cl-member (item list &rest cl-keys)
+  "Find the first occurrence of ITEM in LIST.
+Return the sublist of LIST whose car is ITEM.
+\nKeywords supported:  :test :test-not :key
+\n(fn ITEM LIST [KEYWORD VALUE]...)"
+  (declare (important-return-value t)
+           (compiler-macro cl--compiler-macro-member))
+  (if cl-keys
+      (cl--parsing-keywords (:test :test-not :key :if :if-not) ()
+        (while (and list (not (cl--check-test item (car list))))
+          (setq list (cdr list)))
+        list)
+    (memql item list)))
+
+;;;###autoload
+(defun cl-member-if (pred list &rest cl-keys)
+  "Find the first item satisfying PREDICATE in LIST.
+Return the sublist of LIST whose car matches.
+
+This function is obsolete: use `member-if'.  The new function does not
+support the old `:key KEY-FN' argument, but it is better to compose any
+KEY-FN into PRED.  For example, you can replace
+
+    (cl-member-if #\\='foo items :key #\\='bar)
+
+with
+
+    (member-if (lambda (x) (foo (bar x))) items)
+
+(fn PREDICATE LIST [:KEY KEY-FN])"
+  (declare (important-return-value t))
+  (apply #'cl-member pred list :test #'funcall cl-keys))
+(make-obsolete 'cl-member-if 'member-if "31.1")
+
+;;;###autoload
+(defun cl-member-if-not (pred list &rest cl-keys)
+  "Find the first item not satisfying PREDICATE in LIST.
+Return the sublist of LIST whose car matches.
+This function is deprecated in the Common Lisp standard.
+Prefer `member-if' with a negated predicate, and composing any `:key'
+function into the predicate.
+\nKeywords supported:  :key
+\n(fn PREDICATE LIST [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-member pred list :test-not #'funcall cl-keys))
+
+;;;###autoload
+(defun cl--adjoin (item list &rest cl-keys)
+  (if (cl--parsing-keywords (:key) t
+        (apply #'cl-member (cl--check-key item) list cl-keys))
+      list
+    (cons item list)))
+
+;;;###autoload
+(defun cl-assoc (item alist &rest cl-keys)
+  "Find the first item whose car matches ITEM in LIST.
+\nKeywords supported:  :test :test-not :key
+\n(fn ITEM LIST [KEYWORD VALUE]...)"
+  (declare (important-return-value t)
+           (compiler-macro cl--compiler-macro-assoc))
+  (if cl-keys
+      (cl--parsing-keywords (:test :test-not :key :if :if-not) ()
+        (while (and alist
+                    (or (not (consp (car alist)))
+                        (not (cl--check-test item (car (car alist))))))
+          (setq alist (cdr alist)))
+        (and alist (car alist)))
+    (if (and (numberp item) (not (fixnump item)))
+        (assoc item alist)
+      (assq item alist))))
+
+;;;###autoload
+(defun cl-assoc-if (pred list &rest cl-keys)
+  "Find the first item whose car satisfies PREDICATE in LIST.
+\nKeywords supported:  :key
+\n(fn PREDICATE LIST [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-assoc pred list :test #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-assoc-if-not (pred list &rest cl-keys)
+  "Find the first item whose car does not satisfy PREDICATE in LIST.
+\nKeywords supported:  :key
+\n(fn PREDICATE LIST [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-assoc pred list :test-not #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-rassoc (item alist &rest cl-keys)
+  "Find the first item whose cdr matches ITEM in LIST.
+\nKeywords supported:  :test :test-not :key
+\n(fn ITEM LIST [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (if (or cl-keys (numberp item))
+      (cl--parsing-keywords (:test :test-not :key :if :if-not) ()
+        (while (and alist
+                    (or (not (consp (car alist)))
+                        (not (cl--check-test item (cdr (car alist))))))
+          (setq alist (cdr alist)))
+        (and alist (car alist)))
+    (rassq item alist)))
+
+;;;###autoload
+(defun cl-rassoc-if (pred list &rest cl-keys)
+  "Find the first item whose cdr satisfies PREDICATE in LIST.
+\nKeywords supported:  :key
+\n(fn PREDICATE LIST [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-rassoc pred list :test #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-rassoc-if-not (pred list &rest cl-keys)
+  "Find the first item whose cdr does not satisfy PREDICATE in LIST.
+\nKeywords supported:  :key
+\n(fn PREDICATE LIST [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-rassoc pred list :test-not #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-union (list1 list2 &rest cl-keys)
+  "Combine LIST1 and LIST2 using a set-union operation.
+The resulting list contains all items that appear in either LIST1 or LIST2.
+This is a non-destructive function; it makes a copy of the data if necessary
+to avoid corrupting the original LIST1 and LIST2.
+\nKeywords supported:  :test :test-not :key
+\n(fn LIST1 LIST2 [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cond ((null list1) list2) ((null list2) list1)
+        ((and (not cl-keys) (equal list1 list2)) list1)
+	(t
+         (or (>= (length list1) (length list2))
+             (setq list1 (prog1 list2 (setq list2 list1))))
+         (while list2
+           (if (or cl-keys (numberp (car list2)))
+               (setq list1
+                     (apply #'cl-adjoin (car list2) list1 cl-keys))
+             (or (memq (car list2) list1)
+                 (push (car list2) list1)))
+           (pop list2))
+         list1)))
+
+;;;###autoload
+(defun cl-nunion (list1 list2 &rest cl-keys)
+  "Combine LIST1 and LIST2 using a set-union operation.
+The resulting list contains all items that appear in either LIST1 or LIST2.
+This is a destructive function; it reuses the storage of LIST1 and LIST2
+whenever possible.
+\nKeywords supported:  :test :test-not :key
+\n(fn LIST1 LIST2 [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cond ((null list1) list2) ((null list2) list1)
+        (t (apply #'cl-union list1 list2 cl-keys))))
+
+;;;###autoload
+(defun cl-intersection (list1 list2 &rest cl-keys)
+  "Combine LIST1 and LIST2 using a set-intersection operation.
+The resulting list contains all items that appear in both LIST1 and LIST2.
+This is a non-destructive function; it makes a copy of the data if necessary
+to avoid corrupting the original LIST1 and LIST2.
+\nKeywords supported:  :test :test-not :key
+\n(fn LIST1 LIST2 [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (and list1 list2
+       (if (equal list1 list2) list1
+	 (cl--parsing-keywords (:key) (:test :test-not)
+           (let ((res nil))
+             (or (>= (length list1) (length list2))
+                 (setq list1 (prog1 list2 (setq list2 list1))))
+             (while list2
+               (if (if (or cl-keys (numberp (car list2)))
+                       (apply #'cl-member (cl--check-key (car list2))
+                              list1 cl-keys)
+                     (memq (car list2) list1))
+                   (push (car list2) res))
+               (pop list2))
+             res)))))
+
+;;;###autoload
+(defun cl-nintersection (list1 list2 &rest cl-keys)
+  "Combine LIST1 and LIST2 using a set-intersection operation.
+The resulting list contains all items that appear in both LIST1 and LIST2.
+This is a destructive function; it reuses the storage of LIST1 (but not
+LIST2) whenever possible.
+\nKeywords supported:  :test :test-not :key
+\n(fn LIST1 LIST2 [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (and list1 list2 (apply #'cl-intersection list1 list2 cl-keys)))
+
+;;;###autoload
+(defun cl-set-difference (list1 list2 &rest cl-keys)
+  "Combine LIST1 and LIST2 using a set-difference operation.
+The resulting list contains all items that appear in LIST1 but not LIST2.
+This is a non-destructive function; it makes a copy of the data if necessary
+to avoid corrupting the original LIST1 and LIST2.
+\nKeywords supported:  :test :test-not :key
+\n(fn LIST1 LIST2 [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (if (or (null list1) (null list2)) list1
+    (cl--parsing-keywords (:key) (:test :test-not)
+      (let ((res nil))
+        (while list1
+          (or (if (or cl-keys (numberp (car list1)))
+                  (apply #'cl-member (cl--check-key (car list1))
+                         list2 cl-keys)
+                (memq (car list1) list2))
+              (push (car list1) res))
+          (pop list1))
+        (nreverse res)))))
+
+;;;###autoload
+(defun cl-nset-difference (list1 list2 &rest cl-keys)
+  "Combine LIST1 and LIST2 using a set-difference operation.
+The resulting list contains all items that appear in LIST1 but not LIST2.
+This is a destructive function; it reuses the storage of LIST1 (but not
+LIST2) whenever possible.
+\nKeywords supported:  :test :test-not :key
+\n(fn LIST1 LIST2 [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (if (or (null list1) (null list2)) list1
+    (apply #'cl-set-difference list1 list2 cl-keys)))
+
+;;;###autoload
+(defun cl-set-exclusive-or (list1 list2 &rest cl-keys)
+  "Combine LIST1 and LIST2 using a set-exclusive-or operation.
+The resulting list contains all items appearing in exactly one of LIST1, LIST2.
+This is a non-destructive function; it makes a copy of the data if necessary
+to avoid corrupting the original LIST1 and LIST2.
+\nKeywords supported:  :test :test-not :key
+\n(fn LIST1 LIST2 [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cond ((null list1) list2) ((null list2) list1)
+        ((equal list1 list2) nil)
+        (t (append (apply #'cl-set-difference list1 list2 cl-keys)
+                   (apply #'cl-set-difference list2 list1 cl-keys)))))
+
+;;;###autoload
+(defun cl-nset-exclusive-or (list1 list2 &rest cl-keys)
+  "Combine LIST1 and LIST2 using a set-exclusive-or operation.
+The resulting list contains all items appearing in exactly one of LIST1, LIST2.
+This is a destructive function; it reuses the storage of LIST1 and LIST2
+whenever possible.
+\nKeywords supported:  :test :test-not :key
+\n(fn LIST1 LIST2 [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cond ((null list1) list2) ((null list2) list1)
+        ((equal list1 list2) nil)
+        (t (nconc (apply #'cl-nset-difference list1 list2 cl-keys)
+                  (apply #'cl-nset-difference list2 list1 cl-keys)))))
+
+;;;###autoload
+(defun cl-subsetp (list1 list2 &rest cl-keys)
+  "Return true if LIST1 is a subset of LIST2.
+I.e., if every element of LIST1 also appears in LIST2.
+\nKeywords supported:  :test :test-not :key
+\n(fn LIST1 LIST2 [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cond ((null list1) t) ((null list2) nil)
+        ((equal list1 list2) t)
+	(t (cl--parsing-keywords (:key) (:test :test-not)
+             (while (and list1
+                         (apply #'cl-member (cl--check-key (car list1))
+                                list2 cl-keys))
+               (pop list1))
+             (null list1)))))
+
+;;;###autoload
+(defun cl-subst-if (new pred tree &rest cl-keys)
+  "Substitute NEW for elements matching PREDICATE in TREE (non-destructively).
+Return a copy of TREE with all matching elements replaced by NEW.
+\nKeywords supported:  :key
+\n(fn NEW PREDICATE TREE [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-sublis (list (cons pred new)) tree :test #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-subst-if-not (new pred tree &rest cl-keys)
+  "Substitute NEW for elts not matching PREDICATE in TREE (non-destructively).
+Return a copy of TREE with all non-matching elements replaced by NEW.
+\nKeywords supported:  :key
+\n(fn NEW PREDICATE TREE [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-sublis (list (cons pred new)) tree :test-not #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-nsubst (new old tree &rest cl-keys)
+  "Substitute NEW for OLD everywhere in TREE (destructively).
+Any element of TREE which is `eql' to OLD is changed to NEW (via a call
+to `setcar').
+\nKeywords supported:  :test :test-not :key
+\n(fn NEW OLD TREE [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-nsublis (list (cons old new)) tree cl-keys))
+
+;;;###autoload
+(defun cl-nsubst-if (new pred tree &rest cl-keys)
+  "Substitute NEW for elements matching PREDICATE in TREE (destructively).
+Any element of TREE which matches is changed to NEW (via a call to `setcar').
+\nKeywords supported:  :key
+\n(fn NEW PREDICATE TREE [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-nsublis (list (cons pred new)) tree :test #'funcall cl-keys))
+
+;;;###autoload
+(defun cl-nsubst-if-not (new pred tree &rest cl-keys)
+  "Substitute NEW for elements not matching PREDICATE in TREE (destructively).
+Any element of TREE which matches is changed to NEW (via a call to `setcar').
+\nKeywords supported:  :key
+\n(fn NEW PREDICATE TREE [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (apply #'cl-nsublis (list (cons pred new)) tree :test-not #'funcall cl-keys))
+
+(defvar cl--alist)
+
+;;;###autoload
+(defun cl-sublis (alist tree &rest cl-keys)
+  "Perform substitutions indicated by ALIST in TREE (non-destructively).
+Return a copy of TREE with all matching elements replaced.
+\nKeywords supported:  :test :test-not :key
+\n(fn ALIST TREE [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--parsing-keywords (:test :test-not :key :if :if-not) ()
+    (let ((cl--alist alist))
+      (cl--sublis-rec tree))))
+
+(defun cl--sublis-rec (tree)   ;Uses cl--alist cl-key/test*/if*.
+  (let ((temp (cl--check-key tree))
+        (p cl--alist))
+    (while (and p (not (cl--check-test-nokey (car (car p)) temp)))
+      (setq p (cdr p)))
+    (if p (cdr (car p))
+      (if (consp tree)
+          (let ((a (cl--sublis-rec (car tree)))
+                (d (cl--sublis-rec (cdr tree))))
+            (if (and (eq a (car tree)) (eq d (cdr tree)))
+                tree
+              (cons a d)))
+        tree))))
+
+;;;###autoload
+(defun cl-nsublis (alist tree &rest cl-keys)
+  "Perform substitutions indicated by ALIST in TREE (destructively).
+Any matching element of TREE is changed via a call to `setcar'.
+\nKeywords supported:  :test :test-not :key
+\n(fn ALIST TREE [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--parsing-keywords (:test :test-not :key :if :if-not) ()
+    (let ((hold (list tree))
+          (cl--alist alist))
+      (cl--nsublis-rec hold)
+      (car hold))))
+
+(defun cl--nsublis-rec (tree)   ;Uses cl--alist cl-key/test*/if*.
+  (while (consp tree)
+    (let ((temp (cl--check-key (car tree)))
+          (p cl--alist))
+      (while (and p (not (cl--check-test-nokey (car (car p)) temp)))
+        (setq p (cdr p)))
+      (if p (setcar tree (cdr (car p)))
+        (if (consp (car tree)) (cl--nsublis-rec (car tree))))
+      (setq temp (cl--check-key (cdr tree)) p cl--alist)
+      (while (and p (not (cl--check-test-nokey (car (car p)) temp)))
+        (setq p (cdr p)))
+      (if p
+          (progn (setcdr tree (cdr (car p))) (setq tree nil))
+        (setq tree (cdr tree))))))
+
+;;;###autoload
+(defun cl-tree-equal (x y &rest cl-keys)
+  "Return t if trees TREE1 and TREE2 have `eql' leaves.
+Atoms are compared by `eql'; cons cells are compared recursively.
+\nKeywords supported:  :test :test-not :key
+\n(fn TREE1 TREE2 [KEYWORD VALUE]...)"
+  (declare (important-return-value t))
+  (cl--parsing-keywords (:test :test-not :key) ()
+    (cl--tree-equal-rec x y)))
+
+(defun cl--tree-equal-rec (x y)   ;Uses cl-key/test*.
+  (while (and (consp x) (consp y)
+              (cl--tree-equal-rec (car x) (car y)))
+    (setq x (cdr x) y (cdr y)))
+  (and (not (consp x)) (not (consp y)) (cl--check-match x y)))
+
+
+(make-obsolete-variable 'cl-seq-load-hook
+                        "use `with-eval-after-load' instead." "28.1")
+(run-hooks 'cl-seq-load-hook)
+
+;; Local variables:
+;; generated-autoload-file: "cl-loaddefs.el"
+;; End:
+
+(defun cl--compiler-macro-member (form a list &rest keys)
+  (let ((test (and (= (length keys) 2) (eq (car keys) :test)
+		   (cl--const-expr-val (nth 1 keys)))))
+    (cond ((eq test 'eq) `(memq ,a ,list))
+	  ((eq test 'equal) `(member ,a ,list))
+	  ((or (null keys) (eq test 'eql)) `(memql ,a ,list))
+	  (t form))))
+
+(defun cl--compiler-macro-assoc (form a list &rest keys)
+  (let ((test (and (= (length keys) 2) (eq (car keys) :test)
+		   (cl--const-expr-val (nth 1 keys)))))
+    (cond ((eq test 'eq) `(assq ,a ,list))
+	  ((eq test 'equal) `(assoc ,a ,list))
+	  ((and (macroexp-const-p a) (or (null keys) (eq test 'eql)))
+	   (if (floatp (cl--const-expr-val a))
+	       `(assoc ,a ,list) `(assq ,a ,list)))
+	  (t form))))
+
+;; ---- cl-loop ----
+;; cl-macs.el's loop machinery (emacs-31.1), verbatim: the clause parser, the
+;; binding builder and the `and'-chain builder, so every clause the Emacs macro
+;; accepts expands the way Emacs expands it. `cl--map-intervals' and
+;; `cl--map-overlays' are cl-extra.el's, used by `being the intervals/overlays'.
+(defmacro cl--pop2 (place)
+  `(prog1 (car (cdr ,place))
+     (setq ,place (cdr (cdr ,place)))))
+(defun cl--expr-contains (x y)
+  "Count number of times X refers to Y.  Return nil for 0 times."
+  ;; FIXME: This is naive, and it will cl-count Y as referred twice in
+  ;; (let ((Y 1)) Y) even though it should be 0.  Also it is often called on
+  ;; non-macroexpanded code, so it may also miss some occurrences that would
+  ;; only appear in the expanded code.
+  (cond ((equal y x) 1)
+	((and (consp x) (not (memq (car x) '(quote function cl-function))))
+	 (let ((sum 0))
+	   (while (consp x)
+	     (setq sum (+ sum (or (cl--expr-contains (pop x) y) 0))))
+	   (setq sum (+ sum (or (cl--expr-contains x y) 0)))
+	   (and (> sum 0) sum)))
+	(t nil)))
+
+(defvar cl--loop-args) (defvar cl--loop-accum-var) (defvar cl--loop-accum-vars)
+(defvar cl--loop-bindings) (defvar cl--loop-body) (defvar cl--loop-conditions)
+(defvar cl--loop-finally)
+(defvar cl--loop-finish-flag)           ;Symbol set to nil to exit the loop?
+(defvar cl--loop-first-flag)
+(defvar cl--loop-initially) (defvar cl--loop-iterator-function)
+(defvar cl--loop-name)
+(defvar cl--loop-result) (defvar cl--loop-result-explicit)
+(defvar cl--loop-result-var) (defvar cl--loop-steps)
+(defvar cl--loop-symbol-macs)
+
+(defun cl--loop-set-iterator-function (kind iterator)
+  (if cl--loop-iterator-function
+      ;; FIXME: Of course, we could make it work, but why bother.
+      (error "Iteration on %S does not support this combination" kind)
+    (setq cl--loop-iterator-function iterator)))
+
+;;;###autoload
+(defmacro cl-loop (&rest loop-args)
+  "The Common Lisp `loop' macro.
+Valid clauses include:
+  For clauses:
+    for VAR from/upfrom/downfrom EXPR1 to/upto/downto/above/below EXPR2
+        [by EXPR3]
+    for VAR = EXPR1 then EXPR2
+    for VAR in/on/in-ref LIST [by FUNC]
+    for VAR across/across-ref ARRAY
+    for VAR being:
+      the elements of/of-ref SEQUENCE [using (index VAR2)]
+      the symbols [of OBARRAY]
+      the hash-keys/hash-values of HASH-TABLE [using (hash-values/hash-keys V2)]
+      the key-codes/key-bindings/key-seqs of KEYMAP [using (key-bindings VAR2)]
+      the overlays/intervals [of BUFFER] [from POS1] [to POS2]
+      the frames/buffers
+      the windows [of FRAME]
+  Iteration clauses:
+    repeat INTEGER
+    while/until/always/never/thereis CONDITION
+  Accumulation clauses:
+    collect/append/nconc/concat/vconcat/count/sum/maximize/minimize FORM
+      [into VAR]
+  Miscellaneous clauses:
+    with VAR = INIT
+    if/when/unless COND CLAUSE [and CLAUSE]... else CLAUSE [and CLAUSE...]
+    named NAME
+    initially/finally [do] EXPRS...
+    do EXPRS...
+    [finally] return EXPR
+
+For more details, see Info node `(cl)Loop Facility'.
+
+\(fn CLAUSE...)"
+  (declare (debug (&rest &or
+                         ;; These are usually followed by a symbol, but it can
+                         ;; actually be any destructuring-bind pattern, which
+                         ;; would erroneously match `form'.
+                         [[&or "for" "as" "with" "and"] sexp]
+                         ;; These are followed by expressions which could
+                         ;; erroneously match `symbolp'.
+                         [[&or "from" "upfrom" "downfrom" "to" "upto" "downto"
+                               "above" "below" "by" "in" "on" "=" "across"
+                               "repeat" "while" "until" "always" "never"
+                               "thereis" "collect" "append" "nconc" "sum"
+                               "count" "maximize" "minimize"
+                               "if" "when" "unless"
+                               "return"]
+                          form]
+                         ["using" (symbolp symbolp)]
+                         ;; Simple default, which covers 99% of the cases.
+                         symbolp form)))
+  (if (not (memq t (mapcar #'symbolp
+                           (delq nil (delq t (cl-copy-list loop-args))))))
+      `(cl-block nil (while t ,@loop-args))
+    (let ((cl--loop-args loop-args) (cl--loop-name nil) (cl--loop-bindings nil)
+	  (cl--loop-body nil)		(cl--loop-steps nil)
+	  (cl--loop-result nil)		(cl--loop-result-explicit nil)
+	  (cl--loop-result-var nil)	(cl--loop-finish-flag nil)
+	  (cl--loop-accum-var nil)	(cl--loop-accum-vars nil)
+	  (cl--loop-initially nil)	(cl--loop-finally nil)
+	  (cl--loop-iterator-function nil) (cl--loop-first-flag nil)
+          (cl--loop-symbol-macs nil)
+          (cl--loop-conditions nil))
+      ;; Here is more or less how those dynbind vars are used after looping
+      ;; over cl--parse-loop-clause:
+      ;;
+      ;; (cl-block ,cl--loop-name
+      ;;   (cl-symbol-macrolet ,cl--loop-symbol-macs
+      ;;     (foldl #'cl--loop-let
+      ;;            `((,cl--loop-result-var)
+      ;;              ((,cl--loop-first-flag t))
+      ;;              ((,cl--loop-finish-flag t))
+      ;;              ,@cl--loop-bindings)
+      ;;           ,@(nreverse cl--loop-initially)
+      ;;           (while                   ;(well: cl--loop-iterator-function)
+      ;;               ,(car (cl--loop-build-ands (nreverse cl--loop-body)))
+      ;;             ,@(cadr (cl--loop-build-ands (nreverse cl--loop-body)))
+      ;;             ,@(nreverse cl--loop-steps)
+      ;;             (setq ,cl--loop-first-flag nil))
+      ;;           (if (not ,cl--loop-finish-flag) ;FIXME: Why `if' vs `progn'?
+      ;;               ,cl--loop-result-var
+      ;;             ,@(nreverse cl--loop-finally)
+      ;;             ,(or cl--loop-result-explicit
+      ;;                  cl--loop-result)))))
+      ;;
+      (setq cl--loop-args (append cl--loop-args '(cl-end-loop)))
+      (while (not (eq (car cl--loop-args) 'cl-end-loop))
+        (cl--parse-loop-clause))
+      (if cl--loop-finish-flag
+	  (push `((,cl--loop-finish-flag t)) cl--loop-bindings))
+      (if cl--loop-first-flag
+	  (progn (push `((,cl--loop-first-flag t)) cl--loop-bindings)
+		 (push `(setq ,cl--loop-first-flag nil) cl--loop-steps)))
+      (let* ((epilogue (nconc (nreverse cl--loop-finally)
+			      (list (or cl--loop-result-explicit
+                                        cl--loop-result))))
+	     (ands (cl--loop-build-ands (nreverse cl--loop-body)))
+	     (while-body (nconc (cadr ands) (nreverse cl--loop-steps)))
+	     (body (append
+		    (nreverse cl--loop-initially)
+		    (list (if cl--loop-iterator-function
+			      `(cl-block --cl-finish--
+                                 ,(funcall cl--loop-iterator-function
+                                           (if (eq (car ands) t) while-body
+                                             (cons `(or ,(car ands)
+                                                        (cl-return-from
+                                                            --cl-finish--
+                                                          nil))
+                                                   while-body))))
+			    `(while ,(car ands) ,@while-body)))
+		    (if cl--loop-finish-flag
+			(if (equal epilogue '(nil)) (list cl--loop-result-var)
+			  `((if ,cl--loop-finish-flag
+				(progn ,@epilogue) ,cl--loop-result-var)))
+		      epilogue))))
+	(if cl--loop-result-var
+            (push (list cl--loop-result-var) cl--loop-bindings))
+	(while cl--loop-bindings
+	  (if (cdar cl--loop-bindings)
+	      (setq body (list (cl--loop-let (pop cl--loop-bindings) body t)))
+	    (let ((lets nil))
+	      (while (and cl--loop-bindings
+			  (not (cdar cl--loop-bindings)))
+		(push (car (pop cl--loop-bindings)) lets))
+	      (setq body (list (cl--loop-let lets body nil))))))
+	(if cl--loop-symbol-macs
+	    (setq body
+                  (list `(cl-symbol-macrolet ,cl--loop-symbol-macs ,@body))))
+	`(cl-block ,cl--loop-name ,@body)))))
+
+(defmacro cl--push-clause-loop-body (clause)
+  "Apply CLAUSE to both `cl--loop-conditions' and `cl--loop-body'."
+  (macroexp-let2 nil sym clause
+    `(progn
+       (push ,sym cl--loop-conditions)
+       (push ,sym cl--loop-body))))
+
+;; Below is a complete spec for cl-loop, in several parts that correspond
+;; to the syntax given in CLtL2.  The specs do more than specify where
+;; the forms are; it also specifies, as much as Edebug allows, all the
+;; syntactically valid cl-loop clauses.  The disadvantage of this
+;; completeness is rigidity, but the "for ... being" clause allows
+;; arbitrary extensions of the form: [symbolp &rest &or symbolp form].
+
+;; (def-edebug-spec cl-loop
+;;   ([&optional ["named" symbolp]]
+;;    [&rest
+;;     &or
+;;     ["repeat" form]
+;;     loop-for-as
+;;     loop-with
+;;     loop-initial-final]
+;;    [&rest loop-clause]
+;;    ))
+
+;; (def-edebug-elem-spec 'loop-with
+;;  '("with" loop-var
+;;    loop-type-spec
+;;    [&optional ["=" form]]
+;;    &rest ["and" loop-var
+;; 	  loop-type-spec
+;; 	  [&optional ["=" form]]]))
+
+;; (def-edebug-elem-spec 'loop-for-as
+;;  '([&or "for" "as"] loop-for-as-subclause
+;;    &rest ["and" loop-for-as-subclause]))
+
+;; (def-edebug-elem-spec 'loop-for-as-subclause
+;;  '(loop-var
+;;    loop-type-spec
+;;    &or
+;;    [[&or "in" "on" "in-ref" "across-ref"]
+;;     form &optional ["by" function-form]]
+
+;;    ["=" form &optional ["then" form]]
+;;    ["across" form]
+;;    ["being"
+;;     [&or "the" "each"]
+;;     &or
+;;     [[&or "element" "elements"]
+;;      [&or "of" "in" "of-ref"] form
+;;      &optional "using" ["index" symbolp]];; is this right?
+;;     [[&or "hash-key" "hash-keys"
+;; 	  "hash-value" "hash-values"]
+;;      [&or "of" "in"]
+;;      hash-table-p &optional ["using" ([&or "hash-value" "hash-values"
+;; 					   "hash-key" "hash-keys"] sexp)]]
+
+;;     [[&or "symbol" "present-symbol" "external-symbol"
+;; 	  "symbols" "present-symbols" "external-symbols"]
+;;      [&or "in" "of"] package-p]
+
+;;     ;; Extensions for Emacs Lisp, including Lucid Emacs.
+;;     [[&or "frame" "frames"
+;; 	  "screen" "screens"
+;; 	  "buffer" "buffers"]]
+
+;;     [[&or "window" "windows"]
+;;      [&or "of" "in"] form]
+
+;;     [[&or "overlay" "overlays"
+;; 	  "extent" "extents"]
+;;      [&or "of" "in"] form
+;;      &optional [[&or "from" "to"] form]]
+
+;;     [[&or "interval" "intervals"]
+;;      [&or "in" "of"] form
+;;      &optional [[&or "from" "to"] form]
+;;      ["property" form]]
+
+;;     [[&or "key-code" "key-codes"
+;; 	  "key-seq" "key-seqs"
+;; 	  "key-binding" "key-bindings"]
+;;      [&or "in" "of"] form
+;;      &optional ["using" ([&or "key-code" "key-codes"
+;; 			      "key-seq" "key-seqs"
+;; 			      "key-binding" "key-bindings"]
+;; 			 sexp)]]
+;;     ;; For arbitrary extensions, recognize anything else.
+;;     [symbolp &rest &or symbolp form]
+;;     ]
+
+;;    ;; arithmetic - must be last since all parts are optional.
+;;    [[&optional [[&or "from" "downfrom" "upfrom"] form]]
+;;     [&optional [[&or "to" "downto" "upto" "below" "above"] form]]
+;;     [&optional ["by" form]]
+;;     ]))
+
+;; (def-edebug-elem-spec 'loop-initial-final
+;;  '(&or ["initially"
+;; 	;; [&optional &or "do" "doing"]  ;; CLtL2 doesn't allow this.
+;; 	&rest loop-non-atomic-expr]
+;;        ["finally" &or
+;; 	[[&optional &or "do" "doing"] &rest loop-non-atomic-expr]
+;; 	["return" form]]))
+
+;; (def-edebug-elem-spec 'loop-and-clause
+;;   '(loop-clause &rest ["and" loop-clause]))
+
+;; (def-edebug-elem-spec 'loop-clause
+;;  '(&or
+;;    [[&or "while" "until" "always" "never" "thereis"] form]
+
+;;    [[&or "collect" "collecting"
+;; 	 "append" "appending"
+;; 	 "nconc" "nconcing"
+;; 	 "concat" "vconcat"] form
+;; 	 [&optional ["into" loop-var]]]
+
+;;    [[&or "count" "counting"
+;; 	 "sum" "summing"
+;; 	 "maximize" "maximizing"
+;; 	 "minimize" "minimizing"] form
+;; 	 [&optional ["into" loop-var]]
+;; 	 loop-type-spec]
+
+;;    [[&or "if" "when" "unless"]
+;;     form loop-and-clause
+;;     [&optional ["else" loop-and-clause]]
+;;     [&optional "end"]]
+
+;;    [[&or "do" "doing"] &rest loop-non-atomic-expr]
+
+;;    ["return" form]
+;;    loop-initial-final
+;;    ))
+
+;; (def-edebug-elem-spec 'loop-non-atomic-expr
+;;   '([&not atom] form))
+
+;; (def-edebug-elem-spec 'loop-var
+;;   ;; The symbolp must be last alternative to recognize e.g. (a b . c)
+;;   ;; loop-var =>
+;;   ;; (loop-var . [&or nil loop-var])
+;;   ;; (symbolp . [&or nil loop-var])
+;;   ;; (symbolp . loop-var)
+;;   ;; (symbolp . (symbolp . [&or nil loop-var]))
+;;   ;; (symbolp . (symbolp . loop-var))
+;;   ;; (symbolp . (symbolp . symbolp)) == (symbolp symbolp . symbolp)
+;;   '(&or (loop-var . [&or nil loop-var]) [gate symbolp]))
+
+;; (def-edebug-elem-spec 'loop-type-spec
+;;   '(&optional ["of-type" loop-d-type-spec]))
+
+;; (def-edebug-elem-spec 'loop-d-type-spec
+;;   '(&or (loop-d-type-spec . [&or nil loop-d-type-spec]) cl-type-spec))
+
+(defun cl--parse-loop-clause ()		; uses loop-*
+  (let ((word (pop cl--loop-args))
+	(hash-types '(hash-key hash-keys hash-value hash-values))
+	(key-types '(key-code key-codes key-seq key-seqs
+		     key-binding key-bindings)))
+    (cond
+
+     ((null cl--loop-args)
+      (error "Malformed `cl-loop' macro"))
+
+     ((eq word 'named)
+      (setq cl--loop-name (pop cl--loop-args)))
+
+     ((eq word 'initially)
+      (if (memq (car cl--loop-args) '(do doing)) (pop cl--loop-args))
+      (or (consp (car cl--loop-args))
+          (error "Syntax error on `initially' clause"))
+      (while (consp (car cl--loop-args))
+	(push (pop cl--loop-args) cl--loop-initially)))
+
+     ((eq word 'finally)
+      (if (eq (car cl--loop-args) 'return)
+	  (setq cl--loop-result-explicit
+                (or (cl--pop2 cl--loop-args) '(quote nil)))
+	(if (memq (car cl--loop-args) '(do doing)) (pop cl--loop-args))
+	(or (consp (car cl--loop-args))
+            (error "Syntax error on `finally' clause"))
+	(if (and (eq (caar cl--loop-args) 'return) (null cl--loop-name))
+	    (setq cl--loop-result-explicit
+                  (or (nth 1 (pop cl--loop-args)) '(quote nil)))
+	  (while (consp (car cl--loop-args))
+	    (push (pop cl--loop-args) cl--loop-finally)))))
+
+     ((memq word '(for as))
+      (let ((loop-for-bindings nil) (loop-for-sets nil) (loop-for-steps nil)
+	    (ands nil))
+	(while
+            ;; Use `gensym' rather than `make-symbol'.  It's important that
+	    ;; (not (eq (symbol-name var1) (symbol-name var2))) because
+	    ;; these vars get added to the macro-environment.
+            (let ((var (or (pop cl--loop-args) (gensym "--cl-var--"))))
+	      (setq word (pop cl--loop-args))
+	      (if (eq word 'being) (setq word (pop cl--loop-args)))
+	      (if (memq word '(the each)) (setq word (pop cl--loop-args)))
+	      (if (memq word '(buffer buffers))
+		  (setq word 'in
+                        cl--loop-args (cons '(buffer-list) cl--loop-args)))
+	      (cond
+
+	       ((memq word '(from downfrom upfrom to downto upto
+			     above below by))
+		(push word cl--loop-args)
+		(if (memq (car cl--loop-args) '(downto above))
+		    (error "Must specify `from' value for downward cl-loop"))
+		(let* ((down (or (eq (car cl--loop-args) 'downfrom)
+				 (memq (nth 2 cl--loop-args)
+                                       '(downto above))))
+		       (excl (or (memq (car cl--loop-args) '(above below))
+				 (memq (nth 2 cl--loop-args)
+                                       '(above below))))
+		       (start (and (memq (car cl--loop-args)
+                                         '(from upfrom downfrom))
+				   (cl--pop2 cl--loop-args)))
+		       (end (and (memq (car cl--loop-args)
+				       '(to upto downto above below))
+				 (cl--pop2 cl--loop-args)))
+		       (step (and (eq (car cl--loop-args) 'by)
+                                  (cl--pop2 cl--loop-args)))
+		       (end-var (and (not (macroexp-const-p end))
+				     (make-symbol "--cl-var--")))
+		       (step-var (and (not (macroexp-const-p step))
+				      (make-symbol "--cl-var--"))))
+		  (and step (numberp step) (<= step 0)
+		       (error "Loop `by' value is not positive: %s" step))
+		  (push (list var (or start 0)) loop-for-bindings)
+		  (if end-var (push (list end-var end) loop-for-bindings))
+		  (if step-var (push (list step-var step)
+				     loop-for-bindings))
+		  (when end
+                    (cl--push-clause-loop-body
+                     (list
+                      (if down (if excl '> '>=) (if excl '< '<=))
+                      var (or end-var end))))
+		  (push (list var (list (if down '- '+) var
+					(or step-var step 1)))
+			loop-for-steps)))
+
+	       ((memq word '(in in-ref on))
+		(let* ((on (eq word 'on))
+		       (temp (if (and on (symbolp var))
+				 var (make-symbol "--cl-var--"))))
+		  (push (list temp (pop cl--loop-args)) loop-for-bindings)
+                  (cl--push-clause-loop-body `(consp ,temp))
+		  (if (eq word 'in-ref)
+		      (push (list var `(car ,temp)) cl--loop-symbol-macs)
+		    (or (eq temp var)
+			(progn
+			  (push (list var nil) loop-for-bindings)
+			  (push (list var (if on temp `(car ,temp)))
+				loop-for-sets))))
+		  (push (list temp
+			      (if (eq (car cl--loop-args) 'by)
+				  (let ((step (cl--pop2 cl--loop-args)))
+				    (if (and (memq (car-safe step)
+						   '(quote function
+							   cl-function))
+					     (symbolp (nth 1 step)))
+					(list (nth 1 step) temp)
+				      `(funcall ,step ,temp)))
+				`(cdr ,temp)))
+			loop-for-steps)))
+
+	       ((eq word '=)
+		(let* ((start (pop cl--loop-args))
+		       (then (if (eq (car cl--loop-args) 'then)
+                                 (cl--pop2 cl--loop-args) start))
+                       (first-assign (or cl--loop-first-flag
+					 (setq cl--loop-first-flag
+					       (make-symbol "--cl-var--")))))
+		  (push (list var nil) loop-for-bindings)
+		  (if (or ands (eq (car cl--loop-args) 'and))
+		      (progn
+			(push `(,var (if ,first-assign ,start ,var)) loop-for-sets)
+			(push `(,var (if ,(car (cl--loop-build-ands
+                                                (nreverse cl--loop-conditions)))
+                                         ,then ,var))
+                              loop-for-steps))
+                    (push (if (eq start then)
+		              `(,var ,then)
+                            `(,var (if ,first-assign ,start ,then)))
+                          loop-for-sets))))
+
+	       ((memq word '(across across-ref))
+		(let ((temp-vec (make-symbol "--cl-vec--"))
+		      (temp-idx (make-symbol "--cl-idx--")))
+		  (push (list temp-vec (pop cl--loop-args)) loop-for-bindings)
+		  (push (list temp-idx -1) loop-for-bindings)
+                  (push `(setq ,temp-idx (1+ ,temp-idx)) cl--loop-body)
+		  (cl--push-clause-loop-body
+                   `(< ,temp-idx (length ,temp-vec)))
+		  (if (eq word 'across-ref)
+		      (push (list var `(aref ,temp-vec ,temp-idx))
+			    cl--loop-symbol-macs)
+		    (push (list var nil) loop-for-bindings)
+		    (push (list var `(aref ,temp-vec ,temp-idx))
+			  loop-for-sets))))
+
+	       ((memq word '(element elements))
+		(let ((ref (or (memq (car cl--loop-args) '(in-ref of-ref))
+			       (and (not (memq (car cl--loop-args) '(in of)))
+				    (error "Expected `of'"))))
+		      (seq (cl--pop2 cl--loop-args))
+		      (temp-seq (make-symbol "--cl-seq--"))
+		      (temp-idx
+                       (if (eq (car cl--loop-args) 'using)
+                           (if (and (= (length (cadr cl--loop-args)) 2)
+                                    (eq (caadr cl--loop-args) 'index))
+                               (cadr (cl--pop2 cl--loop-args))
+                             (error "Bad `using' clause"))
+                         (make-symbol "--cl-idx--"))))
+		  (push (list temp-seq seq) loop-for-bindings)
+		  (push (list temp-idx 0) loop-for-bindings)
+		  (if ref
+                      (let ((temp-len (make-symbol "--cl-len--")))
+			(push (list temp-len `(length ,temp-seq))
+			      loop-for-bindings)
+			(push (list var `(elt ,temp-seq ,temp-idx))
+			      cl--loop-symbol-macs)
+                        (cl--push-clause-loop-body `(< ,temp-idx ,temp-len)))
+		    (push (list var nil) loop-for-bindings)
+		    (cl--push-clause-loop-body `(and ,temp-seq
+                                                     (or (consp ,temp-seq)
+                                                         (< ,temp-idx (length ,temp-seq)))))
+		    (push (list var `(if (consp ,temp-seq)
+                                         (pop ,temp-seq)
+                                       (aref ,temp-seq ,temp-idx)))
+			  loop-for-sets))
+		  (push (list temp-idx `(1+ ,temp-idx))
+			loop-for-steps)))
+
+	       ((memq word hash-types)
+		(or (memq (car cl--loop-args) '(in of))
+                    (error "Expected `of'"))
+		(let* ((table (cl--pop2 cl--loop-args))
+		       (other
+                        (if (eq (car cl--loop-args) 'using)
+                            (if (and (= (length (cadr cl--loop-args)) 2)
+                                     (memq (caadr cl--loop-args) hash-types)
+                                     (not (eq (caadr cl--loop-args) word)))
+                                (cadr (cl--pop2 cl--loop-args))
+                              (error "Bad `using' clause"))
+                          (make-symbol "--cl-var--"))))
+		  (if (memq word '(hash-value hash-values))
+		      (setq var (prog1 other (setq other var))))
+		  (cl--loop-set-iterator-function
+                   'hash-tables (lambda (body)
+                                  `(maphash (lambda (,var ,other) . ,body)
+                                            ,table)))))
+
+	       ((memq word '(symbol present-symbol external-symbol
+			     symbols present-symbols external-symbols))
+		(let ((ob (and (memq (car cl--loop-args) '(in of))
+                               (cl--pop2 cl--loop-args))))
+		  (cl--loop-set-iterator-function
+                   'symbols (lambda (body)
+                              `(mapatoms (lambda (,var) . ,body) ,ob)))))
+
+	       ((memq word '(overlay overlays extent extents))
+		(let ((buf nil) (from nil) (to nil))
+		  (while (memq (car cl--loop-args) '(in of from to))
+		    (cond ((eq (car cl--loop-args) 'from)
+                           (setq from (cl--pop2 cl--loop-args)))
+			  ((eq (car cl--loop-args) 'to)
+                           (setq to (cl--pop2 cl--loop-args)))
+			  (t (setq buf (cl--pop2 cl--loop-args)))))
+		  (cl--loop-set-iterator-function
+                   'overlays (lambda (body)
+                               `(cl--map-overlays
+                                 (lambda (,var ,(make-symbol "--cl-var--"))
+                                   (progn . ,body) nil)
+                                 ,buf ,from ,to)))))
+
+	       ((memq word '(interval intervals))
+		(let ((buf nil) (prop nil) (from nil) (to nil)
+		      (var1 (make-symbol "--cl-var1--"))
+		      (var2 (make-symbol "--cl-var2--")))
+		  (while (memq (car cl--loop-args) '(in of property from to))
+		    (cond ((eq (car cl--loop-args) 'from)
+                           (setq from (cl--pop2 cl--loop-args)))
+			  ((eq (car cl--loop-args) 'to)
+                           (setq to (cl--pop2 cl--loop-args)))
+			  ((eq (car cl--loop-args) 'property)
+			   (setq prop (cl--pop2 cl--loop-args)))
+			  (t (setq buf (cl--pop2 cl--loop-args)))))
+		  (if (and (consp var) (symbolp (car var)) (symbolp (cdr var)))
+		      (setq var1 (car var) var2 (cdr var))
+		    (push (list var nil) loop-for-bindings)
+		    (push (list var `(cons ,var1 ,var2)) loop-for-sets))
+		  (cl--loop-set-iterator-function
+                   'intervals (lambda (body)
+                                `(cl--map-intervals
+                                  (lambda (,var1 ,var2) . ,body)
+                                  ,buf ,prop ,from ,to)))))
+
+	       ((memq word key-types)
+		(or (memq (car cl--loop-args) '(in of))
+                    (error "Expected `of'"))
+                (let ((map (cl--pop2 cl--loop-args))
+		      (other
+                       (if (eq (car cl--loop-args) 'using)
+                           (if (and (= (length (cadr cl--loop-args)) 2)
+                                    (memq (caadr cl--loop-args) key-types)
+                                    (not (eq (caadr cl--loop-args) word)))
+                               (cadr (cl--pop2 cl--loop-args))
+                             (error "Bad `using' clause"))
+                         (make-symbol "--cl-var--"))))
+		  (if (memq word '(key-binding key-bindings))
+		      (setq var (prog1 other (setq other var))))
+		  (cl--loop-set-iterator-function
+                   'keys (lambda (body)
+                           `(,(if (memq word '(key-seq key-seqs))
+                                  'cl--map-keymap-recursively 'map-keymap)
+                             (lambda (,var ,other) . ,body) ,map)))))
+
+	       ((memq word '(frame frames screen screens))
+		(let ((temp (make-symbol "--cl-var--")))
+		  (push (list var  '(selected-frame))
+			loop-for-bindings)
+		  (push (list temp nil) loop-for-bindings)
+		  (cl--push-clause-loop-body `(prog1 (not (eq ,var ,temp))
+                                                (or ,temp (setq ,temp ,var))))
+		  (push (list var `(next-frame ,var))
+			loop-for-steps)))
+
+	       ((memq word '(window windows))
+		(let ((scr (and (memq (car cl--loop-args) '(in of))
+                                (cl--pop2 cl--loop-args)))
+		      (temp (make-symbol "--cl-var--"))
+		      (minip (make-symbol "--cl-minip--")))
+		  (push (list var (if scr
+				      `(frame-selected-window ,scr)
+				    '(selected-window)))
+			loop-for-bindings)
+		  ;; If we started in the minibuffer, we need to
+		  ;; ensure that next-window will bring us back there
+		  ;; at some point.  (Bug#7492).
+		  ;; (Consider using walk-windows instead of cl-loop if
+		  ;; you care about such things.)
+		  (push (list minip `(minibufferp (window-buffer ,var)))
+			loop-for-bindings)
+		  (push (list temp nil) loop-for-bindings)
+		  (cl--push-clause-loop-body `(prog1 (not (eq ,var ,temp))
+                                                (or ,temp (setq ,temp ,var))))
+		  (push (list var `(next-window ,var ,minip))
+			loop-for-steps)))
+
+	       (t
+		;; This is an advertised interface: (info "(cl)Other Clauses").
+		(let ((handler (and (symbolp word)
+				    (get word 'cl-loop-for-handler))))
+		  (if handler
+		      (funcall handler var)
+		    (error "Expected a `for' preposition, found %s" word)))))
+	      (eq (car cl--loop-args) 'and))
+	  (setq ands t)
+	  (pop cl--loop-args))
+	(if (and ands loop-for-bindings)
+	    (push (nreverse loop-for-bindings) cl--loop-bindings)
+	  (setq cl--loop-bindings (nconc (mapcar #'list loop-for-bindings)
+				         cl--loop-bindings)))
+	(if loop-for-sets
+	    (push `(progn
+                     ,(cl--loop-let (nreverse loop-for-sets) 'setq ands)
+                     t)
+                  cl--loop-body))
+	(when loop-for-steps
+	  (push (cons (if ands 'cl-psetq 'setq)
+		      (apply #'append (nreverse loop-for-steps)))
+		cl--loop-steps))))
+
+     ((eq word 'repeat)
+      (let ((temp (make-symbol "--cl-var--")))
+	(push (list (list temp (pop cl--loop-args))) cl--loop-bindings)
+	(push `(>= (setq ,temp (1- ,temp)) 0) cl--loop-body)))
+
+     ((memq word '(collect collecting))
+      (let ((what (pop cl--loop-args))
+	    (var (cl--loop-handle-accum nil 'nreverse)))
+	(if (eq var cl--loop-accum-var)
+	    (push `(progn (push ,what ,var) t) cl--loop-body)
+	  (push `(progn
+                   (setq ,var (nconc ,var (list ,what)))
+                   t)
+                cl--loop-body))))
+
+     ((memq word '(nconc nconcing append appending))
+      (let ((what (pop cl--loop-args))
+	    (var (cl--loop-handle-accum nil 'nreverse)))
+	(push `(progn
+                 (setq ,var
+                       ,(if (eq var cl--loop-accum-var)
+                            `(nconc
+                              (,(if (memq word '(nconc nconcing))
+                                    #'nreverse #'reverse)
+                               ,what)
+                              ,var)
+                          `(,(if (memq word '(nconc nconcing))
+                                 #'nconc #'append)
+                            ,var ,what)))
+                 t)
+              cl--loop-body)))
+
+     ((memq word '(concat concating))
+      (let ((what (pop cl--loop-args))
+	    (var (cl--loop-handle-accum "")))
+	(push `(progn (cl-callf concat ,var ,what) t) cl--loop-body)))
+
+     ((memq word '(vconcat vconcating))
+      (let ((what (pop cl--loop-args))
+	    (var (cl--loop-handle-accum [])))
+	(push `(progn (cl-callf vconcat ,var ,what) t) cl--loop-body)))
+
+     ((memq word '(sum summing))
+      (let ((what (pop cl--loop-args))
+	    (var (cl--loop-handle-accum 0)))
+        (push `(progn (incf ,var ,what) t) cl--loop-body)))
+
+     ((memq word '(count counting))
+      (let ((what (pop cl--loop-args))
+	    (var (cl--loop-handle-accum 0)))
+        (push `(progn (if ,what (incf ,var)) t) cl--loop-body)))
+
+     ((memq word '(minimize minimizing maximize maximizing))
+      (push `(progn ,(macroexp-let2 macroexp-copyable-p temp
+                                    (pop cl--loop-args)
+                       (let* ((var (cl--loop-handle-accum nil))
+                              (func (intern (substring (symbol-name word)
+                                                       0 3))))
+                         `(setq ,var (if ,var (,func ,var ,temp) ,temp))))
+                    t)
+            cl--loop-body))
+
+     ((eq word 'with)
+      (let ((bindings nil))
+	(while (progn (push (list (pop cl--loop-args)
+				  (and (eq (car cl--loop-args) '=)
+                                       (cl--pop2 cl--loop-args)))
+			    bindings)
+		      (eq (car cl--loop-args) 'and))
+	  (pop cl--loop-args))
+	(push (nreverse bindings) cl--loop-bindings)))
+
+     ((eq word 'while)
+      (push (pop cl--loop-args) cl--loop-body))
+
+     ((eq word 'until)
+      (push `(not ,(pop cl--loop-args)) cl--loop-body))
+
+     ((eq word 'always)
+      (or cl--loop-finish-flag
+          (setq cl--loop-finish-flag (make-symbol "--cl-flag--")))
+      (push `(setq ,cl--loop-finish-flag ,(pop cl--loop-args)) cl--loop-body)
+      (setq cl--loop-result t))
+
+     ((eq word 'never)
+      (or cl--loop-finish-flag
+          (setq cl--loop-finish-flag (make-symbol "--cl-flag--")))
+      (push `(setq ,cl--loop-finish-flag (not ,(pop cl--loop-args)))
+	    cl--loop-body)
+      (setq cl--loop-result t))
+
+     ((eq word 'thereis)
+      (or cl--loop-finish-flag
+          (setq cl--loop-finish-flag (make-symbol "--cl-flag--")))
+      (or cl--loop-result-var
+          (setq cl--loop-result-var (make-symbol "--cl-var--")))
+      (push `(setq ,cl--loop-finish-flag
+                   (not (setq ,cl--loop-result-var ,(pop cl--loop-args))))
+	    cl--loop-body))
+
+     ((memq word '(if when unless))
+      (let* ((cond (pop cl--loop-args))
+	     (then (let ((cl--loop-body nil))
+		     (cl--parse-loop-clause)
+		     (cl--loop-build-ands (nreverse cl--loop-body))))
+	     (else (let ((cl--loop-body nil))
+		     (if (eq (car cl--loop-args) 'else)
+			 (progn (pop cl--loop-args) (cl--parse-loop-clause)))
+		     (cl--loop-build-ands (nreverse cl--loop-body))))
+	     (simple (and (eq (car then) t) (eq (car else) t))))
+	(if (eq (car cl--loop-args) 'end) (pop cl--loop-args))
+	(if (eq word 'unless) (setq then (prog1 else (setq else then))))
+	(let ((form (cons (if simple (cons 'progn (nth 1 then)) (nth 2 then))
+			  (if simple (nth 1 else) (list (nth 2 else))))))
+	  (setq form (if (cl--expr-contains form 'it)
+                         `(let ((it ,cond)) (if it ,@form))
+                       `(if ,cond ,@form)))
+	  (push (if simple `(progn ,form t) form) cl--loop-body))))
+
+     ((memq word '(do doing))
+      (let ((body nil))
+	(or (consp (car cl--loop-args)) (error "Syntax error on `do' clause"))
+	(while (consp (car cl--loop-args)) (push (pop cl--loop-args) body))
+	(push (cons 'progn (nreverse (cons t body))) cl--loop-body)))
+
+     ((eq word 'return)
+      (or cl--loop-finish-flag
+          (setq cl--loop-finish-flag (make-symbol "--cl-var--")))
+      (or cl--loop-result-var
+          (setq cl--loop-result-var (make-symbol "--cl-var--")))
+      (push `(setq ,cl--loop-result-var ,(pop cl--loop-args)
+                   ,cl--loop-finish-flag nil)
+            cl--loop-body))
+
+     (t
+      ;; This is an advertised interface: (info "(cl)Other Clauses").
+      (let ((handler (and (symbolp word) (get word 'cl-loop-handler))))
+	(or handler (error "Expected a cl-loop keyword, found %s" word))
+	(funcall handler))))
+    (if (eq (car cl--loop-args) 'and)
+	(progn (pop cl--loop-args) (cl--parse-loop-clause)))))
+
+(defun cl--unused-var-p (sym)
+  (or (null sym) (eq ?_ (aref (symbol-name sym) 0))))
+
+(defun cl--loop-let (specs body par)    ; modifies cl--loop-bindings
+  "Build an expression equivalent to (let SPECS BODY).
+SPECS can include bindings using `cl-loop's destructuring (not to be
+confused with the patterns of `cl-destructuring-bind').
+If PAR is nil, do the bindings step by step, like `let*'.
+If BODY is `setq', then use SPECS for assignments rather than for bindings."
+  (let ((temps nil) (new nil))
+    (when par
+      (let ((p specs))
+        (while (and p (or (symbolp (car-safe (car p))) (null (cadar p))))
+          (setq p (cdr p)))
+        (when p
+          (setq par nil)
+          (dolist (spec specs)
+            (or (macroexp-const-p (cadr spec))
+                (let ((temp (make-symbol "--cl-var--")))
+                  (push (list temp (cadr spec)) temps)
+                  (setcar (cdr spec) temp)))))))
+    (while specs
+      (let* ((binding (pop specs))
+             (spec (car-safe binding)))
+        (if (and (consp binding) (or (consp spec) (cl--unused-var-p spec)))
+            (let* ((nspecs nil)
+                   (expr (car (cdr-safe binding)))
+                   (temp (last spec 0)))
+              (if (and (cl--unused-var-p temp) (null expr))
+                  nil ;; Don't bother declaring/setting `temp' since it won't
+		      ;; be used when `expr' is nil, anyway.
+		(when (or (null temp)
+                          (and (eq body 'setq) (cl--unused-var-p temp)))
+                  ;; Prefer a fresh uninterned symbol over "_to", to avoid
+                  ;; warnings that we set an unused variable.
+                  (setq temp (make-symbol "--cl-var--"))
+                  ;; Make sure this temp variable is locally declared.
+                  (when (eq body 'setq)
+                    (push (list (list temp)) cl--loop-bindings)))
+                (push (list temp expr) new))
+              (while (consp spec)
+                (push (list (pop spec)
+                            (and expr (list (if spec 'pop 'car) temp)))
+                      nspecs))
+              (setq specs (nconc (nreverse nspecs) specs)))
+          (push binding new))))
+    (if (eq body 'setq)
+	(let ((set (cons (if par 'cl-psetq 'setq)
+                         (apply #'nconc (nreverse new)))))
+	  (if temps `(let* ,(nreverse temps) ,set) set))
+      `(,(if par 'let 'let*)
+        ,(nconc (nreverse temps) (nreverse new)) ,@body))))
+
+(defun cl--loop-handle-accum (def &optional func) ; uses loop-*
+  (if (eq (car cl--loop-args) 'into)
+      (let ((var (cl--pop2 cl--loop-args)))
+	(or (memq var cl--loop-accum-vars)
+	    (progn (push (list (list var def)) cl--loop-bindings)
+		   (push var cl--loop-accum-vars)))
+	var)
+    (or cl--loop-accum-var
+	(progn
+	  (push (list (list
+                       (setq cl--loop-accum-var (make-symbol "--cl-var--"))
+                       def))
+                cl--loop-bindings)
+	  (setq cl--loop-result (if func (list func cl--loop-accum-var)
+                                  cl--loop-accum-var))
+	  cl--loop-accum-var))))
+
+(defun cl--loop-build-ands (clauses)
+  "Return various representations of (and . CLAUSES).
+CLAUSES is a list of Elisp expressions, where clauses of the form
+\(progn E1 E2 E3 .. t) are the focus of particular optimizations.
+The return value has shape (COND BODY COMBO)
+such that COMBO is equivalent to (and . CLAUSES)."
+  (let ((ands nil)
+	(body nil))
+    ;; Look through `clauses', trying to optimize (progn ,@A t) (progn ,@B) ,@C
+    ;; into (progn ,@A ,@B) ,@C.
+    (while clauses
+      (if (and (eq (car-safe (car clauses)) 'progn)
+	       (eq (car (last (car clauses))) t))
+	  (if (cdr clauses)
+	      (setq clauses (cons (nconc (butlast (car clauses))
+					 (if (eq (car-safe (cadr clauses))
+						 'progn)
+                                             (cdadr clauses)
+					   (list (cadr clauses))))
+				  (cddr clauses)))
+            ;; A final (progn ,@A t) is moved outside of the `and'.
+	    (setq body (cdr (butlast (pop clauses)))))
+	(push (pop clauses) ands)))
+    (setq ands (or (nreverse ands) (list t)))
+    (list (if (cdr ands) (cons 'and ands) (car ands))
+	  body
+	  (let ((full (if body
+			  (append ands (list (cons 'progn (append body '(t)))))
+			ands)))
+	    (if (cdr full) (cons 'and full) (car full))))))
+
+
+(defun cl--map-intervals (func &optional what prop start end)
+  (or what (setq what (current-buffer)))
+  (if (bufferp what)
+      (let (mark mark2 (next t) next2)
+        (with-current-buffer what
+          (setq mark (copy-marker (or start (point-min))))
+          (setq mark2 (and end (copy-marker end))))
+        (while (and next (or (not mark2) (< mark mark2)))
+          (setq next (if prop (next-single-property-change
+                               mark prop what)
+                       (next-property-change mark what))
+                next2 (or next (with-current-buffer what
+                                 (point-max))))
+          (funcall func (prog1 (marker-position mark)
+                          (set-marker mark next2))
+                   (if mark2 (min next2 mark2) next2)))
+        (set-marker mark nil) (if mark2 (set-marker mark2 nil)))
+    (or start (setq start 0))
+    (or end (setq end (length what)))
+    (while (< start end)
+      (let ((next (or (if prop (next-single-property-change
+                                start prop what)
+                        (next-property-change start what))
+                      end)))
+        (funcall func start (min next end))
+        (setq start next)))))
+
+;;;###autoload
+(defun cl--map-overlays (func &optional buffer start end arg)
+  (or buffer (setq buffer (current-buffer)))
+  (let (ovl)
+    (with-current-buffer buffer
+      (setq ovl (overlay-lists))
+      (if start (setq start (copy-marker start)))
+      (if end (setq end (copy-marker end))))
+    (setq ovl (nconc (car ovl) (cdr ovl)))
+    (while (and ovl
+                (or (not (overlay-start (car ovl)))
+                    (and end (>= (overlay-start (car ovl)) end))
+                    (and start (<= (overlay-end (car ovl)) start))
+                    (not (funcall func (car ovl) arg))))
+      (setq ovl (cdr ovl)))
+    (if start (set-marker start nil))
+    (if end (set-marker end nil))))
 
 ;;; ---- cl-macs.el / cl-extra.el: the remaining macro and number surface ----
 ;; Ported from GNU Emacs 31.1's cl-macs.el, cl-extra.el and cl-lib.el.

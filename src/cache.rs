@@ -114,7 +114,12 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 ///
 /// v14: a closure's `SerObj::Closure::env` entries carry an optional value, None
 /// for a local special declaration (`(defvar SYM)` under lexical binding).
-pub const SHARD_FORMAT_VERSION: u32 = 14;
+///
+/// v15: a call whose head is `nil`/`t` now carries the `CHECK_ARITY` guard too,
+/// and the guard signals `void-function` for a head with no function cell
+/// before any argument form runs. No struct changed shape, so a v14 chunk
+/// decodes cleanly and would replay the old argument-first order.
+pub const SHARD_FORMAT_VERSION: u32 = 15;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next

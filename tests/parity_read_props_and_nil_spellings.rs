@@ -132,32 +132,33 @@ fn error_data_keeps_a_strings_text_properties() {
 
 // ── cl-seq `*-if' with a nil predicate ───────────────────────────────────────
 
-/// cl-seq.el's `*-if' functions are wrappers that pass their predicate through
-/// as `:if'; `cl--check-test-nokey' only calls it when it is non-nil, and falls
-/// through to `(eql ITEM X)' — with the implicit nil ITEM — when it is not.
-/// So a nil predicate matches the nil elements; it is never funcalled.
+/// emacs-31.1 cl-seq.el defines the `*-if' functions as `:test #'funcall' over
+/// the predicate, so a nil predicate is funcalled: `void-function nil'. (Emacs
+/// 30 passed it as `:if' and fell through to `(eql ITEM X)', which matched the
+/// nil elements.)
 #[test]
-fn a_nil_predicate_matches_the_nil_elements() {
-    assert_eq!(eval("(cl-position-if nil '(1 nil 2))"), "1");
-    assert_eq!(eval("(cl-position-if nil '(1 2))"), "nil");
-    assert_eq!(eval("(cl-position-if nil \"foo2\")"), "nil");
-    assert_eq!(eval("(cl-position-if-not nil '(1 nil 2))"), "1");
-    assert_eq!(eval("(cl-find-if nil '(1 nil 2))"), "nil");
-    assert_eq!(eval("(cl-find-if-not nil '(1 nil 2))"), "nil");
-    assert_eq!(eval("(cl-count-if nil '(1 nil 2 nil))"), "2");
-    assert_eq!(eval("(cl-count-if-not nil '(1 nil 2))"), "1");
-    assert_eq!(eval("(cl-member-if nil '(1 nil 2))"), "(nil 2)");
-    assert_eq!(eval("(cl-member-if-not nil '(1 nil 2))"), "(nil 2)");
-    assert_eq!(eval("(cl-assoc-if nil '((1 . 2) (nil . 3)))"), "(nil . 3)");
-    assert_eq!(
-        eval("(cl-assoc-if-not nil '((1 . 2) (nil . 3)))"),
-        "(nil . 3)"
-    );
-    assert_eq!(eval("(cl-rassoc-if nil '((1 . 2) (3 . nil)))"), "(3)");
-    assert_eq!(eval("(cl-substitute-if 9 nil '(1 nil 2))"), "(1 9 2)");
-    assert_eq!(eval("(cl-substitute-if-not 9 nil '(1 nil 2))"), "(1 9 2)");
-    assert_eq!(eval("(cl-remove-if nil '(1 nil 2))"), "(1 2)");
-    assert_eq!(eval("(cl-remove-if-not nil '(1 nil 2))"), "(1 2)");
+fn a_nil_predicate_is_funcalled() {
+    for form in [
+        "(cl-position-if nil '(1 nil 2))",
+        "(cl-position-if-not nil '(1 nil 2))",
+        "(cl-find-if nil '(1 nil 2))",
+        "(cl-find-if-not nil '(1 nil 2))",
+        "(cl-count-if nil '(1 nil 2 nil))",
+        "(cl-count-if-not nil '(1 nil 2))",
+        "(cl-member-if nil '(1 nil 2))",
+        "(cl-member-if-not nil '(1 nil 2))",
+        "(cl-assoc-if nil '((1 . 2) (nil . 3)))",
+        "(cl-assoc-if-not nil '((1 . 2) (nil . 3)))",
+        "(cl-rassoc-if nil '((1 . 2) (3 . nil)))",
+        "(cl-substitute-if 9 nil '(1 nil 2))",
+        "(cl-substitute-if-not 9 nil '(1 nil 2))",
+        "(cl-remove-if nil '(1 nil 2))",
+        "(cl-remove-if-not nil '(1 nil 2))",
+        "(cl-subst-if 9 nil '(1 nil 2))",
+        "(cl-nsubst-if-not 9 nil '(1 nil 2))",
+    ] {
+        assert_eq!(caught(form), "(void-function nil)", "{form}");
+    }
 }
 
 /// A real predicate still behaves, and the `-not' wrappers still negate.
@@ -171,15 +172,10 @@ fn a_real_predicate_is_unaffected_by_the_nil_fallback() {
     assert_eq!(eval("(cl-remove-if-not #'numberp '(nil 2))"), "(2)");
 }
 
-/// `cl-subst-if' and its three siblings were missing entirely. They are
-/// `cl-sublis' over the one-entry alist `((nil . NEW))' with the predicate as
-/// `:if', which is why a nil predicate replaces the list's terminating nil too.
+/// `cl-subst-if' and its three siblings substitute through the whole tree: a real
+/// predicate matches every node it accepts, conses included.
 #[test]
 fn subst_if_substitutes_through_the_whole_tree() {
-    assert_eq!(eval("(cl-subst-if 9 nil '(1 nil 2))"), "(1 9 2 . 9)");
-    assert_eq!(eval("(cl-nsubst-if 9 nil '(1 nil 2))"), "(1 9 2 . 9)");
-    assert_eq!(eval("(cl-subst-if-not 9 nil '(1 nil 2))"), "(1 9 2 . 9)");
-    assert_eq!(eval("(cl-nsubst-if-not 9 nil '(1 nil 2))"), "(1 9 2 . 9)");
     // A real predicate matches every node it accepts, conses included, so the
     // whole tree collapses to NEW as soon as the root matches.
     assert_eq!(eval("(cl-subst-if 9 #'numberp '(1 nil 2))"), "(9 nil 9)");

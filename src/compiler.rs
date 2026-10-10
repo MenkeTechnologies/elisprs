@@ -445,6 +445,11 @@ pub(crate) fn special_form_arity_error(name: &str, argc: usize) -> Option<usize>
 }
 
 fn needs_arity_guard(h: &ElispHost, head: &Value, argc: usize) -> bool {
+    // `nil` and `t` are symbols without a function cell: `(nil 1 (f))` signals
+    // `void-function` before `(f)` runs, like any other void head.
+    if matches!(head, Value::Undef | Value::Bool(_)) {
+        return true;
+    }
     if !matches!(h.obj(head), Some(Obj::Symbol(_))) {
         return false;
     }

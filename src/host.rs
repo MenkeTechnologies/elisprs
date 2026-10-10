@@ -824,6 +824,178 @@ impl FnKind {
     }
 }
 
+/// Prelude functions whose Emacs counterpart is a C subr, so a wrong-arity call
+/// names the callee as written (`(wrong-number-of-arguments cl-first 2)`) instead
+/// of the `(MANDATORY . NONREST)` template every other preloaded function reports
+/// (see [`ElispHost::signal_closure_wrong_nargs`]). A name belongs here iff
+/// `(subrp (symbol-function NAME))` is non-nil in Emacs while the prelude defines
+/// NAME as Lisp; sorted, because it is binary-searched.
+const PRELUDE_C_SUBR_NAMES: &[&str] = &[
+    "/=",
+    "all-completions",
+    "arrayp",
+    "assoc-string",
+    "autoload",
+    "backward-prefix-chars",
+    "bare-symbol",
+    "barf-if-buffer-read-only",
+    "bindings--define-key",
+    "buffer-enable-undo",
+    "buffer-file-name",
+    "buffer-hash",
+    "byte-code-function-p",
+    "capitalize",
+    "capitalize-region",
+    "capitalize-word",
+    "car-safe",
+    "cdr-safe",
+    "char-syntax",
+    "characterp",
+    "check-coding-system",
+    "cl-first",
+    "cl-rest",
+    "cl-type-of",
+    "cl-values",
+    "coding-system-base",
+    "coding-system-eol-type",
+    "coding-system-p",
+    "command-remapping",
+    "commandp",
+    "compare-buffer-substrings",
+    "copy-alist",
+    "copy-sequence",
+    "copy-syntax-table",
+    "current-message",
+    "current-time-zone",
+    "defalias",
+    "define-hash-table-test",
+    "define-key",
+    "delete",
+    "delq",
+    "directory-file-name",
+    "directory-files",
+    "directory-name-p",
+    "documentation",
+    "documentation-property",
+    "documentation-stringp",
+    "downcase-region",
+    "downcase-word",
+    "equal-including-properties",
+    "error-message-string",
+    "expand-file-name",
+    "featurep",
+    "file-name-absolute-p",
+    "file-name-as-directory",
+    "file-name-concat",
+    "file-name-directory",
+    "file-name-nondirectory",
+    "following-char",
+    "force-mode-line-update",
+    "format-message",
+    "forward-comment",
+    "get",
+    "get-char-property",
+    "get-load-suffixes",
+    "hash-table-rehash-size",
+    "hash-table-rehash-threshold",
+    "insert-and-inherit",
+    "insert-before-markers",
+    "integer-or-marker-p",
+    "interactive-form",
+    "internal--define-uninitialized-variable",
+    "key-description",
+    "keymap-parent",
+    "keymapp",
+    "kill-all-local-variables",
+    "length<",
+    "length=",
+    "length>",
+    "locate-file-internal",
+    "lookup-key",
+    "make-char-table",
+    "make-sparse-keymap",
+    "make-temp-name",
+    "mapcan",
+    "matching-paren",
+    "modify-syntax-entry",
+    "multibyte-string-p",
+    "nconc",
+    "next-property-change",
+    "next-single-property-change",
+    "ngettext",
+    "nreverse",
+    "ntake",
+    "number-or-marker-p",
+    "overlay-recenter",
+    "parse-partial-sexp",
+    "plist-get",
+    "plist-member",
+    "plist-put",
+    "preceding-char",
+    "prefix-numeric-value",
+    "previous-single-property-change",
+    "proper-list-p",
+    "provide",
+    "purecopy",
+    "put",
+    "remove-list-of-text-properties",
+    "require",
+    "run-hook-with-args",
+    "run-hook-with-args-until-failure",
+    "run-hook-with-args-until-success",
+    "run-hook-wrapped",
+    "run-hooks",
+    "safe-length",
+    "scan-lists",
+    "scan-sexps",
+    "sequencep",
+    "set-default-toplevel-value",
+    "set-keymap-parent",
+    "set-syntax-table",
+    "setplist",
+    "single-key-description",
+    "skip-syntax-backward",
+    "skip-syntax-forward",
+    "standard-syntax-table",
+    "string-as-multibyte",
+    "string-as-unibyte",
+    "string-bytes",
+    "string-collate-equalp",
+    "string-collate-lessp",
+    "string-equal",
+    "string-lessp",
+    "string-reverse",
+    "string-to-multibyte",
+    "string-to-syntax",
+    "string-to-unibyte",
+    "string-version-lessp",
+    "string-width",
+    "string<",
+    "string=",
+    "subst-char-in-region",
+    "symbol-plist",
+    "symbol-with-pos-p",
+    "syntax-class-to-char",
+    "syntax-table",
+    "syntax-table-p",
+    "take",
+    "test-completion",
+    "text-property-any",
+    "text-property-not-all",
+    "text-quoting-style",
+    "time-add",
+    "time-convert",
+    "time-equal-p",
+    "time-less-p",
+    "time-subtract",
+    "try-completion",
+    "upcase-initials",
+    "upcase-region",
+    "upcase-word",
+    "value<",
+    "wholenump",
+];
+
 /// Emacs's `exec_byte_code` arity template — `(MANDATORY, NONREST)` — for every
 /// function elisprs implements as a Rust subr while Emacs implements it in
 /// *byte-compiled Lisp*.
@@ -5851,6 +6023,47 @@ impl ElispHost {
         msg
     }
 
+    /// The `wrong-number-of-arguments` of a call to a prelude or user CLOSURE.
+    ///
+    /// A closure the prelude defined models Emacs's preloaded or autoloaded Lisp,
+    /// which ships byte-compiled: `exec_byte_code` signals the packed
+    /// `(MANDATORY . NONREST)` template, not the function (NONREST counts the
+    /// formals before `&rest`). The exception is a name that is a C subr in Emacs
+    /// ([`PRELUDE_C_SUBR_NAMES`]), which names the callee as written. A closure
+    /// the program defined is interpreted in Emacs too and names the closure.
+    pub fn signal_closure_wrong_nargs(
+        &mut self,
+        callee: &Value,
+        object: &Value,
+        argc: usize,
+    ) -> String {
+        if self.is_prelude_object(object) {
+            let named_subr = self
+                .sym_name(callee)
+                .is_some_and(|n| PRELUDE_C_SUBR_NAMES.binary_search(&n.as_str()).is_ok());
+            if named_subr {
+                return self.signal_wrong_nargs_subject(callee.clone(), argc);
+            }
+            if let Some(Obj::Closure { params, .. }) = self.obj(object) {
+                let mandatory = params.required.len() as i64;
+                let nonrest = mandatory + params.optional.len() as i64;
+                let template = self.cons(Value::Int(mandatory), Value::Int(nonrest));
+                return self.signal_wrong_nargs_subject(template, argc);
+            }
+        }
+        self.signal_wrong_nargs(object, argc)
+    }
+
+    fn signal_wrong_nargs_subject(&mut self, subject: Value, argc: usize) -> String {
+        let sym = self.intern("wrong-number-of-arguments");
+        let data = self.list_from(vec![subject.clone(), Value::Int(argc as i64)]);
+        let display = format!("{} {}", self.print(&subject, true), argc);
+        let obj = self.cons(sym, data);
+        let msg = format!("wrong-number-of-arguments: {display}");
+        self.set_pending_error(&msg, obj);
+        msg
+    }
+
     pub fn signal_wrong_nargs(&mut self, callee: &Value, argc: usize) -> String {
         let sym = self.intern("wrong-number-of-arguments");
         let count = Value::Int(argc as i64);
@@ -6351,6 +6564,20 @@ pub fn set_prelude_compiling(b: bool) {
 /// `signal_wrong_nargs` carries the designator as an object, so it reports the
 /// symbol for `(mapcar)` and the subr for `(funcall #'mapcar)` exactly as Emacs
 /// does, and applies the byte-compiled arity template where one is due.
+/// Whether a head with no function cell is genuinely void: the symbols
+/// `call_function` answers by NAME (its `--catch--` family, `intercept-proceed`,
+/// `__rust-compile`) and the `rust { }` FFI exports have no cell yet are callable.
+fn is_void_function_head(h: &ElispHost, head: &Value) -> bool {
+    if h.special_form_object(head).is_some() {
+        return false;
+    }
+    match h.sym_name(head).as_deref() {
+        Some("--catch--" | "--unwind--" | "--condition-case--" | "intercept-proceed" | "__rust-compile") => false,
+        Some(name) => !fusevm::ffi::is_registered(name),
+        None => true,
+    }
+}
+
 fn intrinsic_wrong_nargs(f: &Value, argc: usize) -> String {
     with_host(|h| h.signal_wrong_nargs(f, argc))
 }
@@ -6574,6 +6801,45 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                 if args.is_empty() {
                     return Err(intrinsic_wrong_nargs(f, 0));
                 }
+                // fns.c `Fsort`: two arguments are the old `(sort SEQ PRED)` call
+                // (in place, whatever PRED is); any other even count is
+                // "Invalid argument list"; otherwise the rest are KEYWORD VALUE
+                // pairs, and an unknown keyword is `(error "Invalid keyword
+                // argument" KW)`. All of that is decided before SEQ is looked at.
+                let mut pred: Option<Value> = None;
+                let mut key: Option<Value> = None;
+                let mut reverse = false;
+                let mut in_place = false;
+                if args.len() == 2 {
+                    // A nil PRED takes the `value<` default.
+                    if el_truthy(&args[1]) {
+                        pred = Some(with_host(|h| h.function_designator(&args[1])));
+                    }
+                    in_place = true;
+                } else if args.len() % 2 == 0 {
+                    return Err("error: Invalid argument list".to_string());
+                } else {
+                    for pair in args[1..].chunks(2) {
+                        let kw = with_host(|h| h.sym_name(&pair[0])).unwrap_or_default();
+                        let val = &pair[1];
+                        let truthy = el_truthy(val);
+                        match kw.as_str() {
+                            ":key" => key = truthy.then(|| val.clone()),
+                            ":lessp" => {
+                                pred = truthy
+                                    .then(|| with_host(|h| h.function_designator(val)))
+                            }
+                            ":in-place" => in_place = truthy,
+                            ":reverse" => reverse = truthy,
+                            _ => {
+                                let bad = pair[0].clone();
+                                return Err(with_host(|h| {
+                                    h.signal_error_arg("Invalid keyword argument", &bad)
+                                }));
+                            }
+                        }
+                    }
+                }
                 let (items, was_vec) = match with_host(|h| match h.obj(&args[0]) {
                     Some(Obj::Vector(v)) => Some((v.clone(), true)),
                     _ => h.list_vec(&args[0]).map(|l| (l, false)),
@@ -6593,54 +6859,6 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                         ))
                     }
                 };
-                let is_kw =
-                    |v: &Value| with_host(|h| h.sym_name(v)).is_some_and(|n| n.starts_with(':'));
-                let mut pred: Option<Value> = None;
-                let mut key: Option<Value> = None;
-                let mut reverse = false;
-                // The classic `(sort SEQ PRED)` form sorts in place; the Emacs-30
-                // keyword form is non-destructive unless `:in-place t`.
-                let mut in_place;
-                if args.len() == 2 && !is_kw(&args[1]) {
-                    // A nil PRED is not a function to call — Emacs 30's `sort`
-                    // documents PREDICATE as defaulting to `value<`, and passing
-                    // nil explicitly takes that default: `(sort '(3 1 2) nil)` is
-                    // `(1 2 3)`, and `(sort '(t "010") nil)` is value<'s
-                    // `(type-mismatch "010" t)`, never `void-function nil`.
-                    if !el_truthy(&args[1]) {
-                        pred = None;
-                    } else {
-                        pred = Some(with_host(|h| h.function_designator(&args[1])));
-                    }
-                    in_place = true;
-                } else {
-                    in_place = false;
-                    let mut idx = 1;
-                    while idx < args.len() {
-                        let kw = with_host(|h| h.sym_name(&args[idx])).unwrap_or_default();
-                        let val = args.get(idx + 1).cloned().unwrap_or(Value::Undef);
-                        let truthy = !matches!(val, Value::Undef | Value::Bool(false));
-                        match kw.as_str() {
-                            // As above: `:lessp nil` selects the `value<` default.
-                            ":lessp" | ":predicate" => {
-                                pred = if truthy {
-                                    Some(with_host(|h| h.function_designator(&val)))
-                                } else {
-                                    None
-                                }
-                            }
-                            ":key" => {
-                                if truthy {
-                                    key = Some(val)
-                                }
-                            }
-                            ":reverse" => reverse = truthy,
-                            ":in-place" => in_place = truthy,
-                            _ => {}
-                        }
-                        idx += 2;
-                    }
-                }
                 let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(items.len());
                 for it in &items {
                     let k = match &key {
@@ -6648,6 +6866,11 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                         None => it.clone(),
                     };
                     pairs.push((k, it.clone()));
+                }
+                // `:reverse` sorts the reversed input and reverses the result, so
+                // elements that compare equal keep their original order.
+                if reverse {
+                    pairs.reverse();
                 }
                 merge_sort_by(&mut pairs, pred.as_ref())?;
                 let mut sorted: Vec<Value> = pairs.into_iter().map(|(_, it)| it).collect();
@@ -7022,10 +7245,11 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             // Passing `callee` here made `(f1 1 2)` report `f1` where Emacs
             // reports `#[(a) (a) (t)]`, and `defalias`ing a second name onto the
             // same function reported that second name.
-            let _ = &callee;
             let max = params.required.len() + params.optional.len();
             if args.len() < params.required.len() || (params.rest.is_none() && args.len() > max) {
-                return Err(with_host(|h| h.signal_wrong_nargs(&object, args.len())));
+                return Err(with_host(|h| {
+                    h.signal_closure_wrong_nargs(&callee, &object, args.len())
+                }));
             }
             // The one place a user function body is entered: every compiled
             // `CALL`, `funcall` and `apply` funnels through here, so the DAP
@@ -8349,13 +8573,27 @@ pub fn ext_dispatch(vm: &mut VM, id: u16, arg: u8) {
             // honours the cell that is live at the call.
             let argc = arg as usize;
             let symv = vm.pop();
-            let bad = with_host(|h| {
+            let failure = with_host(|h| {
                 // An AOP intercept fronts the callee, so the underlying subr's
                 // arity is not the arity being called — leave those to `CALL`.
-                h.intercepts.is_empty() && h.fn_kind(&symv).rejects_before_args(argc)
+                if !h.intercepts.is_empty() {
+                    return None;
+                }
+                // `eval_sub`: `if (NILP (fun)) xsignal1 (Qvoid_function,
+                // original_fun)` — the ORIGINAL symbol, before any argument form
+                // runs, even when the cell is an alias chain that dead-ends.
+                let kind = h.fn_kind(&symv);
+                if matches!(kind, FnKind::Vacant) && is_void_function_head(h, &symv) {
+                    let sym = h.intern("void-function");
+                    let msg = format!("void-function: {}", h.print(&symv, true));
+                    let obj = h.list_from(vec![sym, symv.clone()]);
+                    h.set_pending_error(&msg, obj);
+                    return Some(msg);
+                }
+                kind.rejects_before_args(argc)
+                    .then(|| h.signal_wrong_nargs(&symv, argc))
             });
-            if bad {
-                let e = with_host(|h| h.signal_wrong_nargs(&symv, argc));
+            if let Some(e) = failure {
                 abort(vm, e);
             }
         }
@@ -9080,5 +9318,17 @@ mod numeric_hook_tests {
         assert!(truthy(
             &numeric_hook(NumOp::Lt, &Value::Float(bigf), &big).unwrap()
         ));
+    }
+}
+
+#[cfg(test)]
+mod arity_table_tests {
+    use super::*;
+
+    /// `signal_closure_wrong_nargs` binary-searches the table, so an entry out of
+    /// byte order is silently never found.
+    #[test]
+    fn prelude_c_subr_names_are_sorted_and_unique() {
+        assert!(PRELUDE_C_SUBR_NAMES.windows(2).all(|w| w[0] < w[1]));
     }
 }
