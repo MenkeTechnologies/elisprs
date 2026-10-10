@@ -119,7 +119,12 @@ pub const SHARD_MAGIC: u32 = 0x454C_5350;
 /// and the guard signals `void-function` for a head with no function cell
 /// before any argument form runs. No struct changed shape, so a v14 chunk
 /// decodes cleanly and would replay the old argument-first order.
-pub const SHARD_FORMAT_VERSION: u32 = 15;
+///
+/// v16: `BaseImage::buffer_state`, the always-local slot registry and every
+/// buffer's local bindings the prelude built. A v15 shard replays onto buffers
+/// with no `default-directory`, so every file-name function signalled
+/// `arrayp nil` on a warm run.
+pub const SHARD_FORMAT_VERSION: u32 = 16;
 
 /// The cache schema key: elisprs version + a builtin/prelude fingerprint. A
 /// shard built under a different key is ignored (and overwritten on the next
@@ -199,30 +204,36 @@ struct BaseImage {
     /// serialized at all), but the prelude WRITES to symbols below that line, and
     /// those writes belong to the image just as much as the objects above it.
     builtin_cells: Vec<u8>,
-    /// Hash of the two blobs above; recorded in every entry written against it.
+    /// bincode `host::BufferState` — the always-local slot registry and the
+    /// buffers' local bindings, which live in the buffer structs rather than the
+    /// arena and so are not in `heap`. Captured with `heap`, before the file ran.
+    buffer_state: Vec<u8>,
+    /// Hash of the three blobs above; recorded in every entry written against it.
     fingerprint: u64,
 }
 
 impl BaseImage {
-    fn fingerprint_of(heap: &[u8], builtin_cells: &[u8]) -> u64 {
+    fn fingerprint_of(heap: &[u8], builtin_cells: &[u8], buffer_state: &[u8]) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         heap.hash(&mut h);
         builtin_cells.hash(&mut h);
+        buffer_state.hash(&mut h);
         h.finish()
     }
 
-    fn new(heap: Vec<u8>, builtin_cells: Vec<u8>) -> Self {
-        let fingerprint = Self::fingerprint_of(&heap, &builtin_cells);
+    fn new(heap: Vec<u8>, builtin_cells: Vec<u8>, buffer_state: Vec<u8>) -> Self {
+        let fingerprint = Self::fingerprint_of(&heap, &builtin_cells, &buffer_state);
         Self {
             heap,
             builtin_cells,
+            buffer_state,
             fingerprint,
         }
     }
 
     fn bytes(&self) -> u64 {
-        (self.heap.len() + self.builtin_cells.len()) as u64
+        (self.heap.len() + self.builtin_cells.len() + self.buffer_state.len()) as u64
     }
 }
 
@@ -467,6 +478,7 @@ pub struct CachedScript {
     pub oclosure_meta: Vec<(u32, u32, Vec<u32>)>,
     pub introspection_cells: Vec<(u32, fusevm::Value)>,
     pub builtin_cells: Vec<Option<crate::host::SymbolBaseline>>,
+    pub buffer_state: crate::host::BufferState,
     /// How many of `heap`'s objects are the shared post-prelude base.
     pub base_len: usize,
 }
@@ -504,7 +516,13 @@ pub fn get(path: &str, mtime_ns: i64, schema_key: &str) -> Option<CachedScript> 
     // The entry's handles were assigned against a specific base. The schema key
     // should already guarantee it, so a mismatch is a miss rather than an error.
     let base_fingerprint: u64 = entry.base_fingerprint.into();
-    if base_fingerprint != BaseImage::fingerprint_of(&shard.base.heap, &shard.base.builtin_cells) {
+    if base_fingerprint
+        != BaseImage::fingerprint_of(
+            &shard.base.heap,
+            &shard.base.builtin_cells,
+            &shard.base.buffer_state,
+        )
+    {
         return None;
     }
     // The full image is the shard's shared base followed by this file's tail —
@@ -519,12 +537,15 @@ pub fn get(path: &str, mtime_ns: i64, schema_key: &str) -> Option<CachedScript> 
         bincode::deserialize(&entry.introspection_cells).ok()?;
     let builtin_cells: Vec<Option<crate::host::SymbolBaseline>> =
         bincode::deserialize(&shard.base.builtin_cells).ok()?;
+    let buffer_state: crate::host::BufferState =
+        bincode::deserialize(&shard.base.buffer_state).ok()?;
     Some(CachedScript {
         chunks,
         heap,
         oclosure_meta,
         introspection_cells,
         builtin_cells,
+        buffer_state,
         base_len,
     })
 }
@@ -545,6 +566,7 @@ pub struct ScriptParts<'a> {
     pub introspection_cells: &'a [(u32, fusevm::Value)],
     /// Part of the shared base, like `prelude_heap`.
     pub builtin_cells: &'a [Option<crate::host::SymbolBaseline>],
+    pub buffer_state: &'a crate::host::BufferState,
 }
 
 /// Store a compiled script. Best-effort — any failure just skips caching. Takes
@@ -557,6 +579,7 @@ pub fn put(path: &str, mtime_ns: i64, schema_key: &str, parts: ScriptParts<'_>) 
         oclosure_meta,
         introspection_cells,
         builtin_cells,
+        buffer_state,
     } = parts;
     if !cache_enabled() {
         return;
@@ -580,6 +603,9 @@ pub fn put(path: &str, mtime_ns: i64, schema_key: &str, parts: ScriptParts<'_>) 
     let Ok(builtin_cells_blob) = bincode::serialize(builtin_cells) else {
         return;
     };
+    let Ok(buffer_state_blob) = bincode::serialize(buffer_state) else {
+        return;
+    };
     let Ok(prelude_blob) = bincode::serialize(prelude_heap) else {
         return;
     };
@@ -589,13 +615,18 @@ pub fn put(path: &str, mtime_ns: i64, schema_key: &str, parts: ScriptParts<'_>) 
     // silently dropping the other's entry.
     let _lock = acquire_lock();
 
-    let base = BaseImage::new(prelude_blob, builtin_cells_blob);
+    let base = BaseImage::new(prelude_blob, builtin_cells_blob, buffer_state_blob);
 
     // A shard built under a different schema key / format is discarded wholesale:
     // its chunks reference a builtin layout that no longer exists.
     let mut shard = read_shard()
         .filter(|s| owned_header_ok(&s.header, schema_key))
-        .unwrap_or_else(|| fresh_shard(schema_key, BaseImage::new(Vec::new(), Vec::new())));
+        .unwrap_or_else(|| {
+            fresh_shard(
+                schema_key,
+                BaseImage::new(Vec::new(), Vec::new(), Vec::new()),
+            )
+        });
 
     // Every entry's handles are indices into the base, so a base that is not the
     // one they were written against invalidates all of them. Under a matching
@@ -696,7 +727,7 @@ mod tests {
 
     #[test]
     fn shard_roundtrip_via_rkyv() {
-        let mut shard = fresh_shard("v-test", BaseImage::new(vec![11, 12], vec![13]));
+        let mut shard = fresh_shard("v-test", BaseImage::new(vec![11, 12], vec![13], vec![14]));
         shard.entries.insert(
             "/tmp/x.el".to_string(),
             Entry {
@@ -772,7 +803,7 @@ mod tests {
     fn budget_evicts_oldest_and_never_the_entry_just_written() {
         let dir = std::env::temp_dir().join(format!("elisprs-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut shard = fresh_shard("v-test", BaseImage::new(vec![11, 12], vec![13]));
+        let mut shard = fresh_shard("v-test", BaseImage::new(vec![11, 12], vec![13], vec![14]));
         // 4 x 1000 bytes, ages 10 (oldest) .. 40 (newest).
         let mut paths = Vec::new();
         for (i, age) in [10, 20, 30, 40].iter().enumerate() {
@@ -805,7 +836,7 @@ mod tests {
     fn a_single_oversized_entry_survives_its_own_budget() {
         let dir = std::env::temp_dir().join(format!("elisprs-budget1-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut shard = fresh_shard("v-test", BaseImage::new(vec![11, 12], vec![13]));
+        let mut shard = fresh_shard("v-test", BaseImage::new(vec![11, 12], vec![13], vec![14]));
         let (p, e) = sized_entry(&dir, "big.el", 10_000, 1);
         shard.entries.insert(p.clone(), e);
         enforce_budget(&mut shard, &p, 100);
@@ -820,7 +851,7 @@ mod tests {
     fn budget_sweep_drops_unservable_entries() {
         let dir = std::env::temp_dir().join(format!("elisprs-budget2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut shard = fresh_shard("v-test", BaseImage::new(vec![11, 12], vec![13]));
+        let mut shard = fresh_shard("v-test", BaseImage::new(vec![11, 12], vec![13], vec![14]));
         let (live, e1) = sized_entry(&dir, "live.el", 10, 5);
         let (gone, e2) = sized_entry(&dir, "gone.el", 10, 5);
         let (edited, mut e3) = sized_entry(&dir, "edited.el", 10, 5);

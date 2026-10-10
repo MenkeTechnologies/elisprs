@@ -1347,7 +1347,7 @@ pub struct ClosureSrc {
     /// any expansion. eval.c `Ffunction` hands that unexpanded body to
     /// `cconv-make-interpreted-closure`, which keeps it when no lexical
     /// variable is in scope and otherwise replaces it by its `macroexpand-all`
-    /// — see [`eval_closure_source`].
+    /// — see `eval_closure_source`.
     pub raw_body: Option<Vec<Value>>,
 }
 
@@ -1393,6 +1393,15 @@ impl ClosureSrc {
 /// it runs so a cached heap image can roll them back (the cached chunks replay
 /// every one of them on a hit). `special` is absent on purpose: the compiler sets
 /// it, and a cache hit does not compile.
+/// The prelude-built per-buffer state a cache hit has to restore; see
+/// [`ElispHost::export_buffer_state`].
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct BufferState {
+    pub always_local: Vec<(u32, SlotInit)>,
+    /// One entry per buffer slot, by index: `(variable handle, binding)`.
+    pub locals: Vec<Vec<(u32, Option<Value>)>>,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct SymbolBaseline {
     pub value: Option<Value>,
@@ -1472,7 +1481,7 @@ pub struct EditBuffer {
 
 /// What a new buffer's always-local slot starts as (buffer.c `reset_buffer`,
 /// `reset_buffer_local_variables` and `Fget_buffer_create`).
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum SlotInit {
     /// A fixed value, whatever the default has since been set to.
     Value(Value),
@@ -2337,9 +2346,7 @@ impl ElispHost {
     /// binding in the buffer at index BI.
     pub fn local_variable_p(&self, v: &Value, bi: usize) -> bool {
         match self.sym_handle(v) {
-            Some(id) => self.buffers[bi]
-                .locals
-                .contains_key(&self.indirect_var(id)),
+            Some(id) => self.buffers[bi].locals.contains_key(&self.indirect_var(id)),
             None => false,
         }
     }
@@ -2347,7 +2354,9 @@ impl ElispHost {
     /// is INIT. Every existing buffer gets a local holding the value SYM has
     /// there now, as the C slot would have had all along.
     pub fn make_always_local(&mut self, v: &Value, init: SlotInit) -> Result<Value, String> {
-        let id0 = self.sym_handle(v).ok_or("--make-always-local--: not a symbol")?;
+        let id0 = self
+            .sym_handle(v)
+            .ok_or("--make-always-local--: not a symbol")?;
         let id = self.indirect_var(id0);
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.special = true;
@@ -2559,7 +2568,9 @@ impl ElispHost {
     /// current scope only — a bare symbol consed onto the environment — and
     /// `special-variable-p` stays nil. Under dynamic binding it does nothing.
     pub fn declare_special_locally(&mut self, v: &Value) {
-        let Some(id0) = self.sym_handle(v) else { return };
+        let Some(id0) = self.sym_handle(v) else {
+            return;
+        };
         let id = self.indirect_var(id0);
         if !self.dynamic_binding && !self.is_special(id) {
             self.lex = Some(Rc::new(Scope::declaration(id, self.lex.take())));
@@ -3583,6 +3594,40 @@ impl ElispHost {
             sym.function = cell.function;
             sym.buffer_local_auto = cell.buffer_local_auto;
             sym.alias_of = cell.alias_of;
+        }
+    }
+
+    /// The per-buffer state the prelude builds outside the arena: the
+    /// always-local slot registry and every buffer's local bindings
+    /// (`default-directory`, `major-mode`, the syntax table, ...).
+    ///
+    /// A cache hit skips the prelude, so without this a warm run starts with
+    /// `default-directory` unbound in the initial buffer where a cold run has
+    /// the working directory (`(expand-file-name "a")` then signals
+    /// `(wrong-type-argument arrayp nil)`). Values are arena handles, valid
+    /// because the image is imported into an arena of the same length.
+    pub fn export_buffer_state(&self) -> BufferState {
+        BufferState {
+            always_local: self.always_local.clone(),
+            locals: self
+                .buffers
+                .iter()
+                .map(|b| {
+                    let mut l: Vec<(u32, Option<Value>)> =
+                        b.locals.iter().map(|(k, v)| (*k, v.clone())).collect();
+                    l.sort_by_key(|(k, _)| *k);
+                    l
+                })
+                .collect(),
+        }
+    }
+
+    /// Apply an [`Self::export_buffer_state`] snapshot. Buffers past this
+    /// host's own are ignored, as in [`Self::import_builtin_cells`].
+    pub fn import_buffer_state(&mut self, state: BufferState) {
+        self.always_local = state.always_local;
+        for (b, locals) in self.buffers.iter_mut().zip(state.locals) {
+            b.locals = locals.into_iter().collect();
         }
     }
 
@@ -6029,7 +6074,7 @@ impl ElispHost {
     /// which ships byte-compiled: `exec_byte_code` signals the packed
     /// `(MANDATORY . NONREST)` template, not the function (NONREST counts the
     /// formals before `&rest`). The exception is a name that is a C subr in Emacs
-    /// ([`PRELUDE_C_SUBR_NAMES`]), which names the callee as written. A closure
+    /// (`PRELUDE_C_SUBR_NAMES`), which names the callee as written. A closure
     /// the program defined is interpreted in Emacs too and names the closure.
     pub fn signal_closure_wrong_nargs(
         &mut self,
@@ -6572,7 +6617,10 @@ fn is_void_function_head(h: &ElispHost, head: &Value) -> bool {
         return false;
     }
     match h.sym_name(head).as_deref() {
-        Some("--catch--" | "--unwind--" | "--condition-case--" | "intercept-proceed" | "__rust-compile") => false,
+        Some(
+            "--catch--" | "--unwind--" | "--condition-case--" | "intercept-proceed"
+            | "__rust-compile",
+        ) => false,
         Some(name) => !fusevm::ffi::is_registered(name),
         None => true,
     }
@@ -6826,8 +6874,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
                         match kw.as_str() {
                             ":key" => key = truthy.then(|| val.clone()),
                             ":lessp" => {
-                                pred = truthy
-                                    .then(|| with_host(|h| h.function_designator(val)))
+                                pred = truthy.then(|| with_host(|h| h.function_designator(val)))
                             }
                             ":in-place" => in_place = truthy,
                             ":reverse" => reverse = truthy,

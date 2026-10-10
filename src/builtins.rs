@@ -545,17 +545,14 @@ fn el_equal(h: &ElispHost, a: &Value, b: &Value) -> bool {
                             && abody.len() == bbody.len()
                             && abody.iter().zip(&bbody).all(|(x, y)| el_equal(h, x, y))
                             && aenv.len() == benv.len()
-                            && aenv
-                                .iter()
-                                .zip(&benv)
-                                .all(|((s1, v1), (s2, v2))| {
-                                    s1 == s2
-                                        && match (v1, v2) {
-                                            (Some(v1), Some(v2)) => el_equal(h, v1, v2),
-                                            (None, None) => true,
-                                            _ => false,
-                                        }
-                                })
+                            && aenv.iter().zip(&benv).all(|((s1, v1), (s2, v2))| {
+                                s1 == s2
+                                    && match (v1, v2) {
+                                        (Some(v1), Some(v2)) => el_equal(h, v1, v2),
+                                        (None, None) => true,
+                                        _ => false,
+                                    }
+                            })
                     }
                     _ => false,
                 }
@@ -3945,7 +3942,14 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
     // anchored twin: `concat` accepts any sequence of characters, not only a
     // string, and signals `sequencep` for anything else.
     let anchored = |h: &mut ElispHost, head: &str, tail: &str| -> R {
-        concat_fn(h, &[Value::str(head.to_string()), trim.clone(), Value::str(tail.to_string())])
+        concat_fn(
+            h,
+            &[
+                Value::str(head.to_string()),
+                trim.clone(),
+                Value::str(tail.to_string()),
+            ],
+        )
     };
     let (trim_left_re, trim_right_re) = if is_nil(&trim) {
         (nil.clone(), nil.clone())
@@ -3956,7 +3960,10 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
         )
     };
     let sep_re = if is_nil(&separators) {
-        match h.find_symbol("split-string-default-separators").and_then(|s| h.get_value(&s).ok()) {
+        match h
+            .find_symbol("split-string-default-separators")
+            .and_then(|s| h.get_value(&s).ok())
+        {
             Some(v) if !is_nil(&v) => v,
             _ => Value::str(SPLIT_STRING_DEFAULT_SEPARATORS.to_string()),
         }
@@ -3969,13 +3976,10 @@ fn split_string(h: &mut ElispHost, a: &[Value]) -> R {
     // and the final BEG and END, which `keep-empty` reads.
     let trim_item = |h: &mut ElispHost, item: Value| -> Result<(Value, i64, i64), String> {
         let hit = string_match(h, &[trim_left_re.clone(), item.clone(), Value::Int(0)])?;
-        let beg = if is_nil(&hit) {
-            0
-        } else {
-            match_end_0(h)?
-        };
+        let beg = if is_nil(&hit) { 0 } else { match_end_0(h)? };
         let item_len = emacs_length(h, &item)?;
-        let end = match string_match_p(h, &[trim_right_re.clone(), item.clone(), Value::Int(beg)])? {
+        let end = match string_match_p(h, &[trim_right_re.clone(), item.clone(), Value::Int(beg)])?
+        {
             Value::Int(n) => n,
             _ => item_len,
         };

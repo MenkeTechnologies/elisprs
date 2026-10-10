@@ -253,7 +253,10 @@ fn split_string_applies_and_type_checks_trim() {
     assert_eq!(eval("(split-string \"xx,xx\" \",\" t \"x+\")"), "nil");
     // emacs-31.1 trims with anchored regexps (`\\`\\(?:TRIM\\)`, `\\(?:TRIM\\)\\'`),
     // so a leading TRIM cannot overrun the segment and `substring` never signals.
-    assert_eq!(eval("(split-string \"aXb\" \"X\" nil \"a.\")"), "(\"a\" \"b\")");
+    assert_eq!(
+        eval("(split-string \"aXb\" \"X\" nil \"a.\")"),
+        "(\"a\" \"b\")"
+    );
     // TRIM goes through `concat`, so any sequence of characters is a regexp.
     assert_eq!(
         eval("(split-string \"abc\" \"b\" nil (list ?a))"),

@@ -561,3 +561,21 @@ fn warm_cache_keeps_a_setter_symbol_the_run_interned_and_the_compiler_used() {
     assert_eq!(cold, "7 t\n", "cold run");
     assert_eq!(warm, cold, "a cache hit lost the (setf bx) setter");
 }
+
+/// `default-directory` and the other always-local slots live in the buffer
+/// structs, not the arena. A hit skips the prelude that fills them, so the
+/// initial buffer used to start without a working directory and every
+/// file-name function signalled `(wrong-type-argument arrayp nil)` warm.
+#[test]
+fn warm_cache_keeps_default_directory_and_the_always_local_slots() {
+    let script = r#"
+(princ (format "%S %S %S %S\n"
+               (stringp default-directory)
+               (file-name-absolute-p (expand-file-name "a"))
+               (local-variable-p 'default-directory)
+               (local-variable-p 'major-mode)))
+"#;
+    let (cold, warm) = run_cold_then_warm("alwayslocal", script);
+    assert_eq!(cold, "t t t t\n", "cold run");
+    assert_eq!(warm, cold, "a warm cache hit must behave like a cold run");
+}

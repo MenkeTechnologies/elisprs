@@ -19,7 +19,10 @@ fn empty_matching_separators_split_between_characters() {
         eval(r#"(split-string "abab" "x*")"#),
         r#"("" "a" "b" "a" "b" "")"#
     );
-    assert_eq!(eval(r#"(split-string "abab" "x*" t)"#), r#"("a" "b" "a" "b")"#);
+    assert_eq!(
+        eval(r#"(split-string "abab" "x*" t)"#),
+        r#"("a" "b" "a" "b")"#
+    );
     assert_eq!(eval(r#"(split-string "abc" "\\b")"#), r#"("" "abc" "")"#);
     assert_eq!(eval(r#"(split-string "ab" "\\`")"#), r#"("" "ab")"#);
     assert_eq!(eval(r#"(split-string "ab" "$")"#), r#"("ab" "")"#);
@@ -61,10 +64,22 @@ fn trim_is_concatenated_into_anchored_regexps() {
 fn argument_checks_follow_the_lisp_definition_order() {
     let err = |form: &str| eval(&format!("(condition-case e {form} (error e))"));
     assert_eq!(err("(split-string 0)"), "(wrong-type-argument sequencep 0)");
-    assert_eq!(err("(split-string 1.5)"), "(wrong-type-argument sequencep 1.5)");
-    assert_eq!(err("(split-string 'car)"), "(wrong-type-argument sequencep car)");
-    assert_eq!(err("(split-string nil)"), "(wrong-type-argument stringp nil)");
-    assert_eq!(err("(split-string [97])"), "(wrong-type-argument stringp [97])");
+    assert_eq!(
+        err("(split-string 1.5)"),
+        "(wrong-type-argument sequencep 1.5)"
+    );
+    assert_eq!(
+        err("(split-string 'car)"),
+        "(wrong-type-argument sequencep car)"
+    );
+    assert_eq!(
+        err("(split-string nil)"),
+        "(wrong-type-argument stringp nil)"
+    );
+    assert_eq!(
+        err("(split-string [97])"),
+        "(wrong-type-argument stringp [97])"
+    );
 }
 
 /// The match data is the last `string-match` the walk ran, and the single item

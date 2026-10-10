@@ -410,6 +410,7 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
             oclosure_meta,
             introspection_cells,
             builtin_cells,
+            buffer_state,
             base_len,
         } = cached;
         if debug {
@@ -432,6 +433,9 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
             // `heap` cannot carry because it starts at that line. Without this a
             // warm run lost every prelude-installed cell on a builtin symbol.
             h.import_builtin_cells(builtin_cells);
+            // The always-local slots and every buffer's locals, which the
+            // prelude builds in the buffer structs rather than the arena.
+            h.import_buffer_state(buffer_state);
         });
         install_entry_point_state(path, &src, entry);
         return with_load_file_name(path, || {
@@ -461,6 +465,7 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
     // Captured with `clean_prelude` and for the same reason: this is the state a
     // hit replays the cached chunks onto, so it must predate the file's own run.
     let clean_builtin_cells = host::with_host(|h| h.export_builtin_cells());
+    let clean_buffer_state = host::with_host(|h| h.export_buffer_state());
     install_entry_point_state(path, &src, entry);
 
     // Bind load-file-name only while the forms run; unbind before the clean heap
@@ -482,6 +487,7 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
             oclosure_meta: &oclosure_meta,
             introspection_cells: &introspection_cells,
             builtin_cells: &clean_builtin_cells,
+            buffer_state: &clean_buffer_state,
         },
     );
     Ok(last)
