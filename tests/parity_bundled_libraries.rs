@@ -225,7 +225,7 @@ fn date_to_time_with_an_explicit_zone() {
         r#"=(14445 35280)"#,
     );
     check(
-        r#"(date-to-time "Thu, 1 Jan 70 00:00:00 UTC")"#,
+        r#"(progn (setenv "TZ" "EST5") (date-to-time "Thu, 1 Jan 70 00:00:00 UTC"))"#,
         r#"=(0 18000)"#,
     );
     check(
