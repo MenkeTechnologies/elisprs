@@ -6388,62 +6388,125 @@ delimiter: `?ab` is `(invalid-read-syntax "?")`.
   `let`, where Emacs's `Flet` leaves the environment unbound.
 - `handler-bind`, fill.el — design decisions, not attempted.
 
+## Round 38 — cl-lib ported from source, `split-string`, `sort` argument lists, void heads
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch`; the fuzzer with
+`EMACS_VERSION_EXPECT=31.1`). New corpus families in `scripts/fuzz/gen.el`
+(`cl-loop` clause combinations, cl-seq keyword lists, `sort` argument lists, a
+void head with a side-effecting argument) found the items below. Expectations
+are in `tests/parity_cl_lib_31.rs`, `tests/parity_split_string_31.rs` and the
+files named in each entry
+(`tests/parity_time_zones.rs` for R38-G).
+
+### R38-A. ✅ FIXED — `cl-loop` is cl-macs.el's, not a subset
+
+The prelude carried a hand-written `cl-loop` for "the common clauses". It
+diverged wherever clauses combine: `for i … and j = 0 then i` stepped `j` from the
+already-advanced `i`, `into` was unsupported outside accumulators, and a damaged
+clause reported a message of its own instead of `Expected a cl-loop keyword,
+found X` / `Malformed ‘cl-loop’ macro`. The clause parser, `cl--loop-let`,
+`cl--loop-handle-accum` and `cl--loop-build-ands` are now cl-macs.el's text
+(31.1), with cl-extra.el's `cl--map-intervals` / `cl--map-overlays`.
+
+### R38-B. ✅ FIXED — cl-seq.el is 31.1's
+
+31.1 rewrote cl-seq around `cl--parsing-keywords` and `:test #'funcall`, so the
+`*-if` functions call their predicate (`(cl-position-if nil '(1 nil 2))` is
+`(void-function nil)`; 30 matched the nil elements), `:test nil` / `:key nil`
+mean "not supplied", `:from-end` with `:count` removes from the right, and
+`cl-endp` is `(cl-check-type x list)`. The hand-written versions are replaced by
+the file itself, plus `cl--compiler-macro-member` / `-assoc`, `cl-case` /
+`cl-ecase` / `cl-typecase` / `cl-etypecase` (`Misplaced t or ‘otherwise’
+clause`, `Duplicate key in case`), `cl-list-length` and `cl-parse-integer`
+(`:start`, `:end`, `:junk-allowed`, `Not an integer string`).
+
+`macroexp-let2` ends with `eql` where macroexp.el has `eq`: a float has no
+object identity here (R23-F), and a copyable float constant would otherwise be
+bound as a variable named `1.5`.
+
+### R38-C. ✅ FIXED — `split-string` is 31.1's subr.el
+
+The 30.x `push-one` walk is replaced by the 31.1 index walk, through the real
+`string-match` / `substring` builtins: an empty-matching separator splits between
+every character and keeps both end items, TRIM is built with `concat` (any
+sequence, `sequencep` for the rest), the length of STRING is taken first, the
+match data is the last search's, and `split-string-default-separators` is read at
+call time. This is the "Oracle drift" item below, now followed.
+
+### R38-D. ✅ FIXED — `sort`'s argument list is `Fsort`'s
+
+Two arguments are the old `(sort SEQ PRED)`; any other even count is
+`(error "Invalid argument list")`; keyword pairs reject an unknown keyword with
+`(error "Invalid keyword argument" KW)` (`:predicate` was accepted); all of it is
+decided before SEQ is inspected; `:reverse` sorts the reversed input so equal
+elements keep their order.
+
+### R38-E. ✅ FIXED — a void head is signalled before its arguments
+
+`eval_sub` signals `(void-function F)` before any argument form runs, for an
+unbound symbol, `nil`, `t`, and an alias chain that dead-ends (the datum is the
+symbol as written). elisprs evaluated the arguments first, so
+`(foo (setq x 9))` left `x` at 9. The `CHECK_ARITY` guard now covers a head with
+no function cell (excluding the intrinsic names `call_function` answers itself
+and `rust { }` FFI exports); the cache format version is bumped because a v14
+chunk has no guard on `nil`/`t` heads.
+
+### R38-F. ✅ FIXED — prelude closures report the arity template
+
+Preloaded and autoloaded Lisp is byte-compiled in Emacs, so a wrong-arity call
+signals `(wrong-number-of-arguments (MANDATORY . NONREST) N)`; the prelude's
+Lisp definitions printed their own closure (`(cl-union 1)` printed its whole
+closure `#[(list1 list2 &rest cl-keys) …]`). A closure the prelude created now reports
+the template, except for the names that are C subrs in Emacs
+(`PRELUDE_C_SUBR_NAMES`), which name the callee as written. A program's own
+closures still name themselves, as they do in Emacs.
+
+### R38-G. ✅ FIXED — time zones
+
+`format-time-string`, `current-time-string`, `decode-time` and `encode-time`
+treated every ZONE but nil, `wall` and an integer as UTC. An integer is now
+named `+HH[MM[SS]]` (`%Z`), an `(OFFSET ABBR)` list carries OFFSET and ABBR
+(`(wrong-type-argument stringp ABBR)` for a non-string; a third element is
+ignored), a string is a TZ string resolved by libc (`"America/New_York"`,
+`"JST-9"`, `"<+03>-3"`), and an offset of 168 hours or more falls back to UTC.
+`tests/parity_time_zones.rs` needs the system tz database for the Olson names.
+
+### Not fixed
+
+- **`make-hash-table` keyword list order.** 31.1 scans the pairs from the end,
+  so the LAST unknown keyword is the one named (`(make-hash-table 'eq 'eq :bogus
+  0)` names `:bogus`, `(make-hash-table 'test 'eq 'size 3)` names `size`), and a
+  non-symbol `:test` is `(wrong-type-argument symbolp V)` rather than `(error
+  "Invalid hash table test" V)`. The function is being rewritten in the working
+  tree by another change that is not committed; this item is left to it.
+- **`eq` on a float.** `(let ((x 1.5)) (eq x x))` is `t` in Emacs and `nil` here
+  (R23-F). Needs boxed floats and a collector.
+- **`being the key-codes` / `key-bindings` / `key-seqs`** in `cl-loop` need
+  `map-keymap`, and keymaps are not implemented.
+- **`parse-time-string`, `iso8601-parse`, `date-to-time`, `make-decoded-time`,
+  `decoded-time-add`, `char-fold-to-regexp`** are void.
+- **`string-collate-equalp` with IGNORE-CASE** answers `t`; 31.1 on this
+  platform answers `nil` for `("a" "A" nil t)`.
+- **Eager expansion in `eval_str` / `-e`.** A macro-expansion error inside a
+  `condition-case` is not caught when the form is run through `-e` (a `load`
+  walk, which is also what `emacs -l` does); `eval` is lazy and agrees.
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the
 top of this file), and `scripts/fuzz_parity.sh` refuses any other oracle unless
 `EMACS_VERSION_EXPECT` says otherwise. Run against a **31.1** oracle, a 3 000-form
-corpus reports 5 divergences — and all five are upstream changes between 30 and
-31, not elisprs bugs. They are recorded here so the next run against a 31.x
-oracle costs a lookup instead of a re-triage.
+corpus reported 5 divergences — all upstream changes between 30 and 31, not
+elisprs bugs. `split-string` has since been followed (below); the other two
+remain. They are recorded here so the next run against a 31.x oracle costs a
+lookup instead of a re-triage.
 
-### `split-string` type errors: `stringp` (30) → `sequencep` (31)
+### `split-string` — followed since round 38
 
-Emacs 30's `split-string` (`lisp/subr.el`) goes straight to `string-match`, so a
-non-string STRING is caught by the regexp engine:
-
-```elisp
-(let* ((keep-nulls (not (if separators omit-nulls t)))
-       (rexp (or separators split-string-default-separators))
-       (start 0) …)
-```
-
-Emacs 31 rewrote it and takes the length first, so `length` reports the type
-instead — and TRIM is now built with `concat`, which accepts any sequence:
-
-```elisp
-(let* ((keep-empty (and separators (not omit-empty)))
-       (len (length string))
-       (trim-left-re (and trim (concat "\\`\\(?:" trim "\\)")))
-       …)
-```
-
-Measured, `emacs -Q --batch`:
-
-```text
-form                              30.2 (elisprs)              31.1
-(split-string 5 "_")              (wrong-type-argument        (wrong-type-argument
-                                   stringp 5)                  sequencep 5)
-(split-string 'sym "s" nil)       … stringp sym               … sequencep sym
-(split-string "ab" "b" t 'car)    … stringp car               … sequencep car
-(split-string "ab" "b" t '(1))    … stringp (1)               ("a")   ; concat
-```
-
-A STRING that IS a sequence but not a string still answers `stringp` on both, so
-`(split-string '(1 2) "x")` and `(split-string [97 98] "b")` are unchanged. The
-31 order is length-of-STRING before concat-of-TRIM, so `(split-string 5 "_" nil 'car)`
-names `5` there.
-
-The reordering is observable beyond the predicate NAME, because building TRIM
-now happens before the first `string-match`. An invalid SEPARATORS regexp used
-to be diagnosed first and is now reached only if TRIM is acceptable:
-
-```text
-form                                    30.2 (elisprs)            31.1
-(split-string "1e+19" "a\{" t 'car)     (invalid-regexp           (wrong-type-argument
-                                         "Unmatched \{")           sequencep car)
-(split-string 'sym [1 2])               … stringp [1 2]           … sequencep sym
-```
+Emacs 31 rewrote `split-string` (length of STRING first, TRIM built with
+`concat`, an index walk instead of `push-one`). elisprs ports the 31.1 function
+(R38-C), so the type errors name `sequencep`, and an invalid SEPARATORS regexp is
+reached only after TRIM is accepted. `tests/parity_split_string_31.rs` pins it.
 
 ### `end-of-file` data: unconditional load path (30) → per-source (31)
 
