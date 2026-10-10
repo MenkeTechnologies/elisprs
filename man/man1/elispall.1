@@ -31,6 +31,9 @@ for the full option list:
 .BR \-\-lsp ,
 .BR \-\-dap ,
 .BR \-\-aot ,
+.BR \-\-aot\-exe ,
+.BR \-\-cache\-stats ,
+.BR \-\-cache\-clear ,
 .BR \-V / \-\-version ,
 .BR \-h / \-\-help .
 With no arguments a REPL is started (parenthesis-balanced multi-line input;
@@ -62,7 +65,7 @@ backquote (\fB`\fR, \fB,\fR, \fB,@\fR, read as \fB(\e` X)\fR, \fB(\e, X)\fR,
 \fB(\e,@ X)\fR).
 .SH "SPECIAL FORMS"
 .B quote function lambda progn prog1 if when unless cond and or while setq let
-.B let* defun defmacro defvar defconst condition-case unwind-protect
+.B let* defun defmacro defvar defconst condition-case unwind-protect catch
 .PP
 Lambda lists accept \fB&optional\fR and \fB&rest\fR. Macros expand and are
 re-evaluated.

@@ -57,8 +57,14 @@ document symbols and reader diagnostics.
 Run the line-level debug adapter over stdio (breakpoints, stepping, variables).
 .TP
 .BR \-\-aot " " \fIFILE\fR " " \fB\-o\fR " " \fIOUT\fR
-Ahead-of-time compile \fIFILE\fR to a native object \fIOUT\fR via
-\fBfusevm::aot::compile_object\fR (the lowered chunk plus its heap image).
+Ahead-of-time compile \fIFILE\fR to a native object \fIOUT\fR (default
+\fIout.o\fR) via \fBfusevm::aot::compile_object\fR (the lowered chunk plus its
+heap image).
+.TP
+.BR \-\-aot\-exe " " \fIFILE\fR " " \fB\-o\fR " " \fIOUT\fR
+Compile \fIFILE\fR to a standalone native executable \fIOUT\fR (default
+\fIa.out\fR): emit the AOT object, then link it with \fBcc\fR against the
+elisprs runtime staticlib.
 .TP
 .BR \-\-dump\-tokens " " \fIFILE\fR
 Print the reader's lexical token stream for \fIFILE\fR (one \fBline  Tok\fR per
@@ -71,7 +77,7 @@ AST), one form per line, and exit.
 .BR \-\-dump\-bytecode " " \fIFILE\fR
 Print the compiled \fBfusevm\fR ops for \fIFILE\fR and exit.
 .TP
-.B \-\-tiers
+.BR \-\-tiers " " \fIFILE\fR
 Run it, then report which fusevm execution tier took each of its chunks.
 .TP
 .BR \-\-disasm " " \fIFILE\fR
@@ -83,6 +89,13 @@ Print version and exit.
 .TP
 .BR \-h ", " \-\-help
 Print usage and exit.
+.TP
+.B \-\-cache\-stats
+Print the bytecode cache path (\fI~/.elisprs/scripts.rkyv\fR), entry count,
+size in bytes and whether the cache is enabled, then exit.
+.TP
+.B \-\-cache\-clear
+Delete the bytecode cache and exit.
 .PP
 With no arguments,
 .B elisp
@@ -98,13 +111,26 @@ macro expands them.
 .PP
 Special forms: \fBquote function lambda progn prog1 if when unless cond and or
 while setq let let* defun defmacro defvar defconst condition-case
-unwind-protect\fR.
+unwind-protect catch\fR.
 Rust subrs and a preloaded elisp prelude cover lists, arithmetic, strings,
 buffers, regexps, printing, cl\-lib, pcase, seq and subr\-x.
 .SH LIMITATIONS
 Known divergences from GNU Emacs, and the ones still open, are recorded in
 \fIBUGS.md\fR in the source tree. There is no display: buffers, point and
 markers exist, windows and frames do not.
+.SH ENVIRONMENT
+.TP
+.B ELISPRS_CACHE
+Set to \fB0\fR, \fBfalse\fR or \fBno\fR to disable the bytecode cache.
+.TP
+.B ELISPRS_CACHE_DEBUG
+Set to \fB1\fR to log cache hits and misses to stderr.
+.TP
+.B ELISPRS_REPL_MODE
+\fBemacs\fR or \fBvi\fR; overrides the REPL edit mode from \fI~/.elisprs/config.toml\fR.
+.TP
+.B ELISPRS_NO_CONFIG
+When set, the REPL does not seed \fI~/.elisprs/config.toml\fR on first run.
 .SH EXIT STATUS
 .B elisp
 exits 0 on success and non-zero if a file cannot be read or evaluation signals
