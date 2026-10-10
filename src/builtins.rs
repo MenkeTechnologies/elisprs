@@ -7333,87 +7333,176 @@ fn time_arg_secs(h: &ElispHost, v: Option<&Value>) -> Result<f64, String> {
     crate::timefns::float_seconds(h, v)
 }
 
-/// Decompose epoch seconds into a `struct tm` for the given ZONE (nil = local,
-/// non-nil non-number = UTC, integer = fixed offset seconds east of UTC).
-/// Validate Emacs's ZONE argument (`tzlookup`, editfns.c).
-///
-/// The accepted spellings are exactly: `nil` and the symbol `wall` (local time),
-/// `t` (UTC), an integer offset in seconds, a TZ string, and a two-element
-/// `(OFFSET ABBR)` list. Everything else — including any *other* symbol, a
-/// float, a vector, and a one-element list — is
-/// `(error "Invalid time zone specification" ZONE)`. Measured on GNU Emacs 30.2:
-///
-/// ```text
-/// (format-time-string "%Y" 0 'wall)      => "1969"
-/// (format-time-string "%Y" 0 'utc)       => error, `utc' is not a spelling
-/// (format-time-string "%Y" 0 '(3600 "X")) => "1970"
-/// (format-time-string "%Y" 0 '(3600))    => error
-/// ```
-///
-/// A float ZONE used to be accepted silently here and read as UTC.
-fn check_time_zone(h: &mut ElispHost, zone: Option<&Value>) -> Result<bool, String> {
-    let Some(z) = zone else { return Ok(false) };
-    let mut wall = false;
-    let ok = match z {
-        Value::Undef | Value::Bool(_) | Value::Int(_) | Value::Str(_) => true,
-        v if h.is_string(v) => true,
-        v => match h.obj(v) {
-            Some(Obj::Symbol(s)) => {
-                wall = s.name == "wall";
-                wall
-            }
-            // `(OFFSET ABBR)`: two elements, an integer and a string.
-            Some(Obj::Cons(_, _)) => {
-                let items = h.seq_vec(v);
-                items.is_some_and(|it| {
-                    it.len() == 2 && matches!(it[0], Value::Int(_)) && h.is_string(&it[1])
-                })
-            }
-            _ => false,
-        },
-    };
-    if ok {
-        return Ok(wall);
-    }
-    let z = z.clone();
-    Err(h.signal_error_with("Invalid time zone specification", &z))
+/// A resolved ZONE argument — timefns.c `tzlookup`.
+enum TimeZone {
+    /// nil and `wall`: the process's own zone.
+    Local,
+    /// `t`, and any offset or TZ string libc cannot use.
+    Utc,
+    /// Seconds east of UTC and the abbreviation `%Z` prints: an integer ZONE
+    /// (abbreviated `+HH[MM[SS]]`) or an `(OFFSET ABBR)` list.
+    Fixed(i64, String),
+    /// A TZ string handed to libc: `"America/New_York"`, `"EST5EDT"`, `"JST-9"`.
+    Named(String),
 }
 
-fn time_decompose(secs: f64, zone: Option<&Value>, local: bool) -> libc::tm {
+/// POSIX TZ strings carry at most 167:59:59 of offset; Emacs falls back to UTC
+/// beyond it (`(format-time-string "%Z" 0 604800)` is "UTC").
+const MAX_ZONE_OFFSET: i64 = 7 * 24 * 3600;
+
+/// timefns.c `tzlookup`.
+///
+/// The accepted spellings are exactly: `nil` and the symbol `wall` (local time),
+/// `t` (UTC), an integer offset in seconds, a TZ string, and an `(OFFSET ABBR)`
+/// list whose OFFSET is an integer. Everything else — any *other* symbol, a
+/// float, a vector, a list that does not start with an integer and have a second
+/// element — is `(error "Invalid time zone specification" ZONE)`. An ABBR that
+/// is not a string is `(wrong-type-argument stringp ABBR)`, and a third element
+/// is ignored. Measured on GNU Emacs 31.1:
+///
+/// ```text
+/// (format-time-string "%Z" 0 3600)        => "+01"
+/// (format-time-string "%Z" 0 3601)        => "+010001"
+/// (format-time-string "%Z" 0 '(3600 "X")) => "X"
+/// (format-time-string "%Z" 0 '(1 2))      => (wrong-type-argument stringp 2)
+/// (format-time-string "%Z" 0 'utc)        => error, `utc' is not a spelling
+/// ```
+fn time_zone_arg(h: &mut ElispHost, zone: Option<&Value>) -> Result<TimeZone, String> {
+    let Some(z) = zone else {
+        return Ok(TimeZone::Local);
+    };
+    let invalid = |h: &mut ElispHost| {
+        let z = z.clone();
+        Err(h.signal_error_with("Invalid time zone specification", &z))
+    };
+    match z {
+        Value::Undef | Value::Bool(false) => return Ok(TimeZone::Local),
+        Value::Bool(true) => return Ok(TimeZone::Utc),
+        Value::Int(off) => return Ok(fixed_time_zone(*off, None)),
+        _ => {}
+    }
+    if h.is_string(z) {
+        let tz = as_string(h, z)?;
+        return Ok(TimeZone::Named(tz));
+    }
+    match h.obj(z) {
+        Some(Obj::Symbol(s)) if s.name == "wall" => Ok(TimeZone::Local),
+        Some(Obj::Cons(car, cdr)) => {
+            let (car, cdr) = (car.clone(), cdr.clone());
+            let name = match h.obj(&cdr) {
+                Some(Obj::Cons(name, _)) => name.clone(),
+                _ => return invalid(h),
+            };
+            let Value::Int(off) = car else {
+                return invalid(h);
+            };
+            if !h.is_string(&name) {
+                return Err(h.signal_wrong_type("stringp", &name));
+            }
+            let abbr = as_string(h, &name)?;
+            Ok(fixed_time_zone(off, Some(abbr)))
+        }
+        _ => invalid(h),
+    }
+}
+
+/// A fixed-offset zone. An integer ZONE is named by its offset, `+HH` with
+/// minutes and seconds appended only when non-zero; an offset of 0 is plain
+/// UTC. An `(OFFSET ABBR)` zone is named ABBR.
+fn fixed_time_zone(off: i64, abbr: Option<String>) -> TimeZone {
+    if off.abs() >= MAX_ZONE_OFFSET {
+        return TimeZone::Utc;
+    }
+    if let Some(abbr) = abbr {
+        return TimeZone::Fixed(off, abbr);
+    }
+    if off == 0 {
+        return TimeZone::Utc;
+    }
+    let a = off.abs();
+    let (hh, mm, ss) = (a / 3600, (a % 3600) / 60, a % 60);
+    let sign = if off < 0 { '-' } else { '+' };
+    let name = match (mm, ss) {
+        (0, 0) => format!("{sign}{hh:02}"),
+        (_, 0) => format!("{sign}{hh:02}{mm:02}"),
+        _ => format!("{sign}{hh:02}{mm:02}{ss:02}"),
+    };
+    TimeZone::Fixed(off, name)
+}
+
+/// Serializes every use of libc's `TZ` state: a named zone swaps the variable in,
+/// and the local zone reads it, so a `localtime_r` on another thread must not run
+/// inside the swap.
+static TZ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// libc's `TZ` is process state, so a named zone is evaluated with the variable
+/// swapped in and put back — the same dance gnulib's `localtime_rz` performs on
+/// platforms without a native one.
+fn with_tz_env<T>(tz: &str, f: impl FnOnce() -> T) -> T {
+    extern "C" {
+        fn tzset();
+    }
+    let _guard = TZ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let saved = std::env::var_os("TZ");
+    std::env::set_var("TZ", tz);
+    unsafe { tzset() };
+    let out = f();
+    match saved {
+        Some(v) => std::env::set_var("TZ", v),
+        None => std::env::remove_var("TZ"),
+    }
+    unsafe { tzset() };
+    out
+}
+
+/// A `struct tm` and the storage its `tm_zone` points into, so the abbreviation
+/// stays valid for as long as the pair does.
+struct DecodedTime {
+    tm: libc::tm,
+    _zone_name: Option<std::ffi::CString>,
+}
+
+/// Decompose epoch seconds into a `struct tm` for ZONE.
+fn time_decompose(secs: f64, zone: &TimeZone) -> DecodedTime {
+    let t = secs.floor() as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let mut name: Option<std::ffi::CString> = None;
     match zone {
-        None | Some(Value::Undef) | Some(Value::Bool(false)) => {
-            let t = secs.floor() as libc::time_t;
+        TimeZone::Local => {
+            let _guard = TZ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             unsafe { libc::localtime_r(&t, &mut tm) };
         }
-        Some(Value::Int(off)) => {
-            // Fixed offset: read as UTC at secs+off, then stamp the offset.
-            let t = (secs.floor() as libc::time_t) + *off as libc::time_t;
-            unsafe { libc::gmtime_r(&t, &mut tm) };
-            tm.tm_gmtoff = *off as libc::c_long;
-        }
-        // `wall` is the *local* zone, the same as nil — the spelling for
-        // "whatever the wall clock says", not another name for UTC. It is a heap
-        // symbol, so `check_time_zone` (which holds the host) reports it rather
-        // than this function reaching for the thread-local and re-entering the
-        // borrow it is already inside.
-        _ if local => {
-            let t = secs.floor() as libc::time_t;
-            unsafe { libc::localtime_r(&t, &mut tm) };
-        }
-        _ => {
-            let t = secs.floor() as libc::time_t;
+        TimeZone::Utc => {
             unsafe { libc::gmtime_r(&t, &mut tm) };
             // `gmtime_r` names the zone whatever the platform calls it: glibc
             // says "GMT", the BSD/macOS libc says "UTC". Emacs reaches UTC by
             // setting `TZ=UTC0`, so `%Z` there is "UTC" on every platform
             // (measured: `emacs --batch --eval '(format-time-string "%Z" 0 t)'`).
-            // Stamp the name Emacs prints rather than inheriting libc's, which
-            // made `%#Z` render "gmt" on Linux and "utc" on macOS.
-            tm.tm_zone = c"UTC".as_ptr() as *mut libc::c_char;
+            name = Some(std::ffi::CString::new("UTC").expect("no NUL"));
+        }
+        TimeZone::Fixed(off, abbr) => {
+            let shifted = t + *off as libc::time_t;
+            unsafe { libc::gmtime_r(&shifted, &mut tm) };
+            tm.tm_gmtoff = *off as libc::c_long;
+            name = Some(std::ffi::CString::new(abbr.replace('\0', "")).expect("NUL removed"));
+        }
+        TimeZone::Named(tz) => {
+            with_tz_env(tz, || {
+                unsafe { libc::localtime_r(&t, &mut tm) };
+                if !tm.tm_zone.is_null() {
+                    let s = unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) };
+                    name = Some(s.to_owned());
+                }
+            });
         }
     }
-    tm
+    if let Some(n) = &name {
+        tm.tm_zone = n.as_ptr() as *mut libc::c_char;
+    }
+    DecodedTime {
+        tm,
+        _zone_name: name,
+    }
 }
 
 const WD_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -7784,16 +7873,16 @@ fn build_time(h: &mut ElispHost, _a: &[Value]) -> R {
 fn format_time_string(h: &mut ElispHost, a: &[Value]) -> R {
     let fmt = as_string(h, &a[0])?;
     let secs = time_arg_secs(h, a.get(1))?;
-    let local = check_time_zone(h, a.get(2))?;
-    let tm = time_decompose(secs, a.get(2), local);
-    Ok(h.new_string(fmt_time_string(&fmt, &tm, secs)))
+    let zone = time_zone_arg(h, a.get(2))?;
+    let decoded = time_decompose(secs, &zone);
+    Ok(h.new_string(fmt_time_string(&fmt, &decoded.tm, secs)))
 }
 
 fn current_time_string(h: &mut ElispHost, a: &[Value]) -> R {
     let secs = time_arg_secs(h, a.first())?;
-    let local = check_time_zone(h, a.get(1))?;
-    let tm = time_decompose(secs, a.get(1), local);
-    Ok(h.new_string(fmt_time_string("%a %b %e %H:%M:%S %Y", &tm, secs)))
+    let zone = time_zone_arg(h, a.get(1))?;
+    let decoded = time_decompose(secs, &zone);
+    Ok(h.new_string(fmt_time_string("%a %b %e %H:%M:%S %Y", &decoded.tm, secs)))
 }
 
 // `tm_gmtoff` is `c_long`; `i64::from` is needed on 32-bit but a no-op here.
@@ -7810,8 +7899,9 @@ fn decode_time(h: &mut ElispHost, a: &[Value]) -> R {
         Some(t) => crate::timefns::floor_seconds(t)?,
         None => crate::timefns::seconds_argument(h, a.first())?,
     };
-    let local = check_time_zone(h, a.get(1))?;
-    let tm = time_decompose(secs as f64, a.get(1), local);
+    let zone = time_zone_arg(h, a.get(1))?;
+    let decoded = time_decompose(secs as f64, &zone);
+    let tm = decoded.tm;
     let dst = match tm.tm_isdst {
         0 => Value::Undef,
         n if n > 0 => Value::Bool(true),
@@ -7916,11 +8006,15 @@ fn encode_time(h: &mut ElispHost, a: &[Value]) -> R {
     tm.tm_mon = member(h, &fields[4], 1)?;
     tm.tm_year = member(h, &fields[5], 1900)?;
     tm.tm_isdst = isdst;
-    let local = check_time_zone(h, Some(&zone))?;
-    let value: i64 = match &zone {
-        Value::Int(off) => unsafe { libc::timegm(&mut tm) as i64 - *off },
-        _ if local || is_nil(&zone) => unsafe { libc::mktime(&mut tm) as i64 },
-        _ => unsafe { libc::timegm(&mut tm) as i64 },
+    let tz = time_zone_arg(h, Some(&zone))?;
+    let value: i64 = match &tz {
+        TimeZone::Fixed(off, _) => unsafe { libc::timegm(&mut tm) as i64 - *off },
+        TimeZone::Local => {
+            let _guard = TZ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { libc::mktime(&mut tm) as i64 }
+        }
+        TimeZone::Utc => unsafe { libc::timegm(&mut tm) as i64 },
+        TimeZone::Named(name) => with_tz_env(name, || unsafe { libc::mktime(&mut tm) as i64 }),
     };
     if t.hz == BigInt::from(1) {
         return Ok(h.list_from(vec![Value::Int(value >> 16), Value::Int(value & 0xffff)]));
