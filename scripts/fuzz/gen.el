@@ -678,11 +678,13 @@ does not know at all.")
 (defun fz-keyword-form ()
   "A `make-hash-table' call with a possibly-malformed keyword list.
 
-`Fmake_hash_table' does not scan its arguments pairwise: `get_key_arg' hunts the
-whole vector for each keyword it knows and a second pass rejects the leftovers,
-so an odd count, an unknown keyword and a stray non-keyword are three different
-outcomes and none of them is \"ignore it\".  The list is built one ELEMENT at a
-time, never one pair at a time, precisely so odd lengths occur."
+`Fmake_hash_table' (emacs-31.1) checks an odd count first, then scans the pairs
+from the END of the list for an unknown keyword (so the LAST bad key is named
+and the FIRST occurrence of a known one wins), and only then validates the
+`:test', `:size' and `:weakness' values.  An odd count, an unknown keyword and a
+stray non-keyword are different outcomes and none of them is \"ignore it\".  The
+list is built one ELEMENT at a time, never one pair at a time, precisely so odd
+lengths occur."
   (let ((n (fz-int 6)) (args nil))
     (while (> n 0)
       (push (if (fz-chance 55) (fz-pick fz-ht-keywords) (fz-pick fz-ht-values))
@@ -920,7 +922,182 @@ only the error datum does."
    ((fz-chance 3) (fz-setq-parity-form))
    ((fz-chance 6) (fz-improper-form depth))
    ((fz-chance 5) (fz-literal-form))
+   ((fz-chance 6) (fz-loop-form))
+   ((fz-chance 5) (fz-seq-keyword-form))
+   ((fz-chance 3) (fz-sort-form))
+   ((fz-chance 3) (fz-void-head-form))
    (t (fz-build (fz-pick fz-calls) (1- depth)))))
+
+;;; ── cl-loop clause forms ─────────────────────────────────────────────────────
+
+;; `cl-loop' is a clause grammar, and which clauses COMBINE is where a hand-written
+;; subset diverges from cl-macs.el: parallel `and' bindings, `into', `named', an
+;; accumulation under `if'/`else', destructuring.  `fz-control' only has a
+;; handful of fixed single-clause loops.  Every iteration source here is a small
+;; literal or a bounded range, and every loop variable is numeric, so any
+;; accumulation clause below type-checks and the loop terminates.
+
+(defvar fz-loop-iterations
+  '(((for x in (quote (1 2 3))) x)
+    ((for x in (quote (3 1 2 1))) x)
+    ((for x in nil) x)
+    ((for x on (quote (1 2 3 4))) (length x))
+    ((for x in (quote (1 2 3 4 5)) by (function cddr)) x)
+    ((for x across [1 2 3]) x)
+    ((for x across-ref (vector 1 2 3)) x)
+    ((for x across "abc") x)
+    ((for x being the elements of (quote (4 5 6)) using (index i)) (+ x i))
+    ((for x from 1 to 4) x)
+    ((for x from 0 to 10 by 5) x)
+    ((for x downfrom 5 to 3) x)
+    ((for x from 3 above 0) x)
+    ((for x from 1 below 4) x)
+    ((for x upfrom 0 to 3) x)
+    ((for x = 1 then (* x 2) while (< x 20)) x)
+    ((repeat 3) 1)
+    ((for (a . b) in (quote ((1 . 2) (3 . 4)))) (+ a b))
+    ((for (a b) in (quote ((1 2) (3 4)))) (+ a b))
+    ((for k being the hash-keys of (let ((h (make-hash-table))) (puthash 1 2 h) h)
+          using (hash-values v)) (+ k v))
+    ((with y = 10 for x in (quote (1 2))) (+ x y)))
+  "Each entry is (CLAUSE-WORDS NUMERIC-EXPR).")
+
+(defun fz-loop-accumulation (var)
+  "A list of loop words that accumulate over the numeric expression VAR."
+  (fz-pick
+   (list (list 'collect var)
+         (list 'collect (list 'list var var))
+         (list 'sum var)
+         (list 'count (list '> var 1))
+         (list 'maximize var)
+         (list 'minimize var)
+         (list 'append (list 'list var))
+         (list 'nconc (list 'list var))
+         (list 'vconcat (list 'vector var))
+         (list 'thereis (list 'and (list '> var 1) var))
+         (list 'always (list '> var 0))
+         (list 'never (list '> var 9))
+         (list 'when (list '> var 1) 'return var)
+         (list 'if (list 'cl-evenp var) 'collect var 'into 'ev 'else 'collect var 'into 'od
+               'end 'finally 'return '(list ev od))
+         (list 'collect var 'into 'r 'finally 'return '(nreverse r))
+         (list 'sum var 'into 's 'finally 'return 's)
+         (list 'when (list 'cl-evenp var) 'collect var 'and 'sum var 'into 's
+               'finally 'return 's)
+         (list 'do (list 'ignore var)))))
+
+(defun fz-loop-form ()
+  "A `cl-loop' built from an iteration source, an optional second binding,
+an optional filter and an accumulation; now and then a clause is damaged."
+  (let* ((it (fz-pick fz-loop-iterations))
+         (words (copy-sequence (nth 0 it)))
+         (var (nth 1 it)))
+    (when (fz-chance 25)
+      (setq words (append words (list 'and 'z '= 0 'then var))))
+    (when (fz-chance 20)
+      (setq words (append words (list 'for 'w 'in ''(7 8 9)))))
+    (when (fz-chance 15)
+      (setq words (append words (list (fz-pick '(while until)) (list '> var 3)))))
+    (setq words (append words (fz-loop-accumulation var)))
+    (when (fz-chance 6)
+      (setq words (append words (list (fz-pick '(bogus into collect and))))))
+    (when (fz-chance 4)
+      (setq words (butlast words)))
+    (when (fz-chance 8)
+      (setq words (append (list 'named 'fzloop) words)))
+    (cons 'cl-loop words)))
+
+;;; ── cl-seq keyword forms ─────────────────────────────────────────────────────
+
+;; cl-seq.el parses `:test'/`:key'/`:start'/`:end'/`:from-end'/`:count' by hand,
+;; and which keyword combinations a hand-rolled version honours is exactly what a
+;; one-keyword-at-a-time corpus never reaches.  The list is built an ELEMENT at a
+;; time so an odd count and an unknown keyword occur; `nil' as a keyword value is
+;; a legal spelling of "not supplied".
+
+(defvar fz-seq-keywords
+  '(:test :key :start :end :from-end :count :test-not :if :if-not :bogus))
+
+(defvar fz-seq-keyword-values
+  '((function =) (function eql) (function eq) (function <) (function 1+) (function -)
+    nil t 0 1 2 3 -1 (quote foo)))
+
+(defvar fz-seq-item-fns
+  '(cl-find cl-position cl-count cl-remove cl-member cl-assoc cl-rassoc
+    cl-substitute cl-adjoin cl-delete cl-nsubstitute))
+
+(defvar fz-seq-pred-fns
+  '(cl-find-if cl-position-if cl-count-if cl-remove-if cl-member-if cl-find-if-not
+    cl-position-if-not cl-count-if-not cl-remove-if-not cl-assoc-if cl-delete-if
+    cl-substitute-if))
+
+(defun fz-seq-keyword-form ()
+  "A cl-seq call with a random keyword list, over a small fresh sequence."
+  (let* ((n (fz-int 5)) (keys nil)
+         (kind (fz-int 4))
+         (seq (fz-pick (list '(list 1 2 3 2 1) '(list 3 1 2) '(vector 1 2 1)
+                             '(list (cons 1 2) (cons 2 3) (cons 1 4)) "abca" nil))))
+    (while (> n 0)
+      (push (if (fz-chance 50)
+                (fz-pick fz-seq-keywords)
+              (fz-pick fz-seq-keyword-values))
+            keys)
+      (setq n (1- n)))
+    (cond
+     ((= kind 0)
+      (append (list (fz-pick fz-seq-item-fns) (fz-pick '(1 2 3 nil)) seq) keys))
+     ((= kind 1)
+      (append (list (fz-pick fz-seq-pred-fns)
+                    (fz-pick '((function cl-evenp) (function cl-oddp) (function null)
+                               (function not) nil (function 1+)))
+                    seq)
+              keys))
+     ((= kind 2)
+      (append (list 'cl-reduce (fz-pick '((function +) (function list) (function max) nil))
+                    seq)
+              keys))
+     (t
+      (append (list (fz-pick '(cl-remove-duplicates cl-delete-duplicates cl-sort
+                               cl-stable-sort cl-union cl-intersection cl-set-difference
+                               cl-subsetp cl-search cl-mismatch cl-merge))
+                    seq)
+              (if (fz-chance 50) (list seq) nil)
+              keys)))))
+
+;;; ── sort argument lists ──────────────────────────────────────────────────────
+
+;; `Fsort' is called with `&rest' and decides by COUNT: two arguments are the old
+;; `(sort SEQ PRED)', any other even count is "Invalid argument list", and the
+;; rest are keyword pairs with their own "Invalid keyword argument".  Built one
+;; element at a time for the same reason as `fz-keyword-form'.
+
+(defun fz-sort-form ()
+  (let ((n (fz-int 6)) (args nil)
+        (seq (fz-pick (list '(list 3 1 2 1) '(vector 2 1 3) '(list (cons 1 'a) (cons 0 'b) (cons 1 'c))
+                            nil "cba"))))
+    (while (> n 0)
+      (push (if (fz-chance 55)
+                (fz-pick '(:key :lessp :in-place :reverse :predicate :bogus))
+              (fz-pick '((function -) (function <) (function >) (function car) t nil 5)))
+            args)
+      (setq n (1- n)))
+    (cons 'sort (cons seq args))))
+
+;;; ── void head with a side-effecting argument ────────────────────────────────
+
+;; `eval_sub' signals `void-function' BEFORE it evaluates any argument form, so
+;; `n' stays 0; `funcall' and `apply' receive evaluated arguments, so `n' is 9.
+;; The head is a never-defined name, `nil', `t', or an alias that dead-ends.
+
+(defun fz-void-head-form ()
+  (let ((head (fz-pick '(fzvoid nil t fzvoidalias)))
+        (via (fz-int 3)))
+    (list 'let '((n 0))
+          (list 'ignore-errors
+                (cond ((= via 0) (list head '(setq n 9)))
+                      ((= via 1) (list 'funcall (list 'quote head) '(setq n 9)))
+                      (t (list 'apply (list 'quote head) '(list (setq n 9))))))
+          'n)))
 
 ;;; ── main ─────────────────────────────────────────────────────────────────────
 
