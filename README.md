@@ -16,7 +16,7 @@
 
 > *"The editor's language — without the editor."*
 
-`elisprs` runs **Emacs Lisp** (`.el`) as standalone programs from the command line: a **Lisp-2** obarray (separate value/function cells) with **lexical *and* dynamic binding** and an elisp-correct reader, **compiled to** — and run on — the [`fusevm`](https://github.com/MenkeTechnologies/fusevm) bytecode VM, the same engine behind `zshrs`, `stryke`, `awkrs`, `vimlrs`, and a dozen other language frontends. elisprs is a **pure frontend**: no bespoke VM or JIT — each form lowers to a `fusevm::Chunk`, hot arithmetic/comparison lowers to **native fusevm ops** (JIT/AOT-able), and the elisp object heap rides the VM as `Value::Obj` handles reached through fusevm's extension handler. It **AOT-compiles to standalone native binaries** (`--aot-exe`) and caches lowered bytecode in an **rkyv** shard at `~/.elisprs`.
+`elisprs` runs **Emacs Lisp** (`.el`) as standalone programs from the command line: a **Lisp-2** obarray (separate value/function cells) with **lexical *and* dynamic binding** and an elisp-correct reader, **compiled to** — and run on — the [`fusevm`](https://github.com/MenkeTechnologies/fusevm) bytecode VM, the same engine behind `zshrs`, `stryke`, `awkrs`, `vimlrs`, and other language frontends. elisprs is a **pure frontend**: no bespoke VM or JIT — each form lowers to a `fusevm::Chunk`, hot arithmetic/comparison lowers to **native fusevm ops** (JIT/AOT-able), and the elisp object heap rides the VM as `Value::Obj` handles reached through fusevm's extension handler. It **AOT-compiles to standalone native binaries** (`--aot-exe`) and caches lowered bytecode in an **rkyv** shard at `~/.elisprs`.
 
  ┌──────────────────────────────────────────────────────────────┐
  │ ENGINE: FUSEVM &nbsp; FRONTEND: PURE &nbsp; AOT: STANDALONE BIN &nbsp; CACHE: RKYV │
@@ -55,7 +55,7 @@
 | Lisp-2 obarray, lexical+dynamic binding, special forms, macros, subrs | **ours** — `src/host.rs` + `src/compiler.rs` |
 | Bytecode execution, JIT, AOT | **`fusevm`** — elisprs has no VM/JIT of its own |
 
-**Status:** self-hosting elisp on `fusevm`. Each top-level form is read, macro-expanded, and lowered to a `fusevm::Chunk` (`src/compiler.rs`); fusevm executes it and calls back into the object heap (`src/host.rs`) through a registered extension handler. Core arithmetic/comparison lower to **native fusevm ops** so hot loops are JIT/AOT-able; `--aot-exe` emits **standalone native binaries**; lowered bytecode + a heap image are cached in an **rkyv** shard at `~/.elisprs`. The post-prelude heap is the same bytes for every script one binary compiles, so the shard stores it **once** as a shared base (format v13) and an entry keeps only the objects its own file created; storing it per entry cost ~6.8 MB each. The shard is bounded to 64 MiB (`ELISPRS_CACHE_MAX_BYTES`; `ELISPRS_CACHE=0` disables it) and evicted oldest-first, because `put` rewrites the whole shard and an unbounded one made every run pay for every script ever cached. (An earlier bootstrap built on the `rust_lisp` crate; it was replaced by this own value model — `rust_lisp` is no longer a dependency.)
+**Status:** self-hosting elisp on `fusevm`. Each top-level form is read, macro-expanded, and lowered to a `fusevm::Chunk` (`src/compiler.rs`); fusevm executes it and calls back into the object heap (`src/host.rs`) through a registered extension handler. Core arithmetic/comparison lower to **native fusevm ops** so hot loops are JIT/AOT-able; `--aot-exe` emits **standalone native binaries**; lowered bytecode + a heap image are cached in an **rkyv** shard at `~/.elisprs`. The post-prelude heap is the same bytes for every script one binary compiles, so the shard stores it **once** as a shared base and an entry keeps only the objects its own file created; storing it per entry cost ~6.8 MB each. The shard is bounded to 64 MiB (`ELISPRS_CACHE_MAX_BYTES`; `ELISPRS_CACHE=0` disables it) and evicted oldest-first, because `put` rewrites the whole shard and an unbounded one made every run pay for every script ever cached. (An earlier bootstrap built on the `rust_lisp` crate; it was replaced by this own value model — `rust_lisp` is no longer a dependency.)
 
 ---
 
@@ -141,7 +141,7 @@ elisp --version
   (arith-error (format "caught %s" e)))   ; => "caught (arith-error)"
 ```
 
-**Now supported** (own cons model — `Obj::Cons(Value, Value)` heap cells, not `rust_lisp`'s list-only cdr):
+**Now supported** (own cons model — `Obj::Cons(Value, Value)` heap cells):
 
 - **Dotted pairs.** `(cons 1 2)` / `(a . b)` read, print (`(1 . 2)`), and round-trip; alists may use `(key . value)`.
 - **Backquote / unquote.** `` ` ``, `,`, and `,@` read as `` (\` X) ``, `(\, X)` and `(\,@ X)`, exactly as Emacs reads them, and the `` \` `` macro expands them with a port of backquote.el, so nested backquotes keep their levels, `'`(a ,b)` is data, and `macroexpand` shows backquote.el's `list`/`cons`/`append`/`backquote-list*` output. The printer abbreviates `(\, X)` as `,X` only inside a backquote.
@@ -175,7 +175,7 @@ elisp --version
 
 Registration returns an integer ID; `(intercept-list)` returns `(ID KIND PATTERN FORM)` entries; advice reads the dynamic context vars `intercept-name` / `intercept-args` / `intercept-cmd`, and (in `after`) `intercept-ms` / `intercept-us`. `(intercept-proceed)` runs the original from inside an `around` body.
 
-**Not in scope** — surfaced loudly rather than silently misread: this is a useful elisp core, **not** the ~1000-subr GNU Emacs surface. Within the editor layer, **overlays**, a real **interval tree** (properties use a per-character plist vector, observably identical for get/put/next-change but O(n) in storage), and **redisplay** (windows, header lines, faces) are not modeled.
+**Not in scope** — surfaced loudly rather than silently misread: this is a useful elisp core, **not** the ~1000-subr GNU Emacs surface. Within the editor layer, a real **interval tree** (properties use a per-character plist vector, observably identical for get/put/next-change but O(n) in storage), and **redisplay** (windows, header lines, faces) are not modeled.
 
 ---
 
@@ -185,7 +185,7 @@ Registration returns an integer ID; `(intercept-list)` returns `(ID KIND PATTERN
 .el source  →  reader.rs  →  forms on the ElispHost heap  →  compiler.rs → fusevm::Chunk  →  fusevm executes (calls back into host.rs)
 ```
 
-elisp cells (cons / symbol / vector / closure / macro / subr) live in the `ElispHost` object heap and ride the VM as `Value::Obj(u32)` handles, so elisprs gets full elisp semantics — including dynamic scope and Lisp-2 cells — without forking either `rust_lisp`'s `Value` enum or the `fusevm` core.
+elisp cells (cons / symbol / vector / closure / macro / subr) live in the `ElispHost` object heap and ride the VM as `Value::Obj(u32)` handles, so elisprs gets full elisp semantics — including dynamic scope and Lisp-2 cells — without forking the `fusevm` core.
 
 | File | Role |
 |---|---|
@@ -209,7 +209,6 @@ The grid reflects the current state of the tree.
 | Component | State |
 |---|---|
 | Elisp-correct reader (`1+`/`#'`/`?c`/`:kw`, `nil`/`t`, `'quote`, `#N=` labels) | Working |
-| `Value` / `List` / `Symbol` model (`rust_lisp`) | Reused |
 | Lisp-2 obarray (value + function cells) | Working |
 | Dynamic binding (`let`/`let*`, special vars) | Working |
 | Special forms + macros (`defmacro`) | Working |
@@ -305,7 +304,7 @@ The HUD-themed HTML docs share `hud-static.css`, `hud-theme.js`, and `tutorial.c
 ## [0xFF] LICENSE
 
  ┌──────────────────────────────────────────────────────────────┐
- │ MIT // BUNDLES rust_lisp (MIT) // FREE / OSS   │
+ │ MIT // FREE / OSS                                         │
  └──────────────────────────────────────────────────────────────┘
 
 ---
