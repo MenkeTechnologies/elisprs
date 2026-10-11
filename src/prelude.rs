@@ -1868,12 +1868,46 @@ TYPE nil maps for side effects only and returns nil."
   (let ((vars (mapcar (function car) bindings))
         (vals (mapcar (lambda (b) (car (cdr b))) bindings)))
     `(progn (defun ,name ,vars ,@body) (,name ,@vals))))
-;; cl-block / cl-return-from: a named escape, implemented with catch/throw on a
-;; per-name tag symbol. cl-return / cl-dolist / cl-dotimes use the nil block.
+;; cl-block / cl-return-from (cl-macs.el, 31.1): a LEXICALLY scoped escape. The
+;; catch tag is a fresh cons bound to the variable `--cl-block-NAME--', so only
+;; a `cl-return-from' written inside BODY can reach it: one in a function called
+;; from BODY sees no such variable (`void-variable'), and a closure that outlives
+;; its block throws to a tag no `catch' is waiting for (`no-catch'). A body with
+;; no side effects drops the block outright, and the `cl--block-wrapper' compiler
+;; macro (defined with `cl-define-compiler-macro', below) drops a block nothing
+;; returns from. cl-return / cl-dolist / cl-dotimes use the nil block.
+(defconst cl--simple-funcs '(car cdr nth aref elt if and or + - 1+ 1- min max
+			    car-safe cdr-safe progn prog1 prog2))
+(defconst cl--safe-funcs '(* / % length memq list vector vectorp
+			  < > <= >= = error))
+(defun cl--safe-expr-p (x)
+  "Check if no side effects."
+  (or (not (and (consp x) (not (memq (car x) '(quote function cl-function)))))
+      (and (symbolp (car x))
+	   (or (memq (car x) cl--simple-funcs)
+	       (memq (car x) cl--safe-funcs)
+	       (get (car x) 'side-effect-free))
+	   (progn
+	     (while (and (setq x (cdr x)) (cl--safe-expr-p (car x))))
+	     (null x)))))
+;; cl-lib.el: `(defalias 'cl--block-wrapper #'identity)' and
+;; `(defalias 'cl--block-throw #'throw)'; `defalias' is not defined yet here.
+(fset 'cl--block-wrapper 'identity)
+(fset 'cl--block-throw 'throw)
 (defmacro cl-block (name &rest body)
-  `(catch (quote ,(intern (concat "--cl-block-" (symbol-name name) "--"))) ,@body))
-(defmacro cl-return-from (name &optional value)
-  `(throw (quote ,(intern (concat "--cl-block-" (symbol-name name) "--"))) ,value))
+  (declare (indent 1) (debug (symbolp body)))
+  (if (cl--safe-expr-p `(progn ,@body)) `(progn ,@body)
+    (let ((var (intern (format "--cl-block-%s--" name))))
+      `(cl--block-wrapper
+        ;; Build a unique "tag" in the form of a fresh cons.
+        ;; We include `var' in the cons, just in case it help debugging.
+        (let ((,var (cons ',var nil)))
+         (catch ,var
+           ,@body))))))
+(defmacro cl-return-from (name &optional result)
+  (declare (indent 1) (debug (symbolp &optional form)))
+  (let ((name2 (intern (format "--cl-block-%s--" name))))
+    `(cl--block-throw ,name2 ,result)))
 (defmacro cl-return (&optional value) `(cl-return-from nil ,value))
 (defmacro cl-dolist (spec &rest body) `(cl-block nil (dolist ,spec ,@body)))
 (defmacro cl-dotimes (spec &rest body) `(cl-block nil (dotimes ,spec ,@body)))
@@ -5386,7 +5420,8 @@ PAREN controls the surrounding group: a string is used as the opening bracket,
     (setq plain (nreverse plain) specs (nreverse specs))
     (list 'progn
           (list 'cl--add-method (list 'quote name) qualifier (cons 'list specs)
-                (cons 'lambda (cons plain body)))
+                ;; cl-generic.el: `(cl-function (lambda ,plain-args ,@body))'.
+                (list 'cl-function (cons 'lambda (cons plain body))))
           (list 'defun name '(&rest --args--)
                 (list 'cl--generic-dispatch (list 'quote name) '--args--))
           (list 'quote name))))
@@ -5404,7 +5439,7 @@ PAREN controls the surrounding group: a string is used as the opening bracket,
                        (list 'cons (list 'cons (list 'quote name) nil) 'cl--generic-table))))
      (when real
        (list (list 'cl--add-method (list 'quote name) nil nil
-                   (cons 'lambda (cons arglist real)))))
+                   (list 'cl-function (cons 'lambda (cons arglist real))))))
      ;; `cl-defgeneric' answers nil, not its own name: the trailing `defun'
      ;; would otherwise leave the symbol as the `progn''s value.
      (list (list 'defun name '(&rest --args--)
@@ -5604,16 +5639,8 @@ PAREN controls the surrounding group: a string is used as the opening bracket,
 (defmacro cl-destructuring-bind (arglist expr &rest body)
   `(let ((--cl-db-v-- ,expr))
      (let* ,(cl-db--binds arglist '--cl-db-v-- arglist) ,@body)))
-;; cl-defun/cl-defmacro: defun/defmacro accepting a full cl-lambda-list
-;; (&optional/&key/&rest/&aux with per-arg defaults), via cl-destructuring-bind.
-(defmacro cl-defun (name arglist &rest body)
-  (declare (doc-string 3) (indent 2))
-  `(defun ,name (&rest --cl-args--)
-     (cl-destructuring-bind ,arglist --cl-args-- ,@body)))
-(defmacro cl-defmacro (name arglist &rest body)
-  (declare (doc-string 3) (indent 2))
-  `(defmacro ,name (&rest --cl-args--)
-     (cl-destructuring-bind ,arglist --cl-args-- ,@body)))
+;; `cl-defun' and `cl-defmacro' are cl-macs.el's, built on `cl--transform-lambda'
+;; before the first top-level `cl-defstruct' (`ppss').
 ;; cl multiple values are just lists in this model.
 (defun cl-values (&rest vals) vals)
 (defun cl-values-list (l) l)
@@ -7043,7 +7070,6 @@ This is like the `&' operator of the C language."
                      (,v ,(funcall setter val))
                      ((eq ,getter ,val) ,(funcall setter `(not ,val))))))))))
 
-(defmacro cl-function (f) (list 'function f))
 
 (defun hash-table-empty-p (h) (= 0 (hash-table-count h)))
 ;; Emacs 30 dropped the per-table rehash parameters from `struct
@@ -10396,6 +10422,409 @@ If OLDSTATE is omitted or nil, parsing assumes that FROM is the
               nil
             (--pps-prev-syntax-- state)))))
 
+;; ---- cl-macs.el (31.1) lambda-list machinery, verbatim ----
+;; `cl-defun', `cl-defmacro' and `cl-function' are `cl--transform-lambda': the
+;; leading plain arguments stay in the lambda list (so a simple arglist is an
+;; ordinary function and its arity errors name the closure), the rest arrive as
+;; `&rest --cl-rest--' and are parsed by the code `cl--do-arglist' generates,
+;; which signals `(wrong-number-of-arguments NAME N)' and the keyword errors
+;; Emacs signals; and the body is wrapped in `(cl-block NAME ...)'. Placed
+;; before the first top-level `cl-defstruct' (`ppss', below), whose
+;; constructor is a `cl-defsubst', because
+;; elisprs expands macros when a form is defined.
+;; macroexp.el, needed by `cl--transform-lambda' at the first expansion.
+(defun macroexp-parse-body (body)
+  "Parse a function BODY into (DECLARATIONS . EXPS)."
+  (let ((decls ()))
+    (while
+        (and body
+             (let ((e (car body)))
+               (or (and (stringp e) (cdr body))
+                   (memq (car-safe e)
+                         '(:documentation declare interactive cl-declare)))))
+      (push (pop body) decls))
+    (cons (nreverse decls) body)))
+(defvar cl--bind-block) (defvar cl--bind-defs) (defvar cl--bind-enquote)
+(defvar cl--bind-lets) (defvar cl--bind-forms)
+(defconst cl--lambda-list-keywords
+  '(&optional &rest &key &allow-other-keys &aux &whole &body &environment))
+(defmacro cl--pop2 (place)
+  `(prog1 (car (cdr ,place))
+     (setq ,place (cdr (cdr ,place)))))
+(defun cl--const-expr-p (x)
+  "Check if X is constant (i.e., no side effects or dependencies).
+
+See `macroexp-const-p' for similar functionality without cl-lib dependency."
+  (cond ((consp x)
+	 (or (eq (car x) 'quote)
+	     (and (memq (car x) '(function cl-function))
+		  (or (symbolp (nth 1 x))
+		      (and (eq (car-safe (nth 1 x)) 'lambda) 'func)))))
+	((symbolp x) (and (memq x '(nil t)) t))
+	(t t)))
+(defun cl--const-expr-val (x)
+  "Return the value of X known at compile-time.
+If X is not known at compile time, return nil.  Before testing
+whether X is known at compile time, macroexpand it completely in
+`macroexpand-all-environment'."
+  (let ((x (macroexpand-all x macroexpand-all-environment)))
+    (if (macroexp-const-p x)
+        (if (consp x) (nth 1 x) x))))
+;; macroexp.el (31.1).
+(defun macroexp--dynamic-variable-p (var)
+  "Whether the variable VAR is dynamically scoped.
+Only valid during macro-expansion."
+  (or (not lexical-binding)
+      (special-variable-p var)
+      (memq var macroexp--dynvars)
+      (and (boundp 'byte-compile-bound-variables)
+           (memq var byte-compile-bound-variables))))
+(defun cl--slet (bindings body &optional nowarn)
+  "Like `cl--slet*' but for \"parallel let\"."
+  (let ((dyns nil)) ;Vars declared as dynbound among the bindings?
+    (when lexical-binding
+      (dolist (binding bindings) ;; `seq-some' lead to bootstrap problems.
+        (when (macroexp--dynamic-variable-p (car binding))
+          (push (car binding) dyns))))
+    (cond
+     (dyns
+      (let ((form `(funcall (lambda (,@(mapcar #'car bindings))
+                              ,@(macroexp-unprogn body))
+                            ,@(mapcar #'cadr bindings))))
+        (if (not nowarn) form
+          `(with-suppressed-warnings ((lexical ,@dyns)) ,form))))
+     ((null (cdr bindings))
+      (macroexp-let* bindings body))
+     (t `(let ,bindings ,@(macroexp-unprogn body))))))
+
+(defun cl--slet* (bindings body)
+  "Like `macroexp-let*' but uses static scoping for all the BINDINGS."
+  (if (null bindings) body
+    (cl--slet `(,(car bindings)) (cl--slet* (cdr bindings) body))))
+
+(defun cl--transform-lambda (form bind-block)
+  "Transform a function form FORM of name BIND-BLOCK.
+BIND-BLOCK is the name of the symbol to which the function will be bound,
+and which will be used for the name of the `cl-block' surrounding the
+function's body.
+FORM is of the form (ARGS . BODY)."
+  (let* ((args (car form)) (body (cdr form)) (orig-args args)
+	 (cl--bind-block bind-block) (cl--bind-defs nil) (cl--bind-enquote nil)
+         (parsed-body (macroexp-parse-body body))
+	 (header (car parsed-body)) (simple-args nil))
+    (setq body (cdr parsed-body))
+    ;; "(. X) to (&rest X)" conversion already done in cl--do-arglist, but we
+    ;; do it here as well, so as to be able to see if we can avoid
+    ;; cl--do-arglist.
+    (setq args (if (listp args) (cl-copy-list args) (list '&rest args)))
+    (let ((p (last args))) (if (cdr p) (setcdr p (list '&rest (cdr p)))))
+    (let ((cl-defs (memq '&cl-defs args)))
+      (when cl-defs
+        (setq cl--bind-defs (cadr cl-defs))
+	;; Remove "&cl-defs DEFS" from args.
+        (setcdr cl-defs (cddr cl-defs))
+	(setq args (delq '&cl-defs args))))
+    (if (setq cl--bind-enquote (memq '&cl-quote args))
+	(setq args (delq '&cl-quote args)))
+    (if (memq '&whole args) (error "&whole not currently implemented"))
+    (let* ((p (memq '&environment args))
+           (v (cadr p)))
+      (if p (setq args (nconc (delq (car p) (delq v args))
+                              `(&aux (,v macroexpand-all-environment))))))
+    ;; Take away all the simple args whose parsing can be handled more
+    ;; efficiently by a plain old `lambda' than the manual parsing generated
+    ;; by `cl--do-arglist'.
+    (let ((optional nil))
+      (while (and args (symbolp (car args))
+                  (not (memq (car args) '(nil &rest &body &key &aux)))
+                  (or (not optional)
+                      ;; Optional args whose default is nil are simple.
+                      (null (nth 1 (assq (car args) (cdr cl--bind-defs)))))
+                  (not (and (eq (car args) '&optional) (setq optional t)
+                            (car cl--bind-defs))))
+        (push (pop args) simple-args))
+      (when optional
+        (if args (push '&optional args))
+        ;; Don't keep a dummy trailing &optional without actual optional args.
+        (if (eq '&optional (car simple-args)) (pop simple-args))))
+    (or (eq cl--bind-block 'cl-none)
+	(setq body (list `(cl-block ,cl--bind-block ,@body))))
+    (let* ((cl--bind-lets nil) (cl--bind-forms nil)
+           (rest-args
+            (cond
+             ((null args) nil)
+             ((eq (car args) '&aux)
+              (cl--do-&aux args)
+              (setq cl--bind-lets (nreverse cl--bind-lets))
+              nil)
+             (t ;; `simple-args' doesn't handle all the parsing that we need,
+              ;; so we pass the rest to cl--do-arglist which will do
+              ;; "manual" parsing.
+              (let ((slen (length simple-args))
+                    (usage-str
+                     ;; Macro expansion can take place in the middle of
+                     ;; apparently harmless computation, so it should not
+                     ;; touch the match-data.
+                     (save-match-data
+                       ;; (require (quote help)) -- help.el is preloaded.
+                       (help--docstring-quote
+                        (let ((print-gensym nil) (print-quoted t)
+                              (print-escape-newlines t))
+                          (format "%S" (cons 'fn (cl--make-usage-args
+                                                  orig-args))))))))
+                (when (memq '&optional simple-args)
+                  (decf slen))
+                (setq header
+                      (cons
+                       (if (eq :documentation (car-safe (car header)))
+                           `(:documentation (help-add-fundoc-usage
+                                             ,(cadr (pop header))
+                                             ,usage-str))
+                         (help-add-fundoc-usage
+                          (if (stringp (car header)) (pop header))
+                          ;; Be careful with make-symbol and (back)quote,
+                          ;; see bug#12884.
+                          usage-str))
+                       header))
+                ;; FIXME: we'd want to choose an arg name for the &rest param
+                ;; and pass that as `expr' to cl--do-arglist, but that ends up
+                ;; generating code with a redundant let-binding, so we instead
+                ;; pass a dummy and then look in cl--bind-lets to find what var
+                ;; this was bound to.
+                (cl--do-arglist args :dummy slen)
+                (setq cl--bind-lets (nreverse cl--bind-lets))
+                ;; (cl-assert (eq :dummy (nth 1 (car cl--bind-lets))))
+                (list '&rest (car (pop cl--bind-lets))))))))
+      `((,@(nreverse simple-args) ,@rest-args)
+        ,@header
+        ;; Function arguments are unconditionally statically scoped (bug#47552).
+        ,(cl--slet* cl--bind-lets
+                    (macroexp-progn
+                     `(,@(nreverse cl--bind-forms)
+                       ,@body)))))))
+
+(defmacro cl-defun (name args &rest body)
+  "Define NAME as a function.
+Like normal `defun', except ARGLIST allows full Common Lisp conventions,
+and BODY is implicitly surrounded by (cl-block NAME ...).
+
+\(fn NAME ARGLIST [DOCSTRING] BODY...)"
+  (declare (doc-string 3) (indent 2))
+  `(defun ,name ,@(cl--transform-lambda (cons args body) name)))
+
+(defmacro cl-defmacro (name args &rest body)
+  "Define NAME as a macro.
+Like normal `defmacro', except ARGLIST allows full Common Lisp conventions,
+and BODY is implicitly surrounded by (cl-block NAME ...).
+
+\(fn NAME ARGLIST [DOCSTRING] BODY...)"
+  (declare (doc-string 3) (indent 2))
+  `(defmacro ,name ,@(cl--transform-lambda (cons args body) name)))
+
+(defmacro cl-function (func)
+  "Introduce a function.
+Like normal `function', except that if argument is a lambda form,
+its argument list allows full Common Lisp conventions."
+  (if (eq (car-safe func) 'lambda)
+      `(function (lambda . ,(cl--transform-lambda (cdr func) 'cl-none)))
+    `(function ,func)))
+
+(defun cl--make-usage-var (x)
+  "X can be a var or a (destructuring) lambda-list."
+  (cond
+   ((symbolp x) (make-symbol (upcase (symbol-name x))))
+   ((consp x) (cl--make-usage-args x))
+   (t x)))
+
+(defun cl--make-usage-args (arglist)
+  (let ((aux (ignore-errors (cl-position '&aux arglist))))
+    (when aux
+      ;; `&aux' args aren't arguments, so let's just drop them from the
+      ;; usage info.
+      (setq arglist (take aux arglist))))
+  (if (not (proper-list-p arglist))
+      (let* ((last (last arglist))
+             (tail (cdr last)))
+        (unwind-protect
+            (progn
+              (setcdr last nil)
+              (nconc (cl--make-usage-args arglist) (cl--make-usage-var tail)))
+          (setcdr last tail)))
+    ;; `orig-args' can contain &cl-defs.
+    (let ((x (memq '&cl-defs arglist)))
+      (when x (setq arglist (delq (car x) (remq (cadr x) arglist)))))
+    (let ((state nil))
+      (mapcar (lambda (x)
+                (cond
+                 ((symbolp x)
+                  (let ((first (aref (symbol-name x) 0)))
+                    (if (eq ?\& first)
+                        (setq state x)
+                      ;; Strip a leading underscore, since it only
+                      ;; means that this argument is unused.
+                      (make-symbol (upcase (if (eq ?_ first)
+                                               (substring (symbol-name x) 1)
+                                             (symbol-name x)))))))
+                 ((not (consp x)) x)
+                 ((memq state '(nil &rest)) (cl--make-usage-args x))
+                 (t      ;(VAR INITFORM SVAR) or ((KEYWORD VAR) INITFORM SVAR).
+                  (cl-list*
+                   (if (and (consp (car x)) (eq state '&key))
+                       (list (caar x) (cl--make-usage-var (nth 1 (car x))))
+                     (cl--make-usage-var (car x)))
+                   (nth 1 x)                        ;INITFORM.
+                   (cl--make-usage-args (nthcdr 2 x)) ;SVAR.
+                   ))))
+              arglist))))
+
+(defun cl--do-&aux (args)
+  (while (and (eq (car args) '&aux) (pop args))
+    (while (and args (not (memq (car args) cl--lambda-list-keywords)))
+      (if (consp (car args))
+          (if (and cl--bind-enquote (cadar args))
+              (cl--do-arglist (caar args)
+                              `',(cadr (pop args)))
+            (cl--do-arglist (caar args) (cadr (pop args))))
+        (cl--do-arglist (pop args) nil))))
+  (if args (error "Malformed argument list ends with: %S" args)))
+
+(defun cl--do-arglist (args expr &optional num)   ; uses cl--bind-*
+  (if (nlistp args)
+      (if (or (memq args cl--lambda-list-keywords) (not (symbolp args)))
+	  (error "Invalid argument name: %s" args)
+	(push (list args expr) cl--bind-lets))
+    (setq args (cl-copy-list args))
+    (let ((p (last args))) (if (cdr p) (setcdr p (list '&rest (cdr p)))))
+    (let ((p (memq '&body args))) (if p (setcar p '&rest)))
+    (if (memq '&environment args) (error "&environment used incorrectly"))
+    (let ((restarg (memq '&rest args))
+	  (safety (if (macroexp-compiling-p) cl--optimize-safety 3))
+	  (keys t)
+	  (laterarg nil) (exactarg nil) minarg)
+      (or num (setq num 0))
+      (setq restarg (if (listp (cadr restarg))
+                        (make-symbol "--cl-rest--")
+                      (cadr restarg)))
+      (push (list restarg expr) cl--bind-lets)
+      (if (eq (car args) '&whole)
+	  (push (list (cl--pop2 args) restarg) cl--bind-lets))
+      (let ((p args))
+	(setq minarg restarg)
+	(while (and p (not (memq (car p) cl--lambda-list-keywords)))
+	  (or (eq p args) (setq minarg (list 'cdr minarg)))
+	  (setq p (cdr p)))
+	(if (memq (car p) '(nil &aux))
+	    (setq minarg `(= (length ,restarg)
+                             ,(length (cl-ldiff args p)))
+		  exactarg (not (eq args p)))))
+      (while (and args (not (memq (car args) cl--lambda-list-keywords)))
+	(let ((poparg (list (if (or (cdr args) (not exactarg)) 'pop 'car-safe)
+			    restarg)))
+	  (cl--do-arglist
+	   (pop args)
+	   (if (or laterarg (= safety 0)) poparg
+	     `(if ,minarg ,poparg
+                (signal 'wrong-number-of-arguments
+                        (list ,(and (not (eq cl--bind-block 'cl-none))
+                                    `',cl--bind-block)
+                              (length ,restarg)))))))
+	(setq num (1+ num) laterarg t))
+      (while (and (eq (car args) '&optional) (pop args))
+	(while (and args (not (memq (car args) cl--lambda-list-keywords)))
+	  (let ((arg (pop args)))
+	    (or (consp arg) (setq arg (list arg)))
+	    (if (cddr arg) (cl--do-arglist (nth 2 arg) `(and ,restarg t)))
+	    (let ((def (if (cdr arg) (nth 1 arg)
+			 (or (car cl--bind-defs)
+			     (nth 1 (assq (car arg) cl--bind-defs)))))
+		  (poparg `(pop ,restarg)))
+	      (and def cl--bind-enquote (setq def `',def))
+	      (cl--do-arglist (car arg)
+			     (if def `(if ,restarg ,poparg ,def) poparg))
+	      (setq num (1+ num))))))
+      (if (eq (car args) '&rest)
+	  (let ((arg (cl--pop2 args)))
+	    (if (consp arg) (cl--do-arglist arg restarg)))
+	(or (eq (car args) '&key) (= safety 0) exactarg
+	    (push `(if ,restarg
+                       (signal 'wrong-number-of-arguments
+                               (list
+                                ,(and (not (eq cl--bind-block 'cl-none))
+                                      `',cl--bind-block)
+                                (+ ,num (length ,restarg)))))
+                  cl--bind-forms)))
+      (while (and (eq (car args) '&key) (pop args))
+        (unless (listp keys) (setq keys nil))
+	(while (and args (not (memq (car args) cl--lambda-list-keywords)))
+	  (let ((arg (pop args)))
+	    (or (consp arg) (setq arg (list arg)))
+	    (let* ((karg (if (consp (car arg)) (caar arg)
+                           (let ((name (symbol-name (car arg))))
+                             ;; Strip a leading underscore, since it only
+                             ;; means that this argument is unused, but
+                             ;; shouldn't affect the key's name (bug#12367).
+                             (if (eq ?_ (aref name 0))
+                                 (setq name (substring name 1)))
+                             (intern (format ":%s" name)))))
+                   (varg (if (consp (car arg)) (cadar arg) (car arg)))
+		   (def (if (cdr arg) (cadr arg)
+                          ;; The ordering between those two or clauses is
+                          ;; irrelevant, since in practice only one of the two
+                          ;; is ever non-nil (the car is only used for
+                          ;; cl-deftype which doesn't use the cdr).
+			  (or (car cl--bind-defs)
+                              (cadr (assq varg cl--bind-defs)))))
+                   (look `(plist-member ,restarg ',karg)))
+	      (and def cl--bind-enquote (setq def `',def))
+	      (if (cddr arg)
+		  (let* ((temp (or (nth 2 arg) (make-symbol "--cl-var--")))
+			 (val `(car (cdr ,temp))))
+		    (cl--do-arglist temp look)
+		    (cl--do-arglist varg
+				   `(if ,temp
+                                        (prog1 ,val (setq ,temp t))
+                                      ,def)))
+		(cl--do-arglist
+		 varg
+		 `(car (cdr ,(if (null def)
+				 look
+			       `(or ,look
+                                    ,(if (eq (cl--const-expr-p def) t)
+					 `'(nil ,(cl--const-expr-val def))
+				       `(list nil ,def))))))))
+	      (push karg keys)))))
+      (when (consp keys) (setq keys (nreverse keys)))
+      (or (and (eq (car args) '&allow-other-keys) (pop args))
+	  (= safety 0)
+          (cond
+           ((eq keys t) nil)            ;No &keys at all
+           ((null keys)                 ;A &key but no actual keys specified.
+            (push `(when ,restarg
+                     (error ,(format "Keyword argument %%S not one of %S"
+                                     keys)
+                            (car ,restarg)))
+                  cl--bind-forms))
+           (t
+	    (let* ((var (make-symbol "--cl-keys--"))
+		   (allow '(:allow-other-keys))
+		   (check `(while ,var
+                             (cond
+                              ((memq (car ,var) ',(append keys allow))
+                               (unless (cdr ,var)
+                                 (error "Missing argument for %s" (car ,var)))
+                               (setq ,var (cdr (cdr ,var))))
+                              ((car (cdr (memq (quote ,@allow) ,restarg)))
+                               (setq ,var nil))
+                              (t
+                               (error
+                                ,(format "Keyword argument %%S not one of %S"
+                                         keys)
+                                (car ,var)))))))
+	      (push `(let ((,var ,restarg)) ,check) cl--bind-forms)))))
+      (cl--do-&aux args)
+      nil)))
+
+
 ;; ---- syntax.el: the ppss accessors, syntax-propertize and syntax-ppss ----
 (cl-defstruct (ppss (:constructor make-ppss) (:copier nil) (:type list))
   (depth nil) (innermost-start nil) (last-complete-sexp-start nil)
@@ -12218,17 +12647,6 @@ No problems result if this variable is not bound.
 ;;  * The cl-print pretty-printer methods for accessors are omitted (cosmetic).
 
 ;; -- helpers not yet in the prelude --
-(defun macroexp-parse-body (body)
-  "Parse a function BODY into (DECLARATIONS . EXPS)."
-  (let ((decls ()))
-    (while
-        (and body
-             (let ((e (car body)))
-               (or (and (stringp e) (cdr body))
-                   (memq (car-safe e)
-                         '(:documentation declare interactive cl-declare)))))
-      (push (pop body) decls))
-    (cons (nreverse decls) body)))
 
 ;; macroexp--fgrep (macroexp.el:724): return those of BINDINGS whose var/func
 ;; symbol appears anywhere in SEXP — a poor-man's free-variable test used by
@@ -14864,9 +15282,6 @@ Atoms are compared by `eql'; cons cells are compared recursively.
 ;; binding builder and the `and'-chain builder, so every clause the Emacs macro
 ;; accepts expands the way Emacs expands it. `cl--map-intervals' and
 ;; `cl--map-overlays' are cl-extra.el's, used by `being the intervals/overlays'.
-(defmacro cl--pop2 (place)
-  `(prog1 (car (cdr ,place))
-     (setq ,place (cdr (cdr ,place)))))
 (defun cl--expr-contains (x y)
   "Count number of times X refers to Y.  Return nil for 0 times."
   ;; FIXME: This is naive, and it will cl-count Y as referred twice in
@@ -15950,6 +16365,32 @@ such that COMBO is equivalent to (and . CLAUSES)."
         (and handler
              (not (eq form (setq form (apply handler form (cdr form))))))))
   form)
+
+;; cl-macs.el (31.1): optimize away unused block-wrappers. `cl--block-throw'
+;; marks its block as used while the wrapper's body is expanded; a block nothing
+;; throws to expands to its body alone.
+(defvar cl--active-block-names nil)
+
+(cl-define-compiler-macro cl--block-wrapper (form)
+  (pcase form
+    (`(let ((,var . ,val)) (catch ,var . ,body))
+     (let* ((cl-entry (cons var nil))
+            (cl--active-block-names (cons cl-entry cl--active-block-names))
+            (cl-body (macroexpand-all      ;Performs compiler-macro expansions.
+                      (macroexp-progn body)
+                      macroexpand-all-environment)))
+       ;; FIXME: To avoid re-applying macroexpand-all, we'd like to be able
+       ;; to indicate that this return value is already fully expanded.
+       (if (cdr cl-entry)
+           `(let ((,var . ,val)) (catch ,var ,@(macroexp-unprogn cl-body)))
+           cl-body)))
+    ;; `form' was somehow mangled, god knows what happened, let's not touch it.
+    (_ form)))
+
+(cl-define-compiler-macro cl--block-throw (cl-tag cl-value)
+  (let ((cl-found (and (symbolp cl-tag) (assq cl-tag cl--active-block-names))))
+    (if cl-found (setcdr cl-found t)))
+  `(throw ,cl-tag ,cl-value))
 
 ;; Emacs also gives the function an inlining compiler macro built on
 ;; `cl--defsubst-expand'; that rewrite only changes how a call is compiled,

@@ -6629,11 +6629,12 @@ textprop.c's (overlays included for the latter), and `insert-and-inherit` is
 - **Unibyte strings.** A string is a Rust `String`, so `"\M-a"` is one character
   with code 225 and `(multibyte-string-p "\M-a")` is `t`.
 
-## Round 40 — compile-time evaluation and compiler macros
+## Round 40 — compile-time evaluation, compiler macros, `cl-block` scope and cl lambda lists
 
 **Oracle: GNU Emacs 31.1** (`emacs -Q --batch -l FILE`, `(require 'cl-lib)`).
 Found by differential probes over cl-lib, closures and macro expansion.
-Expectations are in `tests/parity_compile_time_evaluation.rs`.
+Expectations are in `tests/parity_compile_time_evaluation.rs` and
+`tests/parity_cl_block_and_lambda_lists.rs`.
 
 ### R40-A. ✅ FIXED — `eval-when-compile` / `eval-and-compile` run at expansion
 
@@ -6658,11 +6659,59 @@ note is now taken in `put`, which every route goes through. Together with R40-A,
 a compiler macro defined earlier in the same top-level form is already in place
 for the forms after it, as in Emacs.
 
+### R40-C. ✅ FIXED — `cl-block` is lexically scoped (cl-macs.el 31.1)
+
+`cl-block` was `(catch 'TAG …)` on an interned symbol, so it was dynamically
+scoped: a `cl-return-from` in a *function called from* the block escaped it
+(`1`, where Emacs signals `(void-variable --cl-block-outer--)`), and a closure
+that outlived its block returned through a later block of the same name (where
+Emacs signals `(no-catch (--cl-block-b--) 1)`). The 31.1 macros are ported: the
+tag is a fresh cons bound to `--cl-block-NAME--`, `cl-return-from` is
+`(cl--block-throw VAR VALUE)`, a side-effect-free body (`cl--safe-expr-p`) drops
+the block, and the `cl--block-wrapper` / `cl--block-throw` compiler macros drop
+a block nothing returns from, so `(macroexpand-all '(cl-block foo (bar)))` is
+`(bar)` and closures print the bodies Emacs prints.
+
+### R40-D. ✅ FIXED — `cl-defun`, `cl-defmacro`, `cl-function` are `cl--transform-lambda`
+
+`cl-defun` was `(defun NAME (&rest --cl-args--) (cl-destructuring-bind …))` and
+`cl-function` was plain `function`. cl-macs.el's `cl--transform-lambda`,
+`cl--do-arglist`, `cl--do-&aux`, `cl--make-usage-args` and `cl--slet` are now
+ported verbatim, which fixes:
+
+- **no implicit block**: `(cl-defun g4 (a) (cl-return-from g4 (* 2 a)) 0)`
+  signalled `no-catch`; it returns 8.
+- **`cl-function` ignored cl lambda lists**: `(funcall (cl-function (lambda
+  (&key (a 3)) a)))` aborted the whole file with an uncatchable compile error,
+  and `&key` / `&optional` defaults / destructuring / `&aux` did not parse.
+- **arity errors**: a plain arglist stays a plain lambda list, so
+  `(wrong-number-of-arguments #[(a b) ((progn (list a b))) (t)] 1)` names the
+  closure (was `((a b) 1)`); surplus arguments past the parsed part are
+  `(wrong-number-of-arguments NAME TOTAL)`; `func-arity` and the
+  `(fn X &key Y)` usage line in the docstring follow.
+- `cl-defmethod` / `cl-defgeneric` build methods with `cl-function`, as
+  cl-generic.el does, so `(cl-defmethod g ((x integer) &optional (y 3)) …)`
+  works (it aborted the file).
+
+Defining `cl--const-expr-val` also brought the existing `cl-member` /
+`cl-assoc` compiler macros to life (`(macroexpand-all '(cl-member x y))` is
+`(memql x y)`), and `macroexp-parse-body` / `cl--pop2` moved before the first
+expansion that needs them. Expectations are in
+`tests/parity_cl_block_and_lambda_lists.rs`.
+
 ### Still open after round 40
 
 - `setplist` with a `compiler-macro` entry, and a compiler macro on the target
   of a `defalias` (`function-get` follows the alias; the host pre-filter looks
   at the called symbol only), do not reach `macroexpand-all`.
+- `cl-defstruct` constructors do not go through `cl-defun`: an unknown or
+  value-less keyword is accepted (`(make-q2 :z 1)` is `#s(q2 nil)`; Emacs
+  signals `Keyword argument :z not one of (:a)`), and a BOA constructor's
+  `&optional (b 7)` default is ignored.
+- A `cl-defmacro` defined inside a non-top-level form and called later in the
+  same form is compiled as a function call (`invalid-function`), where Emacs's
+  interpreter expands it at run time; a plain `defmacro` there works.
+- `cl-iter-defun` is void (no `generator.el`).
 
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 

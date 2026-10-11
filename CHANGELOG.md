@@ -10,7 +10,11 @@ All notable changes to elisprs are documented here. The format follows
   `eval-and-compile` evaluate their body at expansion time and expand to a
   quoted constant, as byte-run.el defines them; a `compiler-macro` property set
   with `put` / `define-symbol-prop` (so `cl-define-compiler-macro`) applies to
-  `macroexpand-all` and eager expansion.
+  `macroexpand-all` and eager expansion. `cl-block` is lexically scoped (31.1
+  cl-macs.el); `cl-defun`, `cl-defmacro` and `cl-function` are
+  `cl--transform-lambda` (implicit block, cl lambda lists in `cl-function`,
+  Emacs arity and keyword errors), and `cl-defmethod` builds methods with
+  `cl-function`.
 - **Round 35 parity vs Emacs 31.1** (see BUGS.md): `cl-typep` is the body of
   cl-macs.el's `define-inline` (`real`, `character`, `base-char`,
   `extended-char`, bounds, `Unknown type` / `Bad type spec`); `cl-deftype`
