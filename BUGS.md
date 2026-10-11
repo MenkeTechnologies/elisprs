@@ -6629,6 +6629,41 @@ textprop.c's (overlays included for the latter), and `insert-and-inherit` is
 - **Unibyte strings.** A string is a Rust `String`, so `"\M-a"` is one character
   with code 225 and `(multibyte-string-p "\M-a")` is `t`.
 
+## Round 40 — compile-time evaluation and compiler macros
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch -l FILE`, `(require 'cl-lib)`).
+Found by differential probes over cl-lib, closures and macro expansion.
+Expectations are in `tests/parity_compile_time_evaluation.rs`.
+
+### R40-A. ✅ FIXED — `eval-when-compile` / `eval-and-compile` run at expansion
+
+Both were `(cons 'progn body)`. byte-run.el defines them as
+`(list 'quote (eval (cons 'progn body) …))`: in interpreted code the body runs
+when the form is **expanded** and the expansion is a constant. So
+`(macroexpand '(eval-when-compile (+ 1 2)))` is `'3` (was `(progn (+ 1 2))`), a
+`defun` body keeps `'(1 2)` rather than the call, a loop around the form runs
+the body once (was once per iteration), and `(let ((x 1)) (eval-and-compile x))`
+fails with `(void-variable x)` because the body sees no lexical binding of the
+code around it (was `1`). `macroexp--dynvars` exists for `eval-and-compile`'s
+lexical argument.
+
+### R40-B. ✅ FIXED — a compiler macro installed by `put` applies
+
+`macroexpand-all` consults a host-side set of symbols that carry a
+`compiler-macro` property, and only `function-put` added to it.
+`cl-define-compiler-macro` stores the handler with `define-symbol-prop`, so its
+macro never applied to eager expansion: `(my-sq3 4)` called the function, and a
+`defun` calling it kept the call where Emacs has the handler's expansion. The
+note is now taken in `put`, which every route goes through. Together with R40-A,
+a compiler macro defined earlier in the same top-level form is already in place
+for the forms after it, as in Emacs.
+
+### Still open after round 40
+
+- `setplist` with a `compiler-macro` entry, and a compiler macro on the target
+  of a `defalias` (`function-get` follows the alias; the host pre-filter looks
+  at the called symbol only), do not reach `macroexpand-all`.
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the

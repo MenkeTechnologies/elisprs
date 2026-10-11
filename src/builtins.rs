@@ -1742,7 +1742,8 @@ fn aref(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// `(--note-compiler-macro SYMBOL)` — record that SYMBOL now carries a
 /// `compiler-macro` property, so `macroexpand-all` knows to look it up. Called
-/// from the prelude's `function-put`; not an Emacs function.
+/// from the prelude's `put` (so `function-put`, `define-symbol-prop` and
+/// `cl-define-compiler-macro` all reach it); not an Emacs function.
 fn note_compiler_macro(h: &mut ElispHost, a: &[Value]) -> R {
     if let Value::Obj(id) = &a[0] {
         h.compiler_macros.insert(*id);

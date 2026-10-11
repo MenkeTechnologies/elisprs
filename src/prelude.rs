@@ -803,9 +803,19 @@ interpreter; expands to nil."
   (declare (advertised-calling-convention
 	    (fn file &optional arglist fileonly) nil))
   nil)
-;; Compile-time evaluation: elisprs interprets, so these just run BODY.
-(defmacro eval-when-compile (&rest body) (declare (debug (&rest def-form)) (indent 0)) (cons 'progn body))
-(defmacro eval-and-compile (&rest body) (declare (debug (&rest def-form)) (indent 0)) (cons 'progn body))
+;; byte-run.el (31.1): in interpreted code both macros run BODY when they are
+;; EXPANDED -- eager macroexpansion is the "compile time" -- and leave the value
+;; behind as a constant. So the body sees no lexical binding of the code around
+;; it, runs once however often the expansion is evaluated, and anything it
+;; defines (a compiler macro, a defvar) is in place for the rest of the form.
+(defvar macroexp--dynvars nil)
+(defmacro eval-when-compile (&rest body)
+  (declare (debug (&rest def-form)) (indent 0))
+  (list 'quote (eval (cons 'progn body) lexical-binding)))
+(defmacro eval-and-compile (&rest body)
+  (declare (debug (&rest def-form)) (indent 0))
+  (list 'quote (eval (cons 'progn body)
+                     (when lexical-binding (or macroexp--dynvars t)))))
 (defmacro cl-eval-when (situations &rest body)
   ;; Run BODY when a runtime situation (eval/load/:execute/:load-toplevel) applies.
   (if (or (memq 'eval situations) (memq 'load situations)
@@ -2825,8 +2835,15 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
 ;; `(get ERRNAME 'error-conditions)' before it can decide anything about ERRNAME.
 (defun symbol-plist--check (sym)
   (unless (symbolp sym) (signal 'wrong-type-argument (list 'symbolp sym))))
+;; A `compiler-macro' property changes how `macroexpand-all' treats every call
+;; to SYM, so the host keeps a set of the symbols that have one and only looks
+;; the property up for those (see `ElispHost::compiler_macros'). The note is
+;; taken here, not in `function-put', because `cl-define-compiler-macro'
+;; stores the property with `define-symbol-prop' and plain `put' is just as
+;; valid a way to install one: `macroexp--compiler-macro' reads the plist.
 (defun put (sym prop val)
   (symbol-plist--check sym)
+  (when (eq prop 'compiler-macro) (--note-compiler-macro sym))
   (puthash sym (plist-put (gethash sym symbol-plist--table) prop val) symbol-plist--table)
   val)
 (defun get (sym prop)
@@ -2881,10 +2898,6 @@ function may, `gethash' on such a table included."
           (setq f fundef))))
     val))
 (defun function-put (f prop value)
-  ;; A `compiler-macro' property changes how `macroexpand-all' treats every
-  ;; call to F, so the host keeps a set of the symbols that have one and only
-  ;; looks the property up for those (see `ElispHost::compiler_macros').
-  (when (eq prop 'compiler-macro) (--note-compiler-macro f))
   (put f prop value))
 (defun define-symbol-prop (symbol prop value) (put symbol prop value))
 ;; `record'/`make-record' are `Obj::Record' primitives (see builtins.rs); a record

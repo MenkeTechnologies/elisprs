@@ -6,6 +6,11 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Round 40 parity vs Emacs 31.1** (see BUGS.md): `eval-when-compile` and
+  `eval-and-compile` evaluate their body at expansion time and expand to a
+  quoted constant, as byte-run.el defines them; a `compiler-macro` property set
+  with `put` / `define-symbol-prop` (so `cl-define-compiler-macro`) applies to
+  `macroexpand-all` and eager expansion.
 - **Round 35 parity vs Emacs 31.1** (see BUGS.md): `cl-typep` is the body of
   cl-macs.el's `define-inline` (`real`, `character`, `base-char`,
   `extended-char`, bounds, `Unknown type` / `Bad type spec`); `cl-deftype`
