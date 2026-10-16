@@ -2769,7 +2769,7 @@ fn concat_fn(h: &mut ElispHost, a: &[Value]) -> R {
         }
     }
     let (out, key) = h.new_string_keyed(out);
-    h.string_carry_props(&key, &pieces);
+    h.string_copy_props(&key, &pieces);
     Ok(out)
 }
 /// A parsed `%`-directive: `%[-][0][width][.prec]CONV`.
@@ -3446,6 +3446,21 @@ fn apply_format_props(
 }
 
 fn format_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    // editfns.c `styled_format` hands back an existing string instead of building a
+    // new one in two cases (measured, GNU Emacs 31.1): a format with no `%` at all
+    // answers the format string itself, and a bare "%s" over a string argument
+    // answers that argument itself (so its property order is not re-reversed).
+    if let Some(fmt) = h.str_text(&a[0]) {
+        if !fmt.contains('%') {
+            return Ok(a[0].clone());
+        }
+        if fmt == "%s" && a.len() == 2 && h.str_text(&a[1]).is_some() {
+            let plain = h.str_arc(&a[0]).map_or(true, |f| h.string_intervals(&f).is_empty());
+            if plain {
+                return Ok(a[1].clone());
+            }
+        }
+    }
     let (s, fields) = el_format_pieces(h, a)?;
     let (out, key) = h.new_string_keyed(s);
     apply_format_props(h, &key, &a[0], &fields);
@@ -3998,6 +4013,20 @@ fn copy_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── strings ──
+/// `(elisprs--copy-string STRING)` — `Fcopy_sequence` on a string: a fresh string whose
+/// interval tree is copied as it stands, so each interval keeps its plist order
+/// (`substring` and `concat` re-add the pairs and reverse them).
+fn copy_string(h: &mut ElispHost, a: &[Value]) -> R {
+    let Some(text) = h.str_text(&a[0]).map(str::to_string) else {
+        return Err(format!("wrong-type-argument: stringp {}", h.print(&a[0], true)));
+    };
+    let src = h.str_arc(&a[0]);
+    let (out, dst) = h.new_string_keyed(text);
+    if let Some(src) = src {
+        h.string_carry_all(&dst, &src);
+    }
+    Ok(out)
+}
 /// `(substring-no-properties STRING &optional FROM TO)` — a property-free copy.
 /// A C subr in Emacs (editfns.c) that demands `stringp` (never a vector, unlike
 /// `substring`); index handling is then identical to `substring`.
@@ -4090,7 +4119,7 @@ fn substring(h: &mut ElispHost, a: &[Value]) -> R {
             // The slice's characters keep the properties they had in the
             // original, re-based to the new string's start.
             if let Some(src) = src {
-                h.string_carry_props(&dst, &[(Some(src), start as usize, (end - start) as usize)]);
+                h.string_copy_props(&dst, &[(Some(src), start as usize, (end - start) as usize)]);
             }
             Ok(out)
         }
@@ -10917,6 +10946,7 @@ pub fn install(h: &mut ElispHost) {
     s("fillarray", 2, Some(2), fillarray);
     s("make-char-table--new", 3, Some(3), make_char_table_new);
     s("elisprs--copy-char-table", 1, Some(1), copy_char_table);
+    s("elisprs--copy-string", 1, Some(1), copy_string);
     s("elisprs--char-table-runs", 1, Some(1), char_table_runs);
     s("optimize-char-table", 1, Some(2), optimize_char_table);
     s("char-table-p", 1, Some(1), char_table_p);

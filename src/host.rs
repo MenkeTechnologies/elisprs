@@ -6103,6 +6103,28 @@ impl ElispHost {
         out: &Arc<String>,
         pieces: &[(Option<Arc<String>>, usize, usize)],
     ) {
+        self.string_carry_props_ordered(out, pieces, false);
+    }
+
+    /// `copy_text_properties` as `substring` and `concat` call it: each source
+    /// interval's plist reaches the new string with its PAIRS in reverse order
+    /// (measured, GNU Emacs 31.1: `(substring (propertize "abc" 'a 1 'b 2) 0)`
+    /// prints `(b 2 a 1)`). `copy-sequence` and `upcase` copy the interval tree
+    /// and keep the order, so they stay on `string_carry_props`.
+    pub fn string_copy_props(
+        &mut self,
+        out: &Arc<String>,
+        pieces: &[(Option<Arc<String>>, usize, usize)],
+    ) {
+        self.string_carry_props_ordered(out, pieces, true);
+    }
+
+    fn string_carry_props_ordered(
+        &mut self,
+        out: &Arc<String>,
+        pieces: &[(Option<Arc<String>>, usize, usize)],
+        reverse_pairs: bool,
+    ) {
         let total: usize = pieces.iter().map(|p| p.2).sum();
         let mut vec: Vec<Value> = vec![Value::Undef; total];
         let mut bounds: Vec<u32> = Vec::new();
@@ -6119,7 +6141,10 @@ impl ElispHost {
                             continue;
                         }
                         any = true;
-                        let items = self.list_vec(&props[rs]).unwrap_or_default();
+                        let mut items = self.list_vec(&props[rs]).unwrap_or_default();
+                        if reverse_pairs {
+                            items = items.chunks(2).rev().flatten().cloned().collect();
+                        }
                         let copy = self.list_from(items);
                         let a = rs.max(*start) - start + at;
                         let b = re.min(start + len) - start + at;

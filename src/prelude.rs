@@ -1496,9 +1496,8 @@ With VECTORS-AND-RECORDS non-nil, traverse and copy vectors and records too."
         ;; answered t where Emacs answers nil, and — worse — `aset' on the
         ;; "copy" wrote through to the original, so `copy-tree'/`cl-copy-list'
         ;; and every caller that copies before mutating shared one object.
-        ;; `substring' copies a string WITH its text properties (which is what
         ;; Emacs's `copy-sequence' does); `vconcat' copies a vector's slots.
-        ((stringp seq) (substring seq 0))
+        ((stringp seq) (elisprs--copy-string seq))
         ((vectorp seq) (vconcat seq))
         ;; A record is copied slot-for-slot into a fresh record (slot 0, the type,
         ;; is reproduced): `(copy-sequence rec)' preserves record-ness, so it is the
@@ -7771,7 +7770,6 @@ at the front of KEY that were used.  ACCEPT-DEFAULT recognizes default
         (setq events (cdr events))
         (setq i (1+ i))
         (cond
-         ((null res) (setq done t))
          ((null events) (setq done t))
          ((keymapp res) (setq km (keymap--get res)))
          (t (setq res i done t))))
