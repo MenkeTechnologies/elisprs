@@ -619,6 +619,7 @@ pub const PRELUDE: &str = r#"
 (defvar print-escape-newlines nil)
 (defvar print-escape-control-characters nil)
 (defvar print-escape-multibyte nil)
+(defvar print-integers-as-characters nil)
 (defvar print-quoted t)
 (defvar float-output-format nil)
 ;; Without this `defvar' a `(let ((print-circle t)) …)' binds a LEXICAL `print-circle'

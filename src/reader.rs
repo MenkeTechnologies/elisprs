@@ -132,15 +132,21 @@ impl Reader {
         loop {
             match self.peek() {
                 Some(c) if c.is_whitespace() => self.pos += 1,
-                Some(';') => {
-                    while let Some(c) = self.peek() {
-                        self.pos += 1;
-                        if c == '\n' {
-                            break;
-                        }
-                    }
-                }
+                Some(';') => self.skip_line(),
+                // `#!` at the start of a token comments out the rest of the line
+                // (a script's shebang), as `;` does.
+                Some('#') if self.peek_at(1) == Some('!') => self.skip_line(),
                 _ => break,
+            }
+        }
+    }
+
+    /// Consume through the end of the current line.
+    fn skip_line(&mut self) {
+        while let Some(c) = self.peek() {
+            self.pos += 1;
+            if c == '\n' {
+                break;
             }
         }
     }
@@ -229,6 +235,25 @@ impl Reader {
             '#' if self.peek_at(1) == Some('#') => {
                 self.pos += 2;
                 Ok(h.intern(""))
+            }
+            // `#_NAME` is the symbol NAME read without shorthand expansion. The
+            // token is always a symbol (`#_1` is the symbol named "1") and may be
+            // empty (`#_` alone is `##`).
+            '#' if self.peek_at(1) == Some('_') => {
+                self.pos += 2;
+                let mut name = String::new();
+                while let Some(c) = self.peek() {
+                    if c == '\\' {
+                        self.pos += 1;
+                        name.push(self.peek().ok_or("end-of-file")?);
+                    } else if is_delim(c) {
+                        break;
+                    } else {
+                        name.push(c);
+                    }
+                    self.pos += 1;
+                }
+                Ok(h.intern(&name))
             }
             // `#:NAME` is an *uninterned* symbol named NAME — `read_atom` used to
             // produce an interned one whose name still carried the `#:`.
@@ -1023,7 +1048,7 @@ impl Reader {
                         self.pos += 1;
                         had_escape = true;
                     }
-                    None => return Err("trailing backslash in symbol".to_string()),
+                    None => return Err("end-of-file".to_string()),
                 }
             } else if is_delim(c) {
                 break;
@@ -1488,7 +1513,7 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
                                 pos += 1;
                                 escaped = true;
                             }
-                            None => return Err("trailing backslash in symbol".to_string()),
+                            None => return Err("end-of-file".to_string()),
                         }
                     } else if is_delim(ch) {
                         break;

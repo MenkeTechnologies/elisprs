@@ -4644,6 +4644,41 @@ impl ElispHost {
         out
     }
 
+    /// `print-integers-as-characters`: print.c writes a fixnum as `?C` when it is
+    /// a character that reads back as itself -- a printable ASCII character, one
+    /// of `\b \t \n \f \r`, or a non-ASCII letter, number, punctuation, symbol
+    /// or private-use character.  Marks, separators, format and control
+    /// characters stay numbers.  `"'();[]{}` and the backslash are backslashed.
+    fn int_as_character(&self, n: i64) -> Option<String> {
+        use std::sync::OnceLock;
+        static GRAPHIC: OnceLock<fancy_regex::Regex> = OnceLock::new();
+        if !self.print_flag("print-integers-as-characters") {
+            return None;
+        }
+        let c = char::from_u32(u32::try_from(n).ok()?)?;
+        let body = match c {
+            '\u{8}' => "\\b".to_string(),
+            '\t' => "\\t".to_string(),
+            '\n' => "\\n".to_string(),
+            '\u{c}' => "\\f".to_string(),
+            '\r' => "\\r".to_string(),
+            ' ' => "\\s".to_string(),
+            '"' | '\'' | '(' | ')' | ';' | '[' | '\\' | ']' | '{' | '}' => format!("\\{c}"),
+            ' '..='~' => c.to_string(),
+            c if c.is_ascii() => return None,
+            c => {
+                let graphic = GRAPHIC.get_or_init(|| {
+                    fancy_regex::Regex::new(r"^[\p{L}\p{N}\p{P}\p{S}\p{Co}]$").expect("static regex")
+                });
+                if !graphic.is_match(&c.to_string()).unwrap_or(false) {
+                    return None;
+                }
+                c.to_string()
+            }
+        };
+        Some(format!("?{body}"))
+    }
+
     /// True if a printer flag dynamic var (e.g. `print-escape-newlines`) is non-nil.
     fn print_flag(&self, name: &str) -> bool {
         self.print_flag_or(name, false)
@@ -4795,7 +4830,9 @@ impl ElispHost {
             Value::Undef => "nil".to_string(),
             Value::Bool(true) => "t".to_string(),
             Value::Bool(false) => "nil".to_string(),
-            Value::Int(n) => n.to_string(),
+            Value::Int(n) => self
+                .int_as_character(*n)
+                .unwrap_or_else(|| n.to_string()),
             Value::Float(f) => {
                 // Emacs's read syntax for the non-finite floats.
                 if f.is_nan() {

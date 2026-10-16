@@ -6371,8 +6371,7 @@ delimiter: `?ab` is `(invalid-read-syntax "?")`.
   `encode-coding-string`, `byte-to-string`) — design decision, not attempted.
 - Void: `transpose-regions`, `indent-rigidly`, `substitute-in-file-name`,
   `text-mode`, `emacs-lisp-mode`, `get-char-code-property`, `?\N{NAME}`.
-- Reader: `#_SYMBOL` (31.1's shorthand-free symbol) and `#[...]` as an
-  interpreted-function literal.
+- Reader: `#[...]` as an interpreted-function literal (`#_SYMBOL` is read now).
 - A char-table prints its ranges, not Emacs's `#^[...]` slot layout.
 - A closure pruned to only `let`-bound declarations prints `(ww t)` where
   cconv gives `(ww)`; `(let () (defvar x))` ends the declaration with the
