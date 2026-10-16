@@ -1738,24 +1738,15 @@ confirmed against Emacs 30.2 here rather than taken on trust.
 - ~~**`string-version-lessp`'s ORDERING**~~ — CLOSED by round 10's `filevercmp`
   port; this list was never updated. Re-measured in round 18:
   `(string-version-lessp "quote\"d" "  padded  ")` is `t` in both engines.
-- **`[:graph:]` and `[:print:]`.** The manual defines both by COMPLEMENT ("any
-  character except whitespace, control characters, surrogates, and unassigned
-  codepoints"), and a complement is not expressible as character-class BODY text.
-  `[[^…]…]` needs nested classes, which fancy-regex's parser rejects outright
-  ("error parsing pattern"). Reaching them means translating the whole `[...]`
-  alternative rather than one member of it.
-- **`[:space:]`, `[:punct:]`, `[:word:]`.** Improved but still approximations, and
-  they cannot be finished with a Unicode property at all: in Emacs these three
-  read the SYNTAX TABLE, so the answer depends on the major mode —
-  `(string-match "[[:space:]]" "\n")` is nil in fundamental-mode and 0 in
-  text-mode. elisprs has no syntax table to consult.
-- **`[:upper:]`/`[:lower:]`, and the four byte-width classes under
-  `case-fold-search`.** The residue is Emacs's CASE TABLES: `\p{Uppercase}`
-  accepts `U+1D400` (MATHEMATICAL BOLD CAPITAL A) where Emacs does not, because
-  Emacs's test is "downcasing changes the character". The one fold-only mismatch
-  in `[:ascii:]` and friends is the same root: `compile_cf` applies `(?i)` to the
-  whole pattern, so the crate folds `U+017F` (ſ) into an ASCII class and Emacs
-  does not.
+- ~~**`[:graph:]` and `[:print:]`**~~, ~~**`[:space:]`, `[:punct:]`, `[:word:]`**~~ and
+  ~~**`[:upper:]`/`[:lower:]`**~~ -- CLOSED. `graph`/`print` are the union of the
+  general categories Emacs keeps; `space`/`punct`/`word` are answered from the live
+  syntax table at compile time (the standard table now carries characters.el's
+  classification above U+00FF); `upper`/`lower` use the simple case mappings.
+  Residue: characters assigned only in Unicode versions newer than the `regex`
+  crate's tables, and the four byte-width classes under `case-fold-search`:
+  `compile_cf` applies `(?i)` to the whole pattern, so the crate folds `U+017F`
+  (ſ) into an ASCII class and Emacs does not.
 - **`seq-mapn`'s argument-error order** — `(seq-mapn #'string-to-number "-4.5"
   (cons 2 10))` is `(wrong-type-argument stringp 45)` in Emacs and
   `(wrong-type-argument listp 10)` here: the two walk their sequences in a

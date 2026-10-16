@@ -4455,8 +4455,8 @@ struct HostSyntax<'a> {
     host: &'a ElispHost,
     /// Set when the translation actually asked for a syntax class — i.e. the
     /// pattern used `\sC`, `\SC`, `\w`, `\W` or `\cC`. Such a translation is
-    /// only valid for the syntax table in force at the time, so it is the one
-    /// kind of pattern [`compile_cf`] must NOT cache.
+    /// only valid for the syntax table in force at the time, so [`compile_cf`]
+    /// caches it under that table's fingerprint.
     used_syntax: std::cell::Cell<bool>,
 }
 impl crate::regexp::SyntaxLookup for HostSyntax<'_> {
@@ -4490,7 +4490,10 @@ impl std::ops::Deref for CompiledRe {
 
 /// One `case-fold-search` setting's worth of compiled regexps. The value keeps
 /// the FAILURE as well as the success, so an invalid pattern keeps signalling.
-type ReCacheMap = HashMap<String, Result<Rc<CompiledRe>, String>>;
+/// An entry that read the syntax table also carries the table fingerprint it was
+/// compiled under (`ElispHost::syntax_fingerprint`); it is reused only while that
+/// still holds.
+type ReCacheMap = HashMap<String, (Option<u64>, Result<Rc<CompiledRe>, String>)>;
 
 thread_local! {
     /// Compiled regexps, keyed by the elisp pattern — one map per
@@ -4520,8 +4523,10 @@ pub(crate) fn compile_cf(
     case_insensitive: bool,
 ) -> Result<Rc<CompiledRe>, String> {
     let slot = usize::from(case_insensitive);
-    if let Some(hit) = RE_CACHE.with(|c| c.borrow()[slot].get(pat).cloned()) {
-        return hit;
+    if let Some((stamp, hit)) = RE_CACHE.with(|c| c.borrow()[slot].get(pat).cloned()) {
+        if stamp.map_or(true, |s| s == h.syntax_fingerprint()) {
+            return hit;
+        }
     }
     let syntax = HostSyntax {
         host: h,
@@ -4529,17 +4534,16 @@ pub(crate) fn compile_cf(
     };
     let compiled = compile_uncached(pat, case_insensitive, &syntax);
     // A pattern whose translation read the syntax table is valid only for the
-    // table it read; caching it would answer with a stale character set after
-    // `modify-syntax-entry` or a buffer switch.
-    if !syntax.used_syntax.get() {
-        RE_CACHE.with(|c| {
-            let mut maps = c.borrow_mut();
-            if maps[slot].len() >= RE_CACHE_MAX {
-                maps[slot].clear();
-            }
-            maps[slot].insert(pat.to_string(), compiled.clone());
-        });
-    }
+    // table it read, so it is cached under that table's fingerprint: a stale
+    // character set after `modify-syntax-entry` or a buffer switch misses.
+    let stamp = syntax.used_syntax.get().then(|| h.syntax_fingerprint());
+    RE_CACHE.with(|c| {
+        let mut maps = c.borrow_mut();
+        if maps[slot].len() >= RE_CACHE_MAX {
+            maps[slot].clear();
+        }
+        maps[slot].insert(pat.to_string(), (stamp, compiled.clone()));
+    });
     compiled
 }
 

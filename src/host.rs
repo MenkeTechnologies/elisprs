@@ -6364,6 +6364,36 @@ impl ElispHost {
         *Self::SYNTAX_CODE_SPEC.get(code).unwrap_or(&b' ') as char
     }
 
+    /// A hash of everything `syntax_class_ranges` reads: which table is current
+    /// and, down its parent chain, every table's runs, default and parent.  A
+    /// compiled regexp that consulted the syntax table stays valid exactly while
+    /// this value is unchanged, so the regexp cache can keep it instead of
+    /// recompiling on every call.
+    pub fn syntax_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let code_of = |v: &Value| match self.obj(v) {
+            Some(Obj::Cons(Value::Int(n), m)) => (*n, if let Value::Int(m) = m { *m } else { -1 }),
+            _ => (-1, -1),
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut cur = self.current_syntax_table();
+        for _ in 0..64 {
+            let Some(Obj::CharTable(t)) = self.obj(&cur) else {
+                break;
+            };
+            if let Value::Obj(id) = cur {
+                id.hash(&mut hasher);
+            }
+            code_of(&t.default).hash(&mut hasher);
+            for (start, v) in t.runs() {
+                start.hash(&mut hasher);
+                code_of(&v).hash(&mut hasher);
+            }
+            cur = t.parent.clone();
+        }
+        hasher.finish()
+    }
+
     /// Every character range whose syntax class in the current table is `class`
     /// (a `modify-syntax-entry` designator: `w`, `_`, `.`, `<`, `>`, …).
     ///

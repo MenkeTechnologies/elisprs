@@ -117,7 +117,7 @@ pub fn translate_groups(pat: &str, syn: &dyn SyntaxLookup) -> Result<(String, Ve
             // Character alternative: copy through verbatim. Both dialects agree
             // on `[a-z]`, `[^...]`, a leading/`^`-leading `]`, and `[:class:]`.
             '[' => {
-                copy_class(&mut it, &mut out)?;
+                copy_class(&mut it, &mut out, syn)?;
                 can_repeat = true;
             }
             // A repetition operator with no preceding expression is a literal
@@ -175,6 +175,24 @@ const MAX_SCALAR: u32 = 0x10FFFF;
 /// for the positive form, `.`-equivalent for the negated one — because a syntax
 /// class with no characters must match nothing, not everything.
 fn char_class(ranges: &[(u32, u32)], neg: bool) -> String {
+    let mut body = ranges_body(ranges);
+    if body.is_empty() {
+        // No character is in the class.
+        body = "\\x{0}-\\x{10FFFF}".to_string();
+        return format!("(?-i:[{}{body}])", if neg { "" } else { "^" });
+    }
+    // `(?-i:…)` because a syntax class is never case-folded. Emacs's matcher asks
+    // `SYNTAX (c)` of the character as it stands; `case-fold-search` only folds
+    // literal characters. Without the override, `case-fold-search`'s `(?i)`
+    // leaked in and `(progn (modify-syntax-entry ?a "_") (string-match "\\sw"
+    // "a"))` answered 0 — "a" matching the class's `A-Z` run — where Emacs 30.2
+    // answers nil.
+    format!("(?-i:[{}{body}])", if neg { "^" } else { "" })
+}
+
+/// The `\x{..}` members of a character-class body covering `ranges`, clipped to
+/// real scalar values with the surrogate block stepped over.
+fn ranges_body(ranges: &[(u32, u32)]) -> String {
     let mut body = String::new();
     for &(lo, hi) in ranges {
         if lo > MAX_SCALAR {
@@ -194,18 +212,7 @@ fn char_class(ranges: &[(u32, u32)], neg: bool) -> String {
             }
         }
     }
-    if body.is_empty() {
-        // No character is in the class.
-        body = "\\x{0}-\\x{10FFFF}".to_string();
-        return format!("(?-i:[{}{body}])", if neg { "" } else { "^" });
-    }
-    // `(?-i:…)` because a syntax class is never case-folded. Emacs's matcher asks
-    // `SYNTAX (c)` of the character as it stands; `case-fold-search` only folds
-    // literal characters. Without the override, `case-fold-search`'s `(?i)`
-    // leaked in and `(progn (modify-syntax-entry ?a "_") (string-match "\\sw"
-    // "a"))` answered 0 — "a" matching the class's `A-Z` run — where Emacs 30.2
-    // answers nil.
-    format!("(?-i:[{}{body}])", if neg { "^" } else { "" })
+    body
 }
 
 /// Emacs's own `invalid-regexp` messages (`regex-emacs.c`), reproduced verbatim:
@@ -564,26 +571,28 @@ const WS_SYNTAX_NEG: &str = "[^\\t\\x0C\\x{A0} ]";
 /// `compile_cf` already compiles under `(?i)` in exactly that case, which applies
 /// Unicode case folding to these classes and produces the same set.
 ///
-/// NOT closed here, and left at the crate's ASCII-only definition on purpose:
-/// `graph` and `print`. The manual defines both by COMPLEMENT ("any character
-/// except whitespace, control characters, surrogates, and unassigned
-/// codepoints"), and a complement is not expressible as class body text —
-/// `[[^…]…]` needs nested classes, which fancy-regex's parser rejects
-/// ("error parsing pattern"). Reaching them means either translating the whole
-/// alternative rather than one member, or a different engine.
-/// `space`/`punct`/`word` are improved but still approximations: in Emacs those
-/// three read the SYNTAX TABLE, not a Unicode property, so their answer depends
-/// on the major mode — `(string-match "[[:space:]]" "\n")` is nil in
-/// fundamental-mode and 0 in text-mode. `translate` is a pure string→string
-/// function with no host access, so it cannot read the live table here; the
-/// `\s-` escape is handled separately via [`WS_SYNTAX`].
-fn posix_class(name: &str) -> Option<&'static str> {
-    Some(match name {
+/// `graph` and `print` are the manual's complements ("any character except
+/// whitespace, control characters, surrogates, and unassigned codepoints"),
+/// which a class body cannot express, so they are spelled as the union of the
+/// general categories that remain.
+///
+/// `space`/`punct`/`word` read the SYNTAX TABLE in Emacs, so with a table
+/// reachable (`syn.available()`) they are answered from it by
+/// [`syntax_class_body`]; the Unicode-property forms below are only the fallback
+/// for the table-less unit-test path.
+fn posix_class(name: &str, syn: &dyn SyntaxLookup) -> Option<std::borrow::Cow<'static, str>> {
+    use std::borrow::Cow;
+    if syn.available() {
+        if let Some(body) = syntax_class_body(name, syn) {
+            return Some(Cow::Owned(body));
+        }
+    }
+    Some(Cow::Borrowed(match name {
         "alpha" => r"\p{Alphabetic}\p{M}",
         "alnum" => r"\p{Alphabetic}\p{M}\p{Nd}",
         "space" => r"\p{White_Space}",
-        "upper" => r"\p{Uppercase}",
-        "lower" => r"\p{Lowercase}",
+        "upper" => case_class_body(true),
+        "lower" => case_class_body(false),
         "punct" => r"\p{P}\p{S}",
         "word" => r"\p{Alphabetic}\p{Nd}\p{M}",
         "blank" => "\t\\p{Zs}",
@@ -595,8 +604,78 @@ fn posix_class(name: &str) -> Option<&'static str> {
         // at all.
         "ascii" | "unibyte" => "[:ascii:]",
         "nonascii" | "multibyte" => "[:^ascii:]",
+        // `graphicp` (`regex-emacs.c`): every assigned character that is not a
+        // separator or a control.  `print` adds the separators back.  Neither is
+        // expressible as a complement inside a class body, so both are the union
+        // of the general categories they keep.
+        "graph" => r"\p{L}\p{M}\p{N}\p{P}\p{S}\p{Co}\p{Cf}",
+        "print" => r"\p{L}\p{M}\p{N}\p{P}\p{S}\p{Co}\p{Cf}\p{Z}",
         _ => return None,
-    })
+    }))
+}
+
+/// The characters `[:upper:]` / `[:lower:]` match: `uppercasep (c)` is
+/// `downcase (c) != c`, and `lowercasep (c)` is `!uppercasep (c) && upcase (c)
+/// != c` (`buffer.h`), both over the SIMPLE case mappings -- a character whose
+/// mapping is a multi-character sequence (`İ`, `ß`) has none.  Unicode's
+/// `Uppercase`/`Lowercase` properties are the wrong set: they take in
+/// `Other_Uppercase` (`ℂ`, `Ⓐ`) and the modifier letters (`ʰ`), which Emacs
+/// does not case-map.  Built once from the standard library's case mappings.
+fn case_class_body(upper: bool) -> &'static str {
+    use std::sync::OnceLock;
+    static BODIES: OnceLock<[String; 2]> = OnceLock::new();
+    let bodies = BODIES.get_or_init(|| {
+        let simple = |mut m: Box<dyn Iterator<Item = char>>, c: char| match (m.next(), m.next()) {
+            (Some(x), None) => x != c,
+            _ => false,
+        };
+        let (mut up, mut lo): (Vec<(u32, u32)>, Vec<(u32, u32)>) = (Vec::new(), Vec::new());
+        let push = |v: &mut Vec<(u32, u32)>, c: u32| match v.last_mut() {
+            Some(last) if last.1 + 1 == c => last.1 = c,
+            _ => v.push((c, c)),
+        };
+        for c in (0..=MAX_SCALAR).filter_map(char::from_u32) {
+            if simple(Box::new(c.to_lowercase()), c) {
+                push(&mut up, c as u32);
+            } else if simple(Box::new(c.to_uppercase()), c) {
+                push(&mut lo, c as u32);
+            }
+        }
+        [ranges_body(&lo), ranges_body(&up)]
+    });
+    &bodies[upper as usize]
+}
+
+/// The classes `regex-emacs.c` defines by the SYNTAX TABLE rather than by a
+/// Unicode property: `ISSPACE` is `SYNTAX (c) == Swhitespace`, `ISWORD` is
+/// `SYNTAX (c) == Sword`, and `ISPUNCT` is, for ASCII, a printable
+/// non-alphanumeric and otherwise any character that is not a word constituent.
+/// Answered against the table in force at compile time, as `\sC` is.
+fn syntax_class_body(name: &str, syn: &dyn SyntaxLookup) -> Option<String> {
+    match name {
+        "space" => Some(ranges_body(&syn.ranges(' '))),
+        "word" => Some(ranges_body(&syn.ranges('w'))),
+        "punct" => {
+            let mut ranges = vec![(0x21, 0x2F), (0x3A, 0x40), (0x5B, 0x60), (0x7B, 0x7E)];
+            // Everything from U+0080 that is not a word constituent.
+            let mut next = 0x80;
+            for (lo, hi) in syn.ranges('w') {
+                if hi < 0x80 {
+                    continue;
+                }
+                let lo = lo.max(0x80);
+                if lo > next {
+                    ranges.push((next, lo - 1));
+                }
+                next = next.max(hi + 1);
+            }
+            if next <= MAX_SCALAR {
+                ranges.push((next, MAX_SCALAR));
+            }
+            Some(ranges_body(&ranges))
+        }
+        _ => None,
+    }
 }
 
 /// Copy a `[...]` character alternative from `it` into `out`, leading `[`
@@ -605,6 +684,7 @@ fn posix_class(name: &str) -> Option<&'static str> {
 fn copy_class(
     it: &mut std::iter::Peekable<std::str::Chars>,
     out: &mut String,
+    syn: &dyn SyntaxLookup,
 ) -> Result<(), String> {
     // Collect the members first: a reversed range (`[z-a]`) has to be rewritten,
     // because Emacs matches nothing for it where the `regex` crate refuses to
@@ -643,8 +723,8 @@ fn copy_class(
                     if !CLASS_NAMES.contains(&name.as_str()) {
                         return Err(INVALID_CLASS_NAME.into());
                     }
-                    match posix_class(&name) {
-                        Some(repl) => out.push_str(repl),
+                    match posix_class(&name, syn) {
+                        Some(repl) => out.push_str(&repl),
                         // The crate's own definition already agrees with Emacs.
                         None => out.push_str(&format!("[:{name}:]")),
                     }
