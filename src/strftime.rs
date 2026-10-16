@@ -241,6 +241,13 @@ fn internal(
                 }
                 b'a' | b'A' | b'b' | b'h' | b'B' => {
                     bad_if!(modifier != 0 && matches!(fc, b'a' | b'A'));
+                    // gnulib reaches `bad_format` for `%Eb`/`%Eh` only AFTER the `#`
+                    // flag has switched the conversion to upper case (so the literal
+                    // `%#EB` comes out upcased), and for `%EB` before it.
+                    if change_case && fc != b'B' {
+                        to_up = true;
+                        to_low = false;
+                    }
                     bad_if!(modifier == b'E' && matches!(fc, b'b' | b'h' | b'B'));
                     if change_case {
                         to_up = true;

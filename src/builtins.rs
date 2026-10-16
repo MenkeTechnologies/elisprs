@@ -8046,6 +8046,12 @@ fn encode_time(h: &mut ElispHost, a: &[Value]) -> R {
     tm.tm_year = member(h, &fields[5], 1900)?;
     tm.tm_isdst = isdst;
     let tz = time_zone_arg(h, Some(&zone))?;
+    // gnulib `mktime_z` hands the normalised broken-down time back through
+    // `localtime_rz`, which fails (`EOVERFLOW`) when the carry out of the month,
+    // day, hour, minute or second fields leaves `tm_year` outside an `int`.
+    if civil_tm(civil_secs(&tm)).is_none() {
+        return Err(crate::timefns::overflow());
+    }
     let value: i64 = match &tz {
         TimeZone::Fixed(off, _) => civil_secs(&tm) - *off,
         TimeZone::Local => {
