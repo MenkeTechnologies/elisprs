@@ -66,10 +66,7 @@ fn rx_forms_the_previous_subset_lacked() {
 /// `(backref VAR)`.
 #[test]
 fn rx_pcase_pattern_binds_submatches() {
-    assert_eq!(
-        eval(r#"(pcase "abc" ((rx "a" (let x "b")) x))"#),
-        r#""b""#
-    );
+    assert_eq!(eval(r#"(pcase "abc" ((rx "a" (let x "b")) x))"#), r#""b""#);
     assert_eq!(
         eval(r#"(pcase "abab" ((rx (let z "ab") (backref z)) z))"#),
         r#""ab""#

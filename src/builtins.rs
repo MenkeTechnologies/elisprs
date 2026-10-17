@@ -3457,7 +3457,7 @@ fn format_fn(h: &mut ElispHost, a: &[Value]) -> R {
         if fmt == "%s" && a.len() == 2 && h.str_text(&a[1]).is_some() {
             let plain = h
                 .str_arc(&a[0])
-                .map_or(true, |f| h.string_intervals(&f).is_empty());
+                .is_none_or(|f| h.string_intervals(&f).is_empty());
             if plain {
                 return Ok(a[1].clone());
             }
@@ -4529,7 +4529,7 @@ pub(crate) fn compile_cf(
 ) -> Result<Rc<CompiledRe>, String> {
     let slot = usize::from(case_insensitive);
     if let Some((stamp, hit)) = RE_CACHE.with(|c| c.borrow()[slot].get(pat).cloned()) {
-        if stamp.map_or(true, |s| s == h.syntax_fingerprint()) {
+        if stamp.is_none_or(|s| s == h.syntax_fingerprint()) {
             return hit;
         }
     }

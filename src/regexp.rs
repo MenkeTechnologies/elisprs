@@ -629,7 +629,8 @@ fn case_class_body(upper: bool) -> &'static str {
             (Some(x), None) => x != c,
             _ => false,
         };
-        let (mut up, mut lo): (Vec<(u32, u32)>, Vec<(u32, u32)>) = (Vec::new(), Vec::new());
+        let mut up: Vec<(u32, u32)> = Vec::new();
+        let mut lo: Vec<(u32, u32)> = Vec::new();
         let push = |v: &mut Vec<(u32, u32)>, c: u32| match v.last_mut() {
             Some(last) if last.1 + 1 == c => last.1 = c,
             _ => v.push((c, c)),
