@@ -23,8 +23,14 @@ fn check(form: &str, expected: &str) {
 #[test]
 fn substring_and_concat_reverse_the_plist_copy_sequence_keeps_it() {
     let s = r#"(propertize "abc" 'a 1 'b 2 'c 3)"#;
-    check(&format!("(substring {s} 1)"), r#"=#("bc" 0 2 (c 3 b 2 a 1))"#);
-    check(&format!("(concat {s} \"x\")"), r#"=#("abcx" 0 3 (c 3 b 2 a 1))"#);
+    check(
+        &format!("(substring {s} 1)"),
+        r#"=#("bc" 0 2 (c 3 b 2 a 1))"#,
+    );
+    check(
+        &format!("(concat {s} \"x\")"),
+        r#"=#("abcx" 0 3 (c 3 b 2 a 1))"#,
+    );
     check(
         &format!("(concat \"x\" {s})"),
         r#"=#("xabc" 1 4 (c 3 b 2 a 1))"#,
@@ -33,7 +39,10 @@ fn substring_and_concat_reverse_the_plist_copy_sequence_keeps_it() {
         &format!("(mapconcat #'identity (list {s} {s}) \"\")"),
         r#"=#("abcabc" 0 3 (c 3 b 2 a 1) 3 6 (c 3 b 2 a 1))"#,
     );
-    check(&format!("(copy-sequence {s})"), r#"=#("abc" 0 3 (a 1 b 2 c 3))"#);
+    check(
+        &format!("(copy-sequence {s})"),
+        r#"=#("abc" 0 3 (a 1 b 2 c 3))"#,
+    );
     // Two reversals restore the original order.
     check(
         &format!("(substring (substring {s} 0) 0)"),

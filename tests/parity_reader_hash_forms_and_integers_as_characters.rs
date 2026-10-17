@@ -25,7 +25,10 @@ fn check(form: &str, expected: &str) {
 fn hash_underscore_reads_a_bare_symbol() {
     check(r###"(read "#_foo")"###, "=foo");
     check(r###"(read "(#_a #_b)")"###, "=(a b)");
-    check(r##"(list (read "#_1") (symbolp (read "#_1")) (eq (read "#_") (intern "")))"##, r"=(\1 t t)");
+    check(
+        r##"(list (read "#_1") (symbolp (read "#_1")) (eq (read "#_") (intern "")))"##,
+        r"=(\1 t t)",
+    );
     check(r###"(symbol-name (read "#_\\ x"))"###, r###"=" x""###);
 }
 
@@ -34,7 +37,10 @@ fn hash_underscore_reads_a_bare_symbol() {
 fn hash_bang_is_a_line_comment() {
     check(r###"(read "#!x\ny")"###, "=y");
     check(r###"(read "(a #!x\n b)")"###, "=(a b)");
-    check(r###"(condition-case e (read "#!x") (error e))"###, "=(end-of-file)");
+    check(
+        r###"(condition-case e (read "#!x") (error e))"###,
+        "=(end-of-file)",
+    );
 }
 
 /// A backslash with nothing after it is end of file, not a bespoke error.

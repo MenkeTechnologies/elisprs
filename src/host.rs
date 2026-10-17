@@ -4668,7 +4668,8 @@ impl ElispHost {
             c if c.is_ascii() => return None,
             c => {
                 let graphic = GRAPHIC.get_or_init(|| {
-                    fancy_regex::Regex::new(r"^[\p{L}\p{N}\p{P}\p{S}\p{Co}]$").expect("static regex")
+                    fancy_regex::Regex::new(r"^[\p{L}\p{N}\p{P}\p{S}\p{Co}]$")
+                        .expect("static regex")
                 });
                 if !graphic.is_match(&c.to_string()).unwrap_or(false) {
                     return None;
@@ -4830,9 +4831,7 @@ impl ElispHost {
             Value::Undef => "nil".to_string(),
             Value::Bool(true) => "t".to_string(),
             Value::Bool(false) => "nil".to_string(),
-            Value::Int(n) => self
-                .int_as_character(*n)
-                .unwrap_or_else(|| n.to_string()),
+            Value::Int(n) => self.int_as_character(*n).unwrap_or_else(|| n.to_string()),
             Value::Float(f) => {
                 // Emacs's read syntax for the non-finite floats.
                 if f.is_nan() {

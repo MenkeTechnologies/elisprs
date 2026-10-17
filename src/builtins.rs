@@ -3455,7 +3455,9 @@ fn format_fn(h: &mut ElispHost, a: &[Value]) -> R {
             return Ok(a[0].clone());
         }
         if fmt == "%s" && a.len() == 2 && h.str_text(&a[1]).is_some() {
-            let plain = h.str_arc(&a[0]).map_or(true, |f| h.string_intervals(&f).is_empty());
+            let plain = h
+                .str_arc(&a[0])
+                .map_or(true, |f| h.string_intervals(&f).is_empty());
             if plain {
                 return Ok(a[1].clone());
             }
@@ -4018,7 +4020,10 @@ fn copy_hash_table(h: &mut ElispHost, a: &[Value]) -> R {
 /// (`substring` and `concat` re-add the pairs and reverse them).
 fn copy_string(h: &mut ElispHost, a: &[Value]) -> R {
     let Some(text) = h.str_text(&a[0]).map(str::to_string) else {
-        return Err(format!("wrong-type-argument: stringp {}", h.print(&a[0], true)));
+        return Err(format!(
+            "wrong-type-argument: stringp {}",
+            h.print(&a[0], true)
+        ));
     };
     let src = h.str_arc(&a[0]);
     let (out, dst) = h.new_string_keyed(text);
