@@ -215,9 +215,11 @@ fn cl_member_without_keywords_is_memql() {
         err("(cl-member 1 \"abc\")"),
         "(wrong-type-argument listp \"abc\")"
     );
-    // The keyword path keeps naming the tail, exactly as Emacs's does.
+    // The keyword path keeps naming the tail, exactly as Emacs's `eval` does. `eval_str`
+    // is `load`-shaped, where `cl--compiler-macro-member` rewrites `:test #'eql` to `memql`
+    // (whole list, as in the no-keyword case), so the `eval` builtin is called explicitly.
     assert_eq!(
-        err("(cl-member 1 '(2 . 3) :test #'eql)"),
+        err("(eval '(cl-member 1 '(2 . 3) :test #'eql) t)"),
         "(wrong-type-argument listp 3)"
     );
     // `cl-set-difference` compares a numeric element with `cl-member`, so the
