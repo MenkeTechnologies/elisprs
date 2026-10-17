@@ -39,6 +39,11 @@ pub const LIBRARIES: &[Library] = &[
         source: include_str!("lisp/parse-time.el"),
     },
     Library {
+        name: "rx",
+        dir: "emacs-lisp",
+        source: include_str!("lisp/rx.el"),
+    },
+    Library {
         name: "thunk",
         dir: "emacs-lisp",
         source: include_str!("lisp/thunk.el"),

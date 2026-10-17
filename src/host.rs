@@ -6579,6 +6579,9 @@ impl ElispHost {
         for _ in 0..16 {
             match self.obj(&cur) {
                 Some(Obj::Symbol(s)) => match s.function.clone() {
+                    // An autoload object cannot be called as a value: keep the
+                    // symbol so `call_function' loads the file and retries.
+                    Some(_) if self.indirect_autoload(&cur).is_some() => return cur,
                     Some(next) => cur = next,
                     None => return cur,
                 },
@@ -8220,6 +8223,19 @@ pub(crate) fn env_expand(form: &Value, env: &Value) -> Result<EnvHit, String> {
 /// One step of macro expansion: if `form` is `(macro-name . arg-forms)`, run the
 /// macro on the *unevaluated* arg forms and return the expansion. Else `None`.
 pub fn macroexpand_1(form: &Value) -> Result<Option<Value>, String> {
+    // eval.c `Fmacroexpand': a head whose definition is a MACRO autoload (TYPE `t'
+    // or `macro') is loaded first, then expanded as the macro it defined.
+    let pending = with_host(|h| {
+        let head = h.list_vec(form)?.into_iter().next()?;
+        let fundef = h.indirect_autoload(&head)?;
+        let ty = h.list_vec(&fundef)?.get(4).cloned()?;
+        el_truthy(&ty).then_some((head, fundef))
+    });
+    if let Some((head, fundef)) = pending {
+        let loader = with_host(|h| h.intern("autoload-do-load"));
+        let macro_only = with_host(|h| h.intern("macro"));
+        call_function(&loader, &[fundef, head, macro_only])?;
+    }
     let info = with_host(|h| {
         let elems = h.list_vec(form)?;
         if elems.is_empty() {

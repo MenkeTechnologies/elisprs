@@ -31,6 +31,13 @@ pub const AUTOLOADS: &str = r#"
 (autoload 'parse-time-string "parse-time" nil nil)
 (autoload 'char-fold-to-regexp "char-fold" nil nil)
 (autoload 'describe-char-fold-equivalences "char-fold" nil t)
+(autoload 'rx "rx" nil nil t)
+(autoload 'rx-to-string "rx" nil nil)
+(autoload 'rx-let "rx" nil nil t)
+(autoload 'rx-let-eval "rx" nil nil t)
+(autoload 'rx-define "rx" nil nil t)
+(autoload 'rx--pcase-macroexpander "rx" nil nil)
+(define-symbol-prop 'rx 'pcase-macroexpander 'rx--pcase-macroexpander)
 "#;
 
 /// Every segment, in load order.
