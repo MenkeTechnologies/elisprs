@@ -63,7 +63,7 @@
 
 - **Rust** 2021 edition (stable). Builds on `rustc` 1.96+.
 - **Platforms:** macOS (aarch64 / x86_64) and Linux (x86_64 / aarch64).
-- **Dependencies:** `fusevm` (the bytecode VM elisp executes on, with `jit-disk-cache` + `aot`), `rkyv` + `bincode` (the `~/.elisprs` bytecode cache), `serde`/`serde_json`, and `lsp-server`/`lsp-types` (the `--lsp` server). No `rust_lisp`.
+- **Dependencies:** `fusevm` (the bytecode VM elisp executes on, with `jit`, `jit-disk-cache`, `aot` and `ffi`), `rkyv` + `bincode` (the `~/.elisprs` bytecode cache), `num-bigint` (bignums), `fancy-regex` (the regexp engine), `reedline` (the REPL), `serde`/`serde_json`, and `lsp-server`/`lsp-types` (the `--lsp` server). No `rust_lisp`.
 
 ---
 
@@ -88,6 +88,9 @@ elisp --lsp              # language server over stdio        (completion/hover/d
 elisp --dap              # debug adapter over stdio          (breakpoints/stepping/variables)
 elisp --aot FILE -o a.o  # AOT-compile to a native object via fusevm::aot
 elisp --aot-exe FILE -o a.out  # AOT-compile to a standalone native executable
+elisp --dump-tokens FILE  # print the reader token stream (also --dump-ast, --dump-bytecode, --disasm)
+elisp --tiers FILE        # run FILE, report which fusevm execution tier each loop reached
+elisp --cache-stats       # show the bytecode cache stats (--cache-clear deletes the cache)
 elisp --version
 ```
 
@@ -193,6 +196,15 @@ elisp cells (cons / symbol / vector / closure / macro / subr) live in the `Elisp
 | `src/host.rs` | `ElispHost`: the object heap, Lisp-2 obarray, dynamic binding, and the `fusevm` extension handler that runs elisp ops |
 | `src/compiler.rs` | Lowers elisp forms to a `fusevm::Chunk`; lambda bodies become sub-chunks |
 | `src/builtins.rs` | The subr standard library (reached host-side from the `CALL` extension op) |
+| `src/regexp.rs` | Elisp regexp to `regex`/`fancy-regex` dialect translation |
+| `src/backquote.rs` | Port of backquote.el's expander |
+| `src/freevars.rs` | Free-lexical-variable analysis used to prune closure environments |
+| `src/timefns.rs` | Lisp timestamps, ported from timefns.c |
+| `src/json.rs` | Native JSON primitives (`json-parse-string`, `json-serialize`, ...) |
+| `src/cache.rs` | rkyv bytecode cache at `~/.elisprs/scripts.rkyv` |
+| `src/tiers.rs` | `--tiers` execution-tier report |
+| `src/rust_ffi.rs` | Inline `rust { ... }` FFI block desugaring |
+| `src/repl.rs` · `src/banner.rs` | reedline REPL and its stats banner |
 | `src/intercepts.rs` | AOP pattern-intercept layer (glob advice across many function names) — an elisprs extension ported from `zshrs`, fired on the `call_function` join point |
 | `src/prelude.rs` | The `[DERIVED]` elisp prelude — breadth written in elisp on top of the primitives |
 | `src/prelude_31.rs` | Prelude segments loaded after the core prelude: Emacs 31.1 library files included verbatim (`time-date.el`, the `subr.el` definitions the core lacked), ports of the `keymap.c` / `keyboard.c` primitives, and the `autoload` table for the lazily bundled libraries |
