@@ -2009,19 +2009,23 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
          (tag name)
          ;; Options: (:constructor NAME) renames the make-NAME constructor;
          ;; (:conc-name P) overrides the NAME- accessor prefix.
-         ;; Constructors: each (:constructor NAME) is a keyword ctor; (:constructor
-         ;; NAME ARGLIST) is a BOA (positional) ctor; default is make-NAME. A bare
-         ;; (:constructor nil) suppresses the default without adding one.
-         (constructors
-          (let ((cs nil) (saw nil))
-            (when (consp name-spec)
-              (dolist (opt (cdr name-spec))
-                (when (and (consp opt) (eq (car opt) :constructor))
-                  (setq saw t)
-                  (let ((nm (car (cdr opt))) (al (cdr (cdr opt))))
-                    (when nm
-                      (setq cs (cons (cons nm (if al (list 'boa (car al)) 'kw)) cs)))))))
-            (if saw (reverse cs) (list (cons (intern (concat "make-" sname)) 'kw)))))
+         ;; Constructors, as cl-macs.el reads the `:constructor' options in
+         ;; order: `(:constructor NAME)' renames the keyword constructor (nil
+         ;; suppresses it); `(:constructor NAME ARGLIST [DOC])' adds a BOA
+         ;; constructor and, when NAME is the keyword constructor's name,
+         ;; replaces it instead.  CTOR-OPTS is each option's `(cdr opt)'.
+         (ctor-opts (let ((os nil))
+                      (when (consp name-spec)
+                        (dolist (opt (cdr name-spec))
+                          (when (and (consp opt) (eq (car opt) :constructor))
+                            (setq os (cons (cdr opt) os)))))
+                      (reverse os)))
+         ;; The keyword constructor's name, or nil when suppressed.
+         (constructor (let ((c (intern (concat "make-" sname))))
+                        (dolist (args ctor-opts)
+                          (cond ((cdr args) (when (eq (car args) c) (setq c nil)))
+                                (args (setq c (car args)))))
+                        c))
          (conc (let ((p (concat sname "-")))
                  (when (consp name-spec)
                    (dolist (opt (cdr name-spec))
@@ -2078,55 +2082,56 @@ ARGLIST can also be t or a string of the form \"(FUN ARG1 ARG2 ...)\"."
          ;; setf-expander error, matching cl-macs.el:3257.
          (readonly (mapcar (lambda (s) (and (consp s) (plist-get (cdr (cdr s)) :read-only)))
                            all-slots))
+         ;; cl-macs.el's DESCS: every slot as a `(NAME DEFAULT . OPTS)' spec,
+         ;; led by the tag slot of a named struct.  A constructor's lambda list
+         ;; carries it as `&cl-defs (nil . DESCS)', which is how an argument
+         ;; named like a slot defaults to that slot's initform.
+         (descs (append (and named '((cl-tag-slot)))
+                        (mapcar (lambda (s) (if (consp s) s (list s))) all-slots)))
+         ;; Every constructor as `(NAME ARGLIST DOC)': the BOA constructors in
+         ;; option order, then the keyword constructor over all slots.
+         (constrs (let ((cs nil))
+                    (dolist (args ctor-opts)
+                      (when (cdr args) (setq cs (cons args cs))))
+                    (when constructor
+                      (setq cs (cons (list constructor (cons '&key (copy-sequence snames))) cs)))
+                    cs))
          (forms nil)
          ;; How an instance is built and how slot J is read and written.
          (build (cond ((eq stype 'list) 'list) ((eq stype 'vector) 'vector) (t 'record)))
-         (tag-args (if named (list (list 'quote tag)) nil))
-         ;; constructor: the fresh instance, then apply :keyword overrides.
-         (kw-clauses (let ((j base) (cs nil))
-                       (dolist (sn snames)
-                         (setq cs (cons (list (list 'eq '--k-- (intern (concat ":" (symbol-name sn))))
-                                              (if (eq stype 'list)
-                                                  (list 'setcar (list 'nthcdr j '--v--) '--val--)
-                                                (list 'aset '--v-- j '--val--)))
-                                        cs))
-                         (setq j (1+ j)))
-                       (reverse cs))))
+         (tag-args (if named (list (list 'quote tag)) nil)))
     ;; Record this struct's full (inherited + own) slot specs at macroexpansion
     ;; time so a later (:include this) can read them.
     (setq cl-struct--slots (cons (cons name all-slots) cl-struct--slots))
     (setq cl-struct--base (cons (cons name base) cl-struct--base))
     (setq cl-struct--type (cons (cons name stype) cl-struct--type))
-    (dolist (cspec constructors)
-      (let ((cname (car cspec)) (ckind (cdr cspec)))
-        (if (eq ckind 'kw)
-            (setq forms
-                  (cons `(defun ,cname (&rest --args--)
-                           (let ((--v-- (,build ,@tag-args ,@defaults)) (--a-- --args--))
-                             (while --a--
-                               (let ((--k-- (car --a--)) (--val-- (car (cdr --a--))))
-                                 (cond ,@kw-clauses))
-                               (setq --a-- (cdr (cdr --a--))))
-                             --v--))
-                        forms))
-          ;; BOA: ckind = (boa ARGLIST). Each slot takes the like-named arg if it
-          ;; appears in ARGLIST, else its default. Per-arg defaults like (y 10)
-          ;; are reduced to plain params (the var binds to nil if unsupplied).
-          (let* ((arglist (car (cdr ckind)))
-                 (avars (let ((r nil))
-                          (dolist (p arglist)
-                            (cond ((and (symbolp p) (> (length (symbol-name p)) 0)
-                                        (eq (aref (symbol-name p) 0) ?&)) nil)
-                                  ((consp p) (setq r (cons (car p) r)))
-                                  (t (setq r (cons p r)))))
-                          (reverse r)))
-                 (defargs (mapcar (lambda (p) (if (consp p) (car p) p)) arglist))
-                 (vals (let ((vs nil) (sn snames) (df defaults))
-                         (while sn
-                           (setq vs (cons (if (memq (car sn) avars) (car sn) (car df)) vs))
-                           (setq sn (cdr sn) df (cdr df)))
-                         (reverse vs))))
-            (setq forms (cons `(defun ,cname ,defargs (,build ,@tag-args ,@vals)) forms))))))
+    ;; cl-macs.el: a constructor is a `cl-defun' whose lambda list is the
+    ;; option's (or `&key' over every slot for the keyword constructor) behind
+    ;; `&cl-defs (nil . DESCS)'.  `cl--transform-lambda' then gives it Emacs's
+    ;; argument semantics: an unsupplied argument named like a slot takes that
+    ;; slot's initform, evaluated only then and in slot order (so an initform
+    ;; may read an earlier slot); an unknown or value-less keyword signals
+    ;; unless `&allow-other-keys'; `&optional (b 7)', `&rest', `&key' and
+    ;; `&aux' mean what they do in any cl lambda list.  A slot that is not an
+    ;; argument is filled from its initform.  (cl-macs.el uses `cl-defsubst'
+    ;; unless `:noinline'; elisprs has no `cl-defsubst', so the constructor is
+    ;; never inlined and behaves as `(funcall #'make-NAME ...)' does in Emacs.)
+    (dolist (constr constrs)
+      (let* ((cname (nth 0 constr)) (args (nth 1 constr)) (doc (nth 2 constr))
+             (anames (cl--arglist-args args))
+             (make (let ((ms nil) (sn snames) (df defaults))
+                     (while sn
+                       (setq ms (cons (if (memq (car sn) anames) (car sn) (car df)) ms))
+                       (setq sn (cdr sn) df (cdr df)))
+                     (reverse ms))))
+        (setq forms
+              (cons `(cl-defun ,cname (&cl-defs (nil ,@descs) ,@args)
+                       ,(if (stringp doc) doc
+                          (format "Constructor for objects of type `%s'." name))
+                       ,@(if (cl--safe-expr-p `(progn ,@defaults))
+                             '((declare (side-effect-free t))))
+                       (,build ,@tag-args ,@make))
+                    forms))))
     ;; cl-macs.el generates a predicate only for a NAMED struct: an unnamed
     ;; `(:type list)' instance carries nothing to recognize it by, so
     ;; `(fboundp 'NAME-p)' is nil in Emacs and must be here too.
@@ -10112,6 +10117,19 @@ If OLDSTATE is omitted or nil, parsing assumes that FROM is the
 (defvar cl--bind-lets) (defvar cl--bind-forms)
 (defconst cl--lambda-list-keywords
   '(&optional &rest &key &allow-other-keys &aux &whole &body &environment))
+;; cl-macs.el: the variables a cl lambda list binds -- what `cl-defstruct' uses
+;; to tell a slot that a constructor argument names from one it fills itself.
+(defun cl--arglist-args (args)
+  (if (nlistp args) (list args)
+    (let ((res nil) (kind nil) arg)
+      (while (consp args)
+	(setq arg (pop args))
+	(if (memq arg cl--lambda-list-keywords) (setq kind arg)
+	  (if (eq arg '&cl-defs) (pop args)
+	    (and (consp arg) kind (setq arg (car arg)))
+	    (and (consp arg) (cdr arg) (eq kind '&key) (setq arg (cadr arg)))
+	    (setq res (nconc res (cl--arglist-args arg))))))
+      (nconc res (and args (list args))))))
 (defmacro cl--pop2 (place)
   `(prog1 (car (cdr ,place))
      (setq ,place (cdr (cdr ,place)))))

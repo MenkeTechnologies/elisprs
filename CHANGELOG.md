@@ -6,6 +6,15 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Round 41 parity vs Emacs 31.1** (see BUGS.md): `cl-defstruct` constructors
+  are cl-macs.el's `cl-defun`s with `&cl-defs`: an unknown, value-less or
+  non-keyword argument to the keyword constructor signals, `:allow-other-keys`
+  is honoured, a slot's initform is evaluated only when its argument is not
+  supplied and may read an earlier slot, a BOA lambda list keeps `&optional`
+  defaults, `&rest`, `&key` and `&aux`, a BOA `:constructor` no longer
+  suppresses `make-NAME` unless it takes that name, `(:constructor nil)`
+  applies in option order, and constructors carry cl-macs.el's docstring.
+  `cl--arglist-args` is ported.
 - **Round 40 parity vs Emacs 31.1** (see BUGS.md): `eval-when-compile` and
   `eval-and-compile` evaluate their body at expansion time and expand to a
   quoted constant, as byte-run.el defines them; a `compiler-macro` property set

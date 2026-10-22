@@ -6703,6 +6703,59 @@ expansion that needs them. Expectations are in
   interpreter expands it at run time; a plain `defmacro` there works.
 - `cl-iter-defun` is void (no `generator.el`).
 
+## Round 41 — `cl-defstruct` constructors
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch -l FILE`, `(require 'cl-lib)`,
+lexical binding). Expectations are in `tests/parity_cl_defstruct_constructors.rs`.
+
+### R41-A. ✅ FIXED — constructors are cl-macs.el's `cl-defun`s
+
+The keyword constructor was a hand-written `&rest` walk that built the record
+from every slot's initform and then `aset` the supplied keywords over it, and a
+BOA constructor was a plain `defun` whose lambda list had its `&`-keywords and
+per-argument defaults stripped. cl-macs.el emits every constructor as
+`(cl-defun NAME (&cl-defs (nil . DESCS) . ARGLIST) DOC (record 'NAME . SLOTS))`,
+with `&key` over every slot for the keyword constructor, and
+`cl--transform-lambda` (ported in R40-D) supplies the semantics. Measured
+divergences, now agreeing:
+
+```text
+form                                              was                      Emacs 31.1 / now
+(make-q2 :z 1)              ; slot a              #s(q2 nil)               (error "Keyword argument :z not one of (:a)")
+(make-q2 :a)                                      #s(q2 nil)               (error "Missing argument for :a")
+(make-q2 1)                                       #s(q2 nil)               (error "Keyword argument 1 not one of (:a)")
+(make-q2 :a 1 :a 2)                               #s(q2 2)                 #s(q2 1)
+(make-r :w 5)               ; (w 1) (h (* w 2))   (void-variable w)        #s(r 5 10)
+(make-s :a 1) ; (a (setq cnt (1+ cnt)))           cnt = 1                  cnt = 0
+(new-boa 1)   ; (a &optional (b 7) &rest more &key k &aux (z (list a b)))
+                                                  (void-variable more)     #s(boa 1 7 nil nil (1 7))
+(make-ok :zz 1 :a 2)        ; (&key a &allow-other-keys)
+                                                  wrong-number-of-arguments #s(ok 2)
+(fboundp 'make-boa)         ; (:constructor new-boa (a))
+                                                  nil                      t
+(cl-defstruct (p5 (:constructor mk5) (:constructor nil)) a) ; (fboundp 'mk5)
+                                                  t                        nil
+(documentation 'make-q2)                          nil                      "Constructor for objects of type ‘q2’.\n\n(fn &key A)"
+```
+
+The `:constructor` options are read in order as cl-macs.el reads them: a
+`(:constructor NAME ARGLIST [DOC])` adds a BOA constructor and leaves the
+default keyword constructor in place unless it takes its name, `(:constructor
+NAME)` renames the keyword constructor and `(:constructor nil)` drops it.
+`cl--arglist-args` is ported alongside `cl--transform-lambda`.
+
+### Not followed, and why
+
+- cl-macs.el emits `cl-defsubst` unless `:noinline`, and eager expansion
+  inlines a `cl-defsubst` call through its compiler macro, which binds the
+  arguments with a parallel `let`. So in Emacs `(make-r :w 5)` at top level
+  signals `(void-variable w)` while `(funcall #'make-r :w 5)` and a
+  `(:noinline t)` struct answer `#s(r 5 10)`. elisprs has no `cl-defsubst`;
+  every constructor is a `cl-defun`, i.e. the `funcall` / `:noinline` column.
+- The closure printed in a constructor's `wrong-number-of-arguments` data
+  carries Emacs's `(cl-struct-NAME-tags … t)` environment, a `defvar` of
+  cl-macs.el's own; elisprs prints `(t)`.
+
 ## Oracle drift — what GNU Emacs 31.1 changed under `split-string`, `end-of-file` and `#NrDIGITS`
 
 Every expectation in this tree is measured against **GNU Emacs 30.2** (see the
