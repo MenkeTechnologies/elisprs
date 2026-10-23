@@ -51,6 +51,17 @@ pub const SIMPLE_31: &str = include_str!("lisp/simple-31.el");
 /// simple.el's undo commands and subr.el's change groups, verbatim.
 pub const UNDO_31: &str = include_str!("lisp/undo-31.el");
 
+/// window.el, subr.el and simple.el functions over the window model of
+/// src/window.rs, verbatim.
+pub const WINDOW_31: &str = include_str!("lisp/window-31.el");
+
+/// emacs-lisp/timer.el, verbatim (preloaded by loadup.el). Timers are made and
+/// listed; nothing runs them (there is no command loop to be idle in).
+pub const TIMER: &str = include_str!("lisp/timer.el");
+
+/// isearch.el's search core and replace.el's replacement commands, verbatim.
+pub const REPLACE_31: &str = include_str!("lisp/replace-31.el");
+
 /// The `;;;###autoload` entries of the bundled libraries. Calling one loads its
 /// library through `autoload-do-load`; the rest of a library's functions stay
 /// unbound until it is `require`d, as in a stock `emacs -Q`.
@@ -68,7 +79,7 @@ pub const AUTOLOADS: &str = r#"
 "#;
 
 /// Every segment, in load order.
-pub const SEGMENTS: [&str; 14] = [
+pub const SEGMENTS: [&str; 17] = [
     TIME_DATE, SUBR_31, KEYMAP_C, TEXTPROP_C, MAP_31, EDITFNS_C, CATEGORY_C, INDENT, NEWCOMMENT,
-    PARAGRAPHS, FILL, UNDO_31, SIMPLE_31, AUTOLOADS,
+    PARAGRAPHS, FILL, UNDO_31, WINDOW_31, SIMPLE_31, TIMER, REPLACE_31, AUTOLOADS,
 ];

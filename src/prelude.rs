@@ -4282,14 +4282,6 @@ removed, and one that spans the range is split in two -- which is why this needs
 ;; editfns.c `Fsubst_char_in_region': the text from the first FROMCHAR to END
 ;; is rewritten in place (one `modify_text' from there), and nothing at all
 ;; happens when FROMCHAR does not occur.
-(defun subst-char-in-region (start end fromchar tochar &optional _noundo)
-  (let* ((lo (min start end)) (hi (max start end))
-         (s (buffer-substring-no-properties lo hi))
-         (i (seq-position s fromchar #'eq)))
-    (when i
-      (elisprs--replace-chars-in-place
-       (+ lo i) hi (subst-char-in-string fromchar tochar (substring s i))))
-    nil))
 ;; Case-convert ARG words forward from point, leaving point after them.
 (defun buffer--case-word (arg fn)
   (let ((beg (point)))
@@ -4804,6 +4796,7 @@ removed, and one that spans the range is split in two -- which is why this needs
     (if (nth 4 handler)
         (setq this-command (nth 4 handler)))))
 (defun yank (&optional arg)
+  (setq yank-window-start (window-start))
   (setq this-command t)
   (push-mark)
   (insert-for-yank (current-kill (cond
@@ -4812,7 +4805,7 @@ removed, and one that spans the range is split in two -- which is why this needs
                                   (t (1- arg)))))
   (if (consp arg)
       (goto-char (prog1 (mark t)
-                   (set-mark (point)))))
+                   (set-marker (mark-marker) (point) (current-buffer)))))
   (if (eq this-command t)
       (setq this-command 'yank))
   nil)
@@ -7459,6 +7452,96 @@ If NOSET is non-nil, don't bother autoloading LOAD when setting the variable."
 ;; `face-spec-set' then calls `make-empty-face' and recalculates the face on
 ;; every frame (`face-spec-recalc'). elisprs has no display subsystem — no face
 ;; objects, no frames — so those are omitted; no face object is created.
+;; xfaces.c — the frame-independent face table.  Batch Emacs keeps every
+;; face's global attribute vector all-`unspecified' (attributes are
+;; realized per frame from the specs), so that is what is modelled.
+
+(defvar face--new-frame-defaults (make-hash-table :test 'eq)
+  "Hash table of global face definitions (for internal use only.)")
+
+(defun editfns--resolve-face-name (face)
+  "resolve_face_name: a string names the interned symbol; aliases are followed."
+  (when (stringp face)
+    (setq face (intern face)))
+  (let ((depth 0))
+    (while (and (symbolp face) (get face 'face-alias) (< depth 10))
+      (setq face (get face 'face-alias) depth (1+ depth))))
+  face)
+
+(defun internal-make-lisp-face (face &optional frame)
+  "Make FACE, a symbol, a Lisp face with all attributes unspecified.
+If FACE was not known as a face before, create a new one.
+If optional argument FRAME is specified, make a frame-local face
+for that frame.  Otherwise operate on the global face definition.
+Value is a vector of face attributes."
+  (ignore frame)
+  (unless (symbolp face)
+    (signal 'wrong-type-argument (list 'symbolp face)))
+  (let ((entry (gethash face face--new-frame-defaults)))
+    (if entry
+        (cdr entry)
+      (let ((vec (make-vector 20 'unspecified)))
+        (aset vec 0 'face)
+        (puthash face (cons (hash-table-count face--new-frame-defaults) vec)
+                 face--new-frame-defaults)
+        vec))))
+
+(defun internal-lisp-face-p (face &optional frame)
+  "Return non-nil if FACE names a face.
+FACE should be a symbol or string.
+If optional second argument FRAME is non-nil, check for the
+existence of a frame-local face with name FACE on that frame.
+Otherwise check for the existence of a global face."
+  (ignore frame)
+  (setq face (editfns--resolve-face-name face))
+  (and (symbolp face)
+       (cdr (gethash face face--new-frame-defaults))))
+
+(defun make-face-x-resource-internal (face &optional frame)
+  "Make FACE a face with the attributes X resources give it.
+There are no X resources without a window system, so this does nothing."
+  (ignore face frame)
+  nil)
+;; faces.el (Emacs 31.1), verbatim.
+(defun face-list ()
+  "Return a list of all defined faces."
+  (let (faces)
+    (maphash (lambda (face spec)
+               (push `(,(car spec) . ,face) faces))
+             face--new-frame-defaults)
+    (mapcar #'cdr (sort faces (lambda (f1 f2) (> (car f1) (car f2)))))))
+
+(defun make-face (face)
+  "Define a new face with name FACE, a symbol.
+Do not call this directly from Lisp code; use `defface' instead.
+
+If FACE is already known as a face, leave it unmodified.  Return FACE."
+  (interactive (list (read-from-minibuffer
+		      "Make face: " nil nil t 'face-name-history)))
+  (unless (facep face)
+    ;; Make frame-local faces (this also makes the global one).
+    (dolist (frame (frame-list))
+      (internal-make-lisp-face face frame))
+    ;; Add the face to the face menu.
+    (when (fboundp 'facemenu-add-new-face)
+      (facemenu-add-new-face face))
+    ;; Define frame-local faces for all frames from X resources.
+    (make-face-x-resource-internal face))
+  face)
+
+(defun make-empty-face (face)
+  "Define a new, empty face with name FACE.
+Do not call this directly from Lisp code; use `defface' instead."
+  (interactive (list (read-from-minibuffer
+		      "Make empty face: " nil nil t 'face-name-history)))
+  (make-face face))
+
+(defun facep (face)
+  "Return non-nil if FACE is a face name; nil otherwise.
+A face name can be a string or a symbol."
+  (internal-lisp-face-p face))
+
+
 (defun face-spec-set (face spec &optional spec-type)
   (if (get face 'face-alias)
       (setq face (get face 'face-alias)))
@@ -7472,7 +7555,10 @@ If NOSET is non-nil, don't bother autoloading LOAD when setting the variable."
   (if (memq spec-type '(customized-face saved-face reset))
       (put face 'face-override-spec nil))
   (unless (eq face 'face-override-spec)
-    (put face 'face-modified nil)))
+    (put face 'face-modified nil))
+  ;; Initialize the face if it does not exist.  (Recalculating its
+  ;; attributes per frame, `face-spec-recalc', is not modelled.)
+  (make-empty-face face))
 
 ;; cus-face.el:32
 (defun custom-declare-face (face spec doc &rest args)

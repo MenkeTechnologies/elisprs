@@ -7269,3 +7269,107 @@ own commit, and GNU Emacs 31.1 itself fails the old `error-data.el` test.
 - `current-bidi-paragraph-direction` (needs Unicode bidi classes) and the
   rest of characters.el's category data (needs charset and Unicode property
   tables) are still missing.
+
+## Round 45 — windows and frames, replace.el, the remaining change hooks, `eval-buffer`
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch -l scripts/fuzz/drive.el`).
+Closed from round 44's open list: windows (`undo`, `end-of-buffer`,
+`yank-pop`, `append-to-buffer`), replace.el, `undo-auto--undoable-change`,
+the change hooks of printing to a buffer, `move-to-column` FORCE,
+`call-process` output and `subst-char-in-region`, overlay and text-property
+modification hooks, `read` from a function, `eval-buffer`, `eval-region`.
+
+### R45-A. ✅ FIXED — the window and frame objects of batch Emacs
+
+`(selected-window)` was void. `src/window.rs` ports what window.c and
+frame.c give a batch session: the terminal frame `F1` (80x25, its parameter
+alist, its buffer list), the root window `#<window 1 on *scratch*>` (80x24
+with a mode line) and the minibuffer window `#<window 2 on  *Minibuf-0*>`,
+window objects and window configurations (`type-of` `window`, `frame`,
+`window-configuration`). Ported: `selected-window`, `minibuffer-window`,
+`window-buffer`, `window-point` (the buffer's point for the selected
+window), `window-start`, `window-end` (`Z`: batch never displays),
+`set-window-point`, `set-window-start`, `set-window-buffer` (dedication,
+`unshow_buffer`, `last_window_start`, prev/next buffer discard, and its
+`record-window-buffer` call), `select-window` (with `record_buffer`),
+`window-list`, `window-list-1`, `next-window`, `get-buffer-window`, window
+parameters, dedication, prev/next buffers, sizes, `frame-parameters`,
+`frame-parameter`, `modify-frame-parameters`, `window-system`,
+`current-window-configuration` / `set-window-configuration`, `other-buffer`
+and `bury-buffer-internal`. `buffer-list` follows `record_buffer` /
+`bury-buffer` order, and a killed buffer shown in a window is replaced there
+(`replace_buffer_in_windows`); killing the current buffer makes
+`other-buffer` current, as `Fkill_buffer` does. Window points and starts move
+with edits.
+
+window.el's `switch-to-buffer`, `bury-buffer`, `get-buffer-window-list`,
+`count-windows`, `one-window-p`, `record-window-buffer`,
+`display-buffer-record-window` and the window-group functions, subr.el's
+`with-selected-window` / `save-window-excursion`, frame.el's `frame-width` /
+`frame-height` and simple.el's `end-of-buffer`, `yank-pop`, `append-to-buffer`
+are verbatim (`src/lisp/window-31.el`); `yank` sets `yank-window-start` as
+simple.el's does. `undo` works. Also ported: `set-buffer-major-mode`,
+`get-scratch-buffer-create`, `delete-auto-save-file-if-necessary`.
+
+Measured quirk followed: after any `set-window-configuration` batch Emacs's
+root window is 23 lines tall (`(save-window-excursion nil)` then
+`(window-total-height)` is 23).
+
+### R45-B. ✅ FIXED — replace.el, faces and timers
+
+replace.el's `perform-replace` and the commands over it (`replace-string`,
+`replace-regexp`, `query-replace` …, `how-many`, `keep-lines`, `flush-lines`,
+`copy-matching-lines`) are verbatim with isearch.el's search core and its
+faces (`src/lisp/replace-31.el`). Faces: xfaces.c's global table
+(`face--new-frame-defaults`, `internal-make-lisp-face`,
+`internal-lisp-face-p`; a face's global vector is all `unspecified`, as in
+batch), faces.el's `facep`, `make-face`, `make-empty-face`, `face-list`, and
+`face-spec-set` now defines the face. timer.el is verbatim (timers are made
+and listed; nothing runs them), `redisplay` answers t.
+
+### R45-C. ✅ FIXED — the remaining change hooks and undo records
+
+- Printing to a buffer or marker (`princ`, `prin1`, `print`, `terpri`,
+  `write-char`) is one change at the insertion point of that buffer.
+- `move-to-column` with FORCE is indent.c's sequence of changes:
+  `insert-char` with inheritance, the tab deleted, `indent-to`.
+- `call-process` output is a change at point.
+- `subst-char-in-region` is a Rust port of editfns.c: one `modify_text` from
+  the first changed character, `record_change` per character, the after-change
+  call over the changed stretch only, NOUNDO with `buffer-undo-list` t for
+  the duration and the modified flag left as it was.
+- `prepare_to_modify_buffer` calls `undo-auto--undoable-change` when undo is
+  recorded, runs textprop.c's `verify_interval_modification` (`text-read-only`
+  for read-only text, with `inhibit-read-only` and stickiness; the
+  `modification-hooks` text property), and `signal_before_change` /
+  `signal_after_change` run buffer.c's `report_overlay_modification`
+  (overlay `modification-hooks`, `insert-in-front-hooks`,
+  `insert-behind-hooks`) and, after an insertion, the text properties'
+  `insert-behind-hooks` / `insert-in-front-hooks`.
+
+### R45-D. ✅ FIXED — `read` from a function; `eval-buffer`, `eval-region`
+
+`(read FUNCTION)` signalled `wrong-type-argument stringp`; it now calls
+FUNCTION for characters until an object is complete and gives back the one
+read past it. lread.c's `readevalloop` is ported for `eval-buffer` (the
+buffer's `lexical-binding` cookie, point preserved, PRINTFLAG) and
+`eval-region` (each form read with the region narrowed, evaluated outside,
+READ-FUNCTION); `values` is not special, as in Emacs.
+
+### Not followed, and why
+
+- `read` from a function: the values read and the final position of the
+  stream match, but the calls do not: Emacs unreads the delimiter after
+  every atom inside a list (`(a b)` gives back ` ` and `)`); elisprs gives
+  back only the character read past the whole object.
+- `split-window`, `delete-window`, `recenter`, `window-at`, `window-edges`,
+  pixel sizes and terminals are not modelled; the window tree is one leaf.
+- `face-list` holds the faces elisprs defines, not the 186 of a dumped Emacs,
+  and face IDs differ accordingly.
+
+### Still open after round 45
+
+- `current-bidi-paragraph-direction` and the rest of characters.el's
+  category data (Unicode property and charset tables).
+- `pop-to-buffer` / `display-buffer` (window.el's display machinery).
+- `terpri` with ENSURE into a buffer runs no change hooks.

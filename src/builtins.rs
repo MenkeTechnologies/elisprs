@@ -6001,6 +6001,9 @@ fn type_of(h: &mut ElispHost, a: &[Value]) -> R {
         Value::Obj(_) => match h.obj(&a[0]) {
             Some(Obj::Cons(..)) => "cons",
             Some(Obj::Overlay(_)) => "overlay",
+            Some(Obj::Window(_)) => "window",
+            Some(Obj::Frame(_)) => "frame",
+            Some(Obj::WindowConfig(_)) => "window-configuration",
             // Emacs answers `integer` for a bignum too — fixnum and bignum are one
             // type, split only by `fixnump`/`bignump`.
             Some(Obj::Bignum(_)) => "integer",
@@ -9888,7 +9891,7 @@ pub(crate) fn validate_region(
     }
     Ok((lo as usize, hi as usize))
 }
-fn delete_region(h: &mut ElispHost, a: &[Value]) -> R {
+pub(crate) fn delete_region(h: &mut ElispHost, a: &[Value]) -> R {
     let (lo, hi) = validate_region(h, &a[0], &a[1])?;
     if lo < hi {
         h.barf_if_read_only()?;
@@ -11014,7 +11017,7 @@ fn advance_column(c: char, col: i64, tab_width: i64) -> i64 {
 /// invisibility: walk from the start of point's line towards END, stopping at a
 /// newline or once column GOAL is reached. Answers `(pos, col, prev_pos,
 /// prev_col)`, the `prev_` pair naming the last character stepped over.
-fn scan_for_column(h: &ElispHost, end: usize, goal: i64) -> (usize, i64, usize, i64) {
+pub(crate) fn scan_for_column(h: &ElispHost, end: usize, goal: i64) -> (usize, i64, usize, i64) {
     let tab_width = sane_tab_width(h);
     let buf = h.cur_buf_ref();
     let mut pos = find_newline(&buf.text, buf.point, -1, buf.begv, buf.zv).0;
@@ -11093,7 +11096,7 @@ pub(crate) fn indent_to_plan(
 /// `insert-char` calls with INHERIT, so `crate::modhooks` routes them
 /// through the change hooks and property inheritance; this body is what
 /// runs when neither applies.
-fn indent_to(h: &mut ElispHost, a: &[Value]) -> R {
+pub(crate) fn indent_to(h: &mut ElispHost, a: &[Value]) -> R {
     let (mincol, tabs, spaces) = indent_to_plan(h, a)?;
     h.cur_insert(vec!['\t'; tabs], true);
     h.cur_insert(vec![' '; spaces], true);
@@ -11327,6 +11330,7 @@ fn backward_word(h: &mut ElispHost, a: &[Value]) -> R {
 
 /// Install the primitive subr set.
 pub fn install(h: &mut ElispHost) {
+    crate::window::install(h);
     let mut s = |n: &str, min: usize, max: Option<usize>, f: crate::host::SubrFn| {
         h.defsubr(n, min, max, f);
     };
@@ -11610,6 +11614,7 @@ pub fn install(h: &mut ElispHost) {
     s("getenv-internal", 1, Some(2), getenv_internal);
     s("set-time-zone-rule", 1, Some(1), set_time_zone_rule);
     s("undo-boundary", 0, Some(0), undo_boundary_fn);
+    s("subst-char-in-region", 4, Some(5), subst_char_in_region);
     s("recent-auto-save-p", 0, Some(0), recent_auto_save_p);
     s("special-variable-p", 1, Some(1), special_variable_p);
     s("func-arity", 1, Some(1), func_arity);
@@ -12591,6 +12596,69 @@ pub(crate) fn text_prop_change_span(
         _ => !(args.get(2).is_none_or(is_nil) && !h.buffers[bi].has_intervals),
     };
     changes.then_some((bi, lo + 1, hi + 1))
+}
+
+/// The positions `subst-char-in-region` changes: `(START END FIRST LAST)`
+/// with FIRST the first character equal to FROMCHAR and LAST one past the
+/// last; `None` when the arguments are invalid or nothing matches.
+pub(crate) fn subst_char_span(
+    h: &mut ElispHost,
+    a: &[Value],
+) -> Option<(usize, usize, usize, usize)> {
+    let (lo, hi) = validate_region(h, &a[0], &a[1]).ok()?;
+    let from = char::from_u32(check_character(h, &a[2]).ok()? as u32)?;
+    check_character(h, &a[3]).ok()?;
+    let text = &h.cur_buf_ref().text[lo - 1..hi - 1];
+    let first = text.iter().position(|&c| c == from)?;
+    let last = text.iter().rposition(|&c| c == from)?;
+    Some((lo, hi, lo + first, lo + last + 1))
+}
+
+/// `(subst-char-in-region START END FROMCHAR TOCHAR &optional NOUNDO)` —
+/// editfns.c. Each FROMCHAR from START to END becomes TOCHAR in place:
+/// one `modify_text` from the first one to END, a `record_change` per
+/// character unless NOUNDO, and with NOUNDO a buffer unmodified before stays
+/// so when only this change modified it. The change hooks are
+/// `crate::modhooks`'s.
+fn subst_char_in_region(h: &mut ElispHost, a: &[Value]) -> R {
+    let (lo, hi) = validate_region(h, &a[0], &a[1])?;
+    let from = check_character(h, &a[2])?;
+    let to = check_character(h, &a[3])?;
+    let noundo = a.get(4).is_some_and(|v| !is_nil(v));
+    let (from, to) = (
+        char::from_u32(from as u32).unwrap_or('\u{fffd}'),
+        char::from_u32(to as u32).unwrap_or('\u{fffd}'),
+    );
+    let positions: Vec<usize> = (lo..hi)
+        .filter(|&p| h.cur_buf_ref().text[p - 1] == from)
+        .collect();
+    let Some(&first) = positions.first() else {
+        return Ok(Value::Undef);
+    };
+    h.barf_if_read_only()?;
+    {
+        let m = &h.cur_buf_ref().mods;
+        if m.modiff <= m.save_modiff {
+            h.record_first_change_if_undo();
+        }
+    }
+    h.note_text_change(hi - first);
+    if noundo {
+        let m = &mut h.cur_buf().mods;
+        if m.save_modiff == m.modiff - 1 {
+            m.save_modiff = m.modiff;
+        }
+        if m.autosave_modiff == m.modiff - 1 {
+            m.autosave_modiff = m.modiff;
+        }
+    }
+    for p in positions {
+        if !noundo {
+            h.record_change(p, 1);
+        }
+        h.cur_buf().text[p - 1] = to;
+    }
+    Ok(Value::Undef)
 }
 
 #[cfg(test)]

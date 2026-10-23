@@ -426,6 +426,11 @@ pub enum Obj {
     /// never serialized.
     Marker(Rc<RefCell<MarkerData>>),
     Overlay(Rc<RefCell<OverlayData>>),
+    /// A window, frame or saved window configuration: an index into the
+    /// host's tables (see [`crate::window`]). Runtime-only, never serialized.
+    Window(usize),
+    Frame(usize),
+    WindowConfig(usize),
     /// A first-class obarray (`obarray-make`): a private namespace of interned
     /// symbols. Each name maps to a distinct symbol arena id created via
     /// [`ElispHost::make_symbol`], so a private obarray's symbols never collide
@@ -1275,7 +1280,6 @@ const PRELUDE_C_SUBR_NAMES: &[&str] = &[
     "string-width",
     "string<",
     "string=",
-    "subst-char-in-region",
     "substitute-in-file-name",
     "symbol-plist",
     "symbol-with-pos-p",
@@ -1407,6 +1411,20 @@ const PRINT_CIRCLE: usize = 200;
 #[derive(Clone)]
 pub struct ElispHost {
     pub(crate) arena: Vec<Obj>,
+    /// The windows, frames and window configurations of [`crate::window`],
+    /// the selected ones, and window.c's counters.
+    pub(crate) windows: Vec<crate::window::WindowData>,
+    pub(crate) frames: Vec<crate::window::FrameData>,
+    pub(crate) window_configs: Vec<crate::window::WindowConfig>,
+    pub(crate) selected_window: usize,
+    pub(crate) selected_frame: usize,
+    pub(crate) window_count: i64,
+    pub(crate) window_select_count: i64,
+    /// The next buffer-list order key (`EditBuffer::list_order`).
+    pub(crate) buffer_order_seq: i64,
+    /// `b->last_window_start`: where each buffer's window started when a window
+    /// last stopped showing it.
+    pub(crate) last_window_start: HashMap<usize, usize>,
     /// undo.c `point_before_last_command_or_undo` and
     /// `buffer_before_last_command_or_undo`: set by `undo-boundary` (there is
     /// no command loop), read by `record_point`.
@@ -1791,6 +1809,10 @@ pub struct EditBuffer {
     /// (`adjust_intervals_for_deletion`). `set-text-properties` with nil
     /// PROPERTIES answers nil and changes nothing when there is none.
     pub has_intervals: bool,
+    /// Where the buffer sits in `(buffer-list)`: buffers are listed by
+    /// ascending key; a new buffer takes the next key (the end), `record_buffer`
+    /// a key before every other (the front), `bury-buffer` one after.
+    pub list_order: i64,
 }
 
 /// What a new buffer's always-local slot starts as (buffer.c `reset_buffer`,
@@ -1883,6 +1905,15 @@ impl ElispHost {
     pub fn new() -> Self {
         let mut h = ElispHost {
             arena: Vec::new(),
+            windows: Vec::new(),
+            frames: Vec::new(),
+            window_configs: Vec::new(),
+            selected_window: 0,
+            selected_frame: 0,
+            window_count: 0,
+            window_select_count: 0,
+            buffer_order_seq: 0,
+            last_window_start: HashMap::new(),
             point_before_last_command_or_undo: None,
             buffer_before_last_command_or_undo: None,
             obarray: HashMap::new(),
@@ -1928,6 +1959,7 @@ impl ElispHost {
                 local_map: Value::Undef,
                 mods: ModCounts::default(),
                 has_intervals: false,
+                list_order: 0,
             }],
             always_local: Vec::new(),
             current: 0,
@@ -1967,7 +1999,9 @@ impl ElispHost {
         // leading space on ` *Minibuf-0*` is what marks it hidden. Created here
         // so they land in the built-in prefix alongside `*scratch*` and are
         // never serialized as user heap.
-        h.new_buffer(" *Minibuf-0*".to_string());
+        let minibuf = h.new_buffer(" *Minibuf-0*".to_string());
+        let minibuf = h.buffer_slot(&minibuf).expect("minibuffer slot");
+        crate::window::init(&mut h, 0, minibuf);
         h.new_buffer("*Messages*".to_string());
         // The ` *load*` slot, reserved here (in the built-in prefix) but left dead
         // so it stays invisible to `buffer-list` until a file is actually loaded.
@@ -3633,17 +3667,21 @@ impl ElispHost {
                 // Buffer/marker/obarray objects are runtime-only (created after
                 // prelude load) and never appear in a compiled/AOT heap image;
                 // emit a harmless placeholder so the match stays exhaustive.
-                Obj::Buffer(_) | Obj::Marker(_) | Obj::Overlay(_) | Obj::Obarray(_) => {
-                    SerObj::Symbol {
-                        name: "--unexpected-runtime-obj--".to_string(),
-                        value: None,
-                        function: None,
-                        special: false,
-                        buffer_local_auto: false,
-                        alias_of: None,
-                        interned: false,
-                    }
-                }
+                Obj::Buffer(_)
+                | Obj::Marker(_)
+                | Obj::Overlay(_)
+                | Obj::Window(_)
+                | Obj::Frame(_)
+                | Obj::WindowConfig(_)
+                | Obj::Obarray(_) => SerObj::Symbol {
+                    name: "--unexpected-runtime-obj--".to_string(),
+                    value: None,
+                    function: None,
+                    special: false,
+                    buffer_local_auto: false,
+                    alias_of: None,
+                    interned: false,
+                },
                 Obj::Closure {
                     params,
                     body,
@@ -3875,6 +3913,9 @@ impl ElispHost {
             | Obj::Buffer(_)
             | Obj::Marker(_)
             | Obj::Overlay(_)
+            | Obj::Window(_)
+            | Obj::Frame(_)
+            | Obj::WindowConfig(_)
             | Obj::Obarray(_) => SerObj::Symbol {
                 name: "--unexpected-runtime-obj--".to_string(),
                 value: None,
@@ -4996,6 +5037,9 @@ impl ElispHost {
                         None => format!("#<marker {moves}in no buffer>"),
                     }
                 }
+                Some(Obj::Window(w)) => crate::window::print_window(self, *w),
+                Some(Obj::Frame(f)) => crate::window::print_frame(self, *f),
+                Some(Obj::WindowConfig(_)) => "#<window-configuration>".to_string(),
                 Some(Obj::Overlay(o)) => {
                     let od = o.borrow();
                     match od
@@ -5381,7 +5425,10 @@ impl ElispHost {
             local_map: Value::Undef,
             mods: ModCounts::default(),
             has_intervals: false,
+            list_order: 0,
         });
+        self.buffer_order_seq += 1;
+        self.buffers[idx].list_order = self.buffer_order_seq;
         let handle = self.alloc(Obj::Buffer(idx));
         self.buffers[idx].self_obj = handle.clone();
         handle
@@ -5522,21 +5569,25 @@ impl ElispHost {
             md.buffer = None;
             md.pos = 0;
         }
-        if self.current == idx {
-            // `Fkill_buffer` re-selects with `Fset_buffer (Fother_buffer (…))`,
-            // and `other-buffer` ends in `get-scratch-buffer-create` — "If no
-            // other buffer exists, return the buffer `*scratch*' (creating it if
-            // necessary)". So a killed buffer can never stay current; the old
-            // `.unwrap_or(0)` left slot 0 current even when slot 0 was the
-            // buffer just killed.
-            self.current = match self.buffers.iter().position(|b| b.name.is_some()) {
-                Some(i) => i,
-                None => {
-                    let handle = self.new_buffer("*scratch*".to_string());
-                    self.buffer_slot(&handle).expect("fresh buffer slot")
-                }
-            };
+        // `replace_buffer_in_windows`, then `Fset_buffer (Fother_buffer (…))`
+        // when the killed buffer was current; `other-buffer` ends in
+        // `get-scratch-buffer-create`, so a killed buffer never stays current.
+        let fallback = |h: &mut Self| match crate::window::other_buffer(h, Some(idx), false) {
+            Some(b) => b,
+            None => {
+                let handle = h.new_buffer("*scratch*".to_string());
+                h.buffer_slot(&handle).expect("fresh buffer slot")
+            }
+        };
+        if self.windows.iter().any(|w| w.buffer == Some(idx)) {
+            let replacement = fallback(self);
+            crate::window::replace_buffer_in_windows(self, idx, replacement);
         }
+        if self.current == idx {
+            self.current = fallback(self);
+        }
+        let f = self.selected_frame;
+        self.frames[f].buffer_list.retain(|&x| x != idx);
         Value::Bool(true)
     }
     /// `(rename-buffer NEWNAME &optional UNIQUE)` — rename the current buffer.
@@ -5609,6 +5660,8 @@ impl ElispHost {
         let idx = if top_level {
             let idx = self.load_buf;
             self.buffers[idx].name = Some(" *load*".to_string());
+            self.buffer_order_seq += 1;
+            self.buffers[idx].list_order = self.buffer_order_seq;
             idx
         } else {
             let name = self.generate_new_buffer_name(" *load*", None);
@@ -5634,13 +5687,20 @@ impl ElispHost {
     pub fn buffer_object(&self, idx: usize) -> Value {
         self.buffers[idx].self_obj.clone()
     }
-    /// `(buffer-list)` — live buffer objects, in creation order.
+    /// The live buffer slots in `(buffer-list)` order (`Vbuffer_alist`).
+    pub fn buffer_order(&self) -> Vec<usize> {
+        let mut live: Vec<usize> = (0..self.buffers.len())
+            .filter(|&i| self.buffers[i].name.is_some())
+            .collect();
+        live.sort_by_key(|&i| self.buffers[i].list_order);
+        live
+    }
+    /// `(buffer-list)` — live buffer objects, most recently recorded first.
     pub fn buffer_list(&mut self) -> Value {
         let items: Vec<Value> = self
-            .buffers
-            .iter()
-            .filter(|b| b.name.is_some())
-            .map(|b| b.self_obj.clone())
+            .buffer_order()
+            .into_iter()
+            .map(|i| self.buffers[i].self_obj.clone())
             .collect();
         self.list_from(items)
     }
@@ -5650,6 +5710,12 @@ impl ElispHost {
     /// every marker-like position (begv/zv/mark and the save stacks). Point is
     /// handled by the caller.
     fn adjust_for_insert(&mut self, pos: usize, len: usize) {
+        let cur = self.current;
+        for w in self.windows.iter_mut().filter(|w| w.buffer == Some(cur)) {
+            adj_ins(&mut w.pointm, pos, len, false);
+            adj_ins(&mut w.old_pointm, pos, len, false);
+            adj_ins(&mut w.start, pos, len, false);
+        }
         let b = &mut self.buffers[self.current];
         adj_ins(&mut b.begv, pos, len, false);
         adj_ins(&mut b.zv, pos, len, true);
@@ -5678,6 +5744,12 @@ impl ElispHost {
     /// Apply a deletion of `[from, to)` in the current buffer to every marker-like
     /// position, including point.
     fn adjust_for_delete(&mut self, from: usize, to: usize) {
+        let cur = self.current;
+        for w in self.windows.iter_mut().filter(|w| w.buffer == Some(cur)) {
+            adj_del(&mut w.pointm, from, to);
+            adj_del(&mut w.old_pointm, from, to);
+            adj_del(&mut w.start, from, to);
+        }
         let b = &mut self.buffers[self.current];
         adj_del(&mut b.point, from, to);
         adj_del(&mut b.begv, from, to);
@@ -5753,7 +5825,13 @@ impl ElispHost {
     }
     /// `record_first_change`: `(t . VISITED-MODTIME)`; a buffer visiting no
     /// file has modtime 0.
-    fn record_first_change(&mut self) {
+    /// `record_first_change` when undo is recorded in the current buffer.
+    pub(crate) fn record_first_change_if_undo(&mut self) {
+        if self.undo_enabled() {
+            self.record_first_change();
+        }
+    }
+    pub(crate) fn record_first_change(&mut self) {
         let t = Value::Bool(true);
         let entry = self.cons(t, Value::Int(0));
         self.push_undo(entry);

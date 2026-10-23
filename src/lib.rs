@@ -30,6 +30,7 @@ pub mod strftime;
 pub mod textprop;
 pub mod tiers;
 pub mod timefns;
+pub mod window;
 
 pub use fusevm::Value;
 pub use host::{reset_host, run_chunk, with_host};

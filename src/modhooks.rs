@@ -48,6 +48,12 @@ pub fn around(name: &str, f: SubrFn, args: &[Value]) -> Option<R> {
         "line-end-position" => line_position(f, args, false),
         "beginning-of-line" => line_motion(f, args, true),
         "end-of-line" => line_motion(f, args, false),
+        "set-window-buffer" => set_window_buffer(f, args),
+        "princ" | "prin1" | "print" | "terpri" | "write-char" => print_to_buffer(name, f, args),
+        "move-to-column" => move_to_column(f, args),
+        "call-process" => call_process(f, args),
+        "subst-char-in-region" => subst_char(f, args),
+        "read" => read_stream(f, args),
         _ => return None,
     };
     Some(r)
@@ -68,50 +74,61 @@ fn var(h: &mut ElispHost, name: &str) -> Value {
     h.get_value(&sym).unwrap_or(Value::Undef)
 }
 
-/// What a modification must run, `None` when `inhibit-modification-hooks`
-/// suppresses all of it: whether `signal_before_change` has anything to run
-/// (`before-change-functions`, or `first-change-hook` in an unmodified
-/// buffer). The after side is decided after the change, from the hook's value
-/// then.
-fn hook_state(h: &mut ElispHost) -> Option<bool> {
-    if el_truthy(&var(h, "inhibit-modification-hooks")) {
-        return None;
-    }
-    let unmodified = {
-        let m = &h.cur_buf_ref().mods;
-        m.save_modiff >= m.modiff
-    };
-    let before = el_truthy(&var(h, "before-change-functions"))
-        || (unmodified && el_truthy(&var(h, "first-change-hook")));
-    Some(before)
+/// What a change to the current buffer has Lisp to run for
+/// (`prepare_to_modify_buffer_1` / `signal_after_change`).
+struct ModState {
+    inhibit: bool,
+    /// `run_undoable_change`, `verify_interval_modification`, or
+    /// `signal_before_change` has something to do.
+    prepare: bool,
 }
 
-/// insdel.c's frame around one change of the text `[beg, end)`:
-/// `signal_before_change`, `deactivate-mark` set to t, the change itself
-/// (BODY), then `signal_after_change` with the changed span's new end and old
-/// length. BUFFER, when given, is the buffer the change happens in (a text
-/// property change can name another buffer); the hooks run there.
+fn mod_state(h: &mut ElispHost) -> ModState {
+    let inhibit = el_truthy(&var(h, "inhibit-modification-hooks"));
+    let b = h.cur_buf_ref();
+    let unmodified = b.mods.save_modiff >= b.mods.modiff;
+    let (intervals, overlays) = (b.has_intervals, !b.overlays.is_empty());
+    let undo = !matches!(var(h, "buffer-undo-list"), Value::Bool(true));
+    let before = !inhibit
+        && (el_truthy(&var(h, "before-change-functions"))
+            || (unmodified && el_truthy(&var(h, "first-change-hook")))
+            || overlays);
+    ModState {
+        inhibit,
+        prepare: undo || intervals || before,
+    }
+}
+
+/// insdel.c's frame around one change of the text `[beg, end)`.
 fn modify(beg: usize, end: usize, buffer: Option<Value>, body: impl FnOnce() -> R) -> R {
-    let in_buffer = |f: &mut dyn FnMut(&mut ElispHost) -> Option<bool>| {
-        with_host(|h| match &buffer {
-            Some(b) => {
-                let saved = h.current;
-                if let Some(bi) = h.buffer_slot(b) {
-                    h.current = bi;
-                }
-                let r = f(h);
-                h.current = saved;
-                r
+    modify_with(beg, end, buffer, None, body)
+}
+
+/// `modify`, with the after-change span AFTER `(BEG END OLD-LEN)` given
+/// rather than taken from the size change (`subst-char-in-region` reports
+/// only the stretch it changed).
+fn modify_with(
+    beg: usize,
+    end: usize,
+    buffer: Option<Value>,
+    after: Option<(usize, usize, usize)>,
+    body: impl FnOnce() -> R,
+) -> R {
+    let in_buffer = |f: &mut dyn FnMut(&mut ElispHost) -> ModState| {
+        with_host(|h| {
+            let saved = h.current;
+            if let Some(bi) = buffer.as_ref().and_then(|b| h.buffer_slot(b)) {
+                h.current = bi;
             }
-            None => f(h),
+            let r = f(h);
+            h.current = saved;
+            r
         })
     };
-    let Some(before) = in_buffer(&mut hook_state) else {
-        return body();
-    };
+    let state = in_buffer(&mut mod_state);
     let buf_arg = buffer.clone().unwrap_or(Value::Undef);
-    if before {
-        let fname = with_host(|h| h.intern("elisprs--signal-before-change"));
+    if state.prepare {
+        let fname = with_host(|h| h.intern("elisprs--prepare-to-modify"));
         call_function(
             &fname,
             &[
@@ -121,38 +138,56 @@ fn modify(beg: usize, end: usize, buffer: Option<Value>, body: impl FnOnce() -> 
             ],
         )?;
     }
-    in_buffer(&mut |h| {
-        let sym = h.intern("deactivate-mark");
-        let _ = h.set_value(&sym, Value::Bool(true));
-        None
-    });
-    let size = |h: &mut ElispHost| h.cur_buf_ref().text.len() as i64;
-    let size_before = with_host(|h| match &buffer {
-        Some(b) => h
-            .buffer_slot(b)
-            .map(|bi| h.buffers[bi].text.len() as i64)
-            .unwrap_or(0),
-        None => size(h),
-    });
-    let r = body()?;
-    let (size_after, after) = with_host(|h| {
+    if !state.inhibit {
+        in_buffer(&mut |h| {
+            let sym = h.intern("deactivate-mark");
+            let _ = h.set_value(&sym, Value::Bool(true));
+            ModState {
+                inhibit: false,
+                prepare: false,
+            }
+        });
+    }
+    let size = |h: &mut ElispHost| -> i64 {
         let saved = h.current;
         if let Some(bi) = buffer.as_ref().and_then(|b| h.buffer_slot(b)) {
             h.current = bi;
         }
-        let out = (size(h), !el_nil(&var(h, "after-change-functions")));
+        let n = h.cur_buf_ref().text.len() as i64;
+        h.current = saved;
+        n
+    };
+    let size_before = with_host(size);
+    let r = body()?;
+    let size_after = with_host(size);
+    let run_after = with_host(|h| {
+        let saved = h.current;
+        if let Some(bi) = buffer.as_ref().and_then(|b| h.buffer_slot(b)) {
+            h.current = bi;
+        }
+        let b = h.cur_buf_ref();
+        let (intervals, overlays) = (b.has_intervals, !b.overlays.is_empty());
+        let out = !el_truthy(&var(h, "inhibit-modification-hooks"))
+            && (!el_nil(&var(h, "after-change-functions")) || intervals || overlays);
         h.current = saved;
         out
     });
-    if after {
-        let new_end = end as i64 + (size_after - size_before);
+    if run_after {
+        let (a_beg, a_end, a_len) = after.map_or(
+            (
+                beg as i64,
+                end as i64 + (size_after - size_before),
+                (end - beg) as i64,
+            ),
+            |(b, e, l)| (b as i64, e as i64, l as i64),
+        );
         let fname = with_host(|h| h.intern("elisprs--signal-after-change"));
         call_function(
             &fname,
             &[
-                Value::Int(beg as i64),
-                Value::Int(new_end),
-                Value::Int((end - beg) as i64),
+                Value::Int(a_beg),
+                Value::Int(a_end),
+                Value::Int(a_len),
                 buf_arg,
             ],
         )?;
@@ -428,4 +463,188 @@ fn line_motion(f: SubrFn, args: &[Value], bol: bool) -> R {
         }
     });
     Ok(Value::Undef)
+}
+
+/// `set-window-buffer`: before WINDOW shows a different buffer, window.c
+/// calls `record-window-buffer` (unless the window is strongly dedicated,
+/// which the body then refuses).
+fn set_window_buffer(f: SubrFn, args: &[Value]) -> R {
+    let changes = with_host(|h| {
+        let w = match args.first().map(|v| h.obj(v)) {
+            None | Some(None) => Some(h.selected_window),
+            Some(Some(crate::host::Obj::Window(w))) => Some(*w),
+            _ => None,
+        }?;
+        let wd = &h.windows[w];
+        let current = wd.buffer?;
+        let target = h.resolve_buffer(args.get(1)?)?;
+        (current != target && !matches!(wd.dedicated, Value::Bool(true)))
+            .then(|| wd.self_obj.clone())
+    });
+    if let Some(window) = changes {
+        let fname = with_host(|h| h.intern("record-window-buffer"));
+        call_function(&fname, &[window])?;
+    }
+    run(f, args)
+}
+
+/// The printing primitives with a buffer or marker destination: print.c
+/// collects the text and inserts it once (`PRINTFINISH`), one change at the
+/// destination's insertion position in its buffer. `terpri` with ENSURE may
+/// insert nothing, and runs no hooks here.
+fn print_to_buffer(name: &str, f: SubrFn, args: &[Value]) -> R {
+    let pcf = usize::from(name != "terpri");
+    if name == "terpri" && args.get(1).is_some_and(el_truthy) {
+        return run(f, args);
+    }
+    let target = with_host(|h| match builtins::print_dest(h, args.get(pcf)) {
+        Ok(builtins::PrintDest::Buffer(bi)) => Some((bi, h.buffers[bi].point)),
+        Ok(builtins::PrintDest::Marker(m)) => match h.obj(&m) {
+            Some(crate::host::Obj::Marker(md)) => {
+                let md = md.borrow();
+                md.buffer.map(|bi| (bi, md.pos))
+            }
+            _ => None,
+        },
+        _ => None,
+    });
+    match target {
+        Some((bi, pos)) => {
+            let buffer = with_host(|h| h.buffers[bi].self_obj.clone());
+            modify(pos, pos, Some(buffer), || run(f, args))
+        }
+        None => run(f, args),
+    }
+}
+
+/// `move-to-column` with FORCE (indent.c): a tab straddling COLUMN becomes
+/// spaces — `insert-char` of spaces before it, the tab deleted, `indent-to`
+/// its old end column — and with FORCE t a short line is padded with
+/// `indent-to`. Each step is a change of its own.
+fn move_to_column(f: SubrFn, args: &[Value]) -> R {
+    let (Some(Value::Int(goal)), Some(force)) = (args.first(), args.get(1)) else {
+        return run(f, args);
+    };
+    if *goal < 0 || el_nil(force) {
+        return run(f, args);
+    }
+    let goal = *goal;
+    let force_t = matches!(force, Value::Bool(true));
+    let (pos, mut col, prev_pos, prev_col) = with_host(|h| {
+        let zv = h.cur_buf_ref().zv;
+        let r = builtins::scan_for_column(h, zv, goal);
+        h.cur_buf().point = r.0;
+        r
+    });
+    if col > goal {
+        let tab = with_host(|h| h.cur_buf_ref().text[prev_pos - 1] == '\t');
+        if tab && prev_col < goal && prev_pos < pos {
+            with_host(|h| h.cur_buf().point = prev_pos);
+            let spaces = [
+                Value::Int(' ' as i64),
+                Value::Int(goal - prev_col),
+                Value::Bool(true),
+            ];
+            insert_char(builtins::insert_char, &spaces)?;
+            let at = point();
+            let del = [Value::Int(at as i64), Value::Int(at as i64 + 1)];
+            delete_region(builtins::delete_region, &del)?;
+            indent_to(&[Value::Int(col)])?;
+            with_host(|h| h.cur_buf().point = at);
+            col = goal;
+        }
+    }
+    if col < goal && force_t {
+        col = goal;
+        indent_to(&[Value::Int(col)])?;
+    }
+    Ok(Value::Int(col))
+}
+
+/// `call-process` inserting its output: one change at point of the buffer
+/// the output goes to (DESTINATION t is the current buffer).
+fn call_process(f: SubrFn, args: &[Value]) -> R {
+    let inserts = args
+        .get(2)
+        .is_some_and(|d| el_truthy(d) && !matches!(d, Value::Int(0)));
+    if !inserts {
+        return run(f, args);
+    }
+    let pt = point();
+    modify(pt, pt, None, || run(f, args))
+}
+
+/// `subst-char-in-region`: `modify_text` from the first changed character to
+/// END before, `signal_after_change` over the changed stretch after. With
+/// NOUNDO the C sets `buffer-undo-list` to t for the duration, so nothing is
+/// recorded (the first-change record and `undo-auto--undoable-change` neither).
+fn subst_char(f: SubrFn, args: &[Value]) -> R {
+    let Some((_, hi, first, last)) = with_host(|h| builtins::subst_char_span(h, args)) else {
+        return run(f, args);
+    };
+    let noundo = args.get(4).is_some_and(el_truthy);
+    let saved = noundo.then(|| {
+        with_host(|h| {
+            let sym = h.intern("buffer-undo-list");
+            let old = h.get_value(&sym).unwrap_or(Value::Undef);
+            let _ = h.set_value(&sym, Value::Bool(true));
+            old
+        })
+    });
+    let r = modify_with(first, hi, None, Some((first, last, last - first)), || {
+        run(f, args)
+    });
+    if let Some(old) = saved {
+        with_host(|h| {
+            let sym = h.intern("buffer-undo-list");
+            let _ = h.set_value(&sym, old);
+        });
+    }
+    r
+}
+
+/// `read` from a function (lread.c `readchar`/`unreadchar`): FUNCTION is
+/// called with no argument for each character (nil is the end of input) and
+/// with a character to give back the one character read past the object.
+/// The object is complete when a character arrives that it cannot include
+/// (that one is given back), or when it closes with `)`, `]` or `"`.
+fn read_stream(f: SubrFn, args: &[Value]) -> R {
+    let Some(stream) = args.first() else {
+        return run(f, args);
+    };
+    let is_function = with_host(|h| {
+        !el_nil(stream)
+            && !matches!(stream, Value::Bool(true))
+            && !h.is_string(stream)
+            && !matches!(
+                h.obj(stream),
+                Some(crate::host::Obj::Buffer(_)) | Some(crate::host::Obj::Marker(_))
+            )
+    });
+    if !is_function {
+        return run(f, args);
+    }
+    let fun = stream.clone();
+    let mut text = String::new();
+    loop {
+        let c = call_function(&fun, &[])?;
+        let Value::Int(code) = c else {
+            // End of input: whatever was read is all there is.
+            return with_host(|h| crate::reader::read_one(h, &text, 0).map(|(form, _)| form));
+        };
+        let ch = char::from_u32(code as u32).unwrap_or('\u{fffd}');
+        text.push(ch);
+        let len = text.chars().count();
+        let parsed = with_host(|h| crate::reader::read_one(h, &text, 0));
+        match parsed {
+            Ok((form, end)) if end < len => {
+                call_function(&fun, &[Value::Int(code)])?;
+                return Ok(form);
+            }
+            Ok((form, _)) if matches!(ch, ')' | ']' | '"') => return Ok(form),
+            Ok(_) => {}
+            Err(e) if e == "end-of-file" => {}
+            Err(e) => return Err(e),
+        }
+    }
 }

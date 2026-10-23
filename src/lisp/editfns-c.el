@@ -365,6 +365,10 @@ text is replaced by an ellipsis."
 
 (defvar unread-command-events nil
   "List of events to be read as the command input.")
+(defvar timer-list nil
+  "List of active timers in order of increasing time.")
+(defvar timer-idle-list nil
+  "List of active idle-time timers in order of increasing time.")
 
 (defmacro editfns--run-change-hook (hook &rest args)
   "Run HOOK with ARGS, setting HOOK to nil if a function signals an error.
@@ -376,26 +380,178 @@ This is insdel.c's `reset_var_on_error' around `Frun_hook_with_args'."
        (unless done
          (setq ,hook nil)))))
 
+(defvar editfns--interval-insert-behind-hooks nil
+  "textprop.c `interval_insert_behind_hooks', chosen before an insertion.")
+(defvar editfns--interval-insert-in-front-hooks nil
+  "textprop.c `interval_insert_in_front_hooks', chosen before an insertion.")
+(defvar editfns--last-overlay-modification-hooks nil
+  "buffer.c `last_overlay_modification_hooks': (FUNCTIONS . OVERLAY) pairs
+collected before a change, run again after it.")
+
+(defun editfns--textget (pos prop)
+  "textget: PROP of the character at POS, through its `category'."
+  (let ((plist (text-properties-at pos)))
+    (if (plist-member plist prop)
+        (plist-get plist prop)
+      (let ((cat (plist-get plist 'category)))
+        (and cat (symbolp cat) (get cat prop))))))
+
+(defun editfns--text-read-only (propval)
+  "text_read_only: signal `text-read-only', with PROPVAL when it is a string."
+  (signal 'text-read-only (and (stringp propval) (list propval))))
+
+(defun editfns--tmem (sym set)
+  "TMEM: SET is t, or a list containing SYM."
+  (if (consp set) (memq sym set) set))
+
+(defun editfns--verify-interval-modification (start end)
+  "textprop.c `verify_interval_modification' for the text START..END:
+signal `text-read-only' for read-only text, run the `modification-hooks'
+text properties of a changed span, and choose the `insert-behind-hooks' and
+`insert-in-front-hooks' an insertion runs afterwards."
+  (setq editfns--interval-insert-behind-hooks nil
+        editfns--interval-insert-in-front-hooks nil)
+  (when (> start end)
+    (setq start (prog1 end (setq end start))))
+  (if (= start end)
+      (let* ((has-after (< start (point-max)))
+             (has-before (> start (point-min)))
+             (same (and has-after has-before (elisprs--inside-interval-p start))))
+        (when (or (null inhibit-read-only) (consp inhibit-read-only))
+          (let ((after (and has-after (editfns--textget start 'read-only)))
+                (before (and has-before (editfns--textget (1- start) 'read-only))))
+            (if (not same)
+                (progn
+                  (when (and after (not (memq after inhibit-read-only)))
+                    (let ((tem (editfns--textget start 'front-sticky)))
+                      (when (or (editfns--tmem 'read-only tem)
+                                (and (null (plist-get (text-properties-at start) 'read-only))
+                                     (editfns--tmem 'category tem)))
+                        (editfns--text-read-only after))))
+                  (when (and before (not (memq before inhibit-read-only)))
+                    (let ((tem (editfns--textget (1- start) 'rear-nonsticky)))
+                      (when (and (not (editfns--tmem 'read-only tem))
+                                 (or (plist-get (text-properties-at (1- start)) 'read-only)
+                                     (not (editfns--tmem 'category tem))))
+                        (editfns--text-read-only before)))))
+              (when (and after (not (memq after inhibit-read-only)))
+                (let ((tem (editfns--textget start 'front-sticky)))
+                  (when (or (editfns--tmem 'read-only tem)
+                            (and (null (plist-get (text-properties-at start) 'read-only))
+                                 (editfns--tmem 'category tem)))
+                    (editfns--text-read-only after))
+                  (setq tem (editfns--textget (1- start) 'rear-nonsticky))
+                  (when (and (not (editfns--tmem 'read-only tem))
+                             (or (plist-get (text-properties-at (1- start)) 'read-only)
+                                 (not (editfns--tmem 'category tem))))
+                    (editfns--text-read-only after)))))))
+        (when has-before
+          (setq editfns--interval-insert-behind-hooks
+                (editfns--textget (1- start) 'insert-behind-hooks)))
+        (when has-after
+          (setq editfns--interval-insert-in-front-hooks
+                (editfns--textget start 'insert-in-front-hooks))))
+    (let ((buffer-ro (and buffer-read-only (null inhibit-read-only)))
+          (p start) (last 0) (hooks nil) (prev-mod-hooks nil))
+      (while (progn
+               (let* ((read-only (editfns--textget p 'read-only))
+                      (implied (or (null read-only)
+                                   (and inhibit-read-only (not (consp inhibit-read-only)))))
+                      (express (or (editfns--textget p 'inhibit-read-only)
+                                   (and read-only (consp inhibit-read-only)
+                                        (memq read-only inhibit-read-only)))))
+                 (cond ((and (not implied) (not express))
+                        (editfns--text-read-only read-only))
+                       ((and (not express) buffer-ro)
+                        (signal 'buffer-read-only (list (current-buffer)))))
+                 (unless inhibit-modification-hooks
+                   (let ((mod-hooks (editfns--textget p 'modification-hooks)))
+                     (when (and mod-hooks (not (eq mod-hooks prev-mod-hooks)))
+                       (push mod-hooks hooks)
+                       (setq prev-mod-hooks mod-hooks))))
+                 (setq last (or (next-property-change p) (point-max))
+                       p last))
+               (< p end)))
+      (when (and (< last end) buffer-ro)
+        (signal 'buffer-read-only (list (current-buffer))))
+      (unless inhibit-modification-hooks
+        (let ((inhibit-modification-hooks t))
+          (dolist (h (nreverse hooks))
+            (dolist (fn h)
+              (funcall fn start end))))))))
+
+(defun editfns--report-overlay-modification (beg end after &optional len)
+  "buffer.c `report_overlay_modification'.  Before a change of BEG..END,
+collect the `insert-in-front-hooks', `insert-behind-hooks' and
+`modification-hooks' of the overlays it touches; before and after, call
+them with (OVERLAY AFTER BEG END [LEN])."
+  (unless after
+    (let ((insertion (= beg end)) (collected nil))
+      (dolist (ov (sort (overlays-in (point-min) (point-max))
+                        (lambda (a b) (< (overlay-start a) (overlay-start b)))))
+        (let ((ob (overlay-start ov)) (oe (overlay-end ov)))
+          (when (and insertion (or (= beg ob) (= end ob)))
+            (let ((prop (overlay-get ov 'insert-in-front-hooks)))
+              (when prop (push (cons prop ov) collected))))
+          (when (and insertion (or (= beg oe) (= end oe)))
+            (let ((prop (overlay-get ov 'insert-behind-hooks)))
+              (when prop (push (cons prop ov) collected))))
+          (when (and (> end ob) (< beg oe))
+            (let ((prop (overlay-get ov 'modification-hooks)))
+              (when prop (push (cons prop ov) collected))))))
+      (setq editfns--last-overlay-modification-hooks (nreverse collected))))
+  (dolist (entry (copy-sequence editfns--last-overlay-modification-hooks))
+    (let ((ov (cdr entry)))
+      (when (eq (overlay-buffer ov) (current-buffer))
+        (dolist (fn (car entry))
+          (if len
+              (funcall fn ov after beg end len)
+            (funcall fn ov after beg end)))))))
+
+(defun elisprs--prepare-to-modify (beg end &optional buffer)
+  "insdel.c `prepare_to_modify_buffer' from the undo hook on: the text from
+BEG to END of BUFFER is about to change."
+  (with-current-buffer (or buffer (current-buffer))
+    (unless (eq buffer-undo-list t)
+      (undo-auto--undoable-change))
+    (editfns--verify-interval-modification beg end)
+    (unless inhibit-modification-hooks
+      (elisprs--signal-before-change beg end))))
+
 (defun elisprs--signal-before-change (beg end &optional buffer)
   "insdel.c `signal_before_change' for the text from BEG to END of BUFFER.
 `first-change-hook' runs first when the buffer is unmodified, then
-`before-change-functions', with `inhibit-modification-hooks' bound to t."
+`before-change-functions', then the overlays' hooks, with
+`inhibit-modification-hooks' bound to t."
   (with-current-buffer (or buffer (current-buffer))
     (let ((inhibit-modification-hooks t))
       (when (and first-change-hook (not (buffer-modified-p)))
         (run-hooks 'first-change-hook))
       (when before-change-functions
-        (editfns--run-change-hook before-change-functions beg end)))))
+        (editfns--run-change-hook before-change-functions beg end))
+      (when (overlays-in (point-min) (point-max))
+        (editfns--report-overlay-modification beg end nil)))))
 
 (defun elisprs--signal-after-change (beg end oldlen &optional buffer)
   "insdel.c `signal_after_change': the text from BEG to END of BUFFER replaced
-OLDLEN characters.  `after-change-functions' run with
-`inhibit-modification-hooks' bound to t."
+OLDLEN characters.  `after-change-functions', the overlays' hooks and, after
+an insertion, the inserted text's `insert-behind-hooks' and
+`insert-in-front-hooks' run, with `inhibit-modification-hooks' bound to t."
   (with-current-buffer (or buffer (current-buffer))
     (unless inhibit-modification-hooks
-      (let ((inhibit-modification-hooks t))
+      (let ((inhibit-modification-hooks t)
+            (behind editfns--interval-insert-behind-hooks)
+            (in-front editfns--interval-insert-in-front-hooks))
         (when after-change-functions
-          (editfns--run-change-hook after-change-functions beg end oldlen))))))
+          (editfns--run-change-hook after-change-functions beg end oldlen))
+        (when (overlays-in (point-min) (point-max))
+          (editfns--report-overlay-modification beg end t oldlen))
+        (when (= oldlen 0)
+          (dolist (fn behind)
+            (funcall fn beg end))
+          (unless (eq in-front behind)
+            (dolist (fn in-front)
+              (funcall fn beg end))))))))
 
 ;;;; filelock.c
 
@@ -404,3 +560,193 @@ OLDLEN characters.  `after-change-functions' run with
 There are no file locks here (no buffer's file is ever locked), so this
 does nothing and returns nil."
   nil)
+
+(defun set-buffer-major-mode (buffer)
+  "Set an appropriate major mode for BUFFER.
+For the *scratch* buffer, use `initial-major-mode', otherwise choose a mode
+according to the default value of `major-mode'.
+Use this function before selecting the buffer, since it may need to inspect
+the current buffer's major mode."
+  (unless (bufferp buffer)
+    (signal 'wrong-type-argument (list 'bufferp buffer)))
+  (let ((function
+         (if (equal (buffer-name buffer) "*scratch*")
+             (and (boundp 'initial-major-mode) initial-major-mode)
+           (let ((default (default-value 'major-mode)))
+             (if (and (null default) (null (get major-mode 'mode-class)))
+                 major-mode
+               default)))))
+    (when function
+      (with-current-buffer buffer
+        (funcall function)))))
+
+;;;; window.c / buffer.c variables
+
+(defvar window-point-insertion-type nil
+  "Insertion type of marker to use for `window-point'.")
+(defvar buffer-list-update-hook nil
+  "Hook run when the buffer list changes.")
+
+(defun delete-auto-save-file-if-necessary (&optional force)
+  "Delete auto-save file for current buffer if `delete-auto-save-files' is t.
+Normally delete only if the file was written by this Emacs since
+the last real save, but optional arg FORCE non-nil means delete anyway.
+No buffer here has an auto-save file (`buffer-auto-save-file-name' is
+never set), so there is nothing to delete."
+  (ignore force)
+  nil)
+
+;;;; dispnew.c
+
+(defun redisplay (&optional force)
+  "Perform redisplay.
+There is no display in batch mode; the value is t, as Emacs answers there."
+  (ignore force)
+  t)
+
+;;;; lread.c — `eval-buffer' and `eval-region' (readevalloop).
+
+(defvar eval-buffer-list nil
+  "List of buffers being read from by calls to `eval-buffer' and `eval-region'.")
+;; `values' is a global C variable that is not special (`special-variable-p'
+;; is nil for it), so a `let' of it in lexical code does not catch the values.
+(setq values nil)
+(defvar load-read-function 'read
+  "Function used for reading expressions.")
+
+(defun editfns--lexical-cookie (buffer)
+  "lisp_file_lexical_cookie: `lex', `dyn' or nil from BUFFER's first line
+\(after a `#!' line), which must be a comment."
+  (with-current-buffer buffer
+    (save-excursion
+      (save-restriction
+        (widen)
+        (goto-char (point-min))
+        (when (looking-at "#!")
+          (forward-line 1))
+        (when (and (eq (char-after) ?\;)
+                   (looking-at
+                    "[^\n]*-\\*-[^\n]*lexical-binding:[ \t]*\\([^ \t\n;]+\\)[^\n]*-\\*-"))
+          (if (equal (match-string 1) "nil") 'dyn 'lex))))))
+
+(defun editfns--next-sexp-p (buffer)
+  "readevalloop's skip: move BUFFER's point past whitespace and `;'
+comments; non-nil when an expression follows."
+  (with-current-buffer buffer
+    (let ((done nil))
+      (while (not done)
+        (skip-chars-forward " \t\n\f\r ")
+        (if (eq (char-after) ?\;)
+            (progn (skip-chars-forward "^\n") (unless (eobp) (forward-char 1)))
+          (setq done t)))
+      (not (eobp)))))
+
+(defun editfns--readevalloop (buffer printflag readfun start end)
+  "lread.c `readevalloop' over BUFFER.  Without START, read from BUFFER's
+point; with START, from START (narrowed to END), restoring the current
+buffer, point and restriction around each read.  Each form is evaluated
+with the lexical environment `lexical-binding' asked for at the start, and
+with PRINTFLAG pushed onto `values' and printed."
+  (let ((lexical lexical-binding)
+        (standard-input buffer)
+        (continue t)
+        (position start))
+    (while continue
+      (unless (buffer-live-p buffer)
+        (error "Reading from killed buffer"))
+      (let ((form
+             (catch 'editfns--readevalloop-done
+               (if position
+                   (save-excursion
+                     (set-buffer buffer)
+                     (save-excursion
+                       (save-restriction
+                         (goto-char position)
+                         (when end
+                           (narrow-to-region (point-min) end))
+                         (unless (editfns--next-sexp-p buffer)
+                           (throw 'editfns--readevalloop-done 'editfns--eof))
+                         (prog1 (if readfun (funcall readfun buffer)
+                                  (funcall (or load-read-function #'read) buffer))
+                           (setq position (point-marker))))))
+                 (unless (editfns--next-sexp-p buffer)
+                   (throw 'editfns--readevalloop-done 'editfns--eof))
+                 (if readfun
+                     (prog1 (funcall readfun buffer)
+                       (with-current-buffer buffer
+                         (when (= (point) (point-max))
+                           (setq continue nil))))
+                   (funcall (or load-read-function #'read) buffer))))))
+        (if (eq form 'editfns--eof)
+            (setq continue nil)
+          (let ((val (eval form lexical)))
+            (when printflag
+              (push val values)
+              (if (eq standard-output t)
+                  (prin1 val)
+                (print val)))))))))
+
+(defun eval-buffer (&optional buffer printflag filename unibyte do-allow-print)
+  "Execute the accessible portion of current buffer as Lisp code.
+You can use \\[narrow-to-region] to limit the part of buffer to be evaluated.
+When called from a Lisp program (i.e., not interactively), this
+function accepts up to five optional arguments:
+BUFFER is the buffer to evaluate (nil means use current buffer),
+ or a name of a buffer (a string).
+PRINTFLAG controls printing of output by any output functions in the
+ evaluated code, such as `print', `princ', and `prin1':
+  a value of nil means discard it; anything else is the stream to print to.
+FILENAME specifies the file name to use for `load-history'.
+UNIBYTE, if non-nil, specifies `load-convert-to-unibyte' for this
+ invocation.
+DO-ALLOW-PRINT, if non-nil, specifies that output functions in the
+ evaluated code should work normally even if PRINTFLAG is nil, in
+ which case the output is displayed in the echo area.
+
+This function preserves the position of point."
+  (ignore filename unibyte)
+  (let ((buf (if buffer (get-buffer buffer) (current-buffer))))
+    (unless buf
+      (error "No such buffer"))
+    (let* ((cookie (editfns--lexical-cookie buf))
+           (eval-buffer-list (cons buf eval-buffer-list))
+           (standard-output (if (and (null printflag) (null do-allow-print))
+                                'symbolp
+                              printflag))
+           (body (lambda ()
+                   (let ((saved (with-current-buffer buf (point))))
+                     (unwind-protect
+                         (progn
+                           (with-current-buffer buf (goto-char (point-min)))
+                           (editfns--readevalloop buf printflag nil nil nil))
+                       (when (buffer-live-p buf)
+                         (with-current-buffer buf (goto-char saved))))))))
+      (if (local-variable-p 'lexical-binding buf)
+          (funcall body)
+        (let ((lexical-binding (cond ((eq cookie 'lex) t)
+                                     ((eq cookie 'dyn) nil)
+                                     (t (default-toplevel-value 'lexical-binding)))))
+          (funcall body)))
+      nil)))
+
+(defun eval-region (start end &optional printflag read-function)
+  "Execute the region as Lisp code.
+When called from programs, expects two arguments,
+giving starting and ending indices in the current buffer
+of the text to be executed.
+Programs can pass third argument PRINTFLAG which controls output:
+ a value of nil means discard it; anything else is stream for printing it.
+ See Info node `(elisp)Output Streams' for details on streams.
+Also the fourth argument READ-FUNCTION, if non-nil, is used
+instead of `read' to read each expression.  It gets one argument
+which is the input stream for reading characters.
+
+This function does not move point."
+  (let ((cbuf (current-buffer)))
+    (let ((standard-output (if (null printflag) 'symbolp printflag))
+          (eval-buffer-list (cons cbuf eval-buffer-list)))
+      (editfns--readevalloop cbuf printflag read-function start
+                             (and end (if (integerp end)
+                                          (copy-marker end)
+                                        end)))
+      nil)))

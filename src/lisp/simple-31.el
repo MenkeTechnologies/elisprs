@@ -1,9 +1,9 @@
 ;;; simple-31.el --- simple.el, lisp.el and text-mode.el commands the prelude lacked  -*- lexical-binding: t -*-
 
 ;; Verbatim definitions from GNU Emacs 31.1 lisp/simple.el, then
-;; lisp/emacs-lisp/lisp.el and lisp/textmodes/text-mode.el, each in file order.  Commands that need windows
-;; (`end-of-buffer', `yank-pop', `append-to-buffer') or compositions
-;; (`delete-forward-char') are not here.
+;; lisp/emacs-lisp/lisp.el and lisp/textmodes/text-mode.el, each in file order.
+;; `delete-forward-char' (it needs compositions) is not here; the commands
+;; that read window state are in window-31.el.
 
 ;;;; simple.el
 
