@@ -1407,6 +1407,11 @@ const PRINT_CIRCLE: usize = 200;
 #[derive(Clone)]
 pub struct ElispHost {
     pub(crate) arena: Vec<Obj>,
+    /// undo.c `point_before_last_command_or_undo` and
+    /// `buffer_before_last_command_or_undo`: set by `undo-boundary` (there is
+    /// no command loop), read by `record_point`.
+    point_before_last_command_or_undo: Option<usize>,
+    buffer_before_last_command_or_undo: Option<usize>,
     obarray: HashMap<String, u32>,
     /// Arena length right after `install` (the builtin objects). Everything at or
     /// above this index is user/prelude data — the portion serialized for AOT.
@@ -1878,6 +1883,8 @@ impl ElispHost {
     pub fn new() -> Self {
         let mut h = ElispHost {
             arena: Vec::new(),
+            point_before_last_command_or_undo: None,
+            buffer_before_last_command_or_undo: None,
             obarray: HashMap::new(),
             builtin_count: 0,
             prelude_end: 0,
@@ -5300,7 +5307,7 @@ impl ElispHost {
     /// (`get-buffer`, `set-buffer`, `buffer-name`) must be able to see them,
     /// because a killed buffer object stays a buffer object in Emacs and only
     /// `BUFFER_LIVE_P` distinguishes it.
-    fn buffer_slot(&self, v: &Value) -> Option<usize> {
+    pub(crate) fn buffer_slot(&self, v: &Value) -> Option<usize> {
         match self.obj(v) {
             Some(Obj::Buffer(idx)) if *idx < self.buffers.len() => Some(*idx),
             _ => None,
@@ -5619,6 +5626,10 @@ impl ElispHost {
         b.zv = len + 1;
         idx
     }
+    /// The top-level ` *load*` buffer's object (see `open_load_buffer`).
+    pub fn load_buffer_object(&self) -> Value {
+        self.buffers[self.load_buf].self_obj.clone()
+    }
     /// The buffer object for slot `idx` (used to kill a load buffer afterward).
     pub fn buffer_object(&self, idx: usize) -> Value {
         self.buffers[idx].self_obj.clone()
@@ -5721,6 +5732,182 @@ impl ElispHost {
     pub fn note_prop_change(&mut self, bi: usize) {
         self.buffers[bi].mods.incr(1);
     }
+    // ── undo (undo.c) ────────────────────────────────────────────────────────
+    /// The current buffer's `buffer-undo-list`.
+    fn undo_list(&mut self) -> Value {
+        let sym = self.intern("buffer-undo-list");
+        self.get_value(&sym).unwrap_or(Value::Undef)
+    }
+    fn set_undo_list(&mut self, v: Value) {
+        let sym = self.intern("buffer-undo-list");
+        let _ = self.set_value(&sym, v);
+    }
+    /// Whether undo is recorded in the current buffer (`undo_list` is not t).
+    fn undo_enabled(&mut self) -> bool {
+        !matches!(self.undo_list(), Value::Bool(true))
+    }
+    fn push_undo(&mut self, entry: Value) {
+        let list = self.undo_list();
+        let list = self.cons(entry, list);
+        self.set_undo_list(list);
+    }
+    /// `record_first_change`: `(t . VISITED-MODTIME)`; a buffer visiting no
+    /// file has modtime 0.
+    fn record_first_change(&mut self) {
+        let t = Value::Bool(true);
+        let entry = self.cons(t, Value::Int(0));
+        self.push_undo(entry);
+    }
+    /// `record_point` for a change that will leave point at BEG.
+    fn record_point(&mut self, beg: usize) {
+        let inhibit = self.intern("undo-inhibit-record-point");
+        if el_truthy(&self.get_value(&inhibit).unwrap_or(Value::Undef)) {
+            return;
+        }
+        let list = self.undo_list();
+        let at_boundary = match self.obj(&list) {
+            Some(Obj::Cons(car, _)) => el_nil(car),
+            _ => true,
+        };
+        let m = &self.buffers[self.current].mods;
+        if m.modiff <= m.save_modiff {
+            self.record_first_change();
+        }
+        if at_boundary
+            && self.buffer_before_last_command_or_undo == Some(self.current)
+            && self.point_before_last_command_or_undo != Some(beg)
+        {
+            if let Some(p) = self.point_before_last_command_or_undo {
+                self.push_undo(Value::Int(p as i64));
+            }
+        }
+    }
+    /// `record_insert`: LEN characters about to be inserted at BEG, merged into
+    /// an immediately preceding `(BEG . END)` entry that ends at BEG.
+    pub fn record_insert(&mut self, beg: usize, len: usize) {
+        if !self.undo_enabled() {
+            return;
+        }
+        self.record_point(beg);
+        let list = self.undo_list();
+        if let Some(Obj::Cons(elt, _)) = self.obj(&list) {
+            let elt = elt.clone();
+            if let Some(Obj::Cons(Value::Int(_), Value::Int(end))) = self.obj(&elt) {
+                if *end == beg as i64 {
+                    if let Value::Obj(id) = elt {
+                        if let Some(Obj::Cons(_, cdr)) = self.arena.get_mut(id as usize) {
+                            *cdr = Value::Int((beg + len) as i64);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        let entry = self.cons(Value::Int(beg as i64), Value::Int((beg + len) as i64));
+        self.push_undo(entry);
+    }
+    /// The text `[from, to)` of the current buffer as a string carrying its
+    /// text properties (`make_buffer_string` with PROPS).
+    fn buffer_string_with_props(&mut self, from: usize, to: usize) -> Value {
+        let text: String = self.buffers[self.current].text[from - 1..to - 1]
+            .iter()
+            .collect();
+        let plists: Vec<Value> = self.buffers[self.current].props[from - 1..to - 1].to_vec();
+        let (out, arc) = self.new_string_keyed(text);
+        if plists.iter().any(el_truthy) {
+            let plists = self.copy_plist_runs(plists);
+            self.string_set_props_vec(&arc, plists);
+        }
+        out
+    }
+    /// `record_delete` of the text `[from, to)`, about to be deleted, with the
+    /// marker adjustments primitive-undo needs to restore markers inside it.
+    pub fn record_delete(&mut self, from: usize, to: usize, record_markers: bool) {
+        if !self.undo_enabled() {
+            return;
+        }
+        let string = self.buffer_string_with_props(from, to);
+        self.record_point(from);
+        let pt = self.buffers[self.current].point;
+        let sbeg = if pt == to {
+            -(from as i64)
+        } else {
+            from as i64
+        };
+        if record_markers {
+            // `BUF_MARKERS` is newest first.
+            let markers: Vec<(Value, usize, bool)> = self.buffers[self.current]
+                .markers
+                .iter()
+                .rev()
+                .filter_map(|m| {
+                    let md = m.borrow();
+                    (from <= md.pos && md.pos <= to).then(|| (m.clone(), md.pos, md.insertion_type))
+                })
+                .filter_map(|(m, pos, itype)| self.marker_object_of(&m).map(|o| (o, pos, itype)))
+                .collect();
+            for (marker, pos, itype) in markers {
+                let adjustment = (if itype { to } else { from }) as i64 - pos as i64;
+                if adjustment != 0 {
+                    let entry = self.cons(marker, Value::Int(adjustment));
+                    self.push_undo(entry);
+                }
+            }
+        }
+        let entry = self.cons(string, Value::Int(sbeg));
+        self.push_undo(entry);
+    }
+    /// `record_change`: LEN characters at BEG about to be replaced by as many.
+    pub fn record_change(&mut self, beg: usize, len: usize) {
+        self.record_delete(beg, beg + len, false);
+        self.record_insert(beg, len);
+    }
+    /// `record_property_change`: PROP's old VALUE over LEN characters at BEG
+    /// of buffer BI.
+    pub fn record_property_change(
+        &mut self,
+        bi: usize,
+        beg: usize,
+        len: usize,
+        prop: Value,
+        value: Value,
+    ) {
+        let saved = self.current;
+        self.current = bi;
+        if self.undo_enabled() {
+            let m = &self.buffers[bi].mods;
+            if m.modiff <= m.save_modiff {
+                self.record_first_change();
+            }
+            let tail = self.cons(Value::Int(beg as i64), Value::Int((beg + len) as i64));
+            let tail = self.cons(value, tail);
+            let tail = self.cons(prop, tail);
+            let entry = self.cons(Value::Undef, tail);
+            self.push_undo(entry);
+        }
+        self.current = saved;
+    }
+    /// `Fundo_boundary`.
+    pub fn undo_boundary(&mut self) {
+        if !self.undo_enabled() {
+            return;
+        }
+        let list = self.undo_list();
+        let head_nil = match self.obj(&list) {
+            Some(Obj::Cons(car, _)) => el_nil(car),
+            _ => true,
+        };
+        if !head_nil {
+            let list = self.cons(Value::Undef, list);
+            self.set_undo_list(list);
+        }
+        let cause = self.intern("undo-auto--last-boundary-cause");
+        let explicit = self.intern("explicit");
+        let _ = self.set_value(&cause, explicit);
+        self.point_before_last_command_or_undo = Some(self.buffers[self.current].point);
+        self.buffer_before_last_command_or_undo = Some(self.current);
+    }
+
     /// Insert `chars` at point in the current buffer. `leave_after` puts point
     /// after the inserted text (the `insert` default); otherwise point is left at
     /// the start (`insert-file-contents`). Markers are adjusted per Emacs rules.
@@ -5730,6 +5917,7 @@ impl ElispHost {
         if len == 0 {
             return;
         }
+        self.record_insert(pos, len);
         self.note_text_change(len);
         let b = &mut self.buffers[self.current];
         b.text.splice((pos - 1)..(pos - 1), chars);
@@ -5749,6 +5937,7 @@ impl ElispHost {
         if len == 0 {
             return;
         }
+        self.record_insert(pos, len);
         self.note_text_change(len);
         let b = &mut self.buffers[self.current];
         b.text.splice((pos - 1)..(pos - 1), chars);
@@ -5771,6 +5960,7 @@ impl ElispHost {
         if from >= to {
             return;
         }
+        self.record_delete(from, to, true);
         self.note_text_change(to - from);
         if to - from == self.buffers[self.current].text.len() {
             self.buffers[self.current].has_intervals = false;
@@ -5831,6 +6021,14 @@ impl ElispHost {
             self.buffers[bi].markers.push(md.clone());
         }
         self.alloc(Obj::Marker(md))
+    }
+    /// The marker object whose cell is M (a scan of the heap: markers keep no
+    /// back-pointer to their object).
+    fn marker_object_of(&self, m: &Rc<RefCell<MarkerData>>) -> Option<Value> {
+        self.arena
+            .iter()
+            .position(|o| matches!(o, Obj::Marker(x) if Rc::ptr_eq(x, m)))
+            .map(|i| Value::Obj(i as u32))
     }
     /// The shared marker cell behind V, if V is a marker.
     fn marker_rc(&self, v: &Value) -> Option<Rc<RefCell<MarkerData>>> {
@@ -6961,20 +7159,9 @@ impl ElispHost {
         let sym_candidate = trimmed.split_once(':').map_or(trimmed, |(s, _)| s.trim());
         if NIL_DATA_ERRORS.contains(&sym_candidate) {
             let s = self.intern(sym_candidate);
-            // `end-of-file` is the one exception: Emacs's `end_of_file_error`
-            // (lread.c) signals it *with* `load-true-file-name` when there is one,
-            // so a truncated `read` inside a loaded file reports
-            // `(end-of-file "/path/to/file.el")` and only a bare
-            // `emacs --batch --eval` reports `(end-of-file)`.
-            if sym_candidate == "end-of-file" {
-                if let Some(file) = self
-                    .find_symbol("load-true-file-name")
-                    .and_then(|s| self.get_value(&s).ok())
-                    .filter(|v| self.is_string(v))
-                {
-                    return self.list_from(vec![s, file]);
-                }
-            }
+            // `end-of-file` read from a string is bare too (lread.c
+            // `end_of_file_error`); the readers of a buffer or a file being
+            // loaded attach their source themselves.
             return self.list_from(vec![s]);
         }
         let (sym, msg) = match e.split_once(':') {
@@ -7985,6 +8172,11 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             if std::ptr::fn_addr_eq(f, crate::builtins::intercepted_subr as SubrFn) {
                 let target = with_host(|h| h.intern(&name));
                 return call_function(&target, args);
+            }
+            // The change hooks, field constraints and property inheritance the
+            // C runs Lisp for, outside the host borrow (see `crate::modhooks`).
+            if let Some(r) = crate::modhooks::around(&name, f, args) {
+                return r.map(|v| with_host(|h| h.promote_string(v)));
             }
             // Promote a string a subr built as a bare `Value::Str` transient
             // into a string CELL before it can be stored anywhere: an elisp
@@ -9139,7 +9331,8 @@ fn intrinsic_load(f: &Value, args: &[Value]) -> Result<Value, String> {
     // kills it on the way out (`unwind-protect`), so a nested load is visible in
     // `(buffer-list)` while it runs and gone afterward.
     let load_buf = with_host(|h| h.open_load_buffer(&src, false));
-    let result = crate::run_top_forms(&src, true);
+    let load_obj = with_host(|h| h.buffer_object(load_buf));
+    let result = crate::run_top_forms(&src, Some(load_obj));
     with_host(|h| {
         let obj = h.buffer_object(load_buf);
         h.kill_buffer(Some(&obj));

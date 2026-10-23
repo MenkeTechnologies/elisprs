@@ -30,6 +30,33 @@ pub fn read_all(h: &mut ElispHost, src: &str) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
+/// The forms of a source read one at a time, as lread.c's `readevalloop` reads
+/// them: each form is read only after the previous one has run, so a file whose
+/// tail does not read still runs everything before it.
+pub struct FormStream {
+    r: Reader,
+}
+
+impl FormStream {
+    pub fn new(src: &str) -> FormStream {
+        FormStream {
+            r: Reader::new(src.chars().collect(), 0),
+        }
+    }
+
+    /// The next top-level form, or `None` at the end of the source.
+    pub fn next_form(&mut self, h: &mut ElispHost) -> Result<Option<Value>, String> {
+        self.r.skip_ws();
+        if self.r.pos >= self.r.chars.len() {
+            return Ok(None);
+        }
+        // `read_objects_map` is per top-level read (see `read_all`).
+        self.r.labels.clear();
+        self.r.completed.clear();
+        self.r.read_form(h).map(Some)
+    }
+}
+
 /// Read a single form starting at char index `start`, returning it together
 /// with the char index just past it (for `read-from-string`).
 pub fn read_one(h: &mut ElispHost, src: &str, start: usize) -> Result<(Value, usize), String> {

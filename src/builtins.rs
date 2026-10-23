@@ -7486,11 +7486,22 @@ fn read_fn(h: &mut ElispHost, a: &[Value]) -> R {
         Err(e) if e == "end-of-file" => start + text.chars().count(),
         Err(_) => start,
     };
+    let from_buffer = marker.is_none();
     match marker {
         Some(m) => m.borrow_mut().pos = end,
         None => h.buffers[bi].point = end,
     }
-    r.map(|(form, _)| form)
+    match r {
+        // lread.c `end_of_file_error`: a buffer source is the datum; a marker
+        // source is not a buffer source and signals bare.
+        Err(e) if e == "end-of-file" && from_buffer => {
+            let sym = h.intern("end-of-file");
+            let obj = h.list_from(vec![sym, stream]);
+            h.set_pending_error(&e, obj);
+            Err(e)
+        }
+        r => r.map(|(form, _)| form),
+    }
 }
 /// `(read-from-string STRING &optional START END)` — read the first object from
 /// STRING (from char index START), returning `(OBJECT . END-INDEX)`.
@@ -9506,6 +9517,10 @@ fn put_text_property_fn(h: &mut ElispHost, a: &[Value]) -> R {
     match obj {
         PropObj::Str(s) => h.string_put_prop(&s, lo, hi, &prop, &val),
         PropObj::Buf(bi) => {
+            if changed {
+                let pair = [(prop.clone(), val.clone())];
+                record_prop_undo(h, bi, lo, hi, PropUndo::Add(&pair));
+            }
             with_buffer(h, bi, |h| h.buffer_put_prop(lo, hi, &prop, &val));
             if changed {
                 h.note_prop_change(bi);
@@ -9539,6 +9554,7 @@ fn set_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
     match obj {
         PropObj::Str(s) => h.string_set_props(&s, lo, hi, &plist),
         PropObj::Buf(bi) => {
+            record_prop_undo(h, bi, lo, hi, PropUndo::Set(&plist));
             with_buffer(h, bi, |h| h.buffer_set_props(lo, hi, &plist));
             if lo < hi {
                 h.note_prop_change(bi);
@@ -9618,6 +9634,7 @@ fn add_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
         }
         PropObj::Buf(bi) => {
             let bi = *bi;
+            record_prop_undo(h, bi, lo, hi, PropUndo::Add(&pairs));
             with_buffer(h, bi, |h| {
                 h.buffer_add_props(lo, hi, &pairs, crate::textprop::SetType::Replace)
             });
@@ -9643,6 +9660,7 @@ fn remove_text_properties_fn(h: &mut ElispHost, a: &[Value]) -> R {
         PropObj::Buf(bi) => {
             let bi = *bi;
             let names: Vec<Value> = pairs.iter().map(|(k, _)| k.clone()).collect();
+            record_prop_undo(h, bi, lo, hi, PropUndo::Remove(&names));
             with_buffer(h, bi, |h| h.buffer_remove_props(lo, hi, &names));
         }
     }
@@ -9666,6 +9684,7 @@ fn replace_chars_in_place_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
     if lo < hi {
         h.barf_if_read_only()?;
+        h.record_change(lo, hi - lo);
         h.note_text_change(hi - lo);
         h.cur_buf().text[lo - 1..hi - 1].copy_from_slice(&new);
     }
@@ -9695,8 +9714,16 @@ fn transpose_regions_fn(h: &mut ElispHost, a: &[Value]) -> R {
         return Ok(Value::Undef);
     }
     h.barf_if_read_only()?;
-    h.note_text_change(end2 - start1);
     let (len1, len2) = (end1 - start1, end2 - start2);
+    // The undo records: equal lengths are two changes, unless the regions
+    // touch; otherwise one change over the whole span.
+    if len1 == len2 && end1 != start2 {
+        h.record_change(start1, len1);
+        h.record_change(start2, len2);
+    } else {
+        h.record_change(start1, end2 - start1);
+    }
+    h.note_text_change(end2 - start1);
     // 0-based: region 1 [s1, e1), the text between [e1, s2), region 2 [s2, e2).
     let (s1, e1, s2, e2) = (start1 - 1, end1 - 1, start2 - 1, end2 - 1);
     // Where a 0-based position inside the span lands, as transpose_markers
@@ -9847,7 +9874,11 @@ fn args_out_of_range_values(h: &mut ElispHost, data: Vec<Value>) -> String {
 }
 /// Port of `validate_region` (buffer.c): START and END in either order, both
 /// inside the accessible portion, or `(args-out-of-range BUFFER START END)`.
-fn validate_region(h: &mut ElispHost, b: &Value, e: &Value) -> Result<(usize, usize), String> {
+pub(crate) fn validate_region(
+    h: &mut ElispHost,
+    b: &Value,
+    e: &Value,
+) -> Result<(usize, usize), String> {
     let (s0, e0) = (fix_position(h, b)?, fix_position(h, e)?);
     let (lo, hi) = if e0 < s0 { (e0, s0) } else { (s0, e0) };
     let buf = h.cur_buf_ref();
@@ -9984,12 +10015,22 @@ fn eol_n(h: &mut ElispHost, a: &[Value]) -> Result<usize, String> {
     let (pos, counted) = find_newline(&buf.text, buf.point, cnt, buf.begv, buf.zv);
     Ok(if counted == cnt { pos - 1 } else { pos })
 }
+/// cmds.c `Fbeginning_of_line` / `Fend_of_line`: N nil is 1, anything else
+/// must be a fixnum.
+fn check_line_motion_arg(h: &mut ElispHost, a: &[Value]) -> Result<(), String> {
+    match a.first() {
+        Some(v) if !is_nil(v) => as_fixnum_named(h, v, "fixnump").map(|_| ()),
+        _ => Ok(()),
+    }
+}
 fn beginning_of_line(h: &mut ElispHost, a: &[Value]) -> R {
+    check_line_motion_arg(h, a)?;
     let p = bol_n(h, a)?;
     h.cur_buf().point = p;
     Ok(Value::Undef)
 }
 fn end_of_line(h: &mut ElispHost, a: &[Value]) -> R {
+    check_line_motion_arg(h, a)?;
     let p = eol_n(h, a)?;
     h.cur_buf().point = p;
     Ok(Value::Undef)
@@ -10912,7 +10953,7 @@ fn delete_char(h: &mut ElispHost, a: &[Value]) -> R {
     h.cur_delete(lo as usize, hi as usize);
     Ok(Value::Undef)
 }
-fn insert_char(h: &mut ElispHost, a: &[Value]) -> R {
+pub(crate) fn insert_char(h: &mut ElispHost, a: &[Value]) -> R {
     let c = char::from_u32(as_int(h, &a[0])? as u32).unwrap_or('\u{fffd}');
     let count = match a.get(1) {
         Some(v) if !is_nil(v) => as_int(h, v)?.max(0) as usize,
@@ -11014,7 +11055,13 @@ fn current_indentation(h: &mut ElispHost, _a: &[Value]) -> R {
 /// Port of `Findent_to` (indent.c): pad from point's column to COLUMN (and at
 /// least MINIMUM columns), with tabs where `indent-tabs-mode` allows, and
 /// answer the column reached.
-fn indent_to(h: &mut ElispHost, a: &[Value]) -> R {
+/// What `Findent_to` inserts at point: `(MINCOL, TABS, SPACES)`. Nothing to
+/// insert when point is already at MINCOL; otherwise the buffer must be
+/// writable.
+pub(crate) fn indent_to_plan(
+    h: &mut ElispHost,
+    a: &[Value],
+) -> Result<(i64, usize, usize), String> {
     let column = as_fixnum_named(h, &a[0], "fixnump")?;
     let minimum = match a.get(1) {
         Some(v) if !is_nil(v) => as_fixnum_named(h, v, "fixnump")?,
@@ -11025,21 +11072,31 @@ fn indent_to(h: &mut ElispHost, a: &[Value]) -> R {
     let mut fromcol = scan_for_column(h, point, i64::MAX).1;
     let mincol = (fromcol + minimum).max(column);
     if fromcol == mincol {
-        return Ok(Value::Int(mincol));
+        return Ok((mincol, 0, 0));
     }
     h.barf_if_read_only()?;
     let tabs_mode = h
         .find_symbol("indent-tabs-mode")
         .and_then(|s| h.get_value(&s).ok())
         .is_some_and(|v| !is_nil(&v));
+    let mut tabs = 0;
     if tabs_mode {
         let n = mincol / tab_width - fromcol / tab_width;
         if n != 0 {
-            h.cur_insert(vec!['\t'; n.max(0) as usize], true);
+            tabs = n.max(0) as usize;
             fromcol = (mincol / tab_width) * tab_width;
         }
     }
-    h.cur_insert(vec![' '; (mincol - fromcol).max(0) as usize], true);
+    Ok((mincol, tabs, (mincol - fromcol).max(0) as usize))
+}
+/// `(indent-to COLUMN &optional MINIMUM)` — indent.c. Its two insertions are
+/// `insert-char` calls with INHERIT, so `crate::modhooks` routes them
+/// through the change hooks and property inheritance; this body is what
+/// runs when neither applies.
+fn indent_to(h: &mut ElispHost, a: &[Value]) -> R {
+    let (mincol, tabs, spaces) = indent_to_plan(h, a)?;
+    h.cur_insert(vec!['\t'; tabs], true);
+    h.cur_insert(vec![' '; spaces], true);
     Ok(Value::Int(mincol))
 }
 /// Port of `Fmove_to_column` (indent.c): move to COLUMN on the current line,
@@ -11552,6 +11609,8 @@ pub fn install(h: &mut ElispHost) {
     // time
     s("getenv-internal", 1, Some(2), getenv_internal);
     s("set-time-zone-rule", 1, Some(1), set_time_zone_rule);
+    s("undo-boundary", 0, Some(0), undo_boundary_fn);
+    s("recent-auto-save-p", 0, Some(0), recent_auto_save_p);
     s("special-variable-p", 1, Some(1), special_variable_p);
     s("func-arity", 1, Some(1), func_arity);
     s("subr-arity", 1, Some(1), func_arity);
@@ -12381,6 +12440,7 @@ fn add_face_text_property_fn(h: &mut ElispHost, a: &[Value]) -> R {
         }
         PropObj::Buf(bi) => {
             let bi = *bi;
+            record_prop_undo(h, bi, lo, hi, PropUndo::Add(&pairs));
             let changed = with_buffer(h, bi, |h| h.buffer_add_props(lo, hi, &pairs, set_type));
             if changed {
                 h.note_prop_change(bi);
@@ -12405,6 +12465,132 @@ fn inherit_props_fn(h: &mut ElispHost, a: &[Value]) -> R {
     let inside = a.get(5).is_some_and(|v| !is_nil(v));
     h.buffer_inherit_props(start, end, &a[2], inside);
     Ok(Value::Undef)
+}
+
+/// `(undo-boundary)` — undo.c `Fundo_boundary` (see `ElispHost::undo_boundary`).
+fn undo_boundary_fn(h: &mut ElispHost, _a: &[Value]) -> R {
+    h.undo_boundary();
+    Ok(Value::Undef)
+}
+
+/// What a text-property change does to each interval, for its undo records.
+enum PropUndo<'a> {
+    /// `add_properties`: PAIRS are added or replace differing values.
+    Add(&'a [(Value, Value)]),
+    /// `remove_properties`: the properties named are removed.
+    Remove(&'a [Value]),
+    /// `set_properties`: the interval's plist becomes PLIST.
+    Set(&'a Value),
+}
+
+/// The undo records textprop.c's `add_properties`, `remove_properties` and
+/// `set_properties` make for the 0-based span `[lo, hi)` of buffer BI before
+/// changing it: one `(nil PROP OLD-VALUE BEG . END)` per interval (clipped to
+/// the span) and per property whose value changes, OLD-VALUE nil for a
+/// property the interval lacks.
+fn record_prop_undo(h: &mut ElispHost, bi: usize, lo: usize, hi: usize, change: PropUndo) {
+    if lo >= hi {
+        return;
+    }
+    let (props, bounds) = {
+        let b = &h.buffers[bi];
+        (b.props.clone(), b.prop_bounds.clone())
+    };
+    let runs = h.tp_runs(&props, &bounds);
+    let mut records: Vec<(usize, usize, Value, Value)> = Vec::new();
+    for (rs, re) in runs {
+        let (s, e) = (rs.max(lo), re.min(hi));
+        if s >= e {
+            continue;
+        }
+        let plist = props[rs].clone();
+        match &change {
+            PropUndo::Add(pairs) => {
+                for (prop, val) in pairs.iter() {
+                    match plist_lookup(h, &plist, prop) {
+                        Some(old) if h.values_eq(&old, val) => {}
+                        Some(old) => records.push((s, e, prop.clone(), old)),
+                        None => records.push((s, e, prop.clone(), Value::Undef)),
+                    }
+                }
+            }
+            PropUndo::Remove(names) => {
+                for name in names.iter() {
+                    if let Some(old) = plist_lookup(h, &plist, name) {
+                        records.push((s, e, name.clone(), old));
+                    }
+                }
+            }
+            PropUndo::Set(new) => {
+                for (prop, old) in each_prop_pair(h, &plist) {
+                    let same = plist_lookup(h, new, &prop).is_some_and(|v| h.values_eq(&v, &old));
+                    if !same {
+                        records.push((s, e, prop, old));
+                    }
+                }
+                for (prop, _) in each_prop_pair(h, new) {
+                    if plist_lookup(h, &plist, &prop).is_none() {
+                        records.push((s, e, prop, Value::Undef));
+                    }
+                }
+            }
+        }
+    }
+    for (s, e, prop, old) in records {
+        h.record_property_change(bi, s + 1, e - s, prop, old);
+    }
+}
+
+/// `(recent-auto-save-p)` — fileio.c: whether the buffer was auto-saved since
+/// it was last saved (`SAVE_MODIFF < BUF_AUTOSAVE_MODIFF`).
+fn recent_auto_save_p(h: &mut ElispHost, _a: &[Value]) -> R {
+    let m = &h.cur_buf_ref().mods;
+    Ok(nil_or(m.save_modiff < m.autosave_modiff))
+}
+
+/// For `crate::modhooks`: the buffer and 1-based span `[BEG, END)` a call
+/// of the text-property primitive NAME with ARGS changes, `None` when it is
+/// a string, the arguments are invalid, or nothing would change (textprop.c
+/// returns before `modify_text_properties` then). OBJECT is `args[object]`.
+pub(crate) fn text_prop_change_span(
+    h: &mut ElispHost,
+    name: &str,
+    args: &[Value],
+    object: usize,
+) -> Option<(usize, usize, usize)> {
+    let (Value::Int(start), Value::Int(end)) = (args.first()?.clone(), args.get(1)?.clone()) else {
+        return None;
+    };
+    let obj = prop_object(h, args.get(object)).ok()?;
+    let PropObj::Buf(bi) = obj else {
+        return None;
+    };
+    let (lo, hi) = prop_range(&obj, start, end, h).ok()?;
+    if lo >= hi {
+        return None;
+    }
+    let changes = match name {
+        "put-text-property" => {
+            let pair = [(args.get(2)?.clone(), args.get(3)?.clone())];
+            props_would_change(h, &obj, lo, hi, &pair, true)
+        }
+        "add-text-properties" => {
+            let pairs = each_prop_pair(h, args.get(2)?);
+            props_would_change(h, &obj, lo, hi, &pairs, true)
+        }
+        "remove-text-properties" => {
+            let pairs = each_prop_pair(h, args.get(2)?);
+            props_would_change(h, &obj, lo, hi, &pairs, false)
+        }
+        "add-face-text-property" => {
+            let face = h.intern("face");
+            let pair = [(face, args.get(2)?.clone())];
+            props_would_change(h, &obj, lo, hi, &pair, true)
+        }
+        // `set_text_properties`: nil PROPERTIES on text with no intervals.
+        _ => !(args.get(2).is_none_or(is_nil) && !h.buffers[bi].has_intervals),
+    };
+    changes.then_some((bi, lo + 1, hi + 1))
 }
 
 #[cfg(test)]

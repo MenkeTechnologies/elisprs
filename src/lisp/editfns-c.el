@@ -280,9 +280,8 @@ If POS is out of range, the value is nil."
       ch)))
 
 
-;;;; insdel.c — the change hook variables.  Insertions and deletions do not
-;;;; run them yet (see BUGS.md); they exist so the code that binds and
-;;;; inspects them, like subr.el's `combine-change-calls-1', runs.
+;;;; insdel.c — the change hooks.  src/modhooks.rs calls the two signal
+;;;; functions around every buffer-modifying primitive.
 
 (defvar before-change-functions nil
   "List of functions to call before each text change.")
@@ -290,3 +289,118 @@ If POS is out of range, the value is nil."
   "List of functions to call after each text change.")
 (defvar first-change-hook nil
   "A list of functions to call before changing a buffer which is unmodified.")
+
+;;;; undo.c's variables (the recording itself is src/host.rs's).
+
+(defvar undo-limit 160000
+  "Keep no more undo information once it exceeds this size.")
+(defvar undo-strong-limit 240000
+  "Don't keep more than this much size of undo information.")
+(defvar undo-outer-limit nil
+  "Outer limit on size of undo information for one command.")
+(defvar undo-outer-limit-function 'undo-outer-limit-truncate
+  "Function to call when an undo list exceeds `undo-outer-limit'.")
+(defvar undo-inhibit-record-point nil
+  "Non-nil means do not record `point' in `buffer-undo-list'.")
+
+;;;; fileio.c
+
+(defun visited-file-modtime ()
+  "Return the current buffer's recorded visited file modification time.
+Return 0 if the buffer does not visit a file, which is every buffer here:
+nothing records a visited file's modification time."
+  0)
+
+;;;; buffer.c
+
+(defun buffer-base-buffer (&optional buffer)
+  "Return the base buffer of indirect buffer BUFFER.
+If BUFFER is not indirect, return nil.  There are no indirect buffers
+here, so the answer is always nil.
+BUFFER defaults to the current buffer."
+  (unless (or (null buffer) (bufferp buffer))
+    (signal 'wrong-type-argument (list 'bufferp buffer)))
+  nil)
+
+;;;; xdisp.c
+
+(defun editfns--invisible-prop (propval list)
+  "invisible_prop: 1 if PROPVAL (or an element of it) is in LIST, 2 if it is
+the car of a (ATOM . NON-NIL) element there (ellipsis), else 0."
+  (catch 'found
+    (dolist (tem list)
+      (cond ((eq propval tem) (throw 'found 1))
+            ((and (consp tem) (eq propval (car tem)))
+             (throw 'found (if (cdr tem) 2 1)))))
+    (when (consp propval)
+      (dolist (propelt propval)
+        (dolist (tem list)
+          (cond ((eq propelt tem) (throw 'found 1))
+                ((and (consp tem) (eq propelt (car tem)))
+                 (throw 'found (if (cdr tem) 2 1)))))))
+    0))
+
+(defun invisible-p (pos-or-prop)
+  "Non-nil if text properties at POS cause text there to be currently invisible.
+POS should be a marker or a buffer position; the value of the `invisible'
+property at that position in the current buffer is examined.
+POS can also be the actual value of the `invisible' text or overlay
+property of the text of interest, in which case the value itself is
+examined.
+
+The non-nil value returned can be t for currently invisible text that is
+entirely hidden on display, or some other non-nil, non-t value if the
+text is replaced by an ellipsis."
+  (let* ((prop (if (or (natnump pos-or-prop) (markerp pos-or-prop))
+                   (get-char-property pos-or-prop 'invisible)
+                 pos-or-prop))
+         (invis (if (eq buffer-invisibility-spec t)
+                    (if prop 1 0)
+                  (editfns--invisible-prop prop buffer-invisibility-spec))))
+    (cond ((= invis 0) nil)
+          ((= invis 1) t)
+          (t invis))))
+
+;;;; keyboard.c
+
+(defvar unread-command-events nil
+  "List of events to be read as the command input.")
+
+(defmacro editfns--run-change-hook (hook &rest args)
+  "Run HOOK with ARGS, setting HOOK to nil if a function signals an error.
+This is insdel.c's `reset_var_on_error' around `Frun_hook_with_args'."
+  `(let ((done nil))
+     (unwind-protect
+         (progn (run-hook-with-args ',hook ,@args)
+                (setq done t))
+       (unless done
+         (setq ,hook nil)))))
+
+(defun elisprs--signal-before-change (beg end &optional buffer)
+  "insdel.c `signal_before_change' for the text from BEG to END of BUFFER.
+`first-change-hook' runs first when the buffer is unmodified, then
+`before-change-functions', with `inhibit-modification-hooks' bound to t."
+  (with-current-buffer (or buffer (current-buffer))
+    (let ((inhibit-modification-hooks t))
+      (when (and first-change-hook (not (buffer-modified-p)))
+        (run-hooks 'first-change-hook))
+      (when before-change-functions
+        (editfns--run-change-hook before-change-functions beg end)))))
+
+(defun elisprs--signal-after-change (beg end oldlen &optional buffer)
+  "insdel.c `signal_after_change': the text from BEG to END of BUFFER replaced
+OLDLEN characters.  `after-change-functions' run with
+`inhibit-modification-hooks' bound to t."
+  (with-current-buffer (or buffer (current-buffer))
+    (unless inhibit-modification-hooks
+      (let ((inhibit-modification-hooks t))
+        (when after-change-functions
+          (editfns--run-change-hook after-change-functions beg end oldlen))))))
+
+;;;; filelock.c
+
+(defun unlock-buffer ()
+  "Unlock the file visited in the current buffer.
+There are no file locks here (no buffer's file is ever locked), so this
+does nothing and returns nil."
+  nil)

@@ -20,6 +20,7 @@ pub mod host;
 pub mod intercepts;
 pub mod json;
 pub mod lsp;
+pub mod modhooks;
 pub mod prelude;
 pub mod prelude_31;
 pub mod reader;
@@ -119,13 +120,18 @@ fn splice_top_forms(h: &mut host::ElispHost, forms: Vec<Value>) -> Vec<Value> {
 /// machinery shared by `eval_forms`, `eval_file`'s cache-miss path, and the
 /// `load` builtin, so none of them re-implement a divergent evaluator.
 ///
-/// `loading` is true for a file being loaded, whose forms are expanded the way
-/// `load` expands them ([`host::macroexpand_for_load`]); `eval_str` stands in
-/// for `--eval` and keeps the walk that defers an expander's failure.
+/// `load_buffer` is the buffer a file being loaded is read through: its forms
+/// are read one at a time as `readevalloop` reads them, expanded the way `load`
+/// expands them ([`host::macroexpand_for_load`]), and running out of text
+/// mid-form is `(end-of-file BUFFER)` (lread.c `end_of_file_error` for a buffer
+/// source). `None` stands in for `--eval`: the source is read as a whole first,
+/// a truncated form is a bare `(end-of-file)`, and the walk that defers an
+/// expander's failure is kept.
 pub(crate) fn run_top_forms(
     src: &str,
-    loading: bool,
+    load_buffer: Option<Value>,
 ) -> Result<(Vec<fusevm::Chunk>, Value), String> {
+    let loading = load_buffer.is_some();
     // Rewrite any inline `rust { ... }` FFI block into a `(__rust-compile ...)`
     // call before the reader runs (no-op when the source has no `rust` token).
     let src = rust_ffi::desugar(src);
@@ -133,13 +139,51 @@ pub(crate) fn run_top_forms(
     // compiling too: without this the image stopped carrying them and
     // `(intern-soft "a-symbol-this-file-mentions")` answered nil on a warm cache
     // and the symbol on a cold one.
-    let prev_read = host::with_host(|h| h.set_compiling_form(true));
-    let forms = host::with_host(|h| reader::read_all(h, &src).map(|fs| splice_top_forms(h, fs)));
-    host::with_host(|h| h.set_compiling_form(prev_read));
-    let forms = forms?;
-    let mut chunks = Vec::with_capacity(forms.len());
+    let read_forms = |h: &mut host::ElispHost, stream: &mut Option<reader::FormStream>| {
+        let prev_read = h.set_compiling_form(true);
+        let forms = match stream {
+            Some(s) => s
+                .next_form(h)
+                .map(|f| f.map(|f| splice_top_forms(h, vec![f]))),
+            None => reader::read_all(h, &src).map(|fs| Some(splice_top_forms(h, fs))),
+        };
+        h.set_compiling_form(prev_read);
+        forms
+    };
+    let mut stream = loading.then(|| reader::FormStream::new(&src));
+    let mut chunks = Vec::new();
     let mut last = Value::Undef;
-    for form in &forms {
+    loop {
+        let forms = match host::with_host(|h| read_forms(h, &mut stream)) {
+            Ok(Some(forms)) => forms,
+            Ok(None) => break,
+            Err(e) if e == "end-of-file" && loading => {
+                return Err(host::with_host(|h| {
+                    let sym = h.intern("end-of-file");
+                    let buf = load_buffer.clone().unwrap_or(Value::Undef);
+                    let obj = h.list_from(vec![sym, buf]);
+                    h.set_pending_error(&e, obj);
+                    e
+                }));
+            }
+            Err(e) => return Err(e),
+        };
+        run_forms(&forms, loading, &mut chunks, &mut last)?;
+        if stream.is_none() {
+            break;
+        }
+    }
+    Ok((chunks, last))
+}
+
+/// Macro-expand, lower and run FORMS in order, collecting their chunks.
+fn run_forms(
+    forms: &[Value],
+    loading: bool,
+    chunks: &mut Vec<fusevm::Chunk>,
+    last: &mut Value,
+) -> Result<(), String> {
+    for form in forms {
         // Macro-expand + lower with the host marked as COMPILING, so a symbol
         // interned here is recorded as a literal of the file rather than as
         // something the program interned while running. Only the first kind
@@ -159,14 +203,14 @@ pub(crate) fn run_top_forms(
         host::with_host(|h| h.set_compiling_form(prev));
         let chunk = lowered?;
         chunks.push(chunk.clone());
-        last = host::run_chunk(chunk)?;
+        *last = host::run_chunk(chunk)?;
     }
-    Ok((chunks, last))
+    Ok(())
 }
 
 /// Evaluate a sequence of top-level forms (macro-expand → lower → run).
 fn eval_forms(src: &str) -> Result<Value, String> {
-    run_top_forms(src, false).map(|(_, last)| last)
+    run_top_forms(src, None).map(|(_, last)| last)
 }
 
 /// callproc.c `set_initial_environment`: `process-environment` is the
@@ -202,6 +246,8 @@ fn install_process_environment() {
 /// moment; a later change to `HOME` in `process-environment` does not move
 /// it. Per-run state like the environment it is computed from.
 fn install_abbreviated_home_dir() {
+    // The call runs searches; it must not leave its match data behind.
+    let saved = host::with_host(|h| h.match_data.clone());
     let f = host::with_host(|h| {
         let var = h.intern("abbreviated-home-dir");
         let _ = h.set_value(&var, Value::Undef);
@@ -209,6 +255,7 @@ fn install_abbreviated_home_dir() {
     });
     let root = host::with_host(|h| h.new_string("/".to_string()));
     let _ = host::call_function(&f, &[root]);
+    host::with_host(|h| h.match_data = saved);
 }
 
 /// Load the derived-surface prelude once per host, best-effort (a broken
@@ -526,7 +573,9 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
 
     // Bind load-file-name only while the forms run; unbind before the clean heap
     // image is captured so the cached image carries no transient load binding.
-    let (chunks, last) = with_load_file_name(path, || run_top_forms(&src, true))?;
+    let load_buffer = host::with_host(|h| h.load_buffer_object());
+    let (chunks, last) =
+        with_load_file_name(path, || run_top_forms(&src, Some(load_buffer.clone())))?;
     // Only the part of the image this FILE owns: `clean_prelude` is the rest,
     // and the cache stores it once per shard rather than once per entry.
     let heap_tail = host::with_host(|h| h.export_heap_tail_clean(prelude_end));

@@ -7173,3 +7173,99 @@ Expectations: `tests/parity_fields_and_editfns_primitives.rs`.
 - `current-bidi-paragraph-direction` (xdisp.c) is void, so
   `indent-rigidly-left`/`-right`/`-to-tab-stop` signal.
 - `emacs-lisp-mode` and the other major modes are void.
+
+## Round 44 — change hooks, field-aware lines, undo, `end-of-file` per source
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch -l scripts/fuzz/drive.el`).
+Closed from round 43's open list: the change hooks, fields in the line
+functions, `indent-to`/`insert-char` inheritance, undo and `cycle-spacing`,
+and the `end-of-file` data drift.
+
+### R44-A. ✅ FIXED — insdel.c's change hooks run around every modifying primitive
+
+No edit ran `before-change-functions`, `after-change-functions` or
+`first-change-hook`, and none set `deactivate-mark`. A subr body holds the
+host borrow and cannot call Lisp, so `src/modhooks.rs` runs that part from
+`host::call_function`, around the subr: `insert` (one change per argument),
+`insert-before-markers`, `insert-char`, `indent-to`, `delete-region`,
+`delete-and-extract-region`, `delete-char` (KILLFLAG now calls
+`kill-forward-chars`, as cmds.c does), `erase-buffer` (widened first),
+`replace-match`, `transpose-regions`, the case-region primitive,
+`insert-file-contents` and the text-property primitives (only when they
+change something). `elisprs--signal-before-change` /
+`elisprs--signal-after-change` are `signal_before_change` /
+`signal_after_change`: `inhibit-modification-hooks` bound to t while they
+run, a signalling hook reset to nil.
+
+```text
+form                                                              was    Emacs 31.1 / now
+(insert "ab" "cd") etc. with logging hooks (see test)             nil    ((b 1 1 "") (a 1 3 0 "ab") …)
+(with-temp-buffer (setq deactivate-mark nil) (insert "a")
+  deactivate-mark)                                                nil    t
+```
+
+### R44-B. ✅ FIXED — `line-beginning-position` & co. respect fields
+
+`line-beginning-position`, `line-end-position`, `beginning-of-line` and
+`end-of-line` are editfns.c's / cmds.c's: the `pos-bol`/`pos-eol` position
+constrained with `constrain-to-field` (ONLY-IN-LINE t; ESCAPE-FROM-EDGE when
+`bol`'s count is non-zero). The constraint is skipped when the buffer has no
+text properties and no overlays, where it cannot move anything.
+`beginning-of-line`/`end-of-line` check a non-nil N with `fixnump`.
+
+### R44-C. ✅ FIXED — `insert-char` with INHERIT and `indent-to` inherit properties
+
+`Findent_to` inserts with `Finsert_char (…, Qt)`; both now inherit as
+`insert-and-inherit` does, so `set-left-margin` leaves one `left-margin`
+interval over the reindented text.
+
+### R44-D. ✅ FIXED — undo
+
+`buffer-undo-list` recorded nothing and `undo-boundary` / `primitive-undo`
+were void. undo.c is ported in `src/host.rs`: `record_insert` (merging),
+`record_delete` (the text with its properties, `-POS` when point is at its
+end, marker adjustments newest marker first), `record_change` (the case and
+replace-in-place primitives, `transpose-regions` with the C's one-or-two
+change split), `record_property_change` (each interval and property a
+text-property primitive changes), `record_first_change` (`(t . 0)`),
+`record_point` after an `undo-boundary`. simple.el's undo functions and
+subr.el's change groups are verbatim (`src/lisp/undo-31.el`), and
+`cycle-spacing` (which needs them) joined simple-31.el. Also ported:
+`recent-auto-save-p`, `visited-file-modtime` (0: no buffer visits a file),
+`unlock-buffer` (no file locks), `buffer-base-buffer` (no indirect buffers).
+
+### R44-E. ✅ FIXED — `end-of-file` data per source; a load reads form by form
+
+The `end-of-file` drift recorded under "Oracle drift" is followed now: a
+string source is bare `(end-of-file)` even while a file loads, `(read BUFFER)`
+is `(end-of-file BUFFER)`, and a truncated form in a loaded file is
+`(end-of-file LOAD-BUFFER)` — the killed ` *load*` buffer. A loaded file is
+read one form at a time (`readevalloop`), so the forms before a truncated
+one have run; it was read whole first and nothing ran.
+`tests/parity_end_of_file_data.rs` and `examples/error-data.el` pinned the
+Emacs 30 datum (the file name); both are re-measured against 31.1 in their
+own commit, and GNU Emacs 31.1 itself fails the old `error-data.el` test.
+
+### Also
+
+- `invisible-p` (xdisp.c, with `invisible_prop`) and `unread-command-events`.
+
+### Still open after round 44
+
+- `undo` itself needs `selected-window` / `minibuffer-window`: there are no
+  windows (nor `end-of-buffer`, `yank-pop`, `append-to-buffer`).
+- replace.el (`perform-replace`, `replace-string`, `replace-regexp`,
+  `how-many`, `keep-lines`, `flush-lines`) needs windows and faces
+  (`replace-highlight`, `isearch-lazy-highlight-new-loop`, `facep`).
+- `undo-auto--undoable-change` is not called on a change (no timers).
+- Printing to a buffer (`princ` etc. with a buffer or marker destination),
+  `move-to-column` with FORCE, `call-process` output and
+  `subst-char-in-region`'s per-character records run no change hooks / make
+  Emacs's undo records only approximately.
+- Overlay modification hooks and the `modification-hooks` /
+  `insert-in-front-hooks` / `insert-behind-hooks` text properties.
+- `read` from a function stream signals `wrong-type-argument stringp`.
+- `eval-buffer`, `eval-region` are void.
+- `current-bidi-paragraph-direction` (needs Unicode bidi classes) and the
+  rest of characters.el's category data (needs charset and Unicode property
+  tables) are still missing.

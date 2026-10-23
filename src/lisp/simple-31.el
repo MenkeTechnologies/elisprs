@@ -2,8 +2,8 @@
 
 ;; Verbatim definitions from GNU Emacs 31.1 lisp/simple.el, then
 ;; lisp/emacs-lisp/lisp.el and lisp/textmodes/text-mode.el, each in file order.  Commands that need windows
-;; (`end-of-buffer', `yank-pop', `append-to-buffer'), undo change groups
-;; (`cycle-spacing') or compositions (`delete-forward-char') are not here.
+;; (`end-of-buffer', `yank-pop', `append-to-buffer') or compositions
+;; (`delete-forward-char') are not here.
 
 ;;;; simple.el
 
@@ -121,6 +121,213 @@ If BACKWARD-ONLY is non-nil, delete them only before point."
      (progn
        (skip-chars-backward chars)
        (constrain-to-field nil orig-pos)))))
+
+(defvar cycle-spacing--context nil
+  "Stored context used in consecutive calls to `cycle-spacing' command.
+The value is a property list with the following elements:
+- `:orig-pos'    The original position of point when starting the
+                 sequence.
+- `:whitespace-string' All whitespace characters around point
+                       including newlines.
+- `:n'            The prefix arg given to the initial invocation
+                  which is reused for all actions in this cycle.
+- `:last-action'  The last action performed in the cycle.")
+
+(defcustom cycle-spacing-actions
+  '( just-one-space
+     delete-all-space
+     restore)
+  "List of actions cycled through by `cycle-spacing'.
+Supported values are:
+- `just-one-space'      Delete all but N (prefix arg) spaces.
+                        See that command's docstring for details.
+- `delete-space-after'  Delete spaces after point keeping only N.
+- `delete-space-before' Delete spaces before point keeping only N.
+- `delete-all-space'    Delete all spaces around point.
+- `restore'             Restore the original spacing.
+
+All actions make use of the prefix arg given to `cycle-spacing'
+in the initial invocation, i.e., `just-one-space' keeps this
+amount of spaces deleting surplus ones.  `just-one-space' and all
+other actions have the contract that a positive prefix arg (or
+zero) only deletes tabs and spaces whereas a negative prefix arg
+also deletes newlines.
+
+The `delete-space-before' and `delete-space-after' actions handle
+the prefix arg \\[negative-argument] without a number provided
+specially: all spaces before/after point are deleted (as if N was
+0) including newlines (as if N was negative).
+
+In addition to the predefined actions listed above, any function
+which accepts one argument is allowed.  It receives the raw
+prefix arg of this cycle.
+
+In addition, an action may take the form (ACTION ARG) where
+ACTION is one of the predefined actions (except for `restore')
+and ARG is either
+- an integer with the meaning that ACTION should always use this
+  fixed integer instead of the actual prefix arg or
+- the symbol `inverted-arg' with the meaning that ACTION should
+  be performed with the inverted actual prefix arg.
+- the symbol `-' with the meaning that ACTION should include
+  newlines but it's up to the ACTION to decide how to interpret
+  it as a number, e.g., `delete-space-before' and
+  `delete-space-after' treat it like 0 whereas `just-one-space'
+  treats it like -1 as is usual."
+  :group 'editing-basics
+  :type (let ((actions
+               '((const :tag "Just N (prefix arg) spaces" just-one-space)
+                 (const :tag "Delete spaces after point" delete-space-after)
+                 (const :tag "Delete spaces before point" delete-space-before)
+                 (const :tag "Delete all spaces around point" delete-all-space)
+                 (function :tag "Function receiving a numeric arg"))))
+          `(repeat
+            (choice
+             ,@actions
+             (list :tag "Action with modified arg"
+                   (choice ,@actions)
+                   (choice (const :tag "Inverted prefix arg" inverted-arg)
+                           (integer :tag "Fixed numeric arg")
+                           (const :tag "Negative arg" -)))
+             (const :tag "Restore the original spacing" restore))))
+  :version "29.1")
+
+(defun cycle-spacing (&optional n)
+  "Manipulate whitespace around point in a smart way.
+Repeated calls perform the actions in `cycle-spacing-actions' one
+after the other, wrapping around after the last one.
+
+All actions are amendable using a prefix arg N.  In general, a
+zero or positive prefix arg allows only for deletion of tabs and
+spaces whereas a negative prefix arg also allows for deleting
+newlines.
+
+The prefix arg given at the first invocation starting a cycle is
+provided to all following actions, i.e.,
+    \\[negative-argument] \\[cycle-spacing] \\[cycle-spacing] \\[cycle-spacing]
+is equivalent to
+    \\[negative-argument] \\[cycle-spacing] \\[negative-argument] \\[cycle-spacing] \\[negative-argument] \\[cycle-spacing].
+
+A new sequence can be started by providing a different prefix arg
+than provided at the initial invocation (except for 1), or by
+doing any other command before the next \\[cycle-spacing]."
+  (interactive "*P")
+  ;; Initialize `cycle-spacing--context' if needed.
+  (when (or (not (equal last-command this-command))
+            (not cycle-spacing--context)
+            ;; With M-5 M-SPC M-SPC... we pass the prefix arg 5 to
+            ;; each action and only start a new cycle when a different
+            ;; prefix arg is given and which is not the default value
+            ;; 1.
+            (and n (not (equal (plist-get cycle-spacing--context :n)
+                               n))))
+    (let ((orig-pos (point))
+          (skip-characters " \t\n\r"))
+      (save-excursion
+        (skip-chars-backward skip-characters)
+        (constrain-to-field nil orig-pos)
+        (let ((start (point))
+              (end   (progn
+                       (skip-chars-forward skip-characters)
+                       (constrain-to-field nil orig-pos t))))
+          (setq cycle-spacing--context  ;; Save for later.
+                (list :orig-pos orig-pos
+                      :whitespace-string (buffer-substring start end)
+                      :n n
+                      :last-action nil))))))
+
+  ;; Cycle through the actions in `cycle-spacing-actions'.
+  (when cycle-spacing--context
+    (cl-labels ((next-action ()
+                  (let* ((l cycle-spacing-actions)
+                         (elt (plist-get cycle-spacing--context
+                                         :last-action)))
+                    (if (null elt)
+                        (car cycle-spacing-actions)
+                      (catch 'found
+                        (while l
+                          (cond
+                           ((null (cdr l))
+                            (throw 'found
+                                   (when (eq elt (car l))
+                                     (car cycle-spacing-actions))))
+                           ((and (eq elt (car l))
+                                 (cdr l))
+                            (throw 'found (cadr l)))
+                           (t (setq l (cdr l)))))))))
+                (skip-chars (chars max-dist direction)
+                  (if (eq direction 'forward)
+                      (skip-chars-forward
+                       chars
+                       (and max-dist (+ (point) max-dist)))
+                    (skip-chars-backward
+                     chars
+                     (and max-dist (- (point) max-dist)))))
+                (delete-space (n include-newlines direction)
+                  (let ((orig-point (point))
+                        (chars (if include-newlines
+                                   " \t\r\n"
+                                 " \t")))
+                    (when (or (zerop n)
+                              (= n (abs (skip-chars chars n direction))))
+                      (let ((start (point))
+                            (end (progn
+                                   (skip-chars chars nil direction)
+                                   (point))))
+                        (unless (= start end)
+                          (delete-region start end))
+                        (goto-char (if (eq direction 'forward)
+                                       orig-point
+                                     (+ n end)))))))
+                (restore ()
+                  (delete-all-space)
+                  (insert (plist-get cycle-spacing--context
+                                     :whitespace-string))
+                  (goto-char (plist-get cycle-spacing--context
+                                        :orig-pos))))
+      (let ((action (next-action)))
+        (atomic-change-group
+          (restore)
+          (unless (eq action 'restore)
+            ;; action can be some-action or (some-action <arg>) where
+            ;; arg is either an integer, the arg to be always used for
+            ;; this action or - to use the inverted context n for this
+            ;; action.
+            (let* ((actual-action (if (listp action)
+                                      (car action)
+                                    action))
+                   (arg (when (listp action)
+                          (nth 1 action)))
+                   (context-n (plist-get cycle-spacing--context :n))
+                   (actual-n (cond
+                              ((integerp arg) arg)
+                              ((eq 'inverted-arg arg)
+                               (* -1 (prefix-numeric-value context-n)))
+                              ((eq '- arg) '-)
+                              (t context-n)))
+                   (numeric-n (prefix-numeric-value actual-n))
+                   (include-newlines (or (eq actual-n '-)
+                                         (and (integerp actual-n)
+                                              (< actual-n 0)))))
+              (cond
+               ((eq actual-action 'just-one-space)
+                (just-one-space numeric-n))
+               ((eq actual-action 'delete-space-after)
+                (delete-space (if (eq actual-n '-) 0 (abs numeric-n))
+                              include-newlines 'forward))
+               ((eq actual-action 'delete-space-before)
+                (delete-space (if (eq actual-n '-) 0 (abs numeric-n))
+                              include-newlines 'backward))
+               ((eq actual-action 'delete-all-space)
+                (if include-newlines
+                    (delete-all-space)
+                  (delete-horizontal-space)))
+               ((functionp actual-action)
+                (funcall actual-action actual-n))
+               (t
+                (error "Don't know how to handle action %S" action)))))
+          (setf (plist-get cycle-spacing--context :last-action)
+                action))))))
 
 (defun beginning-of-buffer (&optional arg)
   "Move point to the beginning of the buffer.
