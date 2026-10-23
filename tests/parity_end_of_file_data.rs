@@ -1,22 +1,23 @@
-//! `end-of-file` carries the file being loaded, when there is one.
+//! `end-of-file` data follows the reader's source, not the file being loaded.
 //!
-//! Emacs's `end_of_file_error` (lread.c) is
+//! Emacs 31's `end_of_file_error` (lread.c) is
 //!
 //! ```c
-//! if (STRINGP (Vload_true_file_name))
+//! if (from_file_p (source))
 //!   xsignal1 (Qend_of_file, Vload_true_file_name);
-//! xsignal0 (Qend_of_file);
+//! else if (from_buffer_p (source))
+//!   xsignal1 (Qend_of_file, source->object);
+//! else
+//!   xsignal0 (Qend_of_file);
 //! ```
 //!
-//! so the same truncated `read` reports `(end-of-file "/path/to/file.el")` from
-//! inside a loaded file and a bare `(end-of-file)` from `--eval`. elisprs signals
-//! `end-of-file` from a dozen places in the reader and dropped its data
-//! unconditionally, so the loaded case lost the file name.
+//! so a truncated `read` of a string reports a bare `(end-of-file)` even from
+//! inside a loaded file. (Emacs 30 attached `load-true-file-name` to every
+//! `end-of-file`; this file pinned that until the oracle moved to 31.)
 //!
-//! This is a process-level test because the datum comes from
-//! `load-true-file-name`, which is only bound while a file's forms run.
-//! Measured against `emacs -Q --batch -l` / `emacs -Q --batch --eval` on
-//! GNU Emacs 30.2.
+//! This is a process-level test because the question is what happens while a
+//! file's forms run. Measured against `emacs -Q --batch -l` /
+//! `emacs -Q --batch --eval` on GNU Emacs 31.1.
 
 use std::process::Command;
 
@@ -38,21 +39,18 @@ fn run_script(tag: &str, script: &str) -> (String, String) {
     (stdout, path.to_string_lossy().into_owned())
 }
 
-/// Inside a loaded file the datum is the file. Both the `read-from-string` and
-/// the `read` spellings go through the same reader, so both must carry it.
+/// Inside a loaded file a string read still has no datum: both the
+/// `read-from-string` and the `read` spellings read a string.
 #[test]
-fn end_of_file_inside_a_load_names_the_file() {
+fn end_of_file_inside_a_load_reading_a_string_is_bare() {
     let script = r#"
 (prin1 (condition-case e (read-from-string "(1 2") (error e)))
 (terpri)
 (prin1 (condition-case e (read "(1") (error e)))
 (terpri)
 "#;
-    let (stdout, path) = run_script("in-load", script);
-    assert_eq!(
-        stdout,
-        format!("(end-of-file \"{path}\")\n(end-of-file \"{path}\")\n")
-    );
+    let (stdout, _) = run_script("in-load", script);
+    assert_eq!(stdout, "(end-of-file)\n(end-of-file)\n");
 }
 
 /// With no file being loaded the data list stays empty — the fix must not

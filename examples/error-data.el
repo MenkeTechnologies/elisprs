@@ -15,23 +15,15 @@
   (should (equal (condition-case e (% 7 0) (error e)) '(arith-error)))
   (should (equal (condition-case e (mod 7 0) (error e)) '(arith-error))))
 
-(ert-deftest err-data-end-of-file-names-the-file ()
-  "`end-of-file` is the exception: it carries the file being loaded.
+(ert-deftest err-data-end-of-file-from-a-string-is-bare ()
+  "`end-of-file` from reading a string carries no data, even while loading.
 
-`end_of_file_error` (lread.c) is
-
-    if (STRINGP (Vload_true_file_name))
-      xsignal1 (Qend_of_file, Vload_true_file_name);
-    xsignal0 (Qend_of_file);
-
-so a truncated `read` inside a loaded file reports the file and only a bare
-`emacs --batch --eval` reports the empty `(end-of-file)`.  This test file IS
-being loaded, so `load-true-file-name` is the expected datum.  The previous
-expectation here was the empty form, which `emacs -Q --batch -l` fails."
-  (should (equal (condition-case e (read "") (error e))
-                 (list 'end-of-file load-true-file-name)))
-  (should (equal (condition-case e (read "(1 2") (error e))
-                 (list 'end-of-file load-true-file-name)))
+Emacs 31's `end_of_file_error` (lread.c) attaches the source: the file for a
+file stream, the buffer for a buffer, nothing for a string.  Emacs 30
+attached `load-true-file-name` to every `end-of-file`; this test expected
+that until it was measured against `emacs -Q --batch -l` on GNU Emacs 31.1."
+  (should (equal (condition-case e (read "") (error e)) '(end-of-file)))
+  (should (equal (condition-case e (read "(1 2") (error e)) '(end-of-file)))
   (should (stringp load-true-file-name)))
 
 (ert-deftest err-data-message-kept ()
