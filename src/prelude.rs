@@ -4089,6 +4089,39 @@ remote, otherwise search locally."
            (with-current-buffer standard-output
              (buffer-string)))
        (kill-buffer standard-output))))
+;; subr.el (Emacs 31.1): `process-lines' runs PROGRAM through `call-process'.
+(defun process-lines-handling-status (program status-handler &rest args)
+  "Execute PROGRAM with ARGS, returning its output as a list of lines.
+If STATUS-HANDLER is non-nil, it must be a function with one
+argument, which will be called with the exit status of the
+program before the output is collected.  If STATUS-HANDLER is
+nil, an error is signaled if the program returns with a non-zero
+exit status."
+  (with-temp-buffer
+    (let ((status (apply #'call-process program nil (current-buffer) nil args)))
+      (if status-handler
+	  (funcall status-handler status)
+	(unless (eq status 0)
+	  (error "%s exited with status %s" program status)))
+      (goto-char (point-min))
+      (let (lines)
+	(while (not (eobp))
+	  (setq lines (cons (buffer-substring-no-properties
+			     (line-beginning-position)
+			     (line-end-position))
+			    lines))
+	  (forward-line 1))
+	(nreverse lines)))))
+(defun process-lines (program &rest args)
+  "Execute PROGRAM with ARGS, returning its output as a list of lines.
+Signal an error if the program returns with a non-zero exit status.
+Also see `process-lines-ignore-status'."
+  (apply #'process-lines-handling-status program nil args))
+(defun process-lines-ignore-status (program &rest args)
+  "Execute PROGRAM with ARGS, returning its output as a list of lines.
+The exit status of the program is ignored.
+Also see `process-lines'."
+  (apply #'process-lines-handling-status program #'ignore args))
 ;;; ---- format-spec.el ----
 ;; Faithful port of format-spec.el (Emacs 30.2). The previous implementation
 ;; substituted %CHAR and nothing else: it dropped the flag/width/precision

@@ -6,6 +6,14 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Round 46 parity vs Emacs 31.1** (see BUGS.md): `call-process`,
+  `process-lines` and `shell-command-to-string` run their child in
+  `default-directory` (callproc.c `get_current_directory`, with its
+  `Setting current directory` errors) and find the program on `exec-path`
+  (`openp`), not on the child's `PATH`; `exec-path` is rebuilt per run so a
+  cache hit follows the current `PATH`; `process-lines`,
+  `process-lines-handling-status` and `process-lines-ignore-status` are
+  subr.el's.
 - **Round 41 parity vs Emacs 31.1** (see BUGS.md): `cl-defstruct` constructors
   are cl-macs.el's `cl-defun`s with `&cl-defs`: an unknown, value-less or
   non-keyword argument to the keyword constructor signals, `:allow-other-keys`

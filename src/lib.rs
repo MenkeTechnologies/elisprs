@@ -270,6 +270,7 @@ fn load_prelude() {
     // preloaded-Lisp form again. See `host::restore_prelude_snapshot`.
     if host::restore_prelude_snapshot() {
         install_process_environment();
+        host::with_host(crate::builtins::install_exec_path);
         install_abbreviated_home_dir();
         return;
     }
@@ -408,6 +409,7 @@ pub enum EntryPoint {
 ///   `command-line-args` is the whole invocation.
 fn install_entry_point_state(path: &str, src: &str, entry: EntryPoint) {
     install_process_environment();
+    host::with_host(crate::builtins::install_exec_path);
     install_abbreviated_home_dir();
     // The initial buffer's syntax table, re-installed on EVERY run.
     //

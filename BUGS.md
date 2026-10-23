@@ -7373,3 +7373,69 @@ READ-FUNCTION); `values` is not special, as in Emacs.
   category data (Unicode property and charset tables).
 - `pop-to-buffer` / `display-buffer` (window.el's display machinery).
 - `terpri` with ENSURE into a buffer runs no change hooks.
+
+## Round 46 — subprocess working directory, `exec-path` search, subr.el's `process-lines`
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch -l FILE`, each form wrapped in
+`(condition-case e FORM (error e))`). Round 43 gave subprocesses
+`process-environment`; how the child is located and where it runs were
+still the Rust defaults.
+
+### R46-A. ✅ FIXED — a subprocess runs in `default-directory`
+
+`call-process`, `process-lines` and `shell-command-to-string` ran the child
+in elisprs's own working directory. They now go through callproc.c's
+`get_current_directory`: `default-directory` (or `~` when it is not a
+string), expanded, without its trailing slash and `/:` quoting, must pass
+`file_accessible_directory_p` (`access ("DIR/", F_OK)`), or the call signals
+`report_file_error ("Setting current directory", default-directory)`. `PWD`
+in the child's environment is that expanded directory.
+
+```text
+form                                                              was        Emacs 31.1 / now
+(let ((default-directory "/")) (process-lines "pwd"))            (CWD)      ("/")
+(let ((default-directory "/nonexistent-dir/")) (call-process      0          (file-missing "Setting current directory"
+  "pwd"))                                                                       "No such file or directory" "/nonexistent-dir/")
+(let ((default-directory "/etc/passwd")) (process-lines "pwd"))  (CWD)      (file-error "Setting current directory"
+                                                                                "Not a directory" "/etc/passwd")
+```
+
+### R46-B. ✅ FIXED — programs are found on `exec-path`
+
+The program was resolved by `std::process::Command`, which searches the
+`PATH` of the child's environment, so `(let ((process-environment (list
+"PATH=/x"))) (call-process "env"))` failed and `(let ((exec-path nil))
+(call-process "env"))` succeeded — both the other way round in Emacs.
+`call-process` now runs `openp (Vexec_path, PROGRAM, exec-suffixes, X_OK)`:
+an absolute or `~` name is tried once, any other is expanded against each
+`exec-path` element (nil meaning `default-directory`), and the first
+executable non-directory wins; otherwise `(file-missing "Searching for
+program" "No such file or directory" PROGRAM)`.
+
+`exec-path` is built at startup from `PATH` (`init_callproc`), and a
+bytecode-cache hit restored the value of the run that wrote the cache, so a
+changed `PATH` was ignored on warm runs. It is now rebuilt per run, with
+`process-environment`.
+
+### R46-C. ✅ FIXED — `process-lines` is subr.el's
+
+`process-lines` was a Rust subr that signalled `"false exited with non-zero
+status"`; `process-lines-handling-status` and `process-lines-ignore-status`
+were void. All three are subr.el's (over `call-process` into a temporary
+buffer), so a failure is `(error "false exited with status 1")`, a
+STATUS-HANDLER sees the exit status, and `(subrp (symbol-function
+'process-lines))` is nil as in Emacs.
+
+Expectations: `tests/parity_process_environment.rs`.
+
+### Still open after round 46
+
+- The child's environment reaches it in sorted order (`Command::envs`), not
+  `make_environment_block`'s order, which only a program printing its whole
+  environment can see.
+- `shell-command-to-string` runs `sh`; Emacs runs `shell-file-name`
+  (`$SHELL`, else `/bin/sh`) with `shell-command-switch`, and neither
+  variable is defined.
+- `call-process` ignores INFILE and DISPLAY, and a child killed by a signal
+  answers -1 where Emacs answers the signal's description string.
+- `file-truename` and `file-chase-links` are void.

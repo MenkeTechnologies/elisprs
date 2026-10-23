@@ -1376,7 +1376,6 @@ const LISP_LEVEL_ARITY: &[(&str, u16, u16)] = &[
     ("oclosure--get", 3, 3),
     ("oclosure--set", 3, 3),
     ("oclosure-type", 1, 1),
-    ("process-lines", 1, 1),
     ("sha1", 1, 4),
     ("shell-command-to-string", 1, 1),
     ("special-form-p", 1, 1),

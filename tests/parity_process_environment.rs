@@ -178,3 +178,98 @@ fn time_zone_rules() {
         "(ERR (error \"Invalid time specification\"))"
     );
 }
+
+/// callproc.c `get_current_directory`: a subprocess runs in
+/// `default-directory`, which must be an accessible directory; the error
+/// names the unexpanded value. `PWD` is the expanded directory.
+#[test]
+fn subprocesses_run_in_default_directory() {
+    assert_eq!(
+        eval("(let ((default-directory \"/\")) (with-temp-buffer (list (call-process \"pwd\" nil t) (buffer-string))))"),
+        "(0 \"/\n\")"
+    );
+    assert_eq!(
+        eval("(let ((default-directory \"/nonexistent-elisprs-dir/\")) (call-process \"pwd\"))"),
+        "(ERR (file-missing \"Setting current directory\" \"No such file or directory\" \"/nonexistent-elisprs-dir/\"))"
+    );
+    assert_eq!(
+        eval("(let ((default-directory \"/etc/passwd\")) (process-lines \"pwd\"))"),
+        "(ERR (file-error \"Setting current directory\" \"Not a directory\" \"/etc/passwd\"))"
+    );
+    assert_eq!(
+        eval("(let ((default-directory \"/etc/passwd\")) (shell-command-to-string \"pwd\"))"),
+        "(ERR (file-error \"Setting current directory\" \"Not a directory\" \"/etc/passwd\"))"
+    );
+    assert_eq!(
+        eval("(let ((process-environment (list \"A=1\" \"PWD=/elsewhere\")) (initial-environment nil) (default-directory \"/tmp//\")) (sort (process-lines \"env\") #'string<))"),
+        "(\"A=1\" \"PWD=/tmp\")"
+    );
+}
+
+/// `call-process` finds PROGRAM on `exec-path` (`openp`), never through the
+/// `PATH` it hands the child.
+#[test]
+fn programs_are_found_on_exec_path() {
+    assert_eq!(
+        eval("(let ((exec-path nil)) (call-process \"env\"))"),
+        "(ERR (file-missing \"Searching for program\" \"No such file or directory\" \"env\"))"
+    );
+    assert_eq!(
+        eval("(let ((process-environment (list \"PATH=/nonexistent\")) (default-directory \"/\")) (call-process \"env\"))"),
+        "0"
+    );
+    assert_eq!(
+        eval("(call-process \"/nonexistent-elisprs/prog\")"),
+        "(ERR (file-missing \"Searching for program\" \"No such file or directory\" \"/nonexistent-elisprs/prog\"))"
+    );
+}
+
+/// subr.el's `process-lines-handling-status` and the two functions on it.
+#[test]
+fn process_lines_is_subr_el() {
+    assert_eq!(
+        eval("(process-lines \"false\")"),
+        "(ERR (error \"false exited with status 1\"))"
+    );
+    assert_eq!(
+        eval("(process-lines-ignore-status \"sh\" \"-c\" \"echo a; echo b; exit 3\")"),
+        "(\"a\" \"b\")"
+    );
+    assert_eq!(
+        eval("(let (seen) (list (process-lines-handling-status \"sh\" (lambda (s) (setq seen s)) \"-c\" \"printf x; exit 2\") seen))"),
+        "((\"x\") 2)"
+    );
+    assert_eq!(
+        eval("(list (subrp (symbol-function 'process-lines)) (func-arity 'process-lines))"),
+        "(nil (1 . many))"
+    );
+}
+
+/// `exec-path` is rebuilt from `PATH` on every run, so a bytecode-cache hit
+/// searches this run's `PATH`, not the one of the run that wrote the cache.
+#[test]
+fn cache_hit_rebuilds_exec_path() {
+    let exe = env!("CARGO_BIN_EXE_elisp");
+    let dir = std::env::temp_dir().join(format!("elisprs-exec-path-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("script.el");
+    std::fs::write(&path, "(prin1 (car exec-path))\n").expect("write script");
+    let run = |path_var: &str| -> String {
+        let out = std::process::Command::new(exe)
+            .arg(&path)
+            .env("HOME", &dir)
+            .env("ELISPRS_CACHE", "1")
+            .env("PATH", path_var)
+            .output()
+            .expect("run elisp");
+        assert!(
+            out.status.success(),
+            "elisp failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(run("/usr/bin:/bin"), "\"/usr/bin\"");
+    assert_eq!(run("/bin:/usr/bin"), "\"/bin\"");
+    let _ = std::fs::remove_dir_all(&dir);
+}

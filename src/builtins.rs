@@ -8404,18 +8404,17 @@ fn set_time_zone_rule(h: &mut ElispHost, a: &[Value]) -> R {
 
 /// The environment a subprocess starts with — callproc.c
 /// `make_environment_block`. `PWD`, when `process-environment` sets it, is
-/// `default-directory` without its trailing slashes; `DISPLAY`, when
+/// the child's working directory without its trailing slashes; `DISPLAY`, when
 /// `process-environment` does not mention it, comes from
 /// `initial-environment`; then every entry of `process-environment`, the first
 /// one for a name winning and a lone `NAME` removing that variable.
-fn child_environment(h: &mut ElispHost) -> Vec<(String, String)> {
+fn child_environment(h: &mut ElispHost, current_dir: &str) -> Vec<(String, String)> {
     let process_env = symbol_value_or_nil(h, "process-environment");
     let entries = env_entries(h, &process_env, true);
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out = Vec::new();
     if let Some(Some(_)) = env_lookup(&env_entries(h, &process_env, false), "PWD") {
-        let dir = symbol_value_or_nil(h, "default-directory");
-        let mut pwd = h.str_text(&dir).unwrap_or_default().to_string();
+        let mut pwd = current_dir.to_string();
         while pwd.len() > 2 && pwd.ends_with('/') {
             pwd.pop();
         }
@@ -8446,11 +8445,142 @@ fn child_environment(h: &mut ElispHost) -> Vec<(String, String)> {
     out
 }
 
-/// A `Command` for PROGRAM whose environment is `process-environment`.
-fn subprocess(h: &mut ElispHost, program: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new(program);
-    cmd.env_clear().envs(child_environment(h));
-    cmd
+/// A `Command` for PROGRAM started as `call-process` starts one: PROGRAM is
+/// searched for on `exec-path`, it runs in `default-directory`, and its
+/// environment is `make_environment_block`'s.
+fn subprocess(h: &mut ElispHost, program: &str) -> Result<std::process::Command, String> {
+    let cwd = subprocess_directory(h)?;
+    let path = find_program(h, program)?;
+    let mut cmd = std::process::Command::new(path);
+    cmd.current_dir(&cwd)
+        .env_clear()
+        .envs(child_environment(h, &cwd));
+    Ok(cmd)
+}
+
+/// callproc.c `get_current_directory`: `default-directory` (or "~" when it
+/// is not a string), expanded and without its trailing slash, must name an
+/// accessible directory; otherwise `(file-missing "Setting current directory"
+/// ERRSTRING DEFAULT-DIRECTORY)` naming the unexpanded value.
+fn subprocess_directory(h: &mut ElispHost) -> Result<String, String> {
+    let curdir = symbol_value_or_nil(h, "default-directory");
+    let dir = if h.is_string(&curdir) {
+        curdir.clone()
+    } else {
+        h.new_string("~")
+    };
+    let expanded = crate::fileio::expand_file_name(h, &[dir])?;
+    let file = crate::fileio::directory_file_name(h, &[expanded])?;
+    let mut dir = as_string(h, &file)?;
+    // `remove_slash_colon`: a quoted local name "/:..." names what follows.
+    if let Some(rest) = dir.strip_prefix("/:") {
+        dir = if rest.is_empty() {
+            "/".to_string()
+        } else {
+            rest.to_string()
+        };
+    }
+    if let Err(e) = accessible_directory(&dir) {
+        let shown = h.str_text(&curdir).map(str::to_string);
+        let shown = shown.unwrap_or_else(|| h.print(&curdir, false));
+        return Err(report_file_errno(
+            h,
+            "Setting current directory",
+            &[&shown],
+            &e,
+        ));
+    }
+    Ok(dir)
+}
+
+/// fileio.c `file_accessible_directory_p`: `access ("DIR/", F_OK)`, so a file
+/// that is not a directory fails with `ENOTDIR`.
+fn accessible_directory(dir: &str) -> std::io::Result<()> {
+    let probe = if dir.ends_with('/') {
+        dir.to_string()
+    } else {
+        format!("{dir}/")
+    };
+    let c = std::ffi::CString::new(probe)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
+    if unsafe { libc::access(c.as_ptr(), libc::F_OK) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `openp (Vexec_path, PROGRAM, exec-suffixes, X_OK)` as `call-process` runs
+/// it: an absolute or `~` name is tried once; any other is expanded against
+/// each `exec-path` element (nil meaning `default-directory`) with each of
+/// `exec-suffixes`, and the first executable non-directory wins. The `PATH`
+/// in `process-environment` plays no part. Not found is `(file-missing
+/// "Searching for program" "No such file or directory" PROGRAM)`.
+fn find_program(h: &mut ElispHost, program: &str) -> Result<String, String> {
+    let dirs = if program.starts_with('/') || program.starts_with('~') {
+        vec![Value::Undef]
+    } else {
+        let path = symbol_value_or_nil(h, "exec-path");
+        h.list_vec(&path).unwrap_or_default()
+    };
+    let suffixes_v = symbol_value_or_nil(h, "exec-suffixes");
+    let mut suffixes: Vec<String> = h
+        .list_vec(&suffixes_v)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| h.str_text(s).map(str::to_string))
+        .collect();
+    if suffixes.is_empty() {
+        suffixes.push(String::new());
+    }
+    for dir in dirs {
+        let dir = if is_nil(&dir) {
+            symbol_value_or_nil(h, "default-directory")
+        } else {
+            dir
+        };
+        if !is_nil(&dir) && !h.is_string(&dir) {
+            continue;
+        }
+        for suffix in &suffixes {
+            let name = h.new_string(format!("{program}{suffix}"));
+            let full = crate::fileio::expand_file_name(h, &[name, dir.clone()])?;
+            let full = as_string(h, &full)?;
+            let is_file = std::fs::metadata(&full).is_ok_and(|m| !m.is_dir());
+            if is_file && fs_access(std::path::Path::new(&full), libc::X_OK) {
+                return Ok(full);
+            }
+        }
+    }
+    let e = std::io::Error::from_raw_os_error(libc::ENOENT);
+    Err(report_file_errno(
+        h,
+        "Searching for program",
+        &[program],
+        &e,
+    ))
+}
+
+/// callproc.c `init_callproc`: `exec-path` is `PATH` split on `:`, an empty
+/// element meaning ".", followed by `exec-directory` without its trailing
+/// slash. Per-run state, like the environment it is read from: a cached heap
+/// image would otherwise keep the `PATH` of the run that wrote it.
+pub(crate) fn install_exec_path(h: &mut ElispHost) {
+    let path = egetenv(h, "PATH").unwrap_or_default();
+    let mut dirs: Vec<Value> = path
+        .split(':')
+        .map(|d| h.new_string(if d.is_empty() { "." } else { d }))
+        .collect();
+    let exec_dir = symbol_value_or_nil(h, "exec-directory");
+    if h.is_string(&exec_dir) {
+        if let Ok(d) = crate::fileio::directory_file_name(h, &[exec_dir]) {
+            dirs.push(d);
+        }
+    }
+    let exec_path = h.list_from(dirs);
+    let sym = h.intern("exec-path");
+    let _ = h.set_value(&sym, exec_path);
 }
 fn special_variable_p(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(h.symbol_special(&a[0])))
@@ -10864,7 +10994,7 @@ fn copy_file(h: &mut ElispHost, a: &[Value]) -> R {
 // ── subprocesses ──
 fn shell_command_to_string(h: &mut ElispHost, a: &[Value]) -> R {
     let cmd = as_string(h, &a[0])?;
-    match subprocess(h, "sh").arg("-c").arg(&cmd).output() {
+    match subprocess(h, "sh")?.arg("-c").arg(&cmd).output() {
         Ok(o) => Ok(h.new_string(String::from_utf8_lossy(&o.stdout).into_owned())),
         Err(_) => Ok(h.new_string(String::new())),
     }
@@ -10879,7 +11009,7 @@ fn call_process(h: &mut ElispHost, a: &[Value]) -> R {
         .filter_map(|v| as_string(h, v).ok())
         .collect();
     let insert = matches!(a.get(2), Some(v) if !is_nil(v));
-    let out = subprocess(h, &program)
+    let out = subprocess(h, &program)?
         .args(&args)
         .output()
         .map_err(|e| report_file_errno(h, "Searching for program", &[&program], &e))?;
@@ -10888,28 +11018,6 @@ fn call_process(h: &mut ElispHost, a: &[Value]) -> R {
         h.cur_insert(chars, true);
     }
     Ok(Value::Int(out.status.code().unwrap_or(-1) as i64))
-}
-fn process_lines(h: &mut ElispHost, a: &[Value]) -> R {
-    let program = as_string(h, &a[0])?;
-    let args: Vec<String> = a
-        .get(1..)
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|v| as_string(h, v).ok())
-        .collect();
-    let out = subprocess(h, &program)
-        .args(&args)
-        .output()
-        .map_err(|e| report_file_errno(h, "Searching for program", &[&program], &e))?;
-    if !out.status.success() {
-        return Err(format!("error: {program} exited with non-zero status"));
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let mut lines: Vec<&str> = s.split('\n').collect();
-    if lines.last() == Some(&"") {
-        lines.pop();
-    }
-    Ok(h.list_from(lines.into_iter().map(Value::str).collect()))
 }
 
 // ── more buffer editing/motion ──
@@ -11918,7 +12026,6 @@ pub fn install(h: &mut ElispHost) {
         shell_command_to_string,
     );
     s("call-process", 1, None, call_process);
-    s("process-lines", 1, None, process_lines);
     s("char-before", 0, Some(1), char_before);
     s("delete-char", 1, Some(2), delete_char);
     s("insert-char", 1, Some(3), insert_char);
