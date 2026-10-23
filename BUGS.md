@@ -6859,3 +6859,153 @@ a radix under 2 can accept. Every spelling whose digits the radix cannot supply
 is rejected on both versions with the same text, because the message comes from
 `invalid_radix_integer` either way. `tests/parity_read_labels.rs`
 (`radix_under_two_follows_the_thirty_two_gate`) pins the 30.2 column.
+
+## Round 42 — fileio.c's file names, integer `format`, regexp postfix runs and `\=`, reader escapes, the mark
+
+**Oracle: GNU Emacs 31.1** (`/opt/homebrew/bin/emacs`, `emacs -Q --batch -l
+scripts/fuzz/drive.el`, i.e. `*scratch*` in `lisp-interaction-mode`, cl-lib /
+seq / subr-x required). Found by differential probes over file names,
+`format` flags, regexp syntax, reader escapes, buffer editing commands and the
+mark.
+
+### R42-A. ✅ FIXED — the file-name primitives are fileio.c's
+
+`file-name-directory`, `file-name-nondirectory`, `file-name-as-directory`,
+`directory-file-name`, `directory-name-p`, `file-name-concat`,
+`file-name-absolute-p` and `expand-file-name` were prelude approximations.
+They are now `src/fileio.rs`, a port of the Unix branch of each C function
+(no file name handlers). Measured, now agreeing:
+
+```text
+form                                   was                         Emacs 31.1 / now
+(directory-file-name "/a/b///")        "/a/b//"                    "/a/b"
+(directory-file-name "//")             "/"                         "//"
+(directory-file-name "///")            "//"                        "/"
+(expand-file-name "/..")               "/"                         "/.."
+(expand-file-name "/a/b/../../../c")   "/c"                        "/../c"
+(expand-file-name "//a")               "/a"                        "//a"
+(expand-file-name "a" 'b)              (wrong-type-argument …)     "/a"
+(expand-file-name "~nobodyxyz/x")      "~nobodyxyz/x"              "<default-directory>~nobodyxyz/x"
+(file-name-absolute-p "~nobodyxyz/x")  t                           nil
+(file-name-concat nil "a")             (wrong-type-argument …)     "a"
+(file-name-directory 'a)               (… sequencep a)             (wrong-type-argument stringp a)
+```
+
+`~USER` is resolved with `getpwnam`, an already-canonical absolute name comes
+back as the same object, and a NUL byte is `(wrong-type-argument filenamep
+NAME)`. `file-name-case-insensitive-p` is fileio.c's too (`pathconf
+(_PC_CASE_SENSITIVE)` on macOS, case-sensitive elsewhere).
+
+files.el's `file-name-extension`, `file-name-sans-extension`, `file-name-base`,
+`file-name-split`, `file-name-quote`/`-unquote`/`-quoted-p`, `file-local-name`
+and `abbreviate-file-name` (with `directory-abbrev-alist` and
+`abbreviated-home-dir`), env.el's `substitute-env-vars` and
+`substitute-env-in-file-name`, and fileio.c's `substitute-in-file-name` are
+ported. So `(file-name-extension "foo.c.~1~")` is `"c"` (was `"~1~"`),
+`(file-name-split "//a//b")` is `("/" "a" "b")` (was `("" "" "a" "" "b")`),
+`(file-name-unquote "/:")` is `"/"` (was `""`), `(abbreviate-file-name
+(getenv "HOME"))` is `"~"`, and `substitute-in-file-name` exists.
+Expectations: `tests/parity_fileio_names.rs`.
+
+### R42-B. ✅ FIXED — integer conversions in `format` are `styled_format`'s
+
+`%o`/`%x`/`%X` ignored the `+` and space flags, a precision did not turn the
+`0` flag off, `%#.0o` of 0 was `""`, `%#.3o` of 1 was `"0001"`, and a
+bignum's precision did not count its sign. The integer branch now builds the
+field from the C's pieces (sprintf output, prefix array, excess-precision
+zeros, padding):
+
+```text
+form                              was            Emacs 31.1 / now
+(format "% x" 10)                 "a"            " a"
+(format "%+#o" 8)                 "010"          "+010"
+(format "%05.2x|" 1)              "00001|"       "   01|"
+(format "%#.0o" 0)                ""             "0"
+(format "%#.3o" 1)                "0001"         "001"
+(format "%+.0x|" 0)               "|"            "+|"
+(format "%.25x" (- (expt 2 70)))  26 characters  "-000000400000000000000000"
+```
+
+Expectations: `tests/parity_format_integers_and_lengths.rs`.
+
+### R42-C. ✅ FIXED — `length<`, `length>`, `length=` and `string-width`
+
+The comparisons were `(< (length SEQ) N)`, so a dotted list signalled where
+fns.c stops walking at LENGTH (`(length< '(1 2 . 3) 3)` is t), a float LENGTH
+was accepted (Emacs: `(wrong-type-argument fixnump 2.0)`), and `(length= LIST
+-1)` was not short-circuited. `length_internal` is ported, including its
+32-bit `int` parameter and the cycle check for a LENGTH of `#xffff` or more.
+`string-width` ignored FROM and TO (`(string-width "abc" 1 2)` was 3; now 1,
+validated like `substring`). Same test file.
+
+### R42-D. ✅ FIXED — regexp postfix runs, intervals on repeats, `^`/`$` context, `\=`
+
+- A run of postfix operators is one operator in regex-emacs.c (`a**` = `a*`,
+  `a+*` = `a*`, `a?+` = `a*`, `a*??` = `a*?`); fancy-regex rejected or
+  misread them (`Target of repeat operator is invalid`, `a?+` possessive).
+- A postfix operator or interval after a repeated expression applies to the
+  whole of it (`a\{2\}*` matches an even number of `a`s, `a*\{2\}`,
+  `a\{1\}\{2\}`); the translation now wraps the repeated atom in `(?:…)`.
+- With nothing to repeat, a valid `\{N\}` is a literal `{` (`unfetch_interval`).
+- `^` is an anchor only at the start or after `\(`, `\(?:`, `\(?N:`, `\|`
+  (`at_begline_loc_p`), `$` only at the end or before `\)`/`\|`
+  (`at_endline_loc_p`); elsewhere they are ordinary characters. `(string-match
+  "a^b" "a^b")` was nil.
+- `\=` matched the empty string everywhere. It is point: in a string it never
+  matches, in a buffer it is a lookbehind for exactly point's offset, so a
+  backward search and `looking-back` (whose `\(?:RE\)\=` this fixed) see it.
+
+Expectations: `tests/parity_regexp_postfix_runs_and_point.rs`.
+
+### R42-E. ✅ FIXED — the reader's `\x`, `\u`/`\U` and `\N{…}` escapes
+
+Ported from `read_char_escape`: `\x` range checking (`Hex character out of
+range: \x10000000...`) and its message for no digits, `\u`/`\U`'s three
+messages (`Malformed Unicode escape: \u12`, `Non-hex character used for
+Unicode escape: g (103)`, `Non-Unicode character: 0x110000`), `\N` needing its
+brace, an ASCII non-empty name and a non-surrogate `U+` scalar, and
+`read_char_literal`'s raw-byte collapse (`?\xfffffff` is 264241407, was
+268435455). Expectations: `tests/parity_reader_char_escapes.rs`.
+
+### R42-F. ✅ FIXED — the mark is a marker, and simple.el drives it
+
+The mark was a bare position and `set-mark` did not activate it: `(progn
+(set-mark 1) mark-active)` was nil, `mark-marker`, `region-active-p`,
+`use-region-p`, `region-noncontiguous-p`, `region-bounds`, `deactivate-mark`,
+`activate-mark`, `pop-mark`, `exchange-point-and-mark` and
+`save-mark-and-excursion` were void, and `push-mark` kept no global mark ring.
+The buffer's mark is now one marker object (`mark-marker`), and simple.el's
+mark functions are ported over it. `region-beginning`/`region-end` are
+editfns.c's `region_limit` (`mark-inactive` in Transient Mark mode without
+`mark-even-if-inactive`, the mark end clipped to the accessible portion).
+Not followed: the PRIMARY-selection update and the region highlight in
+`deactivate-mark` (no window system, no windows).
+
+Also ported: `transpose-regions` (editfns.c — text, text properties with the
+C's interval clearing, point and markers), simple.el's `zap-to-char`,
+`kill-whole-line`, `mark-word`, `upcase-dwim`/`downcase-dwim`/`capitalize-dwim`,
+misc.el's `zap-up-to-char`, lisp.el's `mark-sexp`, `kill-sexp`,
+`backward-kill-sexp`. Expectations: `tests/parity_mark_and_transpose_regions.rs`.
+
+### Still open after round 42
+
+- `\cC` / `\CC` category escapes in regexps (no category tables).
+- `\N{NAME}` for a Unicode character name (no name table); only `\N{U+X}`.
+- Raw bytes and unibyte strings: `(string 4194303)` drops the character,
+  `"\200"` reads as U+0080, `(string-limit "héllo" 3 nil 'utf-8)` is not
+  encoded; `encode-coding-string`, `decode-coding-string`, `split-char`,
+  `char-charset`, `get-char-code-property` void.
+- `process-environment` is void (`getenv`/`setenv` use the process
+  environment directly).
+- `#@NNN` lazy-string skipping in a string source.
+- `match-substitute-replacement` without STRING uses the last string match;
+  Emacs uses the current buffer.
+- Void: `forward-paragraph`/`backward-paragraph`, `forward-sentence`,
+  `fill-region`/`fill-paragraph`, `indent-region`, `indent-rigidly`,
+  `comment-region`, `goto-line`, `what-line`, `count-words-region`,
+  `split-line`, `beginning-of-line-text`, `cycle-spacing`,
+  `upcase-initials-region`, `file-truename`, `occur`/`replace-string`/
+  `replace-regexp`/`query-replace`, `yank-pop`, `append-next-kill`,
+  `transpose-sexps`, `beginning-of-defun`/`end-of-defun`/`narrow-to-defun`,
+  `insert-pair`/`delete-pair`, `check-parens`, `buffer-local-set-state`.
+- Before/after-change hooks and undo for `transpose-regions`.

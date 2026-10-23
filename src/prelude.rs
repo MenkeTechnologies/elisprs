@@ -180,9 +180,36 @@ pub const PRELUDE: &str = r#"
             (when (eq tail tortoise) (setq done t))
           (setq interval (* interval 2) q interval tortoise tail))))
     len))
-(defun length= (seq n) (= (length seq) n))
-(defun length< (seq n) (< (length seq) n))
-(defun length> (seq n) (> (length seq) n))
+;; fns.c `length_internal': LEN is the C `int' parameter, so a fixnum LENGTH
+;; is truncated to 32 bits on the way in. Walking a list that is no longer
+;; than LEN conses returns what is left of LEN; reaching zero returns -1. A
+;; LEN of #xffff or more walks with FOR_EACH_TAIL, which signals on a cycle.
+(defun length--internal (sequence len)
+  (setq len (logand len #xffffffff))
+  (when (>= len #x80000000) (setq len (- len #x100000000)))
+  (when (>= len #xffff)
+    ;; `length' signals `(circular-list SEQUENCE)' as FOR_EACH_TAIL does.
+    (condition-case nil (length sequence) (wrong-type-argument nil)))
+  (catch 'length--done
+    (while (consp sequence)
+      (when (<= (setq len (1- len)) 0) (throw 'length--done -1))
+      (setq sequence (cdr sequence)))
+    len))
+(defun length< (sequence length)
+  (unless (fixnump length) (signal 'wrong-type-argument (list 'fixnump length)))
+  (if (consp sequence)
+      (not (= (length--internal sequence length) -1))
+    (< (length sequence) length)))
+(defun length> (sequence length)
+  (unless (fixnump length) (signal 'wrong-type-argument (list 'fixnump length)))
+  (if (consp sequence)
+      (= (length--internal sequence (1+ length)) -1)
+    (> (length sequence) length)))
+(defun length= (sequence length)
+  (unless (fixnump length) (signal 'wrong-type-argument (list 'fixnump length)))
+  (cond ((< length 0) nil)
+        ((consp sequence) (= (length--internal sequence (1+ length)) 1))
+        (t (= (length sequence) length))))
 (defun car-safe (x) (if (consp x) (car x) nil))
 (defun cdr-safe (x) (if (consp x) (cdr x) nil))
 (defun caar-safe (x) (if (consp x) (car x) nil))
@@ -3207,11 +3234,12 @@ The datum names START and END as GIVEN, which is why the walk cannot just let
 ;; `Fchar_width' in indent.c. `format' measures its field width and `%.Ns'
 ;; precision in display columns and needs the same table from Rust, so keeping a
 ;; second copy here would have been two implementations of one answer.
-(defun string-width (s &optional _from _to)
+(defun string-width (s &optional from to)
   ;; `string-to-list' accepts any sequence, so the string check has to be explicit:
   ;; Emacs signals `stringp', not `sequencep'.
   (unless (stringp s) (signal 'wrong-type-argument (list 'stringp s)))
-  (let ((w 0) (l (string-to-list s)))
+  ;; character.c validates FROM and TO with `validate_subarray', as `substring' does.
+  (let ((w 0) (l (string-to-list (substring s from to))))
     (while l (setq w (+ w (char-width (car l))) l (cdr l)))
     w))
 (defun cl-type-of (obj)
@@ -3465,28 +3493,33 @@ The argument may be a character or string.  The result has the same type."
 (defun json-read-from-string (s) (car (json--read s 0)))
 ;; The native JSON API (`json-parse-string', `json-parse-buffer',
 ;; `json-serialize', `json-insert') is json.c's, in Rust: src/json.rs.
-;;; ---- file-name path manipulation (pure, no filesystem) ----
-(defun file-name--last (f ch)
-  (let ((i (length f)) (res nil))
-    (while (and (> i 0) (null res))
-      (setq i (1- i))
-      (when (eq (aref f i) ch) (setq res i)))
-    res))
-(defun file-name-directory (f)
-  (let ((i (file-name--last f ?/))) (and i (substring f 0 (1+ i)))))
-(defun file-name-nondirectory (f)
-  (let ((i (file-name--last f ?/))) (if i (substring f (1+ i)) f)))
-(defun file-name-extension (f &optional period)
-  (let* ((nd (file-name-nondirectory f)) (i (file-name--last nd ?.)))
-    (and i (> i 0) (if period (substring nd i) (substring nd (1+ i))))))
-(defun file-name-sans-extension (f)
-  (let* ((nd (file-name-nondirectory f)) (i (file-name--last nd ?.)))
-    (if (and i (> i 0)) (concat (or (file-name-directory f) "") (substring nd 0 i)) f)))
-(defun file-name-base (f) (file-name-sans-extension (file-name-nondirectory f)))
-(defun file-name-as-directory (f)
-  (cond ((string= f "") "./")
-        ((eq (aref f (1- (length f))) ?/) f)
-        (t (concat f "/"))))
+;;; ---- file names ----
+;; `file-name-directory', `file-name-nondirectory', `file-name-as-directory',
+;; `directory-file-name', `directory-name-p', `file-name-concat',
+;; `file-name-absolute-p' and `expand-file-name' are fileio.c's, in Rust:
+;; src/fileio.rs. The Lisp ones below are files.el's (Emacs 31.1) without the
+;; file-name-handler dispatch.
+(defun file-name-sans-extension (filename)
+  (save-match-data
+    (let ((file (file-name-sans-versions (file-name-nondirectory filename)))
+	  directory)
+      (if (and (string-match "\\.[^.]*\\'" file)
+	       (not (eq 0 (match-beginning 0))))
+	  (if (setq directory (file-name-directory filename))
+	      (concat directory (substring file 0 (match-beginning 0)))
+	    (substring file 0 (match-beginning 0)))
+	filename))))
+(defun file-name-extension (filename &optional period)
+  (save-match-data
+    (let ((file (file-name-sans-versions (file-name-nondirectory filename))))
+      (if (and (string-match "\\.[^.]*\\'" file)
+	       (not (eq 0 (match-beginning 0))))
+          (substring file (+ (match-beginning 0) (if period 0 1)))
+        (if period
+            "")))))
+(defun file-name-base (&optional filename)
+  (file-name-sans-extension
+   (file-name-nondirectory (or filename (buffer-file-name)))))
 ;; `temporary-file-directory' (Vtemporary_file_directory, callproc.c
 ;; `init_callproc') is a C variable read at load time by stock lisp (files.el,
 ;; jka-compr.el, url-*.el, ...). The Rust primitive returns the raw dir
@@ -3536,22 +3569,21 @@ and the returned string should both be non-magic."
     (unless result
       (signal 'file-error (list "Creating file name with prefix" prefix)))
     result))
-(defun directory-file-name (f)
-  (if (and (> (length f) 1) (eq (aref f (1- (length f))) ?/))
-      (substring f 0 (1- (length f)))
-    f))
-(defun file-name-concat (&rest parts)
-  (let ((out "") (first t))
-    (dolist (p parts)
-      (unless (string= p "")
-        (if first (setq out p first nil)
-          (setq out (concat out (if (eq (aref out (1- (length out))) ?/) "" "/") p)))))
-    out))
-(defun file-name-absolute-p (f)
-  (and (> (length f) 0) (or (eq (aref f 0) ?/) (eq (aref f 0) ?~)) t))
-(defun file-name-split (f) (split-string f "/"))
-(defun directory-name-p (name)
-  (and (> (length name) 0) (eq (aref name (1- (length name))) ?/)))
+(defun file-name-split (filename)
+  (let ((components nil))
+    (when (directory-name-p filename)
+      (push "" components)
+      (setq filename (directory-file-name filename)))
+    (while (length> filename 0)
+      (push (file-name-nondirectory filename) components)
+      (let ((dir (file-name-directory filename)))
+        (setq filename (and dir (directory-file-name dir)))
+        (when (and dir (equal dir filename))
+          (push (if (equal dir "") ""
+                  (substring dir 0 -1))
+                components)
+          (setq filename nil))))
+    components))
 (defun file-name-with-extension (filename extension)
   (let ((extn (string-trim-left extension "[.]")))
     (cond ((string-empty-p filename) (error "Empty filename"))
@@ -3564,12 +3596,71 @@ and the returned string should both be non-magic."
     (cond ((or (null parent) (equal parent expanded)) nil)
           ((not (file-name-absolute-p filename)) (file-relative-name parent))
           (t parent))))
-;; "/:" quoting marks a name as literal (no remote/wildcard expansion).
-(defun file-name-quote (name &optional _top)
-  (if (string-prefix-p "/:" name) name (concat "/:" name)))
-(defun file-name-unquote (name &optional _top)
-  (if (string-prefix-p "/:" name) (substring name 2) name))
-(defun file-name-quoted-p (name &optional _top) (string-prefix-p "/:" name))
+(defun file-name-quoted-p (name &optional top)
+  (let ((file-name-handler-alist (unless top file-name-handler-alist)))
+    (string-prefix-p "/:" (file-local-name name))))
+(defun file-name-quote (name &optional top)
+  (let ((file-name-handler-alist (unless top file-name-handler-alist)))
+    (if (file-name-quoted-p name top)
+        name
+      (concat (file-remote-p name) "/:" (file-local-name name)))))
+(defun file-name-unquote (name &optional top)
+  (let* ((file-name-handler-alist (unless top file-name-handler-alist))
+         (localname (file-local-name name)))
+    (when (file-name-quoted-p localname top)
+      (setq
+       localname (if (= (length localname) 2) "/" (substring localname 2))))
+    (concat (file-remote-p name) localname)))
+(defun file-local-name (file)
+  (or (file-remote-p file 'localname) file))
+;; env.el (Emacs 31.1).
+(defconst env--substitute-vars-regexp
+  "\\$\\(?:\\(?1:[[:alnum:]_]+\\)\\|{\\(?1:[^{}]+\\)}\\|\\$\\)")
+(defun substitute-env-vars (string &optional when-undefined)
+  (let ((start 0))
+    (while (string-match env--substitute-vars-regexp string start)
+      (cond ((match-beginning 1)
+	     (let* ((var (match-string 1 string))
+                    (value (getenv var)))
+               (if (and (null value)
+                        (if (functionp when-undefined)
+                            (null (setq value (funcall when-undefined var)))
+                          when-undefined))
+                   (setq start (match-end 0))
+                 (setq string (replace-match (or value "") t t string)
+                       start (+ (match-beginning 0) (length value))))))
+	    (t
+	     (setq string (replace-match "$" t t string)
+		   start (+ (match-beginning 0) 1)))))
+    string))
+(defun substitute-env-in-file-name (filename)
+  (substitute-env-vars filename
+                       (if (memq system-type '(windows-nt ms-dos))
+                           (lambda (var) (getenv (upcase var)))
+                         t)))
+;; fileio.c `search_embedded_absfilename': the index of an absolute file name
+;; ("//foo", "/~", "/~user") that follows a `/' inside NM, or nil.
+(defun substitute-in-file-name--embedded (nm)
+  (let ((p 1) (end (length nm)) (found nil))
+    (while (and (not found) (< p end))
+      (when (and (eq (aref nm (1- p)) ?/) (file-name-absolute-p (substring nm p)))
+        (setq found p))
+      (setq p (1+ p)))
+    found))
+;; fileio.c `Fsubstitute_in_file_name', Unix branch.
+(defun substitute-in-file-name (filename)
+  (unless (stringp filename) (signal 'wrong-type-argument (list 'stringp filename)))
+  (let ((p (substitute-in-file-name--embedded filename)))
+    (if p
+        (substitute-in-file-name (substring filename p))
+      (let ((tmp (substitute-env-in-file-name filename)))
+        (unless (stringp tmp) (signal 'wrong-type-argument (list 'stringp tmp)))
+        (if (eq tmp filename)
+            filename
+          (let ((start 0) q)
+            (while (setq q (substitute-in-file-name--embedded (substring tmp start)))
+              (setq start (+ start q)))
+            (if (= start 0) tmp (substring tmp start))))))))
 ;; POSIX: standard file names need no conversion.
 (defun convert-standard-filename (filename) filename)
 (defvar default-directory (file-name-as-directory (--current-directory--)))
@@ -3638,45 +3729,6 @@ of `load-path'."
 ;; (the two symbols are quoted, not evaluated), matching the real Emacs default.
 (defvar custom-theme-load-path (list 'custom-theme-directory t)
   "List of directories to search for custom theme files.")
-(defun expand-file-name--tilde (s)
-  "S with a leading `~' or `~/' replaced by $HOME. (No `~user' handling.)"
-  (cond ((string-prefix-p "~/" s) (concat (or (getenv "HOME") "~") (substring s 1)))
-        ((string= s "~") (or (getenv "HOME") "~"))
-        (t s)))
-(defun expand-file-name (name &optional dir)
-  ;; Expand NAME against DIR (default `default-directory'), `~/' via $HOME, and
-  ;; collapse `.', `..' and `//'. (No remote/`~user' handling.)
-  ;;
-  ;; The result is ABSOLUTE: DIR is itself expanded when it is relative, empty
-  ;; or `~'-prefixed, which is what makes `(expand-file-name "b" "a")' answer
-  ;; "<default-directory>/a/b" rather than "a/b".
-  (setq dir (or dir default-directory))
-  (setq name (expand-file-name--tilde name))
-  (setq dir (expand-file-name--tilde dir))
-  (unless (or (file-name-absolute-p dir)
-              ;; The fully degenerate call: with both NAME and DIR empty
-              ;; Emacs's C has nothing to make absolute and answers "".
-              (and (string= dir "") (string= name ""))
-              ;; A relative `default-directory' would recurse forever.
-              (string= dir default-directory))
-    (setq dir (expand-file-name dir default-directory)))
-  (if (and (string= name "") (string= dir "")) "" (expand-file-name--join name dir)))
-(defun expand-file-name--join (name dir)
-  (let* ((combined (if (file-name-absolute-p name) name (concat (file-name-as-directory dir) name)))
-         (abs (string-prefix-p "/" combined))
-         ;; The trailing slash comes from NAME, not from the joined path: DIR is
-         ;; always given one by `file-name-as-directory', so reading it off
-         ;; COMBINED made `(expand-file-name "" "/a")' answer "/a/" where Emacs
-         ;; answers "/a". `(expand-file-name "b/" "/a")' is still "/a/b/".
-         (trail (and (> (length name) 0) (string-suffix-p "/" name)))
-         (out nil))
-    (dolist (c (split-string combined "/"))
-      (cond ((or (string= c "") (string= c ".")) nil)
-            ((string= c "..") (when out (setq out (cdr out))))
-            (t (setq out (cons c out)))))
-    (let ((res (concat (if abs "/" "") (mapconcat (function identity) (nreverse out) "/"))))
-      (when (and trail (not (string-suffix-p "/" res))) (setq res (concat res "/")))
-      (if (string= res "") (if abs "/" ".") res))))
 ;; files.el (Emacs 31.1). No file name handlers or remote files here, and no
 ;; DOS drive letters; case folding follows minibuffer.el's default for
 ;; `read-file-name-completion-ignore-case', which is what files.el consults.
@@ -3711,11 +3763,42 @@ of `load-path'."
                 rest
               (concat (file-name-as-directory ancestor) rest)))
         ancestor))))
+;; files.el (Emacs 31.1), without the file-name-handler dispatch. elisprs
+;; strings are all multibyte, so `directory-abbrev-make-regexp' never takes
+;; its `decode-coding-string' branch.
+(defvar directory-abbrev-alist nil)
+(defun directory-abbrev-make-regexp (directory)
+  (concat "\\`" (regexp-quote directory) "\\(/\\|\\'\\)"))
+(defun directory-abbrev-apply (filename)
+  (dolist (dir-abbrev directory-abbrev-alist filename)
+    (when (string-match (car dir-abbrev) filename)
+         (setq filename (concat (cdr dir-abbrev)
+                                (substring filename (match-end 0)))))))
+(defvar abbreviated-home-dir nil)
 (defun abbreviate-file-name (filename)
-  (let ((home (getenv "HOME")))
-    (if (and home (string-prefix-p (file-name-as-directory home) filename))
-        (concat "~/" (substring filename (length (file-name-as-directory home))))
-      filename)))
+  (save-match-data
+    (let ((case-fold-search (file-name-case-insensitive-p filename)))
+      (setq filename (directory-abbrev-apply filename))
+      (unless abbreviated-home-dir
+        (put 'abbreviated-home-dir 'home (expand-file-name "~"))
+        (setq abbreviated-home-dir
+              (directory-abbrev-make-regexp
+               (let ((abbreviated-home-dir "\\`\\'."))
+                 (abbreviate-file-name
+                  (get 'abbreviated-home-dir 'home))))))
+      (let (mb1)
+        (if (and (string-match abbreviated-home-dir filename)
+                 (setq mb1 (match-beginning 1))
+                 (not (and (= (match-end 0) 1)
+                           (= (aref filename 0) ?/)))
+                 (not (and (memq system-type '(ms-dos windows-nt cygwin))
+                           (string-match "\\`[a-zA-`]:/\\'" filename)))
+                 (equal (get 'abbreviated-home-dir 'home)
+                        (expand-file-name "~")))
+            (setq filename
+                  (concat "~"
+                          (substring filename mb1))))
+        filename))))
 ;; files.el (Emacs 31.1), without the file-name-handler dispatch. The one
 ;; `mkdir' is `make-directory-internal' (a Rust subr, fileio.c's).
 (defun files--ensure-directory (dir)
@@ -4139,7 +4222,7 @@ removed, and one that spans the range is split in two -- which is why this needs
 (defvar last-command nil)
 (defvar history-length 100)
 (defvar history-delete-duplicates nil)
-(defvar mark-ring nil)
+(defvar-local mark-ring nil)
 (defvar mark-ring-max 16)
 (defvar filter-buffer-substring-function #'buffer-substring--filter)
 (defun add-to-history (history-var newelt &optional maxelt keep-all)
@@ -4303,13 +4386,288 @@ removed, and one that spans the range is split in two -- which is why this needs
   (kill-region (point) (progn (forward-word arg) (point))))
 (defun backward-kill-word (arg)
   (kill-word (- arg)))
-(defun push-mark (&optional location nomsg _activate)
+;;; ---- the mark (simple.el, Emacs 31.1) ----
+;; `mark-marker' is a Rust subr (the buffer's marker); `region-beginning' and
+;; `region-end' are editfns.c's. The C variables keep their batch values.
+(defvar transient-mark-mode nil)
+(defvar mark-even-if-inactive t)
+(defvar select-active-regions t)
+(defvar saved-region-selection nil)
+(defvar executing-kbd-macro nil)
+(defvar last-input-event nil)
+(defvar global-mark-ring nil)
+(defvar global-mark-ring-max 16)
+(defvar use-empty-active-region nil)
+(defvar exchange-point-and-mark-highlight-region t)
+(defvar activate-mark-hook nil)
+(defvar deactivate-mark-hook nil)
+(define-error 'mark-inactive "The mark is not active now")
+(defun mouse-movement-p (object)
+  (eq (car-safe object) 'mouse-movement))
+;; minibuf.c: no minibuffer is ever active in batch.
+(defun minibuffer-depth () 0)
+(defvar region-extract-function
+  (lambda (method)
+    (let ((beg (region-beginning)))
+      (cond
+       ((eq method 'bounds)
+        (list (cons beg (region-end))))
+       ((eq method 'delete-only)
+        (delete-region beg (region-end)))
+       (t
+        (filter-buffer-substring beg (region-end) method))))))
+(defun mark (&optional force)
+  (if (or force (not transient-mark-mode) mark-active mark-even-if-inactive)
+      (marker-position (mark-marker))
+    (signal 'mark-inactive nil)))
+;; Not followed: the PRIMARY-selection update (guarded by
+;; `display-selections-p', nil without a window system) and the region
+;; highlight of `redisplay--update-region-highlight' (elisprs has no windows).
+(defun deactivate-mark (&optional force)
+  (when (or (region-active-p) force)
+    (when mark-active (force-mode-line-update))
+    (cond
+     ((eq (car-safe transient-mark-mode) 'only)
+      (setq transient-mark-mode (cdr transient-mark-mode))
+      (if (eq transient-mark-mode (default-value 'transient-mark-mode))
+          (kill-local-variable 'transient-mark-mode)))
+     ((eq transient-mark-mode 'lambda)
+      (kill-local-variable 'transient-mark-mode)))
+    (setq mark-active nil)
+    (run-hooks 'deactivate-mark-hook)))
+(defun activate-mark (&optional no-tmm)
   (when (mark t)
-    (let ((history-delete-duplicates nil))
-      (add-to-history 'mark-ring (copy-marker (mark t)) mark-ring-max t)))
-  (set-mark (or location (point)))
-  (or nomsg (message "Mark set"))
+    (unless (region-active-p)
+      (force-mode-line-update)
+      (setq mark-active t)
+      (unless (or transient-mark-mode no-tmm)
+        (setq-local transient-mark-mode 'lambda))
+      (run-hooks 'activate-mark-hook))))
+(defun set-mark (pos)
+  (if pos
+      (progn
+        (set-marker (mark-marker) pos (current-buffer))
+        (activate-mark 'no-tmm))
+    (deactivate-mark t)
+    (setq mark-active nil)
+    (set-marker (mark-marker) nil)))
+(defun use-region-p ()
+  (and (region-active-p)
+       (or (> (region-end) (region-beginning))
+           (and use-empty-active-region
+                (not (eq (car-safe last-input-event) 'down-mouse-1))
+                (not (mouse-movement-p last-input-event))))))
+(defun use-region-beginning ()
+  (and (use-region-p) (region-beginning)))
+(defun use-region-end ()
+  (and (use-region-p) (region-end)))
+(defun use-region-noncontiguous-p ()
+  (and (use-region-p) (region-noncontiguous-p)))
+(defun region-bounds ()
+  (funcall region-extract-function 'bounds))
+(defun region-noncontiguous-p ()
+  (let ((bounds (region-bounds))) (and (cdr bounds) bounds)))
+(defun push-mark (&optional location nomsg activate)
+  (when (mark t)
+    (let ((old (nth mark-ring-max mark-ring))
+          (history-delete-duplicates nil))
+      (add-to-history 'mark-ring (copy-marker (mark-marker)) mark-ring-max t)
+      (when old
+        (set-marker old nil))))
+  (set-marker (mark-marker) (or location (point)) (current-buffer))
+  (unless (and global-mark-ring
+               (eq (marker-buffer (car global-mark-ring)) (current-buffer)))
+    (let ((old (nth global-mark-ring-max global-mark-ring))
+          (history-delete-duplicates nil))
+      (add-to-history
+       'global-mark-ring (copy-marker (mark-marker)) global-mark-ring-max t)
+      (when old
+        (set-marker old nil))))
+  (or nomsg executing-kbd-macro (> (minibuffer-depth) 0)
+      (message "Mark set"))
+  (if (or activate (not transient-mark-mode))
+      (set-mark (mark t)))
   nil)
+(defun pop-mark ()
+  (when mark-ring
+    (setq mark-ring (nconc mark-ring (list (copy-marker (mark-marker)))))
+    (set-marker (mark-marker) (car mark-ring))
+    (set-marker (car mark-ring) nil)
+    (pop mark-ring))
+  (deactivate-mark))
+(defun save-mark-and-excursion--save ()
+  (cons
+   (let ((mark (mark-marker)))
+     (and (marker-position mark) (copy-marker mark)))
+   mark-active))
+(defun save-mark-and-excursion--restore (saved-mark-info)
+  (let ((saved-mark (car saved-mark-info))
+        (omark (marker-position (mark-marker)))
+        (nmark nil)
+        (saved-mark-active (cdr saved-mark-info)))
+    (if (null saved-mark)
+        (set-marker (mark-marker) nil)
+      (setf nmark (marker-position saved-mark))
+      (set-marker (mark-marker) nmark)
+      (set-marker saved-mark nil))
+    (let ((cur-mark-active mark-active))
+      (setq mark-active saved-mark-active)
+      (if saved-mark-active
+          (when (or (not cur-mark-active)
+                    (not (eq omark nmark)))
+            (run-hooks 'activate-mark-hook))
+        (when cur-mark-active
+          (run-hooks 'deactivate-mark-hook))))))
+(defmacro save-mark-and-excursion (&rest body)
+  (declare (indent 0) (debug t))
+  (let ((saved-marker-sym (make-symbol "saved-marker")))
+    `(let ((,saved-marker-sym (save-mark-and-excursion--save)))
+       (unwind-protect
+            (save-excursion ,@body)
+         (save-mark-and-excursion--restore ,saved-marker-sym)))))
+;; keyboard.c's `translation-table-for-input' is nil in batch.
+(defvar translation-table-for-input nil)
+(defun zap-to-char (arg char &optional interactive)
+  (with-no-warnings
+    (if (char-table-p translation-table-for-input)
+	(setq char (or (aref translation-table-for-input char) char))))
+  (let ((case-fold-search (if (and interactive (char-uppercase-p char))
+                              nil
+                            case-fold-search)))
+    (kill-region (point) (search-forward (char-to-string char) nil nil arg))))
+;; misc.el
+(defun zap-up-to-char (arg char &optional interactive)
+  (let ((direction (if (>= arg 0) 1 -1))
+        (case-fold-search (if (and interactive (char-uppercase-p char))
+                              nil
+                            case-fold-search)))
+    (kill-region (point)
+		 (progn
+		   (forward-char direction)
+		   (unwind-protect
+		       (search-forward (char-to-string char) nil nil arg)
+		     (backward-char direction))
+		   (point)))))
+(defun kill-whole-line (&optional arg)
+  (or arg (setq arg 1))
+  (if (and (> arg 0) (eobp) (save-excursion (forward-visible-line 0) (eobp)))
+      (signal 'end-of-buffer nil))
+  (if (and (< arg 0) (bobp) (save-excursion (end-of-visible-line) (bobp)))
+      (signal 'beginning-of-buffer nil))
+  (unless (eq last-command 'kill-region)
+    (kill-new "")
+    (setq last-command 'kill-region))
+  (let ((regions-begin (point-marker))
+        (region1-end (cond ((zerop arg)
+                            (prog1 (save-excursion
+                                     (forward-visible-line 0)
+                                     (point-marker))
+                              (end-of-visible-line)))
+	                   ((< arg 0)
+	                    (prog1 (save-excursion
+                                     (end-of-visible-line)
+                                     (point-marker))
+                              (forward-visible-line (1+ arg))
+	                      (unless (bobp) (backward-char))))
+	                   (t
+	                    (prog1 (save-excursion
+                                     (forward-visible-line 0)
+                                     (point-marker))
+	                      (forward-visible-line arg))))))
+    (let ((kill-read-only-ok (or kill-read-only-ok
+                                 (/= regions-begin (point)))))
+      (kill-region (marker-position regions-begin)
+                   (marker-position region1-end)))
+    (kill-region (marker-position regions-begin)
+                 (point))
+    (set-marker regions-begin nil)
+    (set-marker region1-end nil)))
+(defun mark-word (&optional arg allow-extend)
+  (cond ((and allow-extend
+	      (or (and (eq last-command this-command) (mark t))
+		  (region-active-p)))
+	 (setq arg (if arg (prefix-numeric-value arg)
+		     (if (< (mark) (point)) -1 1)))
+	 (set-mark
+	  (save-excursion
+	    (goto-char (mark))
+	    (forward-word arg)
+	    (point))))
+	(t
+	 (push-mark
+	  (save-excursion
+	    (forward-word (prefix-numeric-value arg))
+	    (point))
+	  nil t))))
+;; emacs-lisp/lisp.el
+(defun mark-sexp (&optional arg allow-extend)
+  (cond ((and allow-extend
+	      (or (and (eq last-command this-command) (mark t))
+		  (and transient-mark-mode mark-active)))
+	 (setq arg (if arg (prefix-numeric-value arg)
+		     (if (< (mark) (point)) -1 1)))
+	 (set-mark
+	  (save-excursion
+	    (goto-char (mark))
+            (condition-case error
+	        (forward-sexp arg)
+              (scan-error
+               (user-error (if (equal (cadr error)
+                                      "Containing expression ends prematurely")
+                               "No more sexp to select"
+                             (cadr error)))))
+	    (point))))
+	(t
+	 (push-mark
+	  (save-excursion
+            (condition-case error
+	        (forward-sexp (prefix-numeric-value arg))
+              (scan-error
+               (user-error (if (equal (cadr error)
+                                      "Containing expression ends prematurely")
+                               "No sexp to select"
+                             (cadr error)))))
+	    (point))
+	  nil t))))
+(defun kill-sexp (&optional arg interactive)
+  (if interactive
+      (condition-case _
+          (kill-sexp arg nil)
+        (scan-error (user-error (if (> arg 0)
+                                    "No next sexp"
+                                  "No previous sexp"))))
+    (let ((opoint (point)))
+      (forward-sexp (or arg 1))
+      (kill-region opoint (point)))))
+(defun backward-kill-sexp (&optional arg interactive)
+  (kill-sexp (- (or arg 1)) interactive))
+(defun upcase-dwim (arg)
+  (if (use-region-p)
+      (upcase-region (region-beginning) (region-end) (region-noncontiguous-p))
+    (upcase-word arg)))
+(defun downcase-dwim (arg)
+  (if (use-region-p)
+      (downcase-region (region-beginning) (region-end) (region-noncontiguous-p))
+    (downcase-word arg)))
+(defun capitalize-dwim (arg)
+  (if (use-region-p)
+      (capitalize-region (region-beginning) (region-end) (region-noncontiguous-p))
+    (capitalize-word arg)))
+(defun exchange-point-and-mark (&optional arg)
+  (let ((omark (mark t))
+        (region-was-active (region-active-p))
+	(temp-highlight (eq (car-safe transient-mark-mode) 'only)))
+    (if (null omark)
+        (user-error "No mark set in this buffer"))
+    (set-mark (point))
+    (goto-char omark)
+    (cond (temp-highlight)
+          ((xor arg (if exchange-point-and-mark-highlight-region
+                        (not (region-active-p))
+                      (not region-was-active)))
+	   (deactivate-mark))
+	  (t (activate-mark)))
+    nil))
 (defun insert-for-yank (string)
   (run-hook-wrapped 'yank-transform-functions
                     (lambda (f) (setq string (funcall f string)) nil))
@@ -5457,6 +5815,11 @@ PAREN controls the surrounding group: a string is used as the opening bracket,
   (if string
       (list 'if form nil (cons 'error (cons string args)))
     (list 'if form nil (list 'signal (list 'quote 'cl-assertion-failed) (list 'list (list 'quote form))))))
+;; simple.el's `region-active-p' (with the mark subsystem above), placed after
+;; the `cl-assert' it expands.
+(defun region-active-p ()
+  (and transient-mark-mode mark-active
+       (progn (cl-assert (mark)) t)))
 ;; cl-macs.el: the signal DATA is (STRING-or-TYPE VALUE FORM), FORM evaluated once.
 ;; (`macroexp-let2' is defined further down, after this body is compiled, so its
 ;; expansion is spelled out.)

@@ -14,6 +14,7 @@ pub mod bundled;
 pub mod cache;
 pub mod compiler;
 pub mod dap;
+pub mod fileio;
 pub mod freevars;
 pub mod host;
 pub mod intercepts;

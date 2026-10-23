@@ -40,7 +40,7 @@ fn standard_table_classifies_characters_above_latin_1() {
 fn syntax_escapes_see_the_extended_table() {
     check(
         r#"(list (string-match "\\sw" "€") (string-match "\\s_" "€") (string-match "\\s-" " ")
-                 (string-match "\\sw" "　") (string-match "\\w" "\u{200B}"))"#,
+                 (string-match "\\sw" "　") (string-match "\\w" "\u200B"))"#,
         "=(nil 0 0 nil nil)",
     );
 }

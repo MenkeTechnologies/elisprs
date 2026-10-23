@@ -1183,9 +1183,7 @@ const PRELUDE_C_SUBR_NAMES: &[&str] = &[
     "define-key",
     "delete",
     "delq",
-    "directory-file-name",
     "directory-files",
-    "directory-name-p",
     "documentation",
     "documentation-property",
     "documentation-stringp",
@@ -1193,13 +1191,7 @@ const PRELUDE_C_SUBR_NAMES: &[&str] = &[
     "downcase-word",
     "equal-including-properties",
     "error-message-string",
-    "expand-file-name",
     "featurep",
-    "file-name-absolute-p",
-    "file-name-as-directory",
-    "file-name-concat",
-    "file-name-directory",
-    "file-name-nondirectory",
     "following-char",
     "force-mode-line-update",
     "format-message",
@@ -1284,6 +1276,7 @@ const PRELUDE_C_SUBR_NAMES: &[&str] = &[
     "string<",
     "string=",
     "subst-char-in-region",
+    "substitute-in-file-name",
     "symbol-plist",
     "symbol-with-pos-p",
     "syntax-class-to-char",
@@ -1372,7 +1365,6 @@ const LISP_LEVEL_ARITY: &[(&str, u16, u16)] = &[
     ("macroexpand-1", 1, 2),
     ("macroexpand-all", 1, 2),
     ("macrop", 1, 1),
-    ("mark", 0, 1),
     ("match-string", 1, 2),
     ("member-ignore-case", 2, 2),
     ("oclosure--copy", 2, 2),
@@ -1381,7 +1373,6 @@ const LISP_LEVEL_ARITY: &[(&str, u16, u16)] = &[
     ("oclosure--set", 3, 3),
     ("oclosure-type", 1, 1),
     ("process-lines", 1, 1),
-    ("set-mark", 1, 1),
     ("setenv", 1, 3),
     ("sha1", 1, 4),
     ("shell-command-to-string", 1, 1),
@@ -1771,9 +1762,10 @@ pub struct EditBuffer {
     /// Narrowing upper bound (`point-max`); `text.len()+1` when un-narrowed.
     /// Marker-like with insertion-type t (text inserted at `zv` extends the region).
     pub zv: usize,
-    /// The mark, or `None` when unset. Marker-like (insertion-type nil). Active
-    /// region / mark-ring semantics are not modeled — this is a bare position.
-    pub mark: Option<usize>,
+    /// The buffer's mark marker (`BVAR (b, mark)`), allocated on first use;
+    /// `Value::Undef` until then. It is an ordinary marker in `markers`, so
+    /// edits adjust it like any other.
+    pub mark: Value,
     /// `save-excursion` point markers (insertion-type nil), a per-buffer LIFO
     /// stack: unwind-protect guarantees strict nesting, so the top entry is always
     /// the matching one.
@@ -1923,7 +1915,7 @@ impl ElispHost {
                 point: 1,
                 begv: 1,
                 zv: 1,
-                mark: None,
+                mark: Value::Undef,
                 se_markers: Vec::new(),
                 restrict_stack: Vec::new(),
                 locals: HashMap::new(),
@@ -5362,7 +5354,7 @@ impl ElispHost {
             point: 1,
             begv: 1,
             zv: 1,
-            mark: None,
+            mark: Value::Undef,
             se_markers: Vec::new(),
             restrict_stack: Vec::new(),
             locals,
@@ -5504,7 +5496,6 @@ impl ElispHost {
         b.point = 1;
         b.begv = 1;
         b.zv = 1;
-        b.mark = None;
         // Detach every marker that pointed into the killed buffer.
         for mk in b.markers.drain(..) {
             let mut md = mk.borrow_mut();
@@ -5638,9 +5629,6 @@ impl ElispHost {
         let b = &mut self.buffers[self.current];
         adj_ins(&mut b.begv, pos, len, false);
         adj_ins(&mut b.zv, pos, len, true);
-        if let Some(m) = b.mark.as_mut() {
-            adj_ins(m, pos, len, false);
-        }
         for m in b.se_markers.iter_mut() {
             adj_ins(m, pos, len, false);
         }
@@ -5670,9 +5658,6 @@ impl ElispHost {
         adj_del(&mut b.point, from, to);
         adj_del(&mut b.begv, from, to);
         adj_del(&mut b.zv, from, to);
-        if let Some(m) = b.mark.as_mut() {
-            adj_del(m, from, to);
-        }
         for m in b.se_markers.iter_mut() {
             adj_del(m, from, to);
         }
@@ -5807,6 +5792,20 @@ impl ElispHost {
     }
 
     // ── markers ──────────────────────────────────────────────────────────────
+    /// `(mark-marker)`: the current buffer's mark, one marker object for the
+    /// buffer's lifetime.
+    pub fn mark_marker(&mut self) -> Value {
+        let cur = self.current;
+        if !self.is_marker(&self.buffers[cur].mark) {
+            let m = self.alloc_marker(None, 0, false);
+            self.buffers[cur].mark = m;
+        }
+        self.buffers[cur].mark.clone()
+    }
+    /// The position of the current buffer's mark, or `None` when it is unset.
+    pub fn mark_pos(&self) -> Option<usize> {
+        self.marker_position(&self.buffers[self.current].mark)
+    }
     /// Allocate an `Obj::Marker`; when it points into a buffer, register it in
     /// that buffer's live-marker list so edits keep it up to date.
     pub fn alloc_marker(&mut self, buffer: Option<usize>, pos: usize, itype: bool) -> Value {

@@ -397,7 +397,14 @@ impl Reader {
                             self.pos += 1;
                             continue;
                         }
-                        _ => self.read_escape_scalar()?,
+                        // elisprs strings hold no raw bytes: a raw-byte escape
+                        // keeps the character of the same code, as before.
+                        _ => match self.read_escape_scalar()? {
+                            r if (BYTE8_OFFSET + 0x80..=BYTE8_OFFSET + 0xff).contains(&r) => {
+                                r - BYTE8_OFFSET
+                            }
+                            r => r,
+                        },
                     };
                     match char::from_u32(scalar as u32) {
                         Some(c) => s.push(c),
@@ -416,6 +423,12 @@ impl Reader {
     fn read_char_literal(&mut self) -> Result<Value, String> {
         self.pos += 1; // consume '?'
         let ch = self.read_char_spec()?;
+        // A raw-byte character stands for its byte (`CHAR_TO_BYTE8`), keeping
+        // any modifier bits.
+        let ch = match ch & !C_MODMASK {
+            c if c >= BYTE8_OFFSET + 0x80 => (c - BYTE8_OFFSET) | (ch & C_MODMASK),
+            _ => ch,
+        };
         // lread.c `read_char_literal`: the character must be followed by a
         // delimiter, so `?ab` is not 97 followed by the symbol `b`.
         match self.peek() {
@@ -486,19 +499,31 @@ impl Reader {
     /// the backslash: hex `xHH…`, unicode `uHHHH` / `U00HHHHHH`, octal `OOO`
     /// (1–3 digits), or a single-letter escape via `unescape`.
     fn read_escape_scalar(&mut self) -> Result<i64, String> {
-        let e = self.peek().ok_or("unterminated escape")?;
+        let e = self.peek().ok_or("end-of-file")?;
         match e {
+            // lread.c `read_char_escape`, `case 'x'`: any number of hex digits,
+            // up to `CHAR_META | (CHAR_META - 1)` (values carry modifier bits),
+            // and one or two digits naming 0x80..0xff are a raw byte.
             'x' => {
                 self.pos += 1;
                 let mut n: i64 = 0;
-                let mut any = false;
+                let mut count = 0;
                 while let Some(d) = self.peek().and_then(|c| c.to_digit(16)) {
                     n = n * 16 + d as i64;
                     self.pos += 1;
-                    any = true;
+                    if n > C_META | (C_META - 1) {
+                        return Err(format!("error: Hex character out of range: \\x{n:x}..."));
+                    }
+                    count += usize::from(count < 3);
                 }
-                if !any {
-                    return Err("missing hex digits after \\x".to_string());
+                if count == 0 {
+                    return Err(
+                        "error: Invalid escape char syntax: \\x not followed by hex digit"
+                            .to_string(),
+                    );
+                }
+                if count < 3 && n >= 0x80 {
+                    n += BYTE8_OFFSET;
                 }
                 Ok(n)
             }
@@ -510,20 +535,60 @@ impl Reader {
                 self.pos += 1;
                 self.read_fixed_hex(8)
             }
-            // \N{U+HHHH} codepoint escape (the named-char form needs a name table).
-            'N' if self.peek_at(1) == Some('{') => {
-                self.pos += 2;
-                let start = self.pos;
-                while self.peek().is_some() && self.peek() != Some('}') {
-                    self.pos += 1;
+            // `case 'N'`: `\N{NAME}`, where NAME collapses runs of whitespace,
+            // is ASCII, and is either `U+HEX` or a Unicode character name.
+            'N' => {
+                self.pos += 1;
+                if self.peek() != Some('{') {
+                    return Err("invalid-read-syntax: Expected opening brace after \\N".to_string());
                 }
-                let name: String = self.chars[start..self.pos].iter().collect();
-                if self.peek() == Some('}') {
+                self.pos += 1;
+                let mut name = String::new();
+                let mut whitespace = false;
+                loop {
+                    let c = self.peek().ok_or("end-of-file")?;
                     self.pos += 1;
+                    if c == '}' {
+                        break;
+                    }
+                    if c as u32 >= 0x80 {
+                        return Err(format!(
+                            "invalid-read-syntax: Invalid character U+{:04X} in character name",
+                            c as u32
+                        ));
+                    }
+                    let c = if c.is_ascii_whitespace() || c == '\x0b' {
+                        if whitespace {
+                            continue;
+                        }
+                        whitespace = true;
+                        ' '
+                    } else {
+                        whitespace = false;
+                        c
+                    };
+                    name.push(c);
+                    if name.len() >= 201 {
+                        return Err("invalid-read-syntax: Character name too long".to_string());
+                    }
                 }
-                match name.trim().strip_prefix("U+") {
-                    Some(hex) => i64::from_str_radix(hex.trim(), 16)
-                        .map_err(|_| format!("invalid \\N{{{name}}}")),
+                if name.is_empty() {
+                    return Err("invalid-read-syntax: Empty character name".to_string());
+                }
+                // `character_name_to_code`: "U+" is `string_to_number` of the
+                // rest in base 16, which must consume all of it and name a
+                // Unicode scalar value.
+                match name.strip_prefix("U+") {
+                    Some(hex) => match i64::from_str_radix(hex, 16) {
+                        Ok(n)
+                            if !hex.starts_with(['+', '-'])
+                                && (0..=0x10FFFF).contains(&n)
+                                && !(0xD800..=0xDFFF).contains(&n) =>
+                        {
+                            Ok(n)
+                        }
+                        _ => Err(format!("invalid-read-syntax: \\N{{{name}}}")),
+                    },
                     None => Err(format!("unsupported character name: {name}")),
                 }
             }
@@ -562,18 +627,30 @@ impl Reader {
         }
     }
 
-    /// Read exactly `n` hex digits (for `\u` / `\U`), erroring if any is missing.
+    /// lread.c's `\u` / `\U`: exactly `n` hex digits naming a Unicode scalar
+    /// value, with its three diagnostics.
     fn read_fixed_hex(&mut self, n: usize) -> Result<i64, String> {
-        let mut val: i64 = 0;
+        let letter = if n == 4 { 'u' } else { 'U' };
+        let mut val: u32 = 0;
         for _ in 0..n {
-            let d = self
-                .peek()
-                .and_then(|c| c.to_digit(16))
-                .ok_or("missing hex digits in unicode escape")?;
-            val = val * 16 + d as i64;
+            let Some(c) = self.peek() else {
+                return Err(format!(
+                    "error: Malformed Unicode escape: \\{letter}{val:x}"
+                ));
+            };
             self.pos += 1;
+            let Some(d) = c.to_digit(16) else {
+                return Err(format!(
+                    "error: Non-hex character used for Unicode escape: {c} ({})",
+                    c as u32
+                ));
+            };
+            val = (val << 4) + d;
         }
-        Ok(val)
+        if val > 0x10FFFF {
+            return Err(format!("error: Non-Unicode character: 0x{val:x}"));
+        }
+        Ok(i64::from(val))
     }
 
     /// Read a `#`-then-digits form: `#NNr…` (a radix-N integer, e.g. `#16rFF`),
@@ -1123,6 +1200,8 @@ const C_HYPER: i64 = 1 << 24;
 const C_SUPER: i64 = 1 << 23;
 const C_ALT: i64 = 1 << 22;
 const C_MODMASK: i64 = C_META | C_CTL | C_SHIFT | C_HYPER | C_SUPER | C_ALT;
+/// `BYTE8_TO_CHAR`: raw byte B (0x80..0xff) is character B + 0x3FFF00.
+const BYTE8_OFFSET: i64 = 0x3F_FF00;
 
 /// Apply the control modifier to a (possibly already modified) character: fold
 /// ASCII letters / `@A-Z[\]^_` into 0–31, `?` into 127, and otherwise set the

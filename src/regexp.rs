@@ -9,7 +9,8 @@
 //!
 //! Coverage is the common, portable subset of elisp regexp syntax: grouping
 //! (incl. shy `\(?:` and explicitly-numbered `\(?N:`), alternation, bounded
-//! repeats, anchors (`\``, `\'`, `\<`, `\>`, `\_<`, `\_>`), word/symbol/whitespace
+//! repeats (with Emacs's collapsing of postfix runs), anchors (`\``, `\'`, `\<`, `\>`,
+//! `\_<`, `\_>`, context-dependent `^`/`$`, `\=` as point), word/symbol/whitespace
 //! escapes (`\w \W \b \B \s- \sw`), character alternatives `[...]`, and
 //! backreferences `\1`..`\9`.
 //!
@@ -48,6 +49,12 @@ pub trait SyntaxLookup {
     /// Whether a syntax table is reachable. False only for [`NoSyntax`].
     fn available(&self) -> bool {
         true
+    }
+    /// What `\=` (point) translates to. A buffer search starts its match
+    /// attempt at point, which is where fancy-regex's `\G` matches; the host
+    /// answers with point itself, which a backward search needs.
+    fn at_dot(&self) -> String {
+        r"\G".to_string()
     }
 }
 
@@ -98,44 +105,175 @@ pub fn translate_groups(pat: &str, syn: &dyn SyntaxLookup) -> Result<(String, Ve
     // start of the pattern and just after `\(` or `\|`, where Emacs reads
     // `*`/`+`/`?` as ordinary characters.
     let mut can_repeat = false;
+    // regex-emacs.c's `laststart`: where in OUT the expression a postfix
+    // operator applies to begins. A group's starts where its `\(` was emitted.
+    let mut laststart: usize = 0;
+    let mut group_starts: Vec<usize> = Vec::new();
+    // Whether the expression at LASTSTART already carries a repetition. Emacs
+    // applies a second operator to the whole repeated expression (`a\{2\}*` is
+    // an even number of `a`s), where the crate would reject or misread it.
+    let mut repeated = false;
+    // `at_begline_loc_p`: a `^` is an anchor only at the start of the pattern
+    // and right after `\(`, `\(?:`, `\(?N:` or `\|`; anywhere else it is an
+    // ordinary character.
+    let mut at_begline = true;
     while let Some(c) = it.next() {
+        let tok_start = out.len();
+        let begline = std::mem::replace(&mut at_begline, false);
         match c {
-            '\\' => translate_escape(
-                &mut it,
-                &mut out,
-                &mut depth,
-                &mut can_repeat,
-                syn,
-                &mut groups,
-            )?,
+            '\\' => {
+                let e = it.peek().copied();
+                if e == Some('{') {
+                    // The interval is read (and diagnosed) before Emacs looks
+                    // for something to repeat; with nothing, its `\{` is a
+                    // literal `{` (`unfetch_interval`) and the rest is reread.
+                    let save = it.clone();
+                    let mut scratch = String::new();
+                    translate_escape(
+                        &mut it,
+                        &mut scratch,
+                        &mut depth,
+                        &mut can_repeat.clone(),
+                        syn,
+                        &mut groups,
+                    )?;
+                    if !can_repeat {
+                        it = save;
+                        it.next();
+                        out.push_str(r"\{");
+                        can_repeat = true;
+                        laststart = tok_start;
+                        repeated = false;
+                        continue;
+                    }
+                    if repeated {
+                        wrap_group(&mut out, laststart);
+                    }
+                    out.push_str(&scratch);
+                    repeated = true;
+                    continue;
+                }
+                translate_escape(
+                    &mut it,
+                    &mut out,
+                    &mut depth,
+                    &mut can_repeat,
+                    syn,
+                    &mut groups,
+                )?;
+                match e {
+                    Some('(') => {
+                        group_starts.push(tok_start);
+                        at_begline = true;
+                    }
+                    Some(')') => {
+                        laststart = group_starts.pop().unwrap_or(tok_start);
+                        repeated = false;
+                    }
+                    Some('|') => at_begline = true,
+                    _ => {
+                        laststart = tok_start;
+                        repeated = false;
+                    }
+                }
+            }
             // Literal in elisp, special in the crate → escape.
             '(' | ')' | '{' | '}' | '|' => {
                 out.push('\\');
                 out.push(c);
                 can_repeat = true;
+                laststart = tok_start;
+                repeated = false;
             }
             // Character alternative: copy through verbatim. Both dialects agree
             // on `[a-z]`, `[^...]`, a leading/`^`-leading `]`, and `[:class:]`.
             '[' => {
                 copy_class(&mut it, &mut out, syn)?;
                 can_repeat = true;
+                laststart = tok_start;
+                repeated = false;
+            }
+            // A run of postfix operators collapses to one, as regex-emacs.c
+            // reads it: `*`/`+` allow many, `*`/`?` allow zero, and a `?`
+            // after either kind makes the result non-greedy (`a+*` is `a*`,
+            // `a*??` is `a*?`).
+            '*' | '+' | '?' if can_repeat => {
+                let (mut zero, mut many, mut greedy) = (false, false, true);
+                let mut op = c;
+                loop {
+                    if op == '?' && (zero || many) {
+                        greedy = false;
+                    } else {
+                        zero |= op != '+';
+                        many |= op != '?';
+                    }
+                    match it.peek() {
+                        Some(&n @ ('*' | '+' | '?')) => {
+                            it.next();
+                            op = n;
+                        }
+                        _ => break,
+                    }
+                }
+                if repeated {
+                    wrap_group(&mut out, laststart);
+                }
+                out.push(match (zero, many) {
+                    (true, true) => '*',
+                    (false, true) => '+',
+                    _ => '?',
+                });
+                if !greedy {
+                    out.push('?');
+                }
+                repeated = true;
             }
             // A repetition operator with no preceding expression is a literal
             // character in Emacs, not an error.
             '*' | '+' | '?' => {
-                if can_repeat {
-                    out.push(c);
+                out.push('\\');
+                out.push(c);
+                can_repeat = true;
+                laststart = tok_start;
+                repeated = false;
+            }
+            // Postfix operators after an anchoring `^` are literals.
+            '^' if begline => {
+                out.push('^');
+                can_repeat = false;
+            }
+            // `$` anchors only at the end of the pattern or before `\)`/`\|`.
+            '$' if {
+                let mut ahead = it.clone();
+                match ahead.next() {
+                    None => true,
+                    Some('\\') => matches!(ahead.next(), Some(')' | '|')),
+                    Some(_) => false,
+                }
+            } =>
+            {
+                out.push('$');
+                can_repeat = true;
+                laststart = tok_start;
+                repeated = false;
+            }
+            '^' | '$' | '.' => {
+                if c == '.' {
+                    out.push('.');
                 } else {
                     out.push('\\');
                     out.push(c);
-                    can_repeat = true;
                 }
+                can_repeat = true;
+                laststart = tok_start;
+                repeated = false;
             }
-            '^' | '$' => out.push(c),
-            // `.` and ordinary chars share meaning across dialects.
+            // Ordinary chars share meaning across dialects.
             _ => {
                 out.push(c);
                 can_repeat = true;
+                laststart = tok_start;
+                repeated = false;
             }
         }
     }
@@ -143,6 +281,13 @@ pub fn translate_groups(pat: &str, syn: &dyn SyntaxLookup) -> Result<(String, Ve
         return Err(UNMATCHED_OPEN.into());
     }
     Ok((out, groups.emitted))
+}
+
+/// Make OUT from START one non-capturing group, so the postfix operator that
+/// follows applies to all of it.
+fn wrap_group(out: &mut String, start: usize) {
+    out.insert_str(start, "(?:");
+    out.push(')');
 }
 
 /// The capture-group state `regex-emacs.c` keeps while reading a pattern.
@@ -238,7 +383,7 @@ const INVALID_CLASS_NAME: &str = "Invalid character class name";
 /// A `fancy_regex` construct that matches nothing, for the elisp constructs
 /// Emacs compiles but that can never succeed: a reversed range, and a back
 /// reference to a register no group ever writes.
-const NEVER_MATCHES: &str = "[^\\s\\S]";
+pub(crate) const NEVER_MATCHES: &str = "[^\\s\\S]";
 
 /// The character-class names `re_wctype` (`regex-emacs.c`) accepts. Anything
 /// else between `[:` and `:]` is `Invalid character class name` — Emacs does not
@@ -395,7 +540,7 @@ fn translate_escape(
             out.push_str(&body);
             out.push('}');
         }
-        '}' => out.push('}'),
+        '}' => out.push_str(r"\}"),
         // Anchors.
         '`' => out.push_str(r"\A"),
         '\'' => out.push_str(r"\z"),
@@ -439,7 +584,8 @@ fn translate_escape(
                 None => out.push('_'),
             }
         }
-        '=' => {} // point — no analogue; matches empty.
+        // regex-emacs.c `at_dot`: point in a buffer, nowhere in a string.
+        '=' => out.push_str(&syn.at_dot()),
         // `\w` / `\W` are the word-constituent class of the *syntax table*
         // (`regex-emacs.c` tests `SYNTAX (c) == Sword`), not the crate's
         // `[0-9A-Za-z_]`. The two disagree on `_` under any lisp-mode table,

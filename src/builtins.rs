@@ -2784,41 +2784,137 @@ struct FmtSpec {
     conv: char,
 }
 
-/// Format an integer in `radix` (8/16) the way Emacs's `%o`/`%x`/`%X` do: a
-/// leading `-` and the magnitude's digits (not two's complement), with an
-/// optional `0`/`0x`/`0X` prefix when the `#` flag is set.
-/// Zero-pad a magnitude digit string to at least `prec` digits (integer-precision
-/// semantics). `Some(0)` with value "0" yields an empty string, like C/Emacs.
-fn pad_digits(mag: &str, prec: Option<usize>) -> String {
-    match prec {
-        None => mag.to_string(),
-        Some(0) if mag == "0" => String::new(),
-        Some(p) if mag.len() < p => format!("{}{mag}", "0".repeat(p - mag.len())),
-        Some(_) => mag.to_string(),
-    }
+/// The integer argument of `%d`/`%i`/`%o`/`%x`/`%X`, as editfns.c
+/// `styled_format` dispatches on it.
+enum IntArg {
+    /// A fixnum, or a float whose magnitude fits a `uintmax_t` under
+    /// `%o`/`%x`/`%X`: formatted by `sprintf`.
+    Fixnum(BigInt),
+    /// A float under `%d`/`%i`: `sprintf ("%.0f", trunc (x))`.
+    FloatD(f64),
+    /// A bignum, or a float too large for `uintmax_t` under `%o`/`%x`/`%X`:
+    /// formatted by `bignum_to_c_string`.
+    Bignum(BigInt),
 }
-fn format_radix(n: &BigInt, radix: u32, upper: bool, alt: bool, prec: Option<usize>) -> String {
-    use num_traits::Signed;
-    let negative = n.is_negative();
-    let mag = n.abs();
-    let sign = if negative { "-" } else { "" };
-    // Emacs prints a negative %x/%o as sign + magnitude, not the two's complement.
-    let body = match (radix, upper) {
-        (16, true) => mag.to_str_radix(16).to_uppercase(),
-        (16, false) => mag.to_str_radix(16),
-        _ => mag.to_str_radix(8),
+
+/// One integer conversion of editfns.c `styled_format`, padding included.
+///
+/// The text is built from the same pieces in the same order as the C:
+/// leading padding, the sign and `0x` taken from the start of the `sprintf`
+/// output, the prefix array (sign and `0x` of a bignum), the excess-precision
+/// zeros, the rest of the `sprintf` output, trailing padding. A bignum's
+/// precision counts its `-` sign (`(format "%.25d" (- (expt 2 70)))` has 25
+/// characters), and a `0` flag is dropped when a precision is given.
+fn format_integer(arg: IntArg, spec: &FmtSpec) -> String {
+    use num_traits::{Signed, Zero};
+    let conv = spec.conv;
+    let sharp = spec.alt && !matches!(conv, 'd' | 'i');
+    let plus = spec.plus;
+    let space = spec.space && !plus;
+    let zero_flag = spec.zero && !spec.left && spec.prec.is_none();
+    let radix = match conv {
+        'o' => 8,
+        'x' | 'X' => 16,
+        _ => 10,
     };
-    let body = pad_digits(&body, prec);
-    let prefix = if alt && mag != BigInt::from(0) {
-        match (radix, upper) {
-            (16, true) => "0X",
-            (16, false) => "0x",
-            _ => "0",
+    let digits = |n: &BigInt| {
+        let s = n.abs().to_str_radix(radix);
+        if conv == 'X' {
+            s.to_uppercase()
+        } else {
+            s
         }
-    } else {
-        ""
     };
-    format!("{sign}{prefix}{body}")
+    let sign_char = |negative: bool| {
+        if negative {
+            "-"
+        } else if plus {
+            "+"
+        } else if space {
+            " "
+        } else {
+            ""
+        }
+    };
+    // C printf's integer precision: at least PREC digits, none for a zero
+    // value at precision 0.
+    let printf_digits = |n: &BigInt| match spec.prec {
+        Some(0) if n.is_zero() => String::new(),
+        Some(p) => {
+            let d = digits(n);
+            format!("{}{d}", "0".repeat(p.saturating_sub(d.len())))
+        }
+        None => digits(n),
+    };
+    // P is the `sprintf` (or `bignum_to_c_string`) output, PREC the precision
+    // it was given; EXCESS is what is left over for leading zeros.
+    let mut prefix = String::new();
+    let (p, excess) = match arg {
+        IntArg::Fixnum(n) => {
+            let mut d = printf_digits(&n);
+            // printf's `#` with `o` raises the precision so the first digit is 0.
+            if sharp && conv == 'o' && !d.starts_with('0') {
+                d.insert(0, '0');
+            }
+            if sharp && radix == 16 && !n.is_zero() {
+                d.insert_str(0, if conv == 'X' { "0X" } else { "0x" });
+            }
+            (format!("{}{d}", sign_char(n.is_negative())), 0)
+        }
+        IntArg::FloatD(x) => {
+            let t = x.trunc();
+            let n = <BigInt as num_traits::FromPrimitive>::from_f64(t).unwrap_or_default();
+            let p = format!("{}{}", sign_char(n.is_negative()), digits(&n));
+            let signedp = usize::from(!p.starts_with(|c: char| c.is_ascii_digit()));
+            let len = p.len() - signedp;
+            (p, spec.prec.map_or(0, |pr| pr.saturating_sub(len)))
+        }
+        IntArg::Bignum(n) => {
+            let negative = n.is_negative();
+            let p = format!("{}{}", if negative { "-" } else { "" }, digits(&n));
+            if !negative && (plus || space) {
+                prefix.push(if plus { '+' } else { ' ' });
+            }
+            if sharp && radix == 16 {
+                prefix.push('0');
+                prefix.push(conv);
+            }
+            let len = p.len();
+            (p, spec.prec.map_or(0, |pr| pr.saturating_sub(len)))
+        }
+    };
+    let pb = p.as_bytes();
+    let mut leading_zeros = excess;
+    let numwidth = prefix.len() + p.len() + excess;
+    let mut padding = spec.width.saturating_sub(numwidth);
+    let signedp = usize::from(matches!(pb.first(), Some(b'-' | b'+' | b' ')));
+    let beglen = signedp
+        + if pb.get(signedp) == Some(&b'0') && pb.get(signedp + 1) == Some(&(conv as u8)) {
+            2
+        } else {
+            0
+        };
+    if zero_flag && pb.get(beglen).is_some_and(u8::is_ascii_hexdigit) {
+        leading_zeros += padding;
+        padding = 0;
+    }
+    if leading_zeros == 0 && sharp && conv == 'o' && pb.get(beglen) != Some(&b'0') {
+        leading_zeros += 1;
+        padding -= usize::from(padding != 0);
+    }
+    let (lead, trail) = if spec.left {
+        (0, padding)
+    } else {
+        (padding, 0)
+    };
+    format!(
+        "{}{}{prefix}{}{}{}",
+        " ".repeat(lead),
+        &p[..beglen],
+        "0".repeat(leading_zeros),
+        &p[beglen..],
+        " ".repeat(trail)
+    )
 }
 
 /// Rust's `core::fmt` stores a dynamic precision in a `u16`, so `format!` with
@@ -3218,6 +3314,18 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtField>
                 _ => as_int_exact(h, arg).map_err(|_| BAD_TYPE.to_string()),
             }
         };
+        // How styled_format dispatches an integer conversion on its argument.
+        let int_arg = |idx: usize| -> Result<IntArg, String> {
+            let arg = a.get(idx).ok_or_else(|| NOT_ENOUGH.to_string())?;
+            Ok(match arg {
+                Value::Float(f) if matches!(conv, 'd' | 'i') => IntArg::FloatD(*f),
+                // `abs_d < UINTMAX_MAX + 1.0`
+                Value::Float(f) if f.abs() < 18446744073709551616.0 => IntArg::Fixnum(bigf(idx)?),
+                Value::Float(_) => IntArg::Bignum(bigf(idx)?),
+                _ if h.is_bignum(arg) => IntArg::Bignum(bigf(idx)?),
+                _ => IntArg::Fixnum(bigf(idx)?),
+            })
+        };
         // A `%s` of a string argument reproduces that string's characters, so
         // its properties belong on them. Truncation by a precision drops the
         // tail but keeps the head's, which the offsets below already express.
@@ -3262,19 +3370,7 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtField>
                         apply_sign("inf".to_string(), &spec)
                     }
                 }
-                _ => {
-                    use num_traits::Signed;
-                    let n = bigf(idx)?;
-                    let mag = pad_digits(&n.abs().to_string(), spec.prec);
-                    apply_sign(
-                        if n.is_negative() {
-                            format!("-{mag}")
-                        } else {
-                            mag
-                        },
-                        &spec,
-                    )
-                }
+                _ => format_integer(int_arg(idx)?, &spec),
             },
             // The unsigned radix conversions have no word rendering for a
             // non-finite float: Emacs signals `(overflow-error)` (a NaN/Inf has
@@ -3285,9 +3381,7 @@ fn el_format_pieces(h: &ElispHost, a: &[Value]) -> Result<(String, Vec<FmtField>
                         return Err("overflow-error".to_string());
                     }
                 }
-                let upper = conv == 'X';
-                let radix = if conv == 'o' { 8 } else { 16 };
-                format_radix(&bigf(idx)?, radix, upper, spec.alt, spec.prec)
+                format_integer(int_arg(idx)?, &spec)
             }
             'c' => {
                 // %c takes a character: any float — even an integral one — is a
@@ -4463,11 +4557,23 @@ struct HostSyntax<'a> {
     /// only valid for the syntax table in force at the time, so [`compile_cf`]
     /// caches it under that table's fingerprint.
     used_syntax: std::cell::Cell<bool>,
+    /// The offset of point in the subject; `None` for a string, where `\=`
+    /// can never match.
+    point: Option<usize>,
 }
 impl crate::regexp::SyntaxLookup for HostSyntax<'_> {
     fn ranges(&self, class: char) -> Vec<(u32, u32)> {
         self.used_syntax.set(true);
         self.host.syntax_class_ranges(class)
+    }
+    fn at_dot(&self) -> String {
+        match self.point {
+            None => crate::regexp::NEVER_MATCHES.to_string(),
+            // fancy-regex has no point: assert that exactly P characters
+            // precede the position (a constant-width lookbehind).
+            Some(0) => r"\A".to_string(),
+            Some(p) => format!(r"(?<=\A[\s\S]{{{p}}})"),
+        }
     }
 }
 
@@ -4514,7 +4620,8 @@ thread_local! {
     ///
     /// The FAILURE is cached with the success: an invalid pattern has to keep
     /// signalling `invalid-regexp` on every call, not silently start matching.
-    static RE_CACHE: RefCell<[ReCacheMap; 2]> = RefCell::new([HashMap::new(), HashMap::new()]);
+    static RE_CACHE: RefCell<[ReCacheMap; 4]> =
+        RefCell::new([HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new()]);
 }
 
 /// Entries kept before the cache is dropped wholesale. Bounded because elisp
@@ -4522,13 +4629,42 @@ thread_local! {
 /// so an unbounded cache would grow with the program's input, not its code.
 const RE_CACHE_MAX: usize = 1024;
 
+/// Compile PAT for a match against a string, where `\=` never matches
+/// (regex-emacs.c `at_dot` fails without a buffer).
 pub(crate) fn compile_cf(
     h: &ElispHost,
     pat: &str,
     case_insensitive: bool,
 ) -> Result<Rc<CompiledRe>, String> {
-    let slot = usize::from(case_insensitive);
-    if let Some((stamp, hit)) = RE_CACHE.with(|c| c.borrow()[slot].get(pat).cloned()) {
+    compile_cf_in(h, pat, case_insensitive, None)
+}
+
+/// [`compile_cf`] for a match against the current buffer's accessible text,
+/// where `\=` matches at point.
+pub(crate) fn compile_cf_buf(
+    h: &ElispHost,
+    pat: &str,
+    case_insensitive: bool,
+) -> Result<Rc<CompiledRe>, String> {
+    let b = h.cur_buf_ref();
+    compile_cf_in(h, pat, case_insensitive, Some(b.point - b.begv))
+}
+
+/// POINT is the offset of point in the subject, or `None` for a string. Only
+/// a pattern that can contain `\=` depends on it, so only such a pattern is
+/// cached per point.
+fn compile_cf_in(
+    h: &ElispHost,
+    pat: &str,
+    case_insensitive: bool,
+    point: Option<usize>,
+) -> Result<Rc<CompiledRe>, String> {
+    let slot = usize::from(case_insensitive) + 2 * usize::from(point.is_some());
+    let key = match point {
+        Some(p) if pat.contains("\\=") => format!("{p}\0{pat}"),
+        _ => pat.to_string(),
+    };
+    if let Some((stamp, hit)) = RE_CACHE.with(|c| c.borrow()[slot].get(&key).cloned()) {
         if stamp.is_none_or(|s| s == h.syntax_fingerprint()) {
             return hit;
         }
@@ -4536,6 +4672,7 @@ pub(crate) fn compile_cf(
     let syntax = HostSyntax {
         host: h,
         used_syntax: std::cell::Cell::new(false),
+        point,
     };
     let compiled = compile_uncached(pat, case_insensitive, &syntax);
     // A pattern whose translation read the syntax table is valid only for the
@@ -4547,7 +4684,7 @@ pub(crate) fn compile_cf(
         if maps[slot].len() >= RE_CACHE_MAX {
             maps[slot].clear();
         }
-        maps[slot].insert(pat.to_string(), (stamp, compiled.clone()));
+        maps[slot].insert(key, (stamp, compiled.clone()));
     });
     compiled
 }
@@ -4580,8 +4717,7 @@ fn compile_uncached(
 pub fn clear_regexp_cache() {
     RE_CACHE.with(|c| {
         let mut maps = c.borrow_mut();
-        maps[0].clear();
-        maps[1].clear();
+        maps.iter_mut().for_each(HashMap::clear);
     });
 }
 /// Read the dynamic `case-fold-search` (default t) — string matching folds case
@@ -8466,36 +8602,39 @@ fn buffer_list(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(h.buffer_list())
 }
 
-// ── mark (a bare position; active-region / mark-ring not modeled) ──
-fn set_mark_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let mark = match a.first() {
-        Some(v) if !is_nil(v) => Some(as_int(h, v)?.max(1) as usize),
-        _ => None,
-    };
-    h.cur_buf().mark = mark;
-    Ok(a.first().cloned().unwrap_or(Value::Undef))
+// ── mark ──
+/// `(mark-marker)`. `mark` and `set-mark` are simple.el's, in the prelude.
+fn mark_marker_fn(h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(h.mark_marker())
 }
-fn mark_fn(h: &mut ElispHost, _a: &[Value]) -> R {
-    // The optional FORCE argument is accepted but irrelevant here: with no active
-    // region tracking, `mark` simply reports the mark position (or nil).
-    Ok(match h.cur_buf().mark {
-        Some(m) => Value::Int(m as i64),
-        None => Value::Undef,
-    })
+/// editfns.c `region_limit`: in Transient Mark mode an inactive mark is
+/// `mark-inactive` unless `mark-even-if-inactive`; the mark end is clipped to
+/// the accessible portion.
+fn region_limit(h: &mut ElispHost, beginningp: bool) -> R {
+    let var = |h: &mut ElispHost, name: &str| {
+        let sym = h.intern(name);
+        h.get_dynamic_value(&sym)
+            .map(|v| !is_nil(&v))
+            .unwrap_or(false)
+    };
+    if var(h, "transient-mark-mode") && !var(h, "mark-even-if-inactive") && !var(h, "mark-active") {
+        return Err("mark-inactive".to_string());
+    }
+    let m = h
+        .mark_pos()
+        .ok_or("error: The mark is not set now, so there is no region")?;
+    let b = h.cur_buf_ref();
+    Ok(Value::Int(if (b.point < m) == beginningp {
+        b.point
+    } else {
+        m.clamp(b.begv, b.zv)
+    } as i64))
 }
 fn region_beginning(h: &mut ElispHost, _a: &[Value]) -> R {
-    let buf = h.cur_buf();
-    let m = buf
-        .mark
-        .ok_or("error: The mark is not set now, so there is no region")?;
-    Ok(Value::Int(buf.point.min(m) as i64))
+    region_limit(h, true)
 }
 fn region_end(h: &mut ElispHost, _a: &[Value]) -> R {
-    let buf = h.cur_buf();
-    let m = buf
-        .mark
-        .ok_or("error: The mark is not set now, so there is no region")?;
-    Ok(Value::Int(buf.point.max(m) as i64))
+    region_limit(h, false)
 }
 
 // ── narrowing ──
@@ -9317,6 +9456,110 @@ fn replace_chars_in_place_fn(h: &mut ElispHost, a: &[Value]) -> R {
     }
     Ok(Value::Bool(true))
 }
+/// `(transpose-regions STARTR1 ENDR1 STARTR2 ENDR2 &optional LEAVE-MARKERS)` —
+/// editfns.c `Ftranspose_regions`. The span from the first region's start to
+/// the second's end keeps its length: it becomes region 2, the text between,
+/// region 1, each carrying its own text properties. Unless LEAVE-MARKERS,
+/// point and every marker move with the text they were in
+/// (`transpose_markers`); overlays are not moved.
+///
+/// Not followed: the before/after-change hooks and the undo record.
+fn transpose_regions_fn(h: &mut ElispHost, a: &[Value]) -> R {
+    let (mut start1, mut end1) = validate_region(h, &a[0], &a[1])?;
+    let (mut start2, mut end2) = validate_region(h, &a[2], &a[3])?;
+    let (arg_start1, arg_end2) = (start1, end2);
+    let leave_markers = a.get(4).is_some_and(|v| !is_nil(v));
+    if start2 < end1 {
+        std::mem::swap(&mut start1, &mut start2);
+        std::mem::swap(&mut end1, &mut end2);
+    }
+    if start2 < end1 {
+        return Err("error: Transposed regions overlap".to_string());
+    }
+    if (start1 == end1 || start2 == end2) && end1 == start2 {
+        return Ok(Value::Undef);
+    }
+    h.barf_if_read_only()?;
+    h.note_text_change(end2 - start1);
+    let (len1, len2) = (end1 - start1, end2 - start2);
+    // 0-based: region 1 [s1, e1), the text between [e1, s2), region 2 [s2, e2).
+    let (s1, e1, s2, e2) = (start1 - 1, end1 - 1, start2 - 1, end2 - 1);
+    // Where a 0-based position inside the span lands, as transpose_markers
+    // computes it for a marker.
+    let moved = |p: usize| {
+        if p < s1 || p >= e2 {
+            p
+        } else if p < e1 {
+            p + (e2 - s2) + (s2 - e1)
+        } else if p < s2 {
+            p + (e2 - s2) - (e1 - s1)
+        } else {
+            p - ((e1 - s1) + (s2 - e1))
+        }
+    };
+    fn rearrange<T: Clone>(v: &mut Vec<T>, s1: usize, e1: usize, s2: usize, e2: usize) {
+        let mut span: Vec<T> = v[s2..e2].to_vec();
+        span.extend_from_slice(&v[e1..s2]);
+        span.extend_from_slice(&v[s1..e1]);
+        v.splice(s1..e2, span);
+    }
+    let b = h.cur_buf();
+    rearrange(&mut b.text, s1, e1, s2, e2);
+    rearrange(&mut b.props, s1, e1, s2, e2);
+    // Intervals are positional: a boundary stays where it is while the text
+    // moves under it. The C first clears the properties of the regions (when
+    // they have equal lengths) or of the range from the FIRST argument pair's
+    // start to the SECOND pair's end, as passed — the swap above does not
+    // reach that call — and `set_text_properties_1` merges each cleared range
+    // into one interval. It then grafts each piece's own intervals onto its
+    // new place, splitting at the piece's edges.
+    if b.has_intervals {
+        let cleared: Vec<(usize, usize)> = if len1 == len2 {
+            vec![(s1, e1), (s2, e2)]
+        } else {
+            vec![(arg_start1.min(arg_end2) - 1, arg_start1.max(arg_end2) - 1)]
+        };
+        let inside_cleared = |p: usize| cleared.iter().any(|&(lo, hi)| p > lo && p < hi);
+        let mut bounds: Vec<u32> = b
+            .prop_bounds
+            .iter()
+            .copied()
+            .filter(|&p| !inside_cleared(p as usize))
+            .collect();
+        let mut split = |p: usize| bounds.push(p as u32);
+        for &(lo, hi) in &cleared {
+            split(lo);
+            split(hi);
+        }
+        let mut pieces = vec![(s2, e2, s1), (s1, e1, e2 - len1)];
+        if len1 != len2 {
+            pieces.push((e1, s2, s1 + len2));
+        }
+        for (from, to, at) in pieces {
+            split(at);
+            split(at + (to - from));
+            for &p in &b.prop_bounds {
+                let p = p as usize;
+                if p > from && p < to {
+                    split(p - from + at);
+                }
+            }
+        }
+        bounds.retain(|&p| p != 0 && (p as usize) < b.text.len());
+        bounds.sort_unstable();
+        bounds.dedup();
+        b.prop_bounds = bounds;
+    }
+    if !leave_markers {
+        let pt = b.point - 1;
+        b.point = moved(pt) + 1;
+        for mk in &b.markers {
+            let mut md = mk.borrow_mut();
+            md.pos = moved(md.pos - 1) + 1;
+        }
+    }
+    Ok(Value::Undef)
+}
 /// `(elisprs--carry-text-properties SRC DST)` — DST with SRC's per-character
 /// text properties, when the two are the same length.
 ///
@@ -9758,7 +10001,7 @@ fn record_buf_match(h: &mut ElispHost, spans: Spans, off: usize) -> Spans {
     spans
 }
 fn re_search_forward_once(h: &mut ElispHost, pat: &str, lim: usize) -> Result<Option<i64>, String> {
-    let re = compile_cf(h, pat, case_fold_search(h))?;
+    let re = compile_cf_buf(h, pat, case_fold_search(h))?;
     let (text, off) = accessible_text(h);
     let p = h.cur_buf_ref().point - 1 - off;
     let Some(m) = match_within(&re, &text, p, lim - 1 - off, false) else {
@@ -9793,7 +10036,7 @@ fn re_search_backward_once(
     pat: &str,
     lim: usize,
 ) -> Result<Option<i64>, String> {
-    let re = compile_cf(h, pat, case_fold_search(h))?;
+    let re = compile_cf_buf(h, pat, case_fold_search(h))?;
     let (text, off) = accessible_text(h);
     let p = h.cur_buf_ref().point - 1 - off;
     let lower = lim - 1 - off;
@@ -9810,7 +10053,7 @@ fn re_search_backward_once(
     Ok(None)
 }
 fn looking_at(h: &mut ElispHost, a: &[Value]) -> R {
-    let re = compile_cf(h, &as_string(h, &a[0])?, case_fold_search(h))?;
+    let re = compile_cf_buf(h, &as_string(h, &a[0])?, case_fold_search(h))?;
     let (text, off) = accessible_text(h);
     let p = h.cur_buf_ref().point - 1 - off;
     let stop = text.chars().count();
@@ -11101,6 +11344,55 @@ pub fn install(h: &mut ElispHost) {
     s("subr-arity", 1, Some(1), func_arity);
     s("subr-name", 1, Some(1), subr_name);
     s("--current-directory--", 0, Some(0), current_directory);
+    s(
+        "file-name-directory",
+        1,
+        Some(1),
+        crate::fileio::file_name_directory,
+    );
+    s(
+        "file-name-nondirectory",
+        1,
+        Some(1),
+        crate::fileio::file_name_nondirectory,
+    );
+    s(
+        "file-name-as-directory",
+        1,
+        Some(1),
+        crate::fileio::file_name_as_directory,
+    );
+    s(
+        "directory-file-name",
+        1,
+        Some(1),
+        crate::fileio::directory_file_name,
+    );
+    s(
+        "directory-name-p",
+        1,
+        Some(1),
+        crate::fileio::directory_name_p,
+    );
+    s("file-name-concat", 1, None, crate::fileio::file_name_concat);
+    s(
+        "file-name-absolute-p",
+        1,
+        Some(1),
+        crate::fileio::file_name_absolute_p,
+    );
+    s(
+        "expand-file-name",
+        1,
+        Some(2),
+        crate::fileio::expand_file_name,
+    );
+    s(
+        "file-name-case-insensitive-p",
+        1,
+        Some(1),
+        crate::fileio::file_name_case_insensitive_p,
+    );
     s("--system-type--", 0, Some(0), system_type);
     s("--build-time--", 0, Some(0), build_time);
     s("system-name", 0, Some(0), system_name);
@@ -11133,8 +11425,7 @@ pub fn install(h: &mut ElispHost) {
     s("rename-buffer", 1, Some(2), rename_buffer);
     s("buffer-list", 0, Some(1), buffer_list);
     // mark + narrowing
-    s("set-mark", 1, Some(1), set_mark_fn);
-    s("mark", 0, Some(1), mark_fn);
+    s("mark-marker", 0, Some(0), mark_marker_fn);
     s("region-beginning", 0, Some(0), region_beginning);
     s("region-end", 0, Some(0), region_end);
     s("narrow-to-region", 2, Some(2), narrow_to_region);
@@ -11289,6 +11580,7 @@ pub fn install(h: &mut ElispHost) {
         remove_text_properties_fn,
     );
     s("propertize", 1, None, propertize_fn);
+    s("transpose-regions", 4, Some(5), transpose_regions_fn);
     s(
         "elisprs--replace-chars-in-place",
         3,
