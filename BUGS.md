@@ -7009,3 +7009,167 @@ misc.el's `zap-up-to-char`, lisp.el's `mark-sexp`, `kill-sexp`,
   `transpose-sexps`, `beginning-of-defun`/`end-of-defun`/`narrow-to-defun`,
   `insert-pair`/`delete-pair`, `check-parens`, `buffer-local-set-state`.
 - Before/after-change hooks and undo for `transpose-regions`.
+
+## Round 43 — the preloaded editing libraries, category tables, fields, `process-environment`, `#@`
+
+**Oracle: GNU Emacs 31.1** (`/opt/homebrew/bin/emacs`, `emacs -Q --batch -l
+scripts/fuzz/drive.el`). Found by differential probes over paragraph, fill,
+indentation and comment commands, the `\cC` escape, fields, the environment
+and the reader's `#@`. Closed from round 42's open list: `\cC`/`\CC`,
+`process-environment`, `#@NNN` in a string source, `forward-paragraph`,
+`forward-sentence`, `fill-region`/`fill-paragraph`, `indent-region`,
+`indent-rigidly`, `comment-region`, `goto-line`, `what-line`,
+`count-words-region`, `split-line`, `beginning-of-line-text`,
+`upcase-initials-region`, `append-next-kill`, `transpose-sexps`,
+`beginning-of-defun`/`end-of-defun`/`narrow-to-defun`,
+`insert-pair`/`delete-pair`, `check-parens`.
+
+### R43-A. ✅ FIXED — paragraphs.el, fill.el, indent.el and newcomment.el are loaded verbatim
+
+All four are preloaded by loadup.el; none of their functions existed
+(`(forward-paragraph)` was `void-function`). They are now prelude segments,
+byte for byte (`src/lisp/`). What they reach for in C was added: editfns.c's
+fields (R43-C), minibuf.c's `minibufferp` and `minibuffer-prompt-end`,
+character.c's `char-script-table` (empty: characters.el's script data is not
+loaded), keyboard.c's `overriding-terminal-local-map`/`overriding-local-map`,
+charset.c's `char-charset`/`charset-after` (over the `ascii`, `unicode`,
+`eight-bit` and `emacs` charsets only), textprop's
+`insert-before-markers-and-inherit`, insdel.c's change-hook variables, subr.el's
+`combine-change-calls` and the global keymap tree (`esc-map`, `ctl-x-map`,
+`global-map`, `use-global-map`/`current-global-map`; bindings.el is not
+loaded). `enable-multibyte-characters` is t and, as buffer.c's
+SYMBOL_NOWRITE variable, `setting-constant` for `setq`, `let` and
+`set-default`.
+
+```text
+form                                                          was                 Emacs 31.1 / now
+(forward-paragraph) in "a b c. d e f.  g h\n\nnext para\n"   void-function       20
+(fill-region …) at fill-column 20                             void-function       "aaa bbb ccc ddd eee\nfff …"
+(fill-paragraph) in ";; aaa bbb … iii\n;; jjj kkk"            void-function       ";; aaa bbb ccc\n;; ddd eee fff\n…"
+(indent-rigidly 1 (point-max) 2) in "a\nb\nc"                void-function       "  a\n  b\n  c"
+(comment-region …) with comment-start "# "                    void-function       "# abc\n# def"
+(setq enable-multibyte-characters nil)                        void-variable       (setting-constant enable-multibyte-characters)
+```
+
+simple.el's `goto-line`, `count-words-region`, `what-line`, `split-line`,
+`newline-and-indent`, `forward-`/`backward-to-indentation`,
+`delete-all-space`, `beginning-of-buffer`, `delete-backward-char`,
+`mark-whole-buffer`, `append-next-kill`, `kill-forward-chars`,
+`backward-delete-char-untabify`, `insert-buffer`, `prepend-to-buffer`,
+`copy-to-buffer`, `transpose-sexps`, `forward-unix-word`,
+`unix-word-rubout`, `unix-filename-rubout`, `do-auto-fill` and
+`auto-fill-mode`; lisp.el's defun motion (`beginning-of-defun`,
+`end-of-defun`, `mark-defun`, `narrow-to-defun`), `insert-pair`,
+`insert-parentheses`, `delete-pair`, `raise-sexp`,
+`kill-backward-up-list` and `check-parens`; and text-mode.el's
+`center-line`/`center-region`/`center-paragraph` are verbatim too
+(`src/lisp/simple-31.el`). `upcase-initials-region` is casefiddle.c's
+CASE_CAPITALIZE_UP over the region. Expectations:
+`tests/parity_paragraphs_fill_indent.rs`,
+`tests/parity_simple_and_lisp_commands.rs`.
+
+### R43-B. ✅ FIXED — category tables and `\cC` / `\CC`
+
+`(string-match "\\cg" "aλb")` was `(invalid-regexp "… Invalid escape: \\c")`
+and `char-category-set` was void. category.c is ported
+(`src/lisp/category-c.el`): category sets are 128-bit bool-vectors, a table
+keeps docstrings in extra slot 0 and its `equal`-shared sets in slot 1,
+`modify-category-entry` walks the table's runs (`char_table_ref_and_range`,
+via the `--char-table-run-end--` subr), `set-category-table` is per buffer.
+`\cC`/`\CC` compile to the character class the current table gives category
+C, and a compiled pattern is cached under the table's fingerprint the way
+`\sC` is under the syntax table's. `\c` at the end of a pattern is `Premature
+end of regular expression`.
+
+The standard table holds every characters.el form that defines a category or
+modifies an entry over literal Unicode ranges: `(string-match "\\c|" "ab中c")`
+is 2, `(string-match "\\ca" "中a")` is 1. Expectations:
+`tests/parity_categories.rs`.
+
+### R43-C. ✅ FIXED — fields
+
+`field-beginning`, `field-end`, `field-string`, `field-string-no-properties`,
+`delete-field` and `constrain-to-field` were void. They are editfns.c's
+`find_field` and `Fconstrain_to_field`, including the `boundary` field,
+ESCAPE-FROM-EDGE, ONLY-IN-LINE, INHIBIT-CAPTURE-PROPERTY and
+`inhibit-field-text-motion`. Expectations:
+`tests/parity_fields_and_editfns_primitives.rs`.
+
+### R43-D. ✅ FIXED — `process-environment`, `getenv`, `setenv`, subprocess environments
+
+`process-environment` was void and `getenv`/`setenv` read and wrote the real
+environment. Now callproc.c's `set_initial_environment` builds
+`process-environment` and `initial-environment` (per run, never from a cache
+image), `getenv-internal` is the C, `getenv`/`setenv`/`setenv-internal`/
+`with-environment-variables` are env.el's, and `call-process`,
+`process-lines` and `shell-command-to-string` start their child with
+`make_environment_block`'s environment (first entry wins, a lone `NAME`
+removes it, `PWD` from `default-directory`, `DISPLAY` from
+`initial-environment`). fileio.c's `get_homedir` reads `HOME`, `LOGNAME` and
+`USER` with `egetenv`, so `~` follows `process-environment`;
+`abbreviated-home-dir` is fixed at startup as startup.el leaves it.
+`set-time-zone-rule` (timefns.c `tzlookup` with SETTZ) is ported, which
+`setenv` of `TZ` calls, and `current-time-zone` is timefns.c's (`%Z` and the
+decoded offset; it answered nil for every name).
+
+```text
+form                                                                  was                    Emacs 31.1 / now
+(let ((process-environment (cons "FOOZZ=1" process-environment)))     void-variable          "1"
+  (getenv "FOOZZ"))
+(let ((process-environment (list "HOME=/h"))) (expand-file-name "~"))  the real $HOME        "/h"
+(current-time-zone 0 3600)                                            (3600 nil)             (3600 "+01")
+```
+
+Expectations: `tests/parity_process_environment.rs`.
+
+### R43-E. ✅ FIXED — `#@NNN` in a string or buffer
+
+`(read-from-string "#@4 abc def")` was `(invalid-read-syntax "#@")` (Emacs:
+`(end-of-file)`, the skip running to the end).
+lread.c's `skip_lazy_string` is ported for the reader's sources, which are
+never file streams: the count is read and the text through the next `\037`
+(or to the end) is skipped, `#@00` reads nil and skips everything, and an
+overflowing count is `(invalid-read-syntax "#@")`. Expectations:
+`tests/parity_reader_lazy_strings.rs`.
+
+### R43-F. ✅ FIXED — `char-after`/`char-before` positions, `get-buffer-create` of a buffer
+
+`(char-after "x")` was `(wrong-type-argument integerp "x")` and a bignum
+position signalled; both are `fix_position` now (`integer-or-marker-p`, a
+bignum is out of range). `(get-buffer-create BUFFER)` signalled `stringp`;
+buffer.c's `Fget_buffer` returns a buffer object as it is, killed or not.
+Expectations: `tests/parity_fields_and_editfns_primitives.rs`.
+
+### Not followed, and why
+
+- characters.el's category forms that go through charset code-point maps
+  (`map-charset-chars`), the Unicode property tables (bidi `?L`/`?R`, base
+  `?.`, combining `?^`, digit `?6`) or that also set syntax or case entries
+  (Lao, Thai, Tibetan, Tai Viet, the Latin/Greek/Cyrillic case block) are not
+  loaded, so `(string-match "\\cg" "aλb")` is nil (Emacs: 1) and
+  `(category-set-mnemonics (char-category-set ?a))` is `"al"` (Emacs:
+  `".Lalr"`). There are no charset tables to drive them.
+- env.el's coding steps (`encode-coding-string` with
+  `locale-coding-system`) are the identity: strings are UTF-8 throughout.
+
+### Still open after round 43
+
+- `beginning-of-line`, `end-of-line`, `line-beginning-position` and
+  `line-end-position` ignore fields (editfns.c constrains them with
+  `constrain-to-field`); they are open-coded Rust subrs.
+- Insertions and deletions never run `before-change-functions`,
+  `after-change-functions` or `first-change-hook`.
+- `indent-to` and `insert-char` with INHERIT do not inherit text properties
+  (`Findent_to` inserts with inheritance), so `set-left-margin` leaves the
+  indentation it adds outside the `left-margin` interval.
+- No undo: `buffer-undo-list` records nothing and `primitive-undo`,
+  `undo-boundary`, `atomic-change-group`/`cancel-change-group` are void, so
+  `cycle-spacing` and replace.el's `perform-replace` (`replace-string`,
+  `replace-regexp`, `query-replace`, `how-many`, `keep-lines`,
+  `flush-lines`) are not loaded.
+- No windows: `end-of-buffer`, `yank-pop` and `append-to-buffer` are not
+  loaded (`window-buffer`, `set-window-start`, `get-buffer-window-list`).
+- `delete-forward-char` needs `find-composition` (composite.c).
+- `current-bidi-paragraph-direction` (xdisp.c) is void, so
+  `indent-rigidly-left`/`-right`/`-to-tab-stop` signal.
+- `emacs-lisp-mode` and the other major modes are void.

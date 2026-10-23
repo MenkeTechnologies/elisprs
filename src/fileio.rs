@@ -100,13 +100,15 @@ fn user_homedir(name: &[u8]) -> Option<String> {
 }
 
 /// `get_homedir`: $HOME, else the password entry of $LOGNAME, $USER or the
-/// real uid, made absolute against the working directory.
-fn get_homedir() -> String {
-    let home = std::env::var("HOME").ok().or_else(|| {
-        let by_name = ["LOGNAME", "USER"]
-            .iter()
-            .filter_map(|v| std::env::var(v).ok())
-            .find_map(|u| user_homedir(u.as_bytes()));
+/// real uid, made absolute against the working directory. The variables are
+/// `egetenv`'s, so they come from `process-environment`.
+fn get_homedir(h: &mut ElispHost) -> String {
+    let users: Vec<String> = ["LOGNAME", "USER"]
+        .iter()
+        .filter_map(|v| crate::builtins::egetenv(h, v))
+        .collect();
+    let home = crate::builtins::egetenv(h, "HOME").or_else(|| {
+        let by_name = users.iter().find_map(|u| user_homedir(u.as_bytes()));
         // SAFETY: as in `user_homedir`; getpwuid's record is read at once.
         by_name.or_else(|| unsafe {
             let pw = libc::getpwuid(libc::getuid());
@@ -307,7 +309,7 @@ fn expand(h: &mut ElispHost, name_v: &Value, dd_in: Value) -> Result<Expanded, S
     let mut newdir: Option<String> = None;
     if at(nm, 0) == b'~' {
         if at(nm, 1) == b'/' || nm.len() == 1 {
-            newdir = Some(get_homedir());
+            newdir = Some(get_homedir(h));
             nm = &nm[1..];
         } else if let Some(home) = user_homedir(&nm[1..]) {
             newdir = Some(home);

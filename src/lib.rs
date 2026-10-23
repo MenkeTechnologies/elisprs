@@ -169,6 +169,48 @@ fn eval_forms(src: &str) -> Result<Value, String> {
     run_top_forms(src, false).map(|(_, last)| last)
 }
 
+/// callproc.c `set_initial_environment`: `process-environment` is the
+/// process's environment as `NAME=VALUE` strings, last variable first (each
+/// one is consed on in `environ` order), and `initial-environment` a copy.
+///
+/// Per-run state: it is installed before the prelude loads (env.el's
+/// `getenv` reads it there, as Emacs's preloaded Lisp does), again after a
+/// snapshot restore, and on every script run, so neither the prelude snapshot
+/// nor the bytecode cache's heap image ever supplies a stale environment.
+fn install_process_environment() {
+    host::with_host(|h| {
+        let entries: Vec<String> = std::env::vars_os()
+            .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+            .collect();
+        let strings: Vec<Value> = entries
+            .iter()
+            .rev()
+            .map(|e| h.new_string(e.clone()))
+            .collect();
+        let copy: Vec<Value> = strings.clone();
+        let process_env = h.list_from(strings);
+        let initial_env = h.list_from(copy);
+        let pe = h.intern("process-environment");
+        let ie = h.intern("initial-environment");
+        let _ = h.set_value(&pe, process_env);
+        let _ = h.set_value(&ie, initial_env);
+    });
+}
+
+/// startup.el abbreviates file names while Emacs starts, which fixes
+/// `abbreviated-home-dir` (and its `home` property) from the `HOME` of that
+/// moment; a later change to `HOME` in `process-environment` does not move
+/// it. Per-run state like the environment it is computed from.
+fn install_abbreviated_home_dir() {
+    let f = host::with_host(|h| {
+        let var = h.intern("abbreviated-home-dir");
+        let _ = h.set_value(&var, Value::Undef);
+        h.intern("abbreviate-file-name")
+    });
+    let root = host::with_host(|h| h.new_string("/".to_string()));
+    let _ = host::call_function(&f, &[root]);
+}
+
 /// Load the derived-surface prelude once per host, best-effort (a broken
 /// definition is skipped, not fatal).
 fn load_prelude() {
@@ -179,9 +221,12 @@ fn load_prelude() {
     // later `reset_host` restores it by copy rather than lowering every
     // preloaded-Lisp form again. See `host::restore_prelude_snapshot`.
     if host::restore_prelude_snapshot() {
+        install_process_environment();
+        install_abbreviated_home_dir();
         return;
     }
     host::set_prelude_loaded(true);
+    install_process_environment();
     // The prelude models Emacs's *preloaded* Lisp, which a real Emacs ships
     // byte-compiled. See `compiler::OPEN_CODED`.
     host::set_prelude_compiling(true);
@@ -219,6 +264,7 @@ fn load_prelude() {
     });
     host::set_prelude_compiling(false);
     host::save_prelude_snapshot();
+    install_abbreviated_home_dir();
 }
 
 /// Render a value (prin1 style when `readable`).
@@ -313,6 +359,8 @@ pub enum EntryPoint {
 ///   script path, matching `emacs -l FILE a b c` => `("a" "b" "c")`;
 ///   `command-line-args` is the whole invocation.
 fn install_entry_point_state(path: &str, src: &str, entry: EntryPoint) {
+    install_process_environment();
+    install_abbreviated_home_dir();
     // The initial buffer's syntax table, re-installed on EVERY run.
     //
     // The prelude ends with `(set-syntax-table emacs-lisp-mode-syntax-table)`,

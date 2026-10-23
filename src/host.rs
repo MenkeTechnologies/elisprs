@@ -1294,6 +1294,7 @@ const PRELUDE_C_SUBR_NAMES: &[&str] = &[
     "time-subtract",
     "try-completion",
     "upcase-initials",
+    "upcase-initials-region",
     "upcase-region",
     "upcase-word",
     "value<",
@@ -1357,7 +1358,6 @@ const LISP_LEVEL_ARITY: &[(&str, u16, u16)] = &[
     ("error", 1, 1),
     ("fixnump", 1, 1),
     ("generate-new-buffer", 1, 2),
-    ("getenv", 1, 2),
     ("hash-table-keys", 1, 1),
     ("hash-table-values", 1, 1),
     ("looking-at-p", 1, 1),
@@ -1373,7 +1373,6 @@ const LISP_LEVEL_ARITY: &[(&str, u16, u16)] = &[
     ("oclosure--set", 3, 3),
     ("oclosure-type", 1, 1),
     ("process-lines", 1, 1),
-    ("setenv", 1, 3),
     ("sha1", 1, 4),
     ("shell-command-to-string", 1, 1),
     ("special-form-p", 1, 1),
@@ -1989,6 +1988,16 @@ impl ElispHost {
                 s.special = true;
             }
         }
+        // buffer.c: every buffer is multibyte here (there is no
+        // `set-buffer-multibyte`), and the variable is SYMBOL_NOWRITE, so a
+        // `setq`, `let` or `set-default` of it is `setting-constant` (see
+        // `constant_symbol_name`).
+        if let Value::Obj(sid) = h.intern("enable-multibyte-characters") {
+            if let Some(Obj::Symbol(s)) = h.arena.get_mut(sid as usize) {
+                s.value = Some(Value::Bool(true));
+                s.special = true;
+            }
+        }
         h.builtin_count = h.arena.len();
         h
     }
@@ -2435,7 +2444,11 @@ impl ElispHost {
         let Obj::Symbol(s) = &self.arena[id as usize] else {
             return None;
         };
-        let constant_name = s.name == "nil" || s.name == "t" || s.name.starts_with(':');
+        // `enable-multibyte-characters` is buffer.c's SYMBOL_NOWRITE variable.
+        let constant_name = s.name == "nil"
+            || s.name == "t"
+            || s.name.starts_with(':')
+            || s.name == "enable-multibyte-characters";
         (constant_name && self.interned_in_standard_obarray(id)).then(|| s.name.clone())
     }
     /// `Err("setting-constant: NAME")` if `v` names a constant symbol.
@@ -6472,6 +6485,80 @@ impl ElispHost {
             }
         }
         out
+    }
+
+    /// The current buffer's category table (category.c `BVAR (current_buffer,
+    /// category_table)`): the buffer-local `--current-category-table--`, else
+    /// the standard table. Both are maintained by src/lisp/category-c.el.
+    fn current_category_table(&self) -> Value {
+        let local = self
+            .find_symbol("--current-category-table--")
+            .and_then(|s| self.get_value(&s).ok());
+        match local {
+            Some(v) if el_truthy(&v) => v,
+            _ => self
+                .find_symbol("--standard-category-table--")
+                .and_then(|s| self.get_value(&s).ok())
+                .unwrap_or(Value::Undef),
+        }
+    }
+
+    /// Whether category set SET (a 128-element bool-vector) has CATEGORY —
+    /// category.h `CATEGORY_MEMBER`.
+    fn category_member(&self, set: &Value, category: u8) -> bool {
+        matches!(self.obj(set), Some(Obj::BoolVector(bits))
+                 if bits.get(category as usize).copied().unwrap_or(false))
+    }
+
+    /// Every character range whose category set in the current category table
+    /// contains CATEGORY. This is what `\cC` needs, for the same reason
+    /// [`Self::syntax_class_ranges`] exists: regex-emacs.c asks
+    /// `CHAR_HAS_CATEGORY (c, cat)` per character while matching, and the
+    /// translation has to answer for the whole character space up front.
+    pub fn category_ranges(&self, category: u8) -> Vec<(u32, u32)> {
+        let table = self.current_category_table();
+        let Some(Obj::CharTable(t)) = self.obj(&table) else {
+            return Vec::new();
+        };
+        let runs = t.runs();
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for (i, (lo, val)) in runs.iter().enumerate() {
+            let hi = runs.get(i + 1).map_or(MAX_CHAR, |(n, _)| n - 1);
+            // An unset run reads as the table's default (CHAR_TABLE_REF).
+            let set = if el_truthy(val) { val } else { &t.default };
+            if !self.category_member(set, category) {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if last.1 + 1 == *lo => last.1 = hi,
+                _ => out.push((*lo, hi)),
+            }
+        }
+        out
+    }
+
+    /// A hash of everything [`Self::category_ranges`] reads: which category
+    /// table is current, its runs and the bits of every category set in it. A
+    /// compiled `\cC` regexp stays valid exactly while this is unchanged.
+    pub fn category_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let table = self.current_category_table();
+        if let Value::Obj(id) = table {
+            id.hash(&mut hasher);
+        }
+        let bits_of = |v: &Value| match self.obj(v) {
+            Some(Obj::BoolVector(bits)) => bits.clone(),
+            _ => Vec::new(),
+        };
+        if let Some(Obj::CharTable(t)) = self.obj(&table) {
+            bits_of(&t.default).hash(&mut hasher);
+            for (start, v) in t.runs() {
+                start.hash(&mut hasher);
+                bits_of(&v).hash(&mut hasher);
+            }
+        }
+        hasher.finish()
     }
 
     /// `eq`-style identity comparison (used for `catch`/`throw` tags).

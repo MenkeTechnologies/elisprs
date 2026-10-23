@@ -812,3 +812,165 @@ decide whether the selected frame can display that Unicode character."
    ((char-displayable-p ?…) "…")
    ("...")))
 
+
+;;;; subr-x.el
+
+(defmacro with-buffer-unmodified-if-unchanged (&rest body)
+  "Like `progn', but change buffer-modified status only if buffer text changes.
+If the buffer was unmodified before execution of BODY, and
+buffer text after execution of BODY is identical to what it was
+before, ensure that buffer is still marked unmodified afterwards.
+For example, the following won't change the buffer's modification
+status:
+
+  (with-buffer-unmodified-if-unchanged
+    (insert \"a\")
+    (delete-char -1))
+
+Note that only changes in the raw byte sequence of the buffer text,
+as stored in the internal representation, are monitored for the
+purpose of detecting the lack of changes in buffer text.  Any other
+changes that are normally perceived as \"buffer modifications\", such
+as changes in text properties, `buffer-file-coding-system', buffer
+multibyteness, etc. -- will not be noticed, and the buffer will still
+be marked unmodified, effectively ignoring those changes."
+  (declare (debug t) (indent 0))
+  (cl-with-gensyms (hash buffer)
+    `(let ((,hash (and (not (buffer-modified-p))
+                       (buffer-hash)))
+           (,buffer (current-buffer)))
+       (prog1
+           (progn
+             ,@body)
+         ;; If we didn't change anything in the buffer (and the buffer
+         ;; was previously unmodified), then flip the modification status
+         ;; back to "unchanged".
+         (when (and ,hash (buffer-live-p ,buffer))
+           (with-current-buffer ,buffer
+             (when (and (buffer-modified-p)
+                        (equal ,hash (buffer-hash)))
+               (restore-buffer-modified-p nil))))))))
+
+;;;; subr.el — change-hook combining.  Undo entries are not recorded, so the
+;;;; `buffer-undo-list' rewrite in `combine-change-calls-1' never triggers.
+
+(defvar undo--combining-change-calls nil
+  "Non-nil when `combine-change-calls-1' is running.")
+
+(defun combine-change-calls-1 (beg end body)
+  "Evaluate BODY, running the change hooks just once, for region \(BEG END).
+
+Firstly, `before-change-functions' is invoked for the region
+\(BEG END), then BODY (a function) is evaluated with
+`before-change-functions' and `after-change-functions' bound to
+nil, then finally `after-change-functions' is invoked on the
+updated region (BEG NEW-END) with a calculated OLD-LEN argument.
+If `inhibit-modification-hooks' is initially non-nil, the change
+hooks are not run.
+
+The result of `combine-change-calls-1' is the value returned by
+BODY.  BODY must not make a different buffer current, except
+temporarily.  It must not make any changes to the buffer outside
+the specified region.  It must not change
+`before-change-functions' or `after-change-functions'.
+
+Additionally, the buffer modifications of BODY are recorded on
+the buffer's undo list as a single (apply ...) entry containing
+the function `undo--wrap-and-run-primitive-undo'."
+  (if (markerp beg) (setq beg (marker-position beg)))
+  (if (markerp end) (setq end (marker-position end)))
+  (let ((old-bul buffer-undo-list)
+	(end-marker (copy-marker end t))
+	result)
+    (if undo--combining-change-calls
+	(setq result (funcall body))
+      (let ((undo--combining-change-calls t))
+	(if (not inhibit-modification-hooks)
+	    (run-hook-with-args 'before-change-functions beg end))
+	(let ((bcf before-change-functions)
+	      (acf after-change-functions)
+	      (local-bcf (local-variable-p 'before-change-functions))
+	      (local-acf (local-variable-p 'after-change-functions)))
+	  (unwind-protect
+              ;; FIXME: WIBNI we could just use `inhibit-modification-hooks'?
+              (progn
+                ;; Ugly Hack: if the body uses syntax-ppss/syntax-propertize
+                ;; (e.g. via a regexp-search or sexp-movement triggering
+                ;; on-the-fly syntax-propertize), make sure that this gets
+                ;; properly refreshed after subsequent changes.
+	        (setq-local before-change-functions
+                            (if (memq #'syntax-ppss-flush-cache bcf)
+                                '(syntax-ppss-flush-cache)))
+                (setq-local after-change-functions nil)
+	        (setq result (funcall body)))
+	    (if local-bcf (setq before-change-functions bcf)
+	      (kill-local-variable 'before-change-functions))
+	    (if local-acf (setq after-change-functions acf)
+	      (kill-local-variable 'after-change-functions))))
+	;; If buffer-undo-list is neither t (in which case undo
+	;; information is not recorded) nor equal to buffer-undo-list
+	;; before body was funcalled (in which case (funcall body) did
+	;; not add items to buffer-undo-list) ...
+	(unless (or (eq buffer-undo-list t)
+		    (eq buffer-undo-list old-bul))
+	  (let ((ptr buffer-undo-list) body-undo-list)
+	    ;; ... then loop over buffer-undo-list, until the head of
+	    ;; buffer-undo-list before body was funcalled is found, or
+	    ;; ptr is nil (which may happen if garbage-collect has
+	    ;; been called after (funcall body) and has removed
+	    ;; entries of buffer-undo-list that were added by (funcall
+	    ;; body)), and add these entries to body-undo-list.
+	    (while (and ptr (not (eq ptr old-bul)))
+	      (push (car ptr) body-undo-list)
+	      (setq ptr (cdr ptr)))
+	    (setq body-undo-list (nreverse body-undo-list))
+	    ;; Warn if garbage-collect has truncated buffer-undo-list
+	    ;; behind our back.
+	    (when (and old-bul (not ptr))
+	      (message
+               "combine-change-calls: buffer-undo-list has been truncated"))
+	    ;; Add an (apply ...) entry to buffer-undo-list, using
+	    ;; body-undo-list ...
+	    (push (list 'apply
+			(- end end-marker)
+			beg
+			(marker-position end-marker)
+			#'undo--wrap-and-run-primitive-undo
+			beg (marker-position end-marker)
+			body-undo-list)
+		  buffer-undo-list)
+	    ;; ... and set the cdr of buffer-undo-list to
+	    ;; buffer-undo-list before body was funcalled.
+	    (setcdr buffer-undo-list old-bul)))
+	(if (not inhibit-modification-hooks)
+	    (run-hook-with-args 'after-change-functions
+				beg (marker-position end-marker)
+				(- end beg)))))
+    (set-marker end-marker nil)
+    result))
+
+(defmacro combine-change-calls (beg end &rest body)
+  "Evaluate BODY, running the change hooks just once.
+
+BODY is a sequence of Lisp forms to evaluate.  BEG and END bound
+the region the change hooks will be run for.
+
+Firstly, `before-change-functions' is invoked for the region
+\(BEG END), then the BODY forms are evaluated with
+`before-change-functions' and `after-change-functions' bound to
+nil, and finally `after-change-functions' is invoked on the
+updated region.  The change hooks are not run if
+`inhibit-modification-hooks' is initially non-nil.
+
+The result of `combine-change-calls' is the value returned by the
+last of the BODY forms to be evaluated.  BODY may not make a
+different buffer current, except temporarily.  BODY may not
+change the buffer outside the specified region.  It must not
+change `before-change-functions' or `after-change-functions'.
+
+Additionally, the buffer modifications of BODY are recorded on
+the buffer's undo list as a single \(apply ...) entry containing
+the function `undo--wrap-and-run-primitive-undo'."
+  (declare (debug (form form def-body)) (indent 2))
+  `(combine-change-calls-1 ,beg ,end (lambda () ,@body)))
+

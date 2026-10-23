@@ -3614,6 +3614,110 @@ and the returned string should both be non-magic."
 (defun file-local-name (file)
   (or (file-remote-p file 'localname) file))
 ;; env.el (Emacs 31.1).
+;; callproc.c's environment lists (set at startup by src/lib.rs
+;; `install_process_environment') and env.el's accessors over them.
+;; `locale-coding-system' is UTF-8 here, so env.el's encode/decode steps
+;; are the identity and are left out.
+
+(defvar process-environment nil
+  "List of overridden environment variables for subprocesses to inherit.")
+(defvar initial-environment nil
+  "List of environment variables inherited from the parent process.")
+
+(defun setenv-internal (env variable value keep-empty)
+  "Set VARIABLE to VALUE in ENV, adding empty entries if KEEP-EMPTY.
+Changes ENV by side-effect, and returns its new value."
+  (declare (important-return-value t))
+  (let ((pattern (concat "\\`" (regexp-quote variable) "\\(=\\|\\'\\)"))
+	(case-fold-search nil)
+	(scan env)
+	prev found)
+    ;; Handle deletions from the beginning of the list specially.
+    (if (and (null value)
+	     (not keep-empty)
+	     env
+	     (stringp (car env))
+             (string-match-p pattern (car env)))
+	(cdr env)
+      ;; Try to find existing entry for VARIABLE in ENV.
+      (while (and scan (stringp (car scan)))
+        (when (string-match-p pattern (car scan))
+	  (if value
+	      (setcar scan (concat variable "=" value))
+	    (if keep-empty
+		(setcar scan variable)
+	      (setcdr prev (cdr scan))))
+	  (setq found t
+		scan nil))
+	(setq prev scan
+	      scan (cdr scan)))
+      (if (and (not found) (or value keep-empty))
+	  (cons (if value
+		    (concat variable "=" value)
+		  variable)
+		env)
+	env))))
+
+(defun setenv (variable &optional value substitute-env-vars)
+  "Set the value of the environment variable named VARIABLE to VALUE.
+VARIABLE should be a string.  VALUE is optional; if not provided or
+nil, the environment variable VARIABLE will be removed.
+
+SUBSTITUTE-ENV-VARS, if non-nil, means to substitute environment
+variables in VALUE with `substitute-env-vars', which see.
+
+The return value is the new value of VARIABLE, or nil if
+it was removed from the environment.
+
+This function works by modifying `process-environment'.
+
+As a special case, setting variable `TZ' calls `set-time-zone-rule' as
+a side-effect."
+  (and value
+       substitute-env-vars
+       (setq value (substitute-env-vars value)))
+  (if (string-search "=" variable)
+      (error "Environment variable name `%s' contains `='" variable))
+  (if (string-equal "TZ" variable)
+      (set-time-zone-rule value))
+  (setq process-environment (setenv-internal process-environment
+                                             variable value t))
+  value)
+
+(defun getenv (variable &optional frame)
+  "Get the value of environment variable VARIABLE.
+VARIABLE should be a string.  Value is nil if VARIABLE is undefined in
+the environment.  Otherwise, value is a string.
+
+If optional parameter FRAME is non-nil, then it should be a
+frame.  This function will look up VARIABLE in FRAME's `environment'
+parameter.
+
+Otherwise, this function searches `process-environment' for
+VARIABLE and returns its value if found.  If not found, and VARIABLE
+is \"DISPLAY\", the function uses the `display' parameter of the selected
+frame, and if that is also nil, it searches the `initial-environment' list."
+  (declare (side-effect-free t))
+  (getenv-internal variable
+                   (and frame
+                        (assq 'environment
+                              (frame-parameters frame)))))
+
+(defmacro with-environment-variables (variables &rest body)
+  "Set VARIABLES in the environment and execute BODY.
+VARIABLES is a list of variable settings of the form (VAR VALUE),
+where VAR is the name of the variable (a string) and VALUE
+is its value (also a string).
+
+The previous values will be restored upon exit."
+  (declare (indent 1) (debug (sexp body)))
+  (unless (consp variables)
+    (error "Invalid VARIABLES: %s" variables))
+  `(let ((process-environment (copy-sequence process-environment)))
+     ,@(mapcar (lambda (elem)
+                 `(setenv ,(car elem) ,(cadr elem)))
+               variables)
+     ,@body))
 (defconst env--substitute-vars-regexp
   "\\$\\(?:\\(?1:[[:alnum:]_]+\\)\\|{\\(?1:[^{}]+\\)}\\|\\$\\)")
 (defun substitute-env-vars (string &optional when-undefined)
@@ -4172,6 +4276,9 @@ removed, and one that spans the range is split in two -- which is why this needs
 (defun upcase-region (beg end &optional _region) (interactive (list (region-beginning) (region-end) (region-noncontiguous-p))) (buffer--map-region beg end #'upcase) nil)
 (defun downcase-region (beg end &optional _region) (interactive (list (region-beginning) (region-end) (region-noncontiguous-p))) (buffer--map-region beg end #'downcase) nil)
 (defun capitalize-region (beg end &optional _region) (interactive (list (region-beginning) (region-end) (region-noncontiguous-p))) (buffer--map-region beg end #'capitalize) nil)
+;; casefiddle.c `Fupcase_initials_region': CASE_CAPITALIZE_UP, like `capitalize-region'
+;; but leaving the rest of each word as it is.
+(defun upcase-initials-region (beg end &optional _region) (interactive (list (region-beginning) (region-end) (region-noncontiguous-p))) (buffer--map-region beg end #'upcase-initials) nil)
 ;; editfns.c `Fsubst_char_in_region': the text from the first FROMCHAR to END
 ;; is rewritten in place (one `modify_text' from there), and nothing at all
 ;; happens when FROMCHAR does not occur.
@@ -5308,12 +5415,24 @@ If all LST elements are zeros or LST is nil, return zero."
            (if (and (consp time) (eq form (cdr time)))
                time
              (cons (time--hz-ticks th form) form))))))
-(defun current-time-zone (&optional time zone)
-  ;; (OFFSET NAME). The local zone's offset comes from decode-time's zone field;
-  ;; the abbreviated NAME is unavailable here, so it is nil.
-  (cond ((eq zone t) (list 0 "UTC"))
-        ((integerp zone) (list zone nil))
-        (t (list (or (nth 8 (decode-time (or time (current-time)))) 0) nil))))
+;; timefns.c `Fcurrent_time_zone': (OFFSET NAME) for the whole seconds of TIME
+;; (`lisp_seconds_argument') in ZONE.  NAME is `%Z'; an empty one becomes the
+;; numeric `+HH[MM[SS]]' spelling of OFFSET.
+(defun current-time-zone (&optional specified-time zone)
+  (let* ((secs (time-convert specified-time 'integer))
+         (name (format-time-string "%Z" secs zone))
+         (offset (nth 8 (decode-time secs zone))))
+    (when (string= name "")
+      (let* ((amin-sec (abs (% offset 3600)))
+             (min (/ amin-sec 60))
+             (sec (% amin-sec 60)))
+        (setq name (concat (if (< offset 0) "-" "+")
+                           (format "%02d" (abs (/ offset 3600)))
+                           (if (/= amin-sec 0) (format "%02d" min) "")
+                           (if (and (/= amin-sec 0) (/= sec 0))
+                               (format "%02d" sec)
+                             "")))))
+    (list offset name)))
 ;; decoded-time accessors: (sec min hour day month year weekday dst zone).
 (defun decoded-time-second (dt) (nth 0 dt))
 (defun decoded-time-minute (dt) (nth 1 dt))

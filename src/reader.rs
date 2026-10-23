@@ -44,6 +44,16 @@ pub fn read_one(h: &mut ElispHost, src: &str, start: usize) -> Result<(Value, us
     Ok((form, r.pos))
 }
 
+/// What a `#@` in the input does (see `Reader::lazy_string_skip`).
+enum LazySkip {
+    /// Skip to this position and read the next object.
+    Skip(usize),
+    /// `#@00`: read nil and skip the rest of the input.
+    ToEndNil,
+    /// The count overflowed: `(invalid-read-syntax "#@")`.
+    Overflow,
+}
+
 struct Reader {
     chars: Vec<char>,
     pos: usize,
@@ -136,9 +146,56 @@ impl Reader {
                 // `#!` at the start of a token comments out the rest of the line
                 // (a script's shebang), as `;` does.
                 Some('#') if self.peek_at(1) == Some('!') => self.skip_line(),
+                // `#@NNN` skips the lazily-loaded text after it and reads the
+                // next object, which is what whitespace does too. `#@00` and
+                // an overflowing count are `read_form`'s to answer.
+                Some('#') if self.peek_at(1) == Some('@') => match self.lazy_string_skip() {
+                    LazySkip::Skip(end) => self.pos = end,
+                    LazySkip::ToEndNil | LazySkip::Overflow => break,
+                },
                 _ => break,
             }
         }
+    }
+
+    /// lread.c `skip_lazy_string` at a `#@`. The count is digits; the character
+    /// after them is consumed when the count is positive. The source here is a
+    /// string or a buffer, never a file stream, so `skip_dyn_bytes` ignores the
+    /// count and skips through the next `\037` (or to the end): the skipped text
+    /// is always a dynamic docstring or bytecode string that ends in one.
+    fn lazy_string_skip(&self) -> LazySkip {
+        let mut pos = self.pos + 2;
+        let mut nskip: i64 = 0;
+        let mut digits = 0;
+        loop {
+            match self.chars.get(pos).and_then(|c| c.to_digit(10)) {
+                Some(d) => {
+                    pos += 1;
+                    match nskip.checked_mul(10).and_then(|n| n.checked_add(d as i64)) {
+                        Some(n) => nskip = n,
+                        None => return LazySkip::Overflow,
+                    }
+                    digits += 1;
+                    if digits == 2 && nskip == 0 {
+                        // `#@00` reads as nil and skips to the end.
+                        return LazySkip::ToEndNil;
+                    }
+                }
+                None => {
+                    if nskip > 0 && pos < self.chars.len() {
+                        pos += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        while let Some(&c) = self.chars.get(pos) {
+            pos += 1;
+            if c == '\x1f' {
+                break;
+            }
+        }
+        LazySkip::Skip(pos)
     }
 
     /// Consume through the end of the current line.
@@ -215,6 +272,15 @@ impl Reader {
                 self.pos += 2;
                 self.read_record(h)
             }
+            // `#@NNN` reaching here is `#@00` (nil, and the rest of the input is
+            // skipped) or a count that overflows; `skip_ws` skipped every other.
+            '#' if self.peek_at(1) == Some('@') => match self.lazy_string_skip() {
+                LazySkip::ToEndNil => {
+                    self.pos = self.chars.len();
+                    Ok(Value::Undef)
+                }
+                _ => Err("invalid-read-syntax: #@".to_string()),
+            },
             // #&N"…" — a bool-vector literal.
             '#' if self.peek_at(1) == Some('&') => self.read_bool_vector(h),
             // #("string" START END PLIST …) — a string with text-property intervals.

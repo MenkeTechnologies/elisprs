@@ -268,3 +268,23 @@ buffer; to accomplish this, first convert the string to unibyte with
        (if inside (or pleft pright) (merge-properties-sticky pleft pright))
        pleft pright inside)))
   nil)
+
+(defun insert-before-markers-and-inherit (&rest args)
+  "Insert text at point, relocating markers and inheriting properties.
+Point and markers move forward to end up after the inserted text.
+
+If the current buffer is multibyte, unibyte strings are converted
+to multibyte for insertion (see `unibyte-char-to-multibyte').
+If the current buffer is unibyte, multibyte strings are converted
+to unibyte for insertion."
+  (dolist (arg args)
+    (let* ((start (point))
+           (inside (elisprs--inside-interval-p start))
+           (pleft (and (> start (point-min)) (text-properties-at (1- start))))
+           (pright (and (< start (point-max)) (text-properties-at start))))
+      (insert-before-markers arg)
+      (elisprs--inherit-props
+       start (point)
+       (if inside (or pleft pright) (merge-properties-sticky pleft pright))
+       pleft pright inside)))
+  nil)

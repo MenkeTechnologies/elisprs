@@ -46,6 +46,12 @@ pub trait SyntaxLookup {
     /// with no generic-comment-fence character, say — and `\sC` then matches
     /// nothing, which is not the same as having no table at all.
     fn ranges(&self, class: char) -> Vec<(u32, u32)>;
+    /// Ascending, non-overlapping ranges of the characters whose category set
+    /// in the current category table contains CATEGORY (`\cC`). Empty without
+    /// a table.
+    fn category_ranges(&self, _category: u8) -> Vec<(u32, u32)> {
+        Vec::new()
+    }
     /// Whether a syntax table is reachable. False only for [`NoSyntax`].
     fn available(&self) -> bool {
         true
@@ -665,6 +671,22 @@ fn translate_escape(
                 // here, so emit something that cannot match instead.
                 None => out.push_str(NEVER_MATCHES),
             }
+        }
+        // Categories `\cC` / `\CC` (regex-emacs.c `categoryspec`): the
+        // characters whose category set in the current category table has C.
+        // Like `\sC`, the class is answered for the whole character space up
+        // front. Any character names a category; one no character carries
+        // matches nothing.
+        'c' | 'C' => {
+            let Some(cat) = it.next() else {
+                return Err(PREMATURE_END.into());
+            };
+            let ranges = if cat.is_ascii() {
+                syn.category_ranges(cat as u8)
+            } else {
+                Vec::new()
+            };
+            out.push_str(&char_class(&ranges, e == 'C'));
         }
         // Anything else: keep the escape (covers `\.`, `\*`, `\\`, `\+`, …).
         other => {

@@ -1992,6 +1992,24 @@ fn char_table_range(h: &mut ElispHost, a: &[Value]) -> R {
         }
     }
 }
+/// `(--char-table-run-end-- TABLE FROM LIMIT)`: the last character, at most
+/// LIMIT, of the run of characters starting at FROM that TABLE stores one value
+/// for. This is the TO of chartab.c's `char_table_ref_and_range`, which
+/// category.c's `modify-category-entry` walks a range with.
+fn char_table_run_end(h: &mut ElispHost, a: &[Value]) -> R {
+    let from = as_char(h, &a[1])?;
+    let limit = as_char(h, &a[2])?;
+    let Some(Obj::CharTable(t)) = h.obj(&a[0]) else {
+        return Err(wrong_char_table(h, &a[0]));
+    };
+    let next = t
+        .runs()
+        .iter()
+        .map(|(start, _)| *start)
+        .find(|start| *start > from);
+    let end = next.map_or(crate::host::MAX_CHAR, |n| n - 1).min(limit);
+    Ok(Value::Int(end as i64))
+}
 /// `(set-char-table-range CHAR-TABLE RANGE VALUE)` — RANGE is nil (set default),
 /// `t` (set every char), a character, or a cons `(FROM . TO)`.
 fn set_char_table_range(h: &mut ElispHost, a: &[Value]) -> R {
@@ -4553,10 +4571,12 @@ pub(crate) fn char_of_byte(s: &str, byte_idx: usize) -> usize {
 struct HostSyntax<'a> {
     host: &'a ElispHost,
     /// Set when the translation actually asked for a syntax class — i.e. the
-    /// pattern used `\sC`, `\SC`, `\w`, `\W` or `\cC`. Such a translation is
-    /// only valid for the syntax table in force at the time, so [`compile_cf`]
+    /// pattern used `\sC`, `\SC`, `\w` or `\W`. Such a translation is only
+    /// valid for the syntax table in force at the time, so [`compile_cf`]
     /// caches it under that table's fingerprint.
     used_syntax: std::cell::Cell<bool>,
+    /// Likewise for the category table, set by `\cC` / `\CC`.
+    used_category: std::cell::Cell<bool>,
     /// The offset of point in the subject; `None` for a string, where `\=`
     /// can never match.
     point: Option<usize>,
@@ -4565,6 +4585,10 @@ impl crate::regexp::SyntaxLookup for HostSyntax<'_> {
     fn ranges(&self, class: char) -> Vec<(u32, u32)> {
         self.used_syntax.set(true);
         self.host.syntax_class_ranges(class)
+    }
+    fn category_ranges(&self, category: u8) -> Vec<(u32, u32)> {
+        self.used_category.set(true);
+        self.host.category_ranges(category)
     }
     fn at_dot(&self) -> String {
         match self.point {
@@ -4604,7 +4628,21 @@ impl std::ops::Deref for CompiledRe {
 /// An entry that read the syntax table also carries the table fingerprint it was
 /// compiled under (`ElispHost::syntax_fingerprint`); it is reused only while that
 /// still holds.
-type ReCacheMap = HashMap<String, (Option<u64>, Result<Rc<CompiledRe>, String>)>;
+type ReCacheMap = HashMap<String, (Option<(TablesRead, u64)>, Result<Rc<CompiledRe>, String>)>;
+
+/// Which tables a regexp translation read: `(syntax table, category table)`.
+type TablesRead = (bool, bool);
+
+/// The fingerprint of the tables in TABLES as they stand now.
+fn tables_fingerprint(h: &ElispHost, tables: TablesRead) -> u64 {
+    let syntax = if tables.0 { h.syntax_fingerprint() } else { 0 };
+    let category = if tables.1 {
+        h.category_fingerprint()
+    } else {
+        0
+    };
+    syntax.rotate_left(1) ^ category
+}
 
 thread_local! {
     /// Compiled regexps, keyed by the elisp pattern — one map per
@@ -4665,20 +4703,22 @@ fn compile_cf_in(
         _ => pat.to_string(),
     };
     if let Some((stamp, hit)) = RE_CACHE.with(|c| c.borrow()[slot].get(&key).cloned()) {
-        if stamp.is_none_or(|s| s == h.syntax_fingerprint()) {
+        if stamp.is_none_or(|(tables, s)| s == tables_fingerprint(h, tables)) {
             return hit;
         }
     }
     let syntax = HostSyntax {
         host: h,
         used_syntax: std::cell::Cell::new(false),
+        used_category: std::cell::Cell::new(false),
         point,
     };
     let compiled = compile_uncached(pat, case_insensitive, &syntax);
     // A pattern whose translation read the syntax table is valid only for the
     // table it read, so it is cached under that table's fingerprint: a stale
     // character set after `modify-syntax-entry` or a buffer switch misses.
-    let stamp = syntax.used_syntax.get().then(|| h.syntax_fingerprint());
+    let tables = (syntax.used_syntax.get(), syntax.used_category.get());
+    let stamp = (tables.0 || tables.1).then(|| (tables, tables_fingerprint(h, tables)));
     RE_CACHE.with(|c| {
         let mut maps = c.borrow_mut();
         if maps[slot].len() >= RE_CACHE_MAX {
@@ -8212,23 +8252,191 @@ fn encode_time(h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── environment / working directory ──
-fn getenv_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let name = as_string(h, &a[0])?;
-    Ok(std::env::var(&name).map(Value::str).unwrap_or(Value::Undef))
-}
-fn setenv_fn(h: &mut ElispHost, a: &[Value]) -> R {
-    let name = as_string(h, &a[0])?;
-    match a.get(1) {
-        Some(v) if !is_nil(v) => {
-            let val = as_string(h, v)?;
-            std::env::set_var(&name, &val);
-            Ok(h.new_string(val))
+/// The string entries of the environment list ENV. `getenv_internal_1` walks
+/// every cons and skips a non-string car; `make_environment_block` stops at
+/// the first one (STOP_AT_NON_STRING).
+fn env_entries(h: &ElispHost, env: &Value, stop_at_non_string: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = env.clone();
+    while let Some(Obj::Cons(car, cdr)) = h.obj(&cur) {
+        match h.str_text(car) {
+            Some(s) => out.push(s.to_string()),
+            None if stop_at_non_string => break,
+            None => {}
         }
-        _ => {
-            std::env::remove_var(&name);
-            Ok(Value::Undef)
+        cur = cdr.clone();
+    }
+    out
+}
+
+/// callproc.c `getenv_internal_1`: the first entry of ENV naming VAR. `Some(Some
+/// value)` for `VAR=value`, `Some(None)` for a lone `VAR` (the variable is
+/// removed), `None` when ENV does not mention VAR.
+fn env_lookup(entries: &[String], var: &str) -> Option<Option<String>> {
+    entries.iter().find_map(|entry| {
+        let rest = entry.strip_prefix(var)?;
+        match rest.strip_prefix('=') {
+            Some(value) => Some(Some(value.to_string())),
+            None if rest.is_empty() => Some(None),
+            None => None,
+        }
+    })
+}
+
+/// The value of the global variable NAME, nil when it is void.
+fn symbol_value_or_nil(h: &mut ElispHost, name: &str) -> Value {
+    let sym = h.intern(name);
+    h.get_value(&sym).unwrap_or(Value::Undef)
+}
+
+/// `(getenv-internal VARIABLE &optional ENV)` — callproc.c. Searches
+/// `process-environment`, or the list ENV, for VARIABLE. With a list ENV, a
+/// lone `VARIABLE` entry answers t; otherwise it means unset. `DISPLAY` falls
+/// back to `initial-environment` (batch has no frame `display` parameter).
+fn getenv_internal(h: &mut ElispHost, a: &[Value]) -> R {
+    let Some(var) = h.str_text(&a[0]).map(str::to_string) else {
+        return Err(format!(
+            "wrong-type-argument: stringp {}",
+            h.print(&a[0], true)
+        ));
+    };
+    let env = a.get(1).cloned().unwrap_or(Value::Undef);
+    if matches!(h.obj(&env), Some(Obj::Cons(..))) {
+        let entries = env_entries(h, &env, false);
+        return Ok(match env_lookup(&entries, &var) {
+            Some(Some(value)) => h.new_string(value),
+            Some(None) => Value::Bool(true),
+            None => Value::Undef,
+        });
+    }
+    let process_env = symbol_value_or_nil(h, "process-environment");
+    let mut found = env_lookup(&env_entries(h, &process_env, false), &var);
+    if found.is_none() && var == "DISPLAY" {
+        let initial = symbol_value_or_nil(h, "initial-environment");
+        found = env_lookup(&env_entries(h, &initial, false), &var);
+    }
+    Ok(match found {
+        Some(Some(value)) => h.new_string(value),
+        _ => Value::Undef,
+    })
+}
+
+/// callproc.c `egetenv`: VAR's value in `process-environment` (a lone `VAR`
+/// entry, like no entry, is unset). What the C reads `HOME` and friends with.
+pub(crate) fn egetenv(h: &mut ElispHost, var: &str) -> Option<String> {
+    let process_env = symbol_value_or_nil(h, "process-environment");
+    env_lookup(&env_entries(h, &process_env, false), var).flatten()
+}
+
+/// `(set-time-zone-rule TZ)` — timefns.c: `tzlookup (NILP (tz) ? Qwall : tz,
+/// true)`, which validates TZ like any ZONE argument and then sets the
+/// process's `TZ` to the rule string it builds (`wall` unsets it, `t` and 0
+/// are `UTC0`, an offset is `<+HH>-H:MM:SS`, `(OFFSET ABBR)` is
+/// `<ABBR>-H:MM:SS`). `process-environment` is not touched.
+fn set_time_zone_rule(h: &mut ElispHost, a: &[Value]) -> R {
+    let tz = a[0].clone();
+    if !is_nil(&tz) {
+        time_zone_arg(h, Some(&tz))?;
+    }
+    let offset_rule = |off: i64, abbr: Option<String>| {
+        let abszone = off.abs();
+        let (hour, rem) = (abszone / 3600, abszone % 3600);
+        let (min, sec) = (rem / 60, rem % 60);
+        let sign = if off < 0 { "" } else { "-" };
+        let name = abbr.unwrap_or_else(|| {
+            let (mut prec, mut numzone) = (2, hour);
+            if rem != 0 {
+                prec += 2;
+                numzone = 100 * numzone + min;
+                if sec != 0 {
+                    prec += 2;
+                    numzone = 100 * numzone + sec;
+                }
+            }
+            let numzone = if off < 0 { -numzone } else { numzone };
+            format!("{numzone:+0width$}", width = prec + 1)
+        });
+        format!("<{name}>{sign}{hour}:{min:02}:{sec:02}")
+    };
+    let rule: Option<String> = match &tz {
+        Value::Undef | Value::Bool(false) => None,
+        Value::Bool(true) | Value::Int(0) => Some("UTC0".to_string()),
+        Value::Int(off) => Some(offset_rule(*off, None)),
+        _ if h.is_string(&tz) => Some(as_string(h, &tz)?),
+        _ => match h.obj(&tz) {
+            Some(Obj::Cons(Value::Int(off), rest)) => {
+                let (off, rest) = (*off, rest.clone());
+                let abbr = match h.obj(&rest) {
+                    Some(Obj::Cons(abbr, _)) => abbr.clone(),
+                    _ => Value::Undef,
+                };
+                Some(offset_rule(off, Some(as_string(h, &abbr)?)))
+            }
+            // `wall`.
+            _ => None,
+        },
+    };
+    extern "C" {
+        fn tzset();
+    }
+    let _guard = TZ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    match rule {
+        Some(rule) => std::env::set_var("TZ", rule),
+        None => std::env::remove_var("TZ"),
+    }
+    unsafe { tzset() };
+    Ok(Value::Undef)
+}
+
+/// The environment a subprocess starts with — callproc.c
+/// `make_environment_block`. `PWD`, when `process-environment` sets it, is
+/// `default-directory` without its trailing slashes; `DISPLAY`, when
+/// `process-environment` does not mention it, comes from
+/// `initial-environment`; then every entry of `process-environment`, the first
+/// one for a name winning and a lone `NAME` removing that variable.
+fn child_environment(h: &mut ElispHost) -> Vec<(String, String)> {
+    let process_env = symbol_value_or_nil(h, "process-environment");
+    let entries = env_entries(h, &process_env, true);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    if let Some(Some(_)) = env_lookup(&env_entries(h, &process_env, false), "PWD") {
+        let dir = symbol_value_or_nil(h, "default-directory");
+        let mut pwd = h.str_text(&dir).unwrap_or_default().to_string();
+        while pwd.len() > 2 && pwd.ends_with('/') {
+            pwd.pop();
+        }
+        seen.insert("PWD".to_string());
+        out.push(("PWD".to_string(), pwd));
+    }
+    let mentions_display = entries
+        .iter()
+        .any(|e| e == "DISPLAY" || e.starts_with("DISPLAY="));
+    if !mentions_display {
+        let initial = symbol_value_or_nil(h, "initial-environment");
+        if let Some(Some(display)) = env_lookup(&env_entries(h, &initial, false), "DISPLAY") {
+            seen.insert("DISPLAY".to_string());
+            out.push(("DISPLAY".to_string(), display));
         }
     }
+    for entry in entries {
+        let (name, value) = match entry.split_once('=') {
+            Some((n, v)) => (n.to_string(), Some(v.to_string())),
+            None => (entry.clone(), None),
+        };
+        if seen.insert(name.clone()) {
+            if let Some(value) = value {
+                out.push((name, value));
+            }
+        }
+    }
+    out
+}
+
+/// A `Command` for PROGRAM whose environment is `process-environment`.
+fn subprocess(h: &mut ElispHost, program: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.env_clear().envs(child_environment(h));
+    cmd
 }
 fn special_variable_p(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(h.symbol_special(&a[0])))
@@ -8541,7 +8749,12 @@ fn get_buffer(h: &mut ElispHost, a: &[Value]) -> R {
         None => Ok(Value::Undef),
     }
 }
+/// buffer.c `Fget_buffer_create`: `Fget_buffer` first, which hands a buffer
+/// object back as it is — killed or not — so only a name can create one.
 fn get_buffer_create(h: &mut ElispHost, a: &[Value]) -> R {
+    if matches!(h.obj(&a[0]), Some(Obj::Buffer(_))) {
+        return Ok(a[0].clone());
+    }
     let name = as_string(h, &a[0])?;
     check_buffer_name(&name)?;
     Ok(h.get_buffer_create(&name))
@@ -8980,16 +9193,18 @@ fn erase_buffer(h: &mut ElispHost, _a: &[Value]) -> R {
     h.cur_buf().point = 1;
     Ok(Value::Undef)
 }
+/// editfns.c `Fchar_after`: POS is `fix_position`ed, so a non-position is
+/// `(wrong-type-argument integer-or-marker-p POS)`.
 fn char_after(h: &mut ElispHost, a: &[Value]) -> R {
     let arg = match a.first() {
-        Some(v) if !is_nil(v) => Some(as_int(h, v)? as usize),
+        Some(v) if !is_nil(v) => Some(fix_position(h, v)?),
         _ => None,
     };
     let buf = h.cur_buf();
-    let pos = arg.unwrap_or(buf.point);
+    let pos = arg.unwrap_or(buf.point as i64);
     // Only positions inside the accessible region `[begv, zv)` hold a char.
-    Ok(if pos >= buf.begv && pos < buf.zv {
-        Value::Int(buf.text[pos - 1] as i64)
+    Ok(if pos >= buf.begv as i64 && pos < buf.zv as i64 {
+        Value::Int(buf.text[pos as usize - 1] as i64)
     } else {
         Value::Undef
     })
@@ -10605,11 +10820,7 @@ fn copy_file(h: &mut ElispHost, a: &[Value]) -> R {
 // ── subprocesses ──
 fn shell_command_to_string(h: &mut ElispHost, a: &[Value]) -> R {
     let cmd = as_string(h, &a[0])?;
-    match std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .output()
-    {
+    match subprocess(h, "sh").arg("-c").arg(&cmd).output() {
         Ok(o) => Ok(h.new_string(String::from_utf8_lossy(&o.stdout).into_owned())),
         Err(_) => Ok(h.new_string(String::new())),
     }
@@ -10624,7 +10835,7 @@ fn call_process(h: &mut ElispHost, a: &[Value]) -> R {
         .filter_map(|v| as_string(h, v).ok())
         .collect();
     let insert = matches!(a.get(2), Some(v) if !is_nil(v));
-    let out = std::process::Command::new(&program)
+    let out = subprocess(h, &program)
         .args(&args)
         .output()
         .map_err(|e| report_file_errno(h, "Searching for program", &[&program], &e))?;
@@ -10642,7 +10853,7 @@ fn process_lines(h: &mut ElispHost, a: &[Value]) -> R {
         .iter()
         .filter_map(|v| as_string(h, v).ok())
         .collect();
-    let out = std::process::Command::new(&program)
+    let out = subprocess(h, &program)
         .args(&args)
         .output()
         .map_err(|e| report_file_errno(h, "Searching for program", &[&program], &e))?;
@@ -10658,16 +10869,17 @@ fn process_lines(h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── more buffer editing/motion ──
+/// editfns.c `Fchar_before`: POS is `fix_position`ed like `char-after`'s.
 fn char_before(h: &mut ElispHost, a: &[Value]) -> R {
     let arg = match a.first() {
-        Some(v) if !is_nil(v) => Some(as_int(h, v)? as usize),
+        Some(v) if !is_nil(v) => Some(fix_position(h, v)?),
         _ => None,
     };
     let buf = h.cur_buf();
-    let pos = arg.unwrap_or(buf.point);
+    let pos = arg.unwrap_or(buf.point as i64);
     // The char at pos-1, only when pos-1 is inside the accessible region.
-    Ok(if pos > buf.begv && pos <= buf.zv {
-        Value::Int(buf.text[pos - 2] as i64)
+    Ok(if pos > buf.begv as i64 && pos <= buf.zv as i64 {
+        Value::Int(buf.text[pos as usize - 2] as i64)
     } else {
         Value::Undef
     })
@@ -11220,6 +11432,7 @@ pub fn install(h: &mut ElispHost) {
     );
     s("char-table-range", 2, Some(2), char_table_range);
     s("set-char-table-range", 3, Some(3), set_char_table_range);
+    s("--char-table-run-end--", 3, Some(3), char_table_run_end);
     // symbols
     s("symbol-name", 1, Some(1), symbol_name);
     s("intern", 1, Some(2), intern_fn);
@@ -11337,8 +11550,8 @@ pub fn install(h: &mut ElispHost) {
     s("hash-table-values", 1, Some(1), hash_table_values);
     s("copy-hash-table", 1, Some(1), copy_hash_table);
     // time
-    s("getenv", 1, Some(2), getenv_fn);
-    s("setenv", 1, Some(3), setenv_fn);
+    s("getenv-internal", 1, Some(2), getenv_internal);
+    s("set-time-zone-rule", 1, Some(1), set_time_zone_rule);
     s("special-variable-p", 1, Some(1), special_variable_p);
     s("func-arity", 1, Some(1), func_arity);
     s("subr-arity", 1, Some(1), func_arity);
