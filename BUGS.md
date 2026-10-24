@@ -7669,3 +7669,48 @@ Expectations: `tests/parity_file_truename.rs`,
   `:noinline` / `funcall` case.
 - The file primitives do not dispatch through `file-name-handler-alist`;
   only the files.el functions above do.
+
+## Round 50 — `current-bidi-paragraph-direction`
+
+**Oracle: GNU Emacs 31.1**, each form in a fresh `emacs -Q --batch -l
+scripts/fuzz/drive.el`. Closed from round 45's open list.
+
+### R50-A. ✅ FIXED — the paragraph direction is bidi.c's
+
+`current-bidi-paragraph-direction` was void (indent.el's
+`indent-rigidly-left-to-tab-stop` and friends call it). `src/bidi.rs`
+ports xdisp.c's function over bidi.c's `bidi_paragraph_init`: point's
+paragraph is found with `bidi_find_paragraph_start` (the buffer's
+`bidi-paragraph-start-re`, else `^\(\f\|[ \t]*\)$`), its direction is that
+of its first strong character with isolates skipped
+(`find_first_strong_char`, stopping at a paragraph separator), a paragraph
+with none takes the previous paragraph's direction, and
+`bidi-paragraph-direction`, `bidi-display-reordering` and trailing
+whitespace at point are honoured. The `bidi-class` of every character is
+`src/bidi_data.rs`, generated from the oracle by
+`scripts/gen/bidi-data.el`; `scripts/gen/faces-31.el` regenerates round
+48's `src/lisp/faces-31.el`.
+
+```text
+buffer, point                     Emacs 31.1 / now    was
+"abc\n\n...\n\nמ", point-max      right-to-left       void-function
+"⁧abc⁩ مرحبا"           right-to-left       void-function
+"ש\n\nabc\n\n12", on "12"         left-to-right       void-function
+```
+
+Expectations: `tests/parity_bidi_paragraph_direction.rs`.
+
+### Not followed, and why
+
+- Display properties and overlays are not consulted (`bidi_fetch_char`
+  reads them while displaying).
+- `set-buffer-multibyte` is void, so a unibyte buffer cannot be made to
+  check the `enable-multibyte-characters` branch.
+- `get-char-code-property` is void; the `bidi-class` table is not exposed
+  through it.
+
+### Still open after round 50
+
+- The rest of characters.el's category data (charset tables).
+- `fit-window-to-buffer` (`window-text-pixel-size`), `\N{NAME}`, a
+  standalone `#^^[…]`, and the open items of round 49.

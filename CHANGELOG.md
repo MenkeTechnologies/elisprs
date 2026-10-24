@@ -6,6 +6,12 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Round 50 parity vs Emacs 31.1** (see BUGS.md):
+  `current-bidi-paragraph-direction` is xdisp.c's over bidi.c's paragraph
+  search (first strong character of point's paragraph, isolates skipped,
+  the previous paragraph's direction for a neutral one), with the
+  `bidi-class` of every character generated from Emacs
+  (`scripts/gen/bidi-data.el`).
 - **Round 49 parity vs Emacs 31.1** (see BUGS.md): files.el's
   `file-truename`, `file-chase-links`, `delete-file`, `delete-directory`,
   `file-name-non-special` and `file-attribute-*` accessors load verbatim

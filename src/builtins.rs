@@ -10740,6 +10740,10 @@ fn match_within(
     run_match(re, cut, s).filter(ok)
 }
 type Spans = Vec<Option<(usize, usize)>>;
+/// `fast_looking_at`'s match: RE matched at char S of TEXT, ending by STOP.
+pub(crate) fn match_at(re: &CompiledRe, text: &str, s: usize, stop: usize) -> Option<Spans> {
+    match_within(re, text, s, stop, true)
+}
 /// Record SPANS (offsets into the accessible text starting at buffer offset
 /// OFF) as the current buffer's match data, and answer them rebased.
 fn record_buf_match(h: &mut ElispHost, spans: Spans, off: usize) -> Spans {
@@ -12598,6 +12602,12 @@ pub fn install(h: &mut ElispHost) {
     s("search-forward", 1, Some(4), search_forward);
     s("re-search-forward", 1, Some(4), re_search_forward);
     s("looking-at", 1, Some(2), looking_at);
+    s(
+        "current-bidi-paragraph-direction",
+        0,
+        Some(1),
+        crate::bidi::current_bidi_paragraph_direction,
+    );
     s("looking-at-p", 1, Some(1), looking_at_p);
     s("replace-match", 1, Some(5), replace_match);
     // filesystem writes / mutations

@@ -9,6 +9,8 @@ pub mod aot;
 pub mod aot_runtime;
 pub mod backquote;
 pub mod banner;
+pub mod bidi;
+pub mod bidi_data;
 pub mod builtins;
 pub mod bundled;
 pub mod cache;
