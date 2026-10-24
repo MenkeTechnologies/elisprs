@@ -8445,19 +8445,6 @@ fn child_environment(h: &mut ElispHost, current_dir: &str) -> Vec<(String, Strin
     out
 }
 
-/// A `Command` for PROGRAM started as `call-process` starts one: PROGRAM is
-/// searched for on `exec-path`, it runs in `default-directory`, and its
-/// environment is `make_environment_block`'s.
-fn subprocess(h: &mut ElispHost, program: &str) -> Result<std::process::Command, String> {
-    let cwd = subprocess_directory(h)?;
-    let path = find_program(h, program)?;
-    let mut cmd = std::process::Command::new(path);
-    cmd.current_dir(&cwd)
-        .env_clear()
-        .envs(child_environment(h, &cwd));
-    Ok(cmd)
-}
-
 /// callproc.c `get_current_directory`: `default-directory` (or "~" when it
 /// is not a string), expanded and without its trailing slash, must name an
 /// accessible directory; otherwise `(file-missing "Setting current directory"
@@ -8471,15 +8458,7 @@ fn subprocess_directory(h: &mut ElispHost) -> Result<String, String> {
     };
     let expanded = crate::fileio::expand_file_name(h, &[dir])?;
     let file = crate::fileio::directory_file_name(h, &[expanded])?;
-    let mut dir = as_string(h, &file)?;
-    // `remove_slash_colon`: a quoted local name "/:..." names what follows.
-    if let Some(rest) = dir.strip_prefix("/:") {
-        dir = if rest.is_empty() {
-            "/".to_string()
-        } else {
-            rest.to_string()
-        };
-    }
+    let dir = remove_slash_colon(&as_string(h, &file)?).to_string();
     if let Err(e) = accessible_directory(&dir) {
         let shown = h.str_text(&curdir).map(str::to_string);
         let shown = shown.unwrap_or_else(|| h.print(&curdir, false));
@@ -8564,8 +8543,9 @@ fn find_program(h: &mut ElispHost, program: &str) -> Result<String, String> {
 
 /// callproc.c `init_callproc`: `exec-path` is `PATH` split on `:`, an empty
 /// element meaning ".", followed by `exec-directory` without its trailing
-/// slash. Per-run state, like the environment it is read from: a cached heap
-/// image would otherwise keep the `PATH` of the run that wrote it.
+/// slash, and `shell-file-name` is `SHELL`, or "/bin/sh" when it is unset.
+/// Per-run state, like the environment it is read from: a cached heap
+/// image would otherwise keep the `PATH` and `SHELL` of the run that wrote it.
 pub(crate) fn install_exec_path(h: &mut ElispHost) {
     let path = egetenv(h, "PATH").unwrap_or_default();
     let mut dirs: Vec<Value> = path
@@ -8581,6 +8561,10 @@ pub(crate) fn install_exec_path(h: &mut ElispHost) {
     let exec_path = h.list_from(dirs);
     let sym = h.intern("exec-path");
     let _ = h.set_value(&sym, exec_path);
+    let shell = egetenv(h, "SHELL").unwrap_or_else(|| "/bin/sh".to_string());
+    let shell = h.new_string(shell);
+    let sym = h.intern("shell-file-name");
+    let _ = h.set_value(&sym, shell);
 }
 fn special_variable_p(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(h.symbol_special(&a[0])))
@@ -8710,6 +8694,66 @@ fn system_name(h: &mut ElispHost, _a: &[Value]) -> R {
     Ok(h.new_string(String::from_utf8_lossy(&buf[..end]).into_owned()))
 }
 
+/// editfns.c's UID argument decoding (`CONS_TO_INTEGER` into `uid_t`): a
+/// natural number in range, an integral float, or `(HI . LO)` / `(HI LO)`
+/// meaning HI * 2^16 + LO with LO below 2^16.
+fn uid_arg(h: &ElispHost, v: &Value) -> Result<u32, String> {
+    const MSG: &str = "error: Not an in-range integer, integral float, or cons of integers";
+    let n = match v {
+        Value::Int(n) => Some(*n),
+        Value::Float(f) if f.fract() == 0.0 && *f >= 0.0 && *f <= u32::MAX as f64 => Some(*f as i64),
+        _ => cons_parts(h, v).and_then(|(hi, lo)| {
+            let lo = cons_parts(h, &lo).map_or(lo, |(car, _)| car);
+            match (hi, lo) {
+                (Value::Int(hi), Value::Int(lo)) if hi >= 0 && (0..1 << 16).contains(&lo) => {
+                    hi.checked_mul(1 << 16).map(|v| v + lo)
+                }
+                _ => None,
+            }
+        }),
+    };
+    n.and_then(|n| u32::try_from(n).ok()).ok_or_else(|| MSG.to_string())
+}
+
+/// editfns.c `init_editfns`: the login name is `LOGNAME`, else `USER`, else
+/// the name of the effective uid, else "unknown".
+fn login_name_from_env() -> String {
+    std::env::var("LOGNAME")
+        .or_else(|_| std::env::var("USER"))
+        .ok()
+        .or_else(|| id_name(unsafe { libc::geteuid() }, false))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// `(user-login-name &optional UID)`: with UID, the name `getpwuid` records
+/// for it, or nil; without, the login name from the environment.
+fn user_login_name(h: &mut ElispHost, a: &[Value]) -> R {
+    match a.first().filter(|v| !is_nil(v)) {
+        Some(uid) => {
+            let uid = uid_arg(h, uid)?;
+            Ok(id_name(uid, false).map_or(Value::Undef, |s| h.new_string(s)))
+        }
+        None => Ok(h.new_string(login_name_from_env())),
+    }
+}
+
+/// `(user-real-login-name)`: the name of the real uid, ignoring the
+/// environment, or "unknown".
+fn user_real_login_name(h: &mut ElispHost, _a: &[Value]) -> R {
+    let name = id_name(unsafe { libc::getuid() }, false).unwrap_or_else(|| "unknown".to_string());
+    Ok(h.new_string(name))
+}
+
+/// `(user-uid)`: the effective uid.
+fn user_uid(_h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::Int(unsafe { libc::geteuid() } as i64))
+}
+
+/// `(user-real-uid)`: the real uid.
+fn user_real_uid(_h: &mut ElispHost, _a: &[Value]) -> R {
+    Ok(Value::Int(unsafe { libc::getuid() } as i64))
+}
+
 /// Raw temp-dir string behind Emacs C `Vtemporary_file_directory`
 /// (callproc.c `init_callproc`). The caller wraps this in
 /// `file-name-as-directory`, exactly as the C does (`build_string` then
@@ -8789,15 +8833,19 @@ pub(crate) fn report_file_errno(
 }
 
 // ── filesystem (read-only queries) ──
-/// Expand a leading `~/` against $HOME; relative paths resolve against the
-/// process cwd (= `default-directory`), as elisp expects.
+/// The local file an already expanded file name (see `FILE_NAME_ARGS` in
+/// host.rs) names. A quoted name "/:..." is the file it quotes, as
+/// files.el's `file-name-non-special` handler hands it to the primitive.
 fn fs_expand(s: &str) -> std::path::PathBuf {
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return std::path::PathBuf::from(home).join(rest);
-        }
+    std::path::PathBuf::from(remove_slash_colon(s))
+}
+/// callproc.c / files.el `remove_slash_colon`: "/:" is "/", "/:REST" is REST.
+fn remove_slash_colon(s: &str) -> &str {
+    match s.strip_prefix("/:") {
+        Some("") => "/",
+        Some(rest) => rest,
+        None => s,
     }
-    std::path::PathBuf::from(s)
 }
 fn fs_access(p: &std::path::Path, mode: libc::c_int) -> bool {
     use std::os::unix::ffi::OsStrExt;
@@ -8836,6 +8884,300 @@ fn file_symlink_p(h: &mut ElispHost, a: &[Value]) -> R {
         Ok(t) => Ok(h.new_string(t.to_string_lossy().into_owned())),
         Err(_) => Ok(Value::Undef),
     }
+}
+/// `file_attribute_errno` (fileio.c): a file that is not there (ENOENT, or a
+/// non-directory in its leading part) answers nil; any other failure signals
+/// `("Getting attributes" ERRSTRING FILE)`.
+fn file_attribute_errno(h: &mut ElispHost, file: &str, err: &std::io::Error) -> R {
+    match err.raw_os_error() {
+        Some(libc::ENOENT) | Some(libc::ENOTDIR) => Ok(Value::Undef),
+        _ => Err(report_file_errno(h, "Getting attributes", &[file], err)),
+    }
+}
+/// timefns.c `make_lisp_time` in `current-time-list` form:
+/// `(HIGH LOW USEC PSEC)`.
+fn lisp_timestamp(h: &mut ElispHost, sec: i64, nsec: i64) -> Value {
+    h.list_from(vec![
+        Value::Int(sec >> 16),
+        Value::Int(sec & 0xffff),
+        Value::Int(nsec / 1000),
+        Value::Int(nsec % 1000 * 1000),
+    ])
+}
+/// filemode.c `filemodestring`: the ten-character `ls -l` mode string.
+fn file_mode_string(mode: u32) -> String {
+    let kind = match mode & libc::S_IFMT as u32 {
+        m if m == libc::S_IFREG as u32 => '-',
+        m if m == libc::S_IFDIR as u32 => 'd',
+        m if m == libc::S_IFBLK as u32 => 'b',
+        m if m == libc::S_IFCHR as u32 => 'c',
+        m if m == libc::S_IFLNK as u32 => 'l',
+        m if m == libc::S_IFIFO as u32 => 'p',
+        m if m == libc::S_IFSOCK as u32 => 's',
+        _ => '?',
+    };
+    let bit = |mask: u32, c: char| if mode & mask != 0 { c } else { '-' };
+    // The execute slot also shows set-id / sticky: lower case when the
+    // execute bit is set too, upper case when it is not.
+    let exec = |x: u32, special: u32, set: char, unset: char| match (mode & x != 0, mode & special != 0) {
+        (true, true) => set,
+        (false, true) => unset,
+        (true, false) => 'x',
+        (false, false) => '-',
+    };
+    [
+        kind,
+        bit(0o400, 'r'),
+        bit(0o200, 'w'),
+        exec(0o100, 0o4000, 's', 'S'),
+        bit(0o040, 'r'),
+        bit(0o020, 'w'),
+        exec(0o010, 0o2000, 's', 'S'),
+        bit(0o004, 'r'),
+        bit(0o002, 'w'),
+        exec(0o001, 0o1000, 't', 'T'),
+    ]
+    .iter()
+    .collect()
+}
+/// dired.c `stat_uname` / `stat_gname`: the user or group name of an id,
+/// or None when the password or group database has no entry.
+fn id_name(id: u32, group: bool) -> Option<String> {
+    // SAFETY: the record getpwuid / getgrgid return is read at once, before
+    // any other call could overwrite it.
+    unsafe {
+        let name = if group {
+            let gr = libc::getgrgid(id);
+            if gr.is_null() {
+                return None;
+            }
+            (*gr).gr_name
+        } else {
+            let pw = libc::getpwuid(id);
+            if pw.is_null() {
+                return None;
+            }
+            (*pw).pw_name
+        };
+        if name.is_null() {
+            return None;
+        }
+        Some(std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned())
+    }
+}
+/// dired.c `Ffile_attributes`: `lstat` FILENAME (expanded on the way in; a
+/// name `expand-file-name` refuses, such as a non-string, answers nil) and
+/// answer `(TYPE LINKS UID GID ATIME MTIME CTIME SIZE MODES t INODE
+/// DEVICE)`. TYPE is t for a directory, the link's target for a symbolic
+/// link, else nil. UID and GID are names when ID-FORMAT is non-nil and not
+/// `integer` and the name is known, else numbers.
+fn file_attributes(h: &mut ElispHost, a: &[Value]) -> R {
+    use std::os::unix::fs::MetadataExt;
+    let Some(name) = h.str_text(&a[0]).map(str::to_string) else {
+        return Ok(Value::Undef);
+    };
+    let path = fs_expand(&name);
+    let st = match std::fs::symlink_metadata(&path) {
+        Ok(st) => st,
+        Err(e) => return file_attribute_errno(h, &name, &e),
+    };
+    let ft = st.file_type();
+    let kind = if ft.is_dir() {
+        Value::Bool(true)
+    } else if ft.is_symlink() {
+        match std::fs::read_link(&path) {
+            Ok(t) => h.new_string(t.to_string_lossy().into_owned()),
+            Err(e) => return file_attribute_errno(h, &name, &e),
+        }
+    } else {
+        Value::Undef
+    };
+    let by_name = match a.get(1) {
+        Some(v) if !is_nil(v) => h.sym_name(v).is_none_or(|n| n.as_str() != "integer"),
+        _ => false,
+    };
+    let id = |h: &mut ElispHost, n: u32, group: bool| match by_name.then(|| id_name(n, group)).flatten() {
+        Some(s) => h.new_string(s),
+        None => Value::Int(n as i64),
+    };
+    let uid = id(h, st.uid(), false);
+    let gid = id(h, st.gid(), true);
+    let size = h.make_integer(BigInt::from(st.size()));
+    let atime = lisp_timestamp(h, st.atime(), st.atime_nsec());
+    let mtime = lisp_timestamp(h, st.mtime(), st.mtime_nsec());
+    let ctime = lisp_timestamp(h, st.ctime(), st.ctime_nsec());
+    let modes = h.new_string(file_mode_string(st.mode()));
+    let inode = h.make_integer(BigInt::from(st.ino()));
+    let device = h.make_integer(BigInt::from(st.dev()));
+    Ok(h.list_from(vec![
+        kind,
+        Value::Int(st.nlink() as i64),
+        uid,
+        gid,
+        atime,
+        mtime,
+        ctime,
+        size,
+        modes,
+        Value::Bool(true),
+        inode,
+        device,
+    ]))
+}
+/// FLAG of `file-modes` / `set-file-modes`: `nofollow` acts on a symbolic
+/// link itself.
+fn nofollow_flag(h: &ElispHost, flag: Option<&Value>) -> bool {
+    flag.and_then(|v| h.sym_name(v)).is_some_and(|n| n.as_str() == "nofollow")
+}
+/// fileio.c `Ffile_modes`: the permission bits (`st_mode & 07777`), nil
+/// when FILENAME does not exist.
+fn file_modes(h: &mut ElispHost, a: &[Value]) -> R {
+    use std::os::unix::fs::MetadataExt;
+    let name = as_string(h, &a[0])?;
+    let path = fs_expand(&name);
+    let st = if nofollow_flag(h, a.get(1)) {
+        std::fs::symlink_metadata(&path)
+    } else {
+        std::fs::metadata(&path)
+    };
+    match st {
+        Ok(st) => Ok(Value::Int((st.mode() & 0o7777) as i64)),
+        Err(e) => file_attribute_errno(h, &name, &e),
+    }
+}
+/// fileio.c `Fset_file_modes`: `fchmodat`, signalling `"Doing chmod"`.
+fn set_file_modes(h: &mut ElispHost, a: &[Value]) -> R {
+    let name = as_string(h, &a[0])?;
+    let mode = as_fixnum_named(h, &a[1], "fixnump")?;
+    let flags = if nofollow_flag(h, a.get(2)) {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    let Ok(c) = std::ffi::CString::new(remove_slash_colon(&name)) else {
+        let e = std::io::Error::from_raw_os_error(libc::EINVAL);
+        return Err(report_file_errno(h, "Doing chmod", &[&name], &e));
+    };
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
+    if unsafe { libc::fchmodat(libc::AT_FDCWD, c.as_ptr(), mode as libc::mode_t, flags) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(report_file_errno(h, "Doing chmod", &[&name], &e));
+    }
+    Ok(Value::Undef)
+}
+/// fileio.c `Ffile_newer_than_file_p`: nil when FILE1 does not exist, t
+/// when only FILE2 does not, else whether FILE1's modification time is
+/// later. Both names are expanded and lose a trailing slash
+/// (`expand_and_dir_to_file`).
+fn file_newer_than_file_p(h: &mut ElispHost, a: &[Value]) -> R {
+    let mut names = Vec::with_capacity(2);
+    for v in &a[..2] {
+        as_string(h, v)?;
+        let file = crate::fileio::directory_file_name(h, std::slice::from_ref(v))?;
+        names.push(as_string(h, &file)?);
+    }
+    let mtime = |n: &str| {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(fs_expand(n)).map(|m| (m.mtime(), m.mtime_nsec()))
+    };
+    let t1 = match mtime(&names[0]) {
+        Ok(t) => t,
+        Err(e) => return file_attribute_errno(h, &names[0], &e),
+    };
+    match mtime(&names[1]) {
+        Ok(t2) => Ok(nil_or(t1 > t2)),
+        Err(e) => {
+            file_attribute_errno(h, &names[1], &e)?;
+            Ok(Value::Bool(true))
+        }
+    }
+}
+/// fileio.c `Ffile_accessible_directory_p` / `file_accessible_directory_p`:
+/// "DIR/." exists, so DIR is a directory that can be searched.
+fn file_accessible_directory_p(h: &mut ElispHost, a: &[Value]) -> R {
+    let name = as_string(h, &a[0])?;
+    let dir = remove_slash_colon(&name);
+    let probe = if dir.ends_with('/') {
+        format!("{dir}.")
+    } else {
+        format!("{dir}/.")
+    };
+    Ok(nil_or(fs_access(std::path::Path::new(&probe), libc::F_OK)))
+}
+/// fileio.c `Fdelete_directory_internal`: one `rmdir`.
+fn delete_directory_internal(h: &mut ElispHost, a: &[Value]) -> R {
+    let name = as_string(h, &a[0])?;
+    std::fs::remove_dir(fs_expand(&name))
+        .map_err(|e| report_file_errno(h, "Removing directory", &[&name], &e))?;
+    Ok(Value::Undef)
+}
+/// fileio.c `expand_cp_target` for a NEWNAME already expanded: a directory
+/// name receives FILE's last component.
+fn cp_target(file: &str, newname: &str) -> String {
+    if newname.ends_with('/') {
+        let base = file.rsplit('/').next().unwrap_or(file);
+        format!("{newname}{base}")
+    } else {
+        newname.to_string()
+    }
+}
+/// The link-making half of fileio.c `Fmake_symbolic_link` and
+/// `Fadd_name_to_file`: MAKE creates NAMES' last element. When that exists
+/// already, a non-nil OK-IF-ALREADY-EXISTS removes it and tries again, and
+/// nil signals `(file-already-exists "File already exists" NEWNAME)`. (A
+/// number, which asks the user in Emacs, is taken as nil: batch Emacs has
+/// no one to ask either.) Other failures are `(STRING ERRSTRING NAMES...)`.
+fn make_link(
+    h: &mut ElispHost,
+    string: &str,
+    names: &[&str],
+    ok_if_exists: Option<&Value>,
+    make: impl Fn() -> std::io::Result<()>,
+) -> Result<(), String> {
+    let newname = names[names.len() - 1];
+    let mut result = make();
+    if matches!(&result, Err(e) if e.raw_os_error() == Some(libc::EEXIST)) {
+        let replace = ok_if_exists.is_some_and(|v| !is_nil(v) && !matches!(v, Value::Int(_)));
+        if !replace {
+            let sym = h.intern("file-already-exists");
+            let data = vec![
+                h.new_string("File already exists".to_string()),
+                h.new_string(newname.to_string()),
+            ];
+            let data = h.list_from(data);
+            let obj = h.cons(sym, data);
+            let msg = format!("file-already-exists: {}", h.print(&obj, true));
+            h.set_pending_error(&msg, obj);
+            return Err(msg);
+        }
+        // A failed `unlink` is not reported: the second attempt is.
+        let _ = std::fs::remove_file(fs_expand(newname));
+        result = make();
+    }
+    result.map_err(|e| report_file_errno(h, string, names, &e))
+}
+/// fileio.c `Fmake_symbolic_link`: TARGET is stored as written; LINKNAME
+/// (expanded on the way in, `expand_cp_target`) is the link made. Errors
+/// are `("Making symbolic link" ERRSTRING TARGET LINKNAME)`.
+fn make_symbolic_link(h: &mut ElispHost, a: &[Value]) -> R {
+    let target = as_string(h, &a[0])?;
+    let link = cp_target(&target, &as_string(h, &a[1])?);
+    let path = fs_expand(&link);
+    make_link(h, "Making symbolic link", &[&target, &link], a.get(2), || {
+        std::os::unix::fs::symlink(&target, &path)
+    })?;
+    Ok(Value::Undef)
+}
+/// fileio.c `Fadd_name_to_file`: a hard link NEWNAME to FILE, both expanded
+/// on the way in. Errors are `("Adding new name" ERRSTRING FILE NEWNAME)`.
+fn add_name_to_file(h: &mut ElispHost, a: &[Value]) -> R {
+    let file = as_string(h, &a[0])?;
+    let newname = cp_target(&file, &as_string(h, &a[1])?);
+    let (from, to) = (fs_expand(&file), fs_expand(&newname));
+    make_link(h, "Adding new name", &[&file, &newname], a.get(2), || {
+        std::fs::hard_link(&from, &to)
+    })?;
+    Ok(Value::Undef)
 }
 fn file_executable_p(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(nil_or(fs_access(
@@ -10960,12 +11302,13 @@ fn write_region(h: &mut ElispHost, a: &[Value]) -> R {
     res.map_err(|e| report_file_errno(h, "Opening output file", &[&filename], &e))?;
     Ok(Value::Undef)
 }
-fn delete_file(h: &mut ElispHost, a: &[Value]) -> R {
+/// fileio.c `Fdelete_file_internal`: one `unlink`; a file that is already
+/// gone is not an error. `delete-file` is files.el's.
+fn delete_file_internal(h: &mut ElispHost, a: &[Value]) -> R {
     let f = as_string(h, &a[0])?;
-    // `Fdelete_file_internal`: a file that is already gone is not an error.
     match std::fs::remove_file(fs_expand(&f)) {
         Err(e) if e.raw_os_error() != Some(libc::ENOENT) => {
-            Err(report_file_errno(h, "Removing file", &[&f], &e))
+            Err(report_file_errno(h, "Removing old name", &[&f], &e))
         }
         _ => Ok(Value::Undef),
     }
@@ -11011,32 +11354,237 @@ fn copy_file(h: &mut ElispHost, a: &[Value]) -> R {
 }
 
 // ── subprocesses ──
-fn shell_command_to_string(h: &mut ElispHost, a: &[Value]) -> R {
-    let cmd = as_string(h, &a[0])?;
-    match subprocess(h, "sh")?.arg("-c").arg(&cmd).output() {
-        Ok(o) => Ok(h.new_string(String::from_utf8_lossy(&o.stdout).into_owned())),
-        Err(_) => Ok(h.new_string(String::new())),
+/// Where `call-process` sends the child's standard output (callproc.c's
+/// reading of DESTINATION).
+pub(crate) enum ProcOutput {
+    /// nil: discarded, waited for.
+    Discard,
+    /// A number: discarded, not waited for; `call-process` answers nil.
+    NoWait,
+    /// t, a buffer or a buffer name: inserted at that buffer's point.
+    Buffer(Value),
+    /// `(:file FILE)`: written to FILE (expanded), truncated first.
+    File(String),
+}
+/// Where the child's standard error goes: the second element of a list
+/// DESTINATION. Without one it is mixed with the output.
+pub(crate) enum ProcStderr {
+    Discard,
+    Mix,
+    File(String),
+}
+/// The car and cdr of V when it is a cons.
+fn cons_parts(h: &ElispHost, v: &Value) -> Option<(Value, Value)> {
+    match h.obj(v) {
+        Some(Obj::Cons(a, d)) => Some((a.clone(), d.clone())),
+        _ => None,
     }
 }
-fn call_process(h: &mut ElispHost, a: &[Value]) -> R {
-    let program = as_string(h, &a[0])?;
-    // a[1] INFILE and a[3] DISPLAY are ignored; a[2] DESTINATION; a[4..] ARGS.
-    let args: Vec<String> = a
-        .get(4..)
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|v| as_string(h, v).ok())
-        .collect();
-    let insert = matches!(a.get(2), Some(v) if !is_nil(v));
-    let out = subprocess(h, &program)?
-        .args(&args)
-        .output()
-        .map_err(|e| report_file_errno(h, "Searching for program", &[&program], &e))?;
-    if insert {
-        let chars: Vec<char> = String::from_utf8_lossy(&out.stdout).chars().collect();
-        h.cur_insert(chars, true);
+/// callproc.c `call_process`'s decoding of DESTINATION. A buffer name is
+/// `get-buffer-create`d; a killed buffer is `Selecting deleted buffer`; a
+/// file name is expanded against `default-directory`.
+pub(crate) fn process_destination(
+    h: &mut ElispHost,
+    dest: Option<&Value>,
+) -> Result<(ProcOutput, ProcStderr), String> {
+    let Some(dest) = dest.cloned() else {
+        return Ok((ProcOutput::Discard, ProcStderr::Mix));
+    };
+    let mut stderr = ProcStderr::Mix;
+    let mut buffer = dest.clone();
+    if let Some((car, cdr)) = cons_parts(h, &dest) {
+        if h.sym_name(&car).is_some_and(|n| n.as_str() == ":file") {
+            let file = cons_parts(h, &cdr).map(|(file, _)| file);
+            let file = file.unwrap_or(Value::Undef);
+            let file = crate::fileio::expand_file_name(h, &[file])?;
+            return Ok((ProcOutput::File(as_string(h, &file)?), stderr));
+        }
+        if let Some((err, _)) = cons_parts(h, &cdr) {
+            stderr = if is_nil(&err) {
+                ProcStderr::Discard
+            } else if matches!(err, Value::Bool(true)) {
+                ProcStderr::Mix
+            } else {
+                let file = crate::fileio::expand_file_name(h, &[err])?;
+                ProcStderr::File(as_string(h, &file)?)
+            };
+        }
+        buffer = car;
     }
-    Ok(Value::Int(out.status.code().unwrap_or(-1) as i64))
+    let out = match buffer {
+        Value::Undef => ProcOutput::Discard,
+        Value::Bool(false) => ProcOutput::Discard,
+        Value::Bool(true) => ProcOutput::Buffer(h.cur_buf_ref().self_obj.clone()),
+        Value::Int(_) => ProcOutput::NoWait,
+        v => {
+            let b = get_buffer_create(h, &[v])?;
+            if h.resolve_buffer(&b).is_none_or(|i| h.buffers[i].name.is_none()) {
+                return Err("error: Selecting deleted buffer".to_string());
+            }
+            ProcOutput::Buffer(b)
+        }
+    };
+    Ok((out, stderr))
+}
+/// callproc.c: a child killed by a signal answers `strsignal`'s text.
+fn exit_value(h: &mut ElispHost, status: std::process::ExitStatus) -> Value {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(sig) = status.signal() {
+        // SAFETY: strsignal returns a pointer to a static or thread-local
+        // string, read at once.
+        let text = unsafe {
+            let p = libc::strsignal(sig);
+            if p.is_null() {
+                "unknown".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+        return h.new_string(text);
+    }
+    Value::Int(status.code().unwrap_or(0) as i64)
+}
+/// `open (FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666)` for the child's output
+/// or error file; STRING names the failure.
+fn create_output_file(h: &mut ElispHost, file: &str, string: &str) -> Result<std::fs::File, String> {
+    std::fs::File::create(fs_expand(file)).map_err(|e| report_file_errno(h, string, &[file], &e))
+}
+/// callproc.c `call_process` with DISPLAY ignored (batch Emacs never
+/// redisplays). The checks run in Emacs's order: INFILE's type, PROGRAM and
+/// ARGS, DESTINATION, `default-directory`, INFILE opened (`/dev/null` when
+/// nil), PROGRAM on `exec-path`, then the output and error files. Output is
+/// decoded as UTF-8. Answers the exit status, `strsignal`'s description of
+/// the signal that killed the child, or nil for a numeric DESTINATION.
+pub(crate) fn run_process(
+    h: &mut ElispHost,
+    program: &Value,
+    infile: Option<&Value>,
+    dest: Option<&Value>,
+    args: &[Value],
+) -> R {
+    use std::process::Stdio;
+    let infile = match infile {
+        Some(v) if !is_nil(v) => {
+            let f = crate::fileio::expand_file_name(h, std::slice::from_ref(v))?;
+            Some(as_string(h, &f)?)
+        }
+        _ => None,
+    };
+    let program = as_string(h, program)?;
+    let args: Vec<String> = args
+        .iter()
+        .map(|v| as_string(h, v))
+        .collect::<Result<_, _>>()?;
+    let (out, stderr) = process_destination(h, dest)?;
+    let cwd = subprocess_directory(h)?;
+    let stdin = match &infile {
+        Some(f) => Stdio::from(
+            std::fs::File::open(fs_expand(f))
+                .map_err(|e| report_file_errno(h, "Opening process input file", &[f], &e))?,
+        ),
+        None => Stdio::null(),
+    };
+    let path = find_program(h, &program)?;
+    let mut cmd = std::process::Command::new(path);
+    cmd.args(&args)
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(child_environment(h, &cwd))
+        .stdin(stdin);
+    // The pipe both streams share when the output is captured and the error
+    // is mixed in, so the two interleave as the child wrote them.
+    let mut reader = None;
+    let stdout_file = match &out {
+        ProcOutput::File(f) => Some(create_output_file(h, f, "Opening process output file")?),
+        _ => None,
+    };
+    let stderr_file = match &stderr {
+        ProcStderr::File(f) => Some(create_output_file(h, f, "Cannot redirect stderr")?),
+        _ => None,
+    };
+    let to_stdout: Stdio = match (&out, &stdout_file) {
+        (ProcOutput::Buffer(_), _) => {
+            let (r, w) = std::io::pipe().map_err(|e| e.to_string())?;
+            reader = Some(r);
+            if matches!(stderr, ProcStderr::Mix) {
+                cmd.stderr(w.try_clone().map_err(|e| e.to_string())?);
+            }
+            w.into()
+        }
+        (_, Some(f)) => {
+            if matches!(stderr, ProcStderr::Mix) {
+                cmd.stderr(f.try_clone().map_err(|e| e.to_string())?);
+            }
+            f.try_clone().map_err(|e| e.to_string())?.into()
+        }
+        _ => Stdio::null(),
+    };
+    cmd.stdout(to_stdout);
+    match (stderr_file, &stderr) {
+        (Some(f), _) => {
+            cmd.stderr(f);
+        }
+        (None, ProcStderr::Discard) => {
+            cmd.stderr(Stdio::null());
+        }
+        (None, _) if reader.is_none() && stdout_file.is_none() => {
+            cmd.stderr(Stdio::null());
+        }
+        _ => {}
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| report_file_errno(h, "Searching for program", &[&program], &e))?;
+    // The parent's copies of the pipe's write end go with the Command.
+    drop(cmd);
+    if matches!(out, ProcOutput::NoWait) {
+        return Ok(Value::Undef);
+    }
+    let mut bytes = Vec::new();
+    if let Some(mut r) = reader {
+        std::io::Read::read_to_end(&mut r, &mut bytes)
+            .map_err(|e| report_file_errno(h, "Read error", &[&program], &e))?;
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if let ProcOutput::Buffer(buffer) = &out {
+        if !bytes.is_empty() {
+            let saved = h.cur_buf_ref().self_obj.clone();
+            h.set_buffer(buffer)?;
+            let inserted = h.barf_if_read_only().map(|()| {
+                let chars: Vec<char> = String::from_utf8_lossy(&bytes).chars().collect();
+                h.cur_insert(chars, true);
+            });
+            h.set_buffer(&saved)?;
+            inserted?;
+        }
+    }
+    Ok(exit_value(h, status))
+}
+/// simple.el `shell-command-to-string`, which runs `shell-command` into a
+/// temporary buffer: `(call-process shell-file-name nil t nil
+/// shell-command-switch COMMAND)`, standard error mixed into the output.
+fn shell_command_to_string(h: &mut ElispHost, a: &[Value]) -> R {
+    as_string(h, &a[0])?;
+    let shell = symbol_value_or_nil(h, "shell-file-name");
+    let switch = symbol_value_or_nil(h, "shell-command-switch");
+    let saved = h.cur_buf_ref().self_obj.clone();
+    let name = h.generate_new_buffer_name(" *temp*", None);
+    let temp = h.get_buffer_create(&name);
+    if let Some(i) = h.resolve_buffer(&temp) {
+        h.buffers[i].inhibit_hooks = true;
+    }
+    let dest = Value::Bool(true);
+    h.set_buffer(&temp)?;
+    let result = run_process(h, &shell, None, Some(&dest), &[switch, a[0].clone()]);
+    let text: String = h.cur_buf_ref().text.iter().collect();
+    h.set_buffer(&saved)?;
+    h.kill_buffer(Some(&temp));
+    result?;
+    Ok(h.new_string(text))
+}
+/// `(call-process PROGRAM &optional INFILE DESTINATION DISPLAY &rest ARGS)`.
+fn call_process(h: &mut ElispHost, a: &[Value]) -> R {
+    run_process(h, &a[0], a.get(1), a.get(2), a.get(4..).unwrap_or(&[]))
 }
 
 // ── more buffer editing/motion ──
@@ -11802,6 +12350,10 @@ pub fn install(h: &mut ElispHost) {
     s("--system-type--", 0, Some(0), system_type);
     s("--build-time--", 0, Some(0), build_time);
     s("system-name", 0, Some(0), system_name);
+    s("user-login-name", 0, Some(1), user_login_name);
+    s("user-real-login-name", 0, Some(0), user_real_login_name);
+    s("user-uid", 0, Some(0), user_uid);
+    s("user-real-uid", 0, Some(0), user_real_uid);
     s("--temp-directory--", 0, Some(0), temp_directory);
     s("file-exists-p", 1, Some(1), file_exists_p);
     s("file-directory-p", 1, Some(1), file_directory_p);
@@ -11809,6 +12361,24 @@ pub fn install(h: &mut ElispHost) {
     s("file-readable-p", 1, Some(1), file_readable_p);
     s("file-writable-p", 1, Some(1), file_writable_p);
     s("file-symlink-p", 1, Some(1), file_symlink_p);
+    s("file-attributes", 1, Some(2), file_attributes);
+    s("file-modes", 1, Some(2), file_modes);
+    s("set-file-modes", 2, Some(3), set_file_modes);
+    s("file-newer-than-file-p", 2, Some(2), file_newer_than_file_p);
+    s(
+        "file-accessible-directory-p",
+        1,
+        Some(1),
+        file_accessible_directory_p,
+    );
+    s(
+        "delete-directory-internal",
+        1,
+        Some(1),
+        delete_directory_internal,
+    );
+    s("make-symbolic-link", 2, Some(3), make_symbolic_link);
+    s("add-name-to-file", 2, Some(3), add_name_to_file);
     s("file-executable-p", 1, Some(1), file_executable_p);
     s("--invocation-file--", 0, Some(0), invocation_file);
     s("--directory-files--", 1, Some(3), directory_files_raw);
@@ -12032,7 +12602,7 @@ pub fn install(h: &mut ElispHost) {
     s("replace-match", 1, Some(5), replace_match);
     // filesystem writes / mutations
     s("write-region", 3, Some(7), write_region);
-    s("delete-file", 1, Some(2), delete_file);
+    s("delete-file-internal", 1, Some(1), delete_file_internal);
     s(
         "make-directory-internal",
         1,

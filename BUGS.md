@@ -7603,3 +7603,69 @@ Expectations: `tests/parity_window_tree.rs`, `tests/parity_display_buffer.rs`,
 - `\N{NAME}` with a character name, a standalone `#^^[…]`.
 - The open items of round 46 (child environment order, `shell-file-name`,
   `call-process` INFILE / DISPLAY / signals, `file-truename`).
+
+## Round 49 — files.el's truenames and deletion, the file attribute primitives, `call-process` INFILE, `shell-file-name`
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch -l FILE`, each form wrapped in
+`(condition-case e FORM (error e))`, over the same symbolic-link fixture).
+Starts from round 46's open items.
+
+### R49-A. ✅ FIXED — `file-truename`, `file-chase-links`, file name handlers
+
+`file-truename` and `file-chase-links` were void. src/lisp/files-31.el loads
+files.el's `file-truename`, `file-chase-links`, `delete-file`,
+`delete-directory`, `file-name-non-special` and the `file-attribute-*`
+accessors verbatim, after fileio.c's `find-file-name-handler` and
+`unhandled-file-name-directory`, ported. `delete-file` and `delete-directory`
+are therefore files.el's over the primitives `delete-file-internal` and
+`delete-directory-internal`.
+
+### R49-B. ✅ FIXED — the file attribute and link primitives
+
+New subrs, each expanding its file name arguments against
+`default-directory` as fileio.c does: dired.c's `file-attributes` (`lstat`;
+TYPE is t, the link target or nil; UID / GID as names for a non-`integer`
+ID-FORMAT; times as `(HIGH LOW USEC PSEC)`), `file-modes`, `set-file-modes`,
+`file-newer-than-file-p`, `file-accessible-directory-p`,
+`make-symbolic-link`, `add-name-to-file`. The predicates (`file-exists-p`,
+`file-directory-p`, `file-regular-p`, `file-readable-p`, `file-writable-p`,
+`file-executable-p`, `file-symlink-p`) now expand a relative name against
+`default-directory` instead of elisprs's working directory. editfns.c's
+`user-login-name` (with its `CONS_TO_INTEGER` UID decoding),
+`user-real-login-name`, `user-uid` and `user-real-uid` are ported for the
+UID / GID names.
+
+### R49-C. ✅ FIXED — `call-process` INFILE and signals, `shell-file-name`
+
+`call-process` ignored INFILE; it is now the child's standard input
+(`/dev/null` when nil), opened after the DESTINATION and
+`default-directory` checks, in callproc.c's order. A child killed by a
+signal answered -1; it answers `strsignal`'s description. `shell-file-name`
+(`$SHELL`, else `/bin/sh`, set per run) and `shell-command-switch` (`"-c"`)
+are defined, and `shell-command-to-string` runs `(call-process
+shell-file-name nil t nil shell-command-switch COMMAND)`.
+
+```text
+form                                                          Emacs 31.1 / now
+(file-truename "d/link/f")                                    "DIR/d/real/f"
+(file-chase-links "d/link")                                   "d/real"
+(car (file-attributes "d/link"))                              "real"
+(with-temp-buffer (list (call-process "cat" "in.txt" t)       (0 "hi\n")
+  (buffer-string)))
+(call-process "sh" nil nil nil "-c" "kill -9 $$")             "Killed: 9"   (macOS strsignal)
+(shell-command-to-string "echo $0")  ; SHELL=/bin/zsh         "/bin/zsh\n"
+```
+
+Expectations: `tests/parity_file_truename.rs`,
+`tests/parity_call_process_destination.rs`.
+
+### Still open after round 49
+
+- `call-process` DISPLAY is accepted and not acted on (batch Emacs has no
+  redisplay to run).
+- The child's environment order (round 46).
+- `cl-defsubst` still defines the function without the inlining compiler
+  macro (R29-E), so a `cl-defstruct` constructor call behaves as the
+  `:noinline` / `funcall` case.
+- The file primitives do not dispatch through `file-name-handler-alist`;
+  only the files.el functions above do.

@@ -1358,7 +1358,6 @@ const LISP_LEVEL_ARITY: &[(&str, u16, u16)] = &[
     ("cddr", 1, 1),
     ("char-uppercase-p", 1, 1),
     ("count-lines", 2, 3),
-    ("delete-file", 1, 2),
     ("error", 1, 1),
     ("fixnump", 1, 1),
     ("generate-new-buffer", 1, 2),
@@ -7610,16 +7609,31 @@ fn intrinsic_wrong_nargs(f: &Value, argc: usize) -> String {
 /// `(insert-file-contents "x")` signals `(file-missing "Opening input file"
 /// "No such file or directory" "<default-directory>x")`. `expand-file-name` is
 /// prelude Lisp, which a subr cannot call from inside the host borrow, so the
-/// expansion happens here, on the way in. `delete-file` is files.el's
-/// `(delete-file-internal (expand-file-name FILENAME))` collapsed into one subr.
+/// expansion happens here, on the way in. `file-attributes` answers nil for a
+/// name that cannot be expanded, so a non-string reaches it unexpanded.
 const FILE_NAME_ARGS: &[(&str, &[usize])] = &[
     ("insert-file-contents", &[0]),
     ("write-region", &[2]),
-    ("delete-file", &[0]),
+    ("delete-file-internal", &[0]),
+    ("delete-directory-internal", &[0]),
     ("make-directory-internal", &[0]),
     ("rename-file", &[0, 1]),
     ("copy-file", &[0, 1]),
     ("--directory-files--", &[0]),
+    ("file-exists-p", &[0]),
+    ("file-directory-p", &[0]),
+    ("file-regular-p", &[0]),
+    ("file-readable-p", &[0]),
+    ("file-writable-p", &[0]),
+    ("file-executable-p", &[0]),
+    ("file-symlink-p", &[0]),
+    ("file-attributes", &[0]),
+    ("file-modes", &[0]),
+    ("set-file-modes", &[0]),
+    ("file-newer-than-file-p", &[0, 1]),
+    ("file-accessible-directory-p", &[0]),
+    ("make-symbolic-link", &[1]),
+    ("add-name-to-file", &[0, 1]),
 ];
 
 /// ARGS with the [`FILE_NAME_ARGS`] positions expanded when F resolves to one

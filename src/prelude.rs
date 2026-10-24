@@ -3986,6 +3986,14 @@ Signal an error if unsuccessful."
                   (split-string (or (getenv "PATH") "") path-separator))
           (list (directory-file-name exec-directory)))
   "List of directories to search programs to run in subprocesses.")
+;; callproc.c; set per run from $SHELL by src/builtins.rs `install_exec_path'.
+(defvar shell-file-name "/bin/sh"
+  "File name to load inferior shells from.
+Initialized from the SHELL environment variable, or to a system-dependent
+default if SHELL is unset.  See Info node `(elisp)Security Considerations'.")
+;; simple.el.
+(defvar shell-command-switch "-c"
+  "Switch used to have the shell execute its command line argument.")
 ;; elisprs models no remote/TRAMP files, so every file name is local: this
 ;; returns nil for all inputs (Emacs returns nil for local names too), which
 ;; makes `executable-find's remote branch dead code (as intended here).

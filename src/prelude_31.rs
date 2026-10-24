@@ -13,6 +13,10 @@ pub const TIME_DATE: &str = include_str!("lisp/time-date.el");
 /// verbatim.
 pub const SUBR_31: &str = include_str!("lisp/subr-31.el");
 
+/// fileio.c's `find-file-name-handler`, and files.el's `file-truename`,
+/// `file-chase-links` and `file-name-non-special`, verbatim.
+pub const FILES_31: &str = include_str!("lisp/files-31.el");
+
 /// Ports of the C primitives of `keymap.c` and `keyboard.c` that read keymaps
 /// and event symbols.
 pub const KEYMAP_C: &str = include_str!("lisp/keymap-c.el");
@@ -89,8 +93,8 @@ pub const AUTOLOADS: &str = r#"
 pub const FACES_31: &str = include_str!("lisp/faces-31.el");
 
 /// Every segment, in load order.
-pub const SEGMENTS: [&str; 20] = [
-    FACES_31, TIME_DATE, SUBR_31, KEYMAP_C, TEXTPROP_C, MAP_31, EDITFNS_C, CATEGORY_C, INDENT,
-    NEWCOMMENT, PARAGRAPHS, FILL, UNDO_31, WINDOW_C, WINDOW_31, WINDOW_EL, SIMPLE_31, TIMER,
-    REPLACE_31, AUTOLOADS,
+pub const SEGMENTS: [&str; 21] = [
+    FACES_31, TIME_DATE, SUBR_31, FILES_31, KEYMAP_C, TEXTPROP_C, MAP_31, EDITFNS_C, CATEGORY_C,
+    INDENT, NEWCOMMENT, PARAGRAPHS, FILL, UNDO_31, WINDOW_C, WINDOW_31, WINDOW_EL, SIMPLE_31,
+    TIMER, REPLACE_31, AUTOLOADS,
 ];

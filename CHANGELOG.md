@@ -6,6 +6,17 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Round 49 parity vs Emacs 31.1** (see BUGS.md): files.el's
+  `file-truename`, `file-chase-links`, `delete-file`, `delete-directory`,
+  `file-name-non-special` and `file-attribute-*` accessors load verbatim
+  over fileio.c's `find-file-name-handler`; `file-attributes`,
+  `file-modes`, `set-file-modes`, `file-newer-than-file-p`,
+  `file-accessible-directory-p`, `make-symbolic-link`, `add-name-to-file`,
+  `user-login-name`, `user-real-login-name`, `user-uid` and `user-real-uid`
+  are defined, and the file predicates expand relative names against
+  `default-directory`; `call-process` reads INFILE as standard input and
+  answers a killing signal's description; `shell-command-to-string` runs
+  `shell-file-name` with `shell-command-switch`.
 - **Round 48 parity vs Emacs 31.1** (see BUGS.md): window.c's window tree
   (internal windows, sibling chains, pixel and character geometry, normal
   sizes, `split-window-internal`, `delete-window-internal`,
