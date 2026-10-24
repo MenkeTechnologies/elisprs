@@ -8701,7 +8701,9 @@ fn uid_arg(h: &ElispHost, v: &Value) -> Result<u32, String> {
     const MSG: &str = "error: Not an in-range integer, integral float, or cons of integers";
     let n = match v {
         Value::Int(n) => Some(*n),
-        Value::Float(f) if f.fract() == 0.0 && *f >= 0.0 && *f <= u32::MAX as f64 => Some(*f as i64),
+        Value::Float(f) if f.fract() == 0.0 && *f >= 0.0 && *f <= u32::MAX as f64 => {
+            Some(*f as i64)
+        }
         _ => cons_parts(h, v).and_then(|(hi, lo)| {
             let lo = cons_parts(h, &lo).map_or(lo, |(car, _)| car);
             match (hi, lo) {
@@ -8712,7 +8714,8 @@ fn uid_arg(h: &ElispHost, v: &Value) -> Result<u32, String> {
             }
         }),
     };
-    n.and_then(|n| u32::try_from(n).ok()).ok_or_else(|| MSG.to_string())
+    n.and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| MSG.to_string())
 }
 
 /// editfns.c `init_editfns`: the login name is `LOGNAME`, else `USER`, else
@@ -8919,12 +8922,13 @@ fn file_mode_string(mode: u32) -> String {
     let bit = |mask: u32, c: char| if mode & mask != 0 { c } else { '-' };
     // The execute slot also shows set-id / sticky: lower case when the
     // execute bit is set too, upper case when it is not.
-    let exec = |x: u32, special: u32, set: char, unset: char| match (mode & x != 0, mode & special != 0) {
-        (true, true) => set,
-        (false, true) => unset,
-        (true, false) => 'x',
-        (false, false) => '-',
-    };
+    let exec =
+        |x: u32, special: u32, set: char, unset: char| match (mode & x != 0, mode & special != 0) {
+            (true, true) => set,
+            (false, true) => unset,
+            (true, false) => 'x',
+            (false, false) => '-',
+        };
     [
         kind,
         bit(0o400, 'r'),
@@ -8962,7 +8966,11 @@ fn id_name(id: u32, group: bool) -> Option<String> {
         if name.is_null() {
             return None;
         }
-        Some(std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned())
+        Some(
+            std::ffi::CStr::from_ptr(name)
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 }
 /// dired.c `Ffile_attributes`: `lstat` FILENAME (expanded on the way in; a
@@ -8996,10 +9004,12 @@ fn file_attributes(h: &mut ElispHost, a: &[Value]) -> R {
         Some(v) if !is_nil(v) => h.sym_name(v).is_none_or(|n| n.as_str() != "integer"),
         _ => false,
     };
-    let id = |h: &mut ElispHost, n: u32, group: bool| match by_name.then(|| id_name(n, group)).flatten() {
-        Some(s) => h.new_string(s),
-        None => Value::Int(n as i64),
-    };
+    let id =
+        |h: &mut ElispHost, n: u32, group: bool| match by_name.then(|| id_name(n, group)).flatten()
+        {
+            Some(s) => h.new_string(s),
+            None => Value::Int(n as i64),
+        };
     let uid = id(h, st.uid(), false);
     let gid = id(h, st.gid(), true);
     let size = h.make_integer(BigInt::from(st.size()));
@@ -9027,7 +9037,8 @@ fn file_attributes(h: &mut ElispHost, a: &[Value]) -> R {
 /// FLAG of `file-modes` / `set-file-modes`: `nofollow` acts on a symbolic
 /// link itself.
 fn nofollow_flag(h: &ElispHost, flag: Option<&Value>) -> bool {
-    flag.and_then(|v| h.sym_name(v)).is_some_and(|n| n.as_str() == "nofollow")
+    flag.and_then(|v| h.sym_name(v))
+        .is_some_and(|n| n.as_str() == "nofollow")
 }
 /// fileio.c `Ffile_modes`: the permission bits (`st_mode & 07777`), nil
 /// when FILENAME does not exist.
@@ -9163,9 +9174,13 @@ fn make_symbolic_link(h: &mut ElispHost, a: &[Value]) -> R {
     let target = as_string(h, &a[0])?;
     let link = cp_target(&target, &as_string(h, &a[1])?);
     let path = fs_expand(&link);
-    make_link(h, "Making symbolic link", &[&target, &link], a.get(2), || {
-        std::os::unix::fs::symlink(&target, &path)
-    })?;
+    make_link(
+        h,
+        "Making symbolic link",
+        &[&target, &link],
+        a.get(2),
+        || std::os::unix::fs::symlink(&target, &path),
+    )?;
     Ok(Value::Undef)
 }
 /// fileio.c `Fadd_name_to_file`: a hard link NEWNAME to FILE, both expanded
@@ -11422,7 +11437,9 @@ pub(crate) fn process_destination(
         Value::Int(_) => ProcOutput::NoWait,
         v => {
             let b = get_buffer_create(h, &[v])?;
-            if h.resolve_buffer(&b).is_none_or(|i| h.buffers[i].name.is_none()) {
+            if h.resolve_buffer(&b)
+                .is_none_or(|i| h.buffers[i].name.is_none())
+            {
                 return Err("error: Selecting deleted buffer".to_string());
             }
             ProcOutput::Buffer(b)
@@ -11450,7 +11467,11 @@ fn exit_value(h: &mut ElispHost, status: std::process::ExitStatus) -> Value {
 }
 /// `open (FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666)` for the child's output
 /// or error file; STRING names the failure.
-fn create_output_file(h: &mut ElispHost, file: &str, string: &str) -> Result<std::fs::File, String> {
+fn create_output_file(
+    h: &mut ElispHost,
+    file: &str,
+    string: &str,
+) -> Result<std::fs::File, String> {
     std::fs::File::create(fs_expand(file)).map_err(|e| report_file_errno(h, string, &[file], &e))
 }
 /// callproc.c `call_process` with DISPLAY ignored (batch Emacs never

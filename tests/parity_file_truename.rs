@@ -7,7 +7,7 @@
 
 use elisprs::{eval_str, print, reset_host};
 use std::os::unix::fs::{symlink, MetadataExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Evaluate SRC in a fresh host; a signalled error comes back as `(ERR ERROR)`.
 fn eval(src: &str) -> String {
@@ -45,7 +45,7 @@ fn fixture(name: &str) -> PathBuf {
 
 /// Evaluate FORM with `default-directory` the fixture D, answering its
 /// printed value with D replaced by "D".
-fn in_dir(d: &PathBuf, form: &str) -> String {
+fn in_dir(d: &Path, form: &str) -> String {
     let d = d.to_string_lossy();
     eval(&format!("(let ((default-directory \"{d}/\")) {form})")).replace(&*d, "D")
 }
@@ -65,7 +65,10 @@ fn file_predicates_expand_against_default_directory() {
         eval(&format!("(list (file-symlink-p \"/:{q}/link\") (file-exists-p \"/:{q}/link\") (file-exists-p \"/:\") (file-writable-p \"/:{q}/real/new\"))")),
         "(\"real\" t t t)"
     );
-    assert_eq!(eval("(file-symlink-p 1)"), "(ERR (wrong-type-argument stringp 1))");
+    assert_eq!(
+        eval("(file-symlink-p 1)"),
+        "(ERR (wrong-type-argument stringp 1))"
+    );
 }
 
 /// files.el's `file-truename`: links chased at every level, `.` and `..`
@@ -79,10 +82,16 @@ fn file_truename_chases_every_level() {
         "(\"D/real/sub/f\" \"D/real/sub/f\" \"D/real/real\" \"D/real\" \"/nonexistent/x\" \"D/nonexist/a/b\" \"D\" \"D/real/f.gz\" \"D/real\" \"D/real/sub\" \"D/real/sub/\" \"/\")"
     );
     assert_eq!(
-        in_dir(&d, "(condition-case e (file-truename \"loop1\") (error (car e)))"),
+        in_dir(
+            &d,
+            "(condition-case e (file-truename \"loop1\") (error (car e)))"
+        ),
         "error"
     );
-    assert_eq!(eval("(file-truename 'x)"), "(ERR (wrong-type-argument arrayp x))");
+    assert_eq!(
+        eval("(file-truename 'x)"),
+        "(ERR (wrong-type-argument arrayp x))"
+    );
     // A quoted name goes through `file-name-non-special', which quotes the result.
     let q = d.to_string_lossy();
     assert_eq!(
@@ -138,7 +147,15 @@ fn find_file_name_handler_follows_fileio_c() {
 fn file_attributes_reads_lstat() {
     let d = fixture("attributes");
     let st = std::fs::symlink_metadata(d.join("link")).unwrap();
-    let t = |s: i64, ns: i64| format!("({} {} {} {})", s >> 16, s & 0xffff, ns / 1000, ns % 1000 * 1000);
+    let t = |s: i64, ns: i64| {
+        format!(
+            "({} {} {} {})",
+            s >> 16,
+            s & 0xffff,
+            ns / 1000,
+            ns % 1000 * 1000
+        )
+    };
     let expected = format!(
         "(\"real\" {} {} {} {} {} {} 4 \"lrwxr-xr-x\" t {} {})",
         st.nlink(),
@@ -170,15 +187,27 @@ fn file_attributes_reads_lstat() {
 #[test]
 fn file_modes_and_times() {
     let d = fixture("modes");
-    std::fs::set_permissions(d.join("real/sub/f"), std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(
+        d.join("real/sub/f"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
     let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-    std::fs::File::options().write(true).open(d.join("real/sub/f")).unwrap().set_modified(old).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(d.join("real/sub/f"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
     assert_eq!(
         in_dir(&d, "(list (file-modes \"real/sub/f\") (progn (set-file-modes \"real/sub/f\" #o600) (file-modes \"real/sub/f\")) (file-modes \"nope\") (file-modes \"real/sub/f/x\"))"),
         "(420 384 nil nil)"
     );
     assert_eq!(
-        in_dir(&d, "(list (set-file-modes \"nope\" 420) (set-file-modes \"real/sub/f\" \"x\"))"),
+        in_dir(
+            &d,
+            "(list (set-file-modes \"nope\" 420) (set-file-modes \"real/sub/f\" \"x\"))"
+        ),
         "(ERR (file-missing \"Doing chmod\" \"No such file or directory\" \"D/nope\"))"
     );
     assert_eq!(
@@ -247,8 +276,18 @@ fn user_login_name_decodes_uid() {
         "(t t)"
     );
     let bad = "(ERR (error \"Not an in-range integer, integral float, or cons of integers\"))";
-    for arg in ["-1", "1.5", "\"x\"", "'(0 . 70000)", "'(0 . 1.0)", "(expt 2 40)"] {
+    for arg in [
+        "-1",
+        "1.5",
+        "\"x\"",
+        "'(0 . 70000)",
+        "'(0 . 1.0)",
+        "(expt 2 40)",
+    ] {
         assert_eq!(eval(&format!("(user-login-name {arg})")), bad, "{arg}");
     }
-    assert_eq!(eval("(user-real-login-name 1)"), "(ERR (wrong-number-of-arguments user-real-login-name 1))");
+    assert_eq!(
+        eval("(user-real-login-name 1)"),
+        "(ERR (wrong-number-of-arguments user-real-login-name 1))"
+    );
 }

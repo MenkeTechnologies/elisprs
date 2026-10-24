@@ -5,7 +5,7 @@
 //! Expectations are GNU Emacs 31.1's (`emacs -Q --batch -l FILE`).
 
 use elisprs::{eval_str, print, reset_host};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Evaluate SRC in a fresh host; a signalled error comes back as `(ERR ERROR)`.
 fn eval(src: &str) -> String {
@@ -28,7 +28,7 @@ fn fixture(name: &str) -> PathBuf {
 /// FORM run in a temporary buffer holding "<>" with point between the two,
 /// `default-directory` the fixture D: `(VALUE BUFFER-STRING POINT)`, with D
 /// replaced by "D".
-fn in_buffer(d: &PathBuf, form: &str) -> String {
+fn in_buffer(d: &Path, form: &str) -> String {
     let d = d.to_string_lossy();
     eval(&format!(
         "(let ((default-directory \"{d}/\")) (with-temp-buffer (insert \"<>\") (goto-char 2) (let ((r {form})) (list r (buffer-string) (point)))))"
@@ -45,7 +45,10 @@ fn infile_is_standard_input() {
         in_buffer(&d, "(call-process \"cat\" \"in.txt\" t)"),
         "(0 \"<line1\nline2\n>\" 14)"
     );
-    assert_eq!(in_buffer(&d, "(call-process \"cat\" nil t)"), "(0 \"<>\" 2)");
+    assert_eq!(
+        in_buffer(&d, "(call-process \"cat\" nil t)"),
+        "(0 \"<>\" 2)"
+    );
     assert_eq!(
         in_buffer(&d, "(call-process \"cat\" \"nope.txt\" t)"),
         "(ERR (file-missing \"Opening process input file\" \"No such file or directory\" \"D/nope.txt\"))"
@@ -60,9 +63,18 @@ fn infile_is_standard_input() {
 fn destination_forms() {
     let d = fixture("destination");
     let sh = "nil \"-c\" \"echo out; echo err >&2\"";
-    assert_eq!(in_buffer(&d, &format!("(call-process \"sh\" nil t {sh})")), "(0 \"<out\nerr\n>\" 10)");
-    assert_eq!(in_buffer(&d, &format!("(call-process \"sh\" nil '(t nil) {sh})")), "(0 \"<out\n>\" 6)");
-    assert_eq!(in_buffer(&d, &format!("(call-process \"sh\" nil '(t t) {sh})")), "(0 \"<out\nerr\n>\" 10)");
+    assert_eq!(
+        in_buffer(&d, &format!("(call-process \"sh\" nil t {sh})")),
+        "(0 \"<out\nerr\n>\" 10)"
+    );
+    assert_eq!(
+        in_buffer(&d, &format!("(call-process \"sh\" nil '(t nil) {sh})")),
+        "(0 \"<out\n>\" 6)"
+    );
+    assert_eq!(
+        in_buffer(&d, &format!("(call-process \"sh\" nil '(t t) {sh})")),
+        "(0 \"<out\nerr\n>\" 10)"
+    );
     assert_eq!(
         in_buffer(&d, &format!("(list (call-process \"sh\" nil '(t \"err.txt\") {sh}) (with-temp-buffer (insert-file-contents \"err.txt\") (buffer-string)))")),
         "((0 \"err\n\") \"<out\n>\" 6)"
@@ -71,8 +83,14 @@ fn destination_forms() {
         in_buffer(&d, &format!("(list (call-process \"sh\" nil '(:file \"out.txt\") {sh}) (with-temp-buffer (insert-file-contents \"out.txt\") (buffer-string)))")),
         "((0 \"out\nerr\n\") \"<>\" 2)"
     );
-    assert_eq!(in_buffer(&d, "(call-process \"sh\" nil nil nil \"-c\" \"echo out\")"), "(0 \"<>\" 2)");
-    assert_eq!(in_buffer(&d, "(call-process \"sh\" nil 0 nil \"-c\" \"echo out\")"), "(nil \"<>\" 2)");
+    assert_eq!(
+        in_buffer(&d, "(call-process \"sh\" nil nil nil \"-c\" \"echo out\")"),
+        "(0 \"<>\" 2)"
+    );
+    assert_eq!(
+        in_buffer(&d, "(call-process \"sh\" nil 0 nil \"-c\" \"echo out\")"),
+        "(nil \"<>\" 2)"
+    );
     assert_eq!(
         in_buffer(&d, "(list (call-process \"sh\" nil \"cpbuf\" nil \"-c\" \"echo out\") (with-current-buffer \"cpbuf\" (buffer-string)))"),
         "((0 \"out\n\") \"<>\" 2)"
@@ -82,7 +100,10 @@ fn destination_forms() {
         "((0 \"line1\nline2\ne\n\") \"<>\" 2)"
     );
     assert_eq!(
-        in_buffer(&d, "(call-process \"sh\" nil '(t . \"x\") nil \"-c\" \"echo x; echo y >&2\")"),
+        in_buffer(
+            &d,
+            "(call-process \"sh\" nil '(t . \"x\") nil \"-c\" \"echo x; echo y >&2\")"
+        ),
         "(0 \"<x\ny\n>\" 6)"
     );
     // Output with no characters inserts nothing, so a read-only buffer is fine.
@@ -119,7 +140,8 @@ fn check_order() {
     ];
     let dir = d.to_string_lossy();
     for (form, want) in cases {
-        let got = eval(&format!("(let ((default-directory \"{dir}/\")) {form})")).replace(&*dir, "D");
+        let got =
+            eval(&format!("(let ((default-directory \"{dir}/\")) {form})")).replace(&*dir, "D");
         assert_eq!(got, want, "{form}");
     }
 }
@@ -136,7 +158,10 @@ fn signal_answers_its_description() {
         eval("(let ((r (call-process \"sh\" nil nil nil \"-c\" \"kill -KILL $$\"))) (and (stringp r) (string-prefix-p \"Killed\" r)))"),
         "t"
     );
-    assert_eq!(eval("(call-process \"sh\" nil nil nil \"-c\" \"exit 7\")"), "7");
+    assert_eq!(
+        eval("(call-process \"sh\" nil nil nil \"-c\" \"exit 7\")"),
+        "7"
+    );
 }
 
 /// `shell-command-to-string` runs `shell-file-name` with
