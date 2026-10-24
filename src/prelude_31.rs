@@ -51,9 +51,15 @@ pub const SIMPLE_31: &str = include_str!("lisp/simple-31.el");
 /// simple.el's undo commands and subr.el's change groups, verbatim.
 pub const UNDO_31: &str = include_str!("lisp/undo-31.el");
 
-/// window.el, subr.el and simple.el functions over the window model of
+/// window.c's variables.
+pub const WINDOW_C: &str = include_str!("lisp/window-c.el");
+
+/// subr.el, simple.el and frame.el functions over the window model of
 /// src/window.rs, verbatim.
 pub const WINDOW_31: &str = include_str!("lisp/window-31.el");
+
+/// window.el, verbatim (preloaded by loadup.el).
+pub const WINDOW_EL: &str = include_str!("lisp/window.el");
 
 /// emacs-lisp/timer.el, verbatim (preloaded by loadup.el). Timers are made and
 /// listed; nothing runs them (there is no command loop to be idle in).
@@ -78,8 +84,13 @@ pub const AUTOLOADS: &str = r#"
 (define-symbol-prop 'rx 'pcase-macroexpander 'rx--pcase-macroexpander)
 "#;
 
+/// The `defface' forms of every face batch Emacs has, verbatim, in face-id
+/// order; loaded first so later definitions keep that order.
+pub const FACES_31: &str = include_str!("lisp/faces-31.el");
+
 /// Every segment, in load order.
-pub const SEGMENTS: [&str; 17] = [
-    TIME_DATE, SUBR_31, KEYMAP_C, TEXTPROP_C, MAP_31, EDITFNS_C, CATEGORY_C, INDENT, NEWCOMMENT,
-    PARAGRAPHS, FILL, UNDO_31, WINDOW_31, SIMPLE_31, TIMER, REPLACE_31, AUTOLOADS,
+pub const SEGMENTS: [&str; 20] = [
+    FACES_31, TIME_DATE, SUBR_31, KEYMAP_C, TEXTPROP_C, MAP_31, EDITFNS_C, CATEGORY_C, INDENT,
+    NEWCOMMENT, PARAGRAPHS, FILL, UNDO_31, WINDOW_C, WINDOW_31, WINDOW_EL, SIMPLE_31, TIMER,
+    REPLACE_31, AUTOLOADS,
 ];

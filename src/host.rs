@@ -1756,6 +1756,9 @@ pub struct EditBuffer {
     /// The buffer's name, or `None` once killed (the slot is retained so existing
     /// buffer objects keep resolving; `buffer-live-p` reads this).
     pub name: Option<String>,
+    /// `inhibit_buffer_hooks`: made with INHIBIT-BUFFER-HOOKS, so killing it
+    /// runs neither `kill-buffer-query-functions` nor `kill-buffer-hook`.
+    pub inhibit_hooks: bool,
     /// This buffer's own `Obj::Buffer` handle, allocated once so buffer objects
     /// are `eq`-stable. `Value::Undef` only during initial construction.
     pub self_obj: Value,
@@ -1959,6 +1962,7 @@ impl ElispHost {
                 mods: ModCounts::default(),
                 has_intervals: false,
                 list_order: 0,
+                inhibit_hooks: false,
             }],
             always_local: Vec::new(),
             current: 0,
@@ -5425,6 +5429,7 @@ impl ElispHost {
             mods: ModCounts::default(),
             has_intervals: false,
             list_order: 0,
+            inhibit_hooks: false,
         });
         self.buffer_order_seq += 1;
         self.buffers[idx].list_order = self.buffer_order_seq;

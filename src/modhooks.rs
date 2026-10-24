@@ -54,6 +54,10 @@ pub fn around(name: &str, f: SubrFn, args: &[Value]) -> Option<R> {
         "call-process" => call_process(f, args),
         "subst-char-in-region" => subst_char(f, args),
         "read" => read_stream(f, args),
+        "kill-buffer" => kill_buffer(f, args),
+        "set-window-configuration" => set_window_configuration(f, args),
+        "split-window-internal" => split_window_internal(f, args),
+        "delete-other-windows-internal" => crate::window::delete_other_windows_internal(args),
         _ => return None,
     };
     Some(r)
@@ -508,7 +512,25 @@ fn set_window_buffer(f: SubrFn, args: &[Value]) -> R {
         let fname = with_host(|h| h.intern("record-window-buffer"));
         call_function(&fname, &[window])?;
     }
-    run(f, args)
+    let r = run(f, args)?;
+    let window = args.first().cloned().unwrap_or(Value::Undef);
+    run_window_scroll_functions(window)?;
+    Ok(r)
+}
+
+/// `set_window_buffer` with RUN_HOOKS_P: `window-scroll-functions` for
+/// WINDOW, which now shows its new buffer.
+fn run_window_scroll_functions(window: Value) -> R {
+    let fname = with_host(|h| h.intern("run-window-scroll-functions"));
+    call_function(&fname, &[window])
+}
+
+/// `split-window-internal`: the new window's `set_window_buffer` runs
+/// `window-scroll-functions`.
+fn split_window_internal(f: SubrFn, args: &[Value]) -> R {
+    let new = run(f, args)?;
+    run_window_scroll_functions(new.clone())?;
+    Ok(new)
 }
 
 /// The printing primitives with a buffer or marker destination: print.c
@@ -669,4 +691,97 @@ fn read_stream(f: SubrFn, args: &[Value]) -> R {
         return run(f, args);
     }
     crate::lread_fn::read_from_function(&stream)
+}
+
+/// `set-window-configuration` (window.c): `record-window-buffer` for every
+/// window that is to show another buffer, the restore itself, then the Lisp
+/// that resizes a root window with children and deletes dedicated windows
+/// whose buffer was killed.
+fn set_window_configuration(f: SubrFn, args: &[Value]) -> R {
+    let windows = with_host(|h| {
+        args.first()
+            .map(|c| crate::window::windows_changing_buffer(h, c))
+            .unwrap_or_default()
+    });
+    let record = with_host(|h| h.intern("record-window-buffer"));
+    for w in windows {
+        call_function(&record, &[w])?;
+    }
+    let r = run(f, args)?;
+    crate::window::after_set_window_configuration()?;
+    Ok(r)
+}
+
+/// buffer.c `Fkill_buffer`'s Lisp: with the buffer current,
+/// `kill-buffer-query-functions` may refuse and `kill-buffer-hook` runs
+/// (neither for a buffer made with INHIBIT-BUFFER-HOOKS); then window.el's
+/// `replace-buffer-in-windows` gives its windows other buffers. The subr
+/// does the killing.
+fn kill_buffer(f: SubrFn, args: &[Value]) -> R {
+    let target = with_host(|h| match args.first() {
+        Some(v) if el_truthy(v) => h.resolve_buffer(v),
+        _ => Some(h.current),
+    });
+    let Some(b) = target.filter(|&b| with_host(|h| h.buffers[b].name.is_some())) else {
+        return run(f, args);
+    };
+    let (buffer, inhibit) =
+        with_host(|h| (h.buffers[b].self_obj.clone(), h.buffers[b].inhibit_hooks));
+    if !inhibit {
+        let saved = with_host(|h| std::mem::replace(&mut h.current, b));
+        let restore = |saved: usize| {
+            with_host(|h| {
+                if h.buffers[saved].name.is_some() {
+                    h.current = saved;
+                }
+            })
+        };
+        let query = with_host(|h| {
+            let run = h.intern("run-hook-with-args-until-failure");
+            let hook = h.intern("kill-buffer-query-functions");
+            (run, hook)
+        });
+        let ok = call_function(&query.0, &[query.1]);
+        match ok {
+            Ok(v) if el_nil(&v) => {
+                restore(saved);
+                return Ok(Value::Undef);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                restore(saved);
+                return Err(e);
+            }
+        }
+        let alive = with_host(|h| h.buffers[b].name.is_some());
+        if alive {
+            let (run_hooks, hook) =
+                with_host(|h| (h.intern("run-hooks"), h.intern("kill-buffer-hook")));
+            if let Err(e) = call_function(&run_hooks, &[hook]) {
+                restore(saved);
+                return Err(e);
+            }
+        }
+        restore(saved);
+        if !with_host(|h| h.buffers[b].name.is_some()) {
+            return Ok(Value::Bool(true));
+        }
+    }
+    let (fbound, minibuf) = with_host(|h| {
+        let sym = h.intern("replace-buffer-in-windows");
+        let mini = h.frames[h.selected_frame].mini;
+        (h.is_fbound(&sym), h.windows[mini].buffer == Some(b))
+    });
+    if minibuf {
+        return Ok(Value::Undef);
+    }
+    if fbound {
+        let fname = with_host(|h| h.intern("replace-buffer-in-windows"));
+        call_function(&fname, std::slice::from_ref(&buffer))?;
+        if !with_host(|h| h.buffers[b].name.is_some()) {
+            return Ok(Value::Bool(true));
+        }
+    }
+    // The buffer named at the start: the hooks may have made another current.
+    run(f, std::slice::from_ref(&buffer))
 }

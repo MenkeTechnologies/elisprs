@@ -4071,14 +4071,21 @@ remote, otherwise search locally."
 (defmacro with-current-buffer (buffer-or-name &rest body)
   (declare (indent 1) (debug t))
   `(save-current-buffer (set-buffer ,buffer-or-name) ,@body))
-;; with-temp-buffer: run BODY in a fresh temporary buffer, killing it afterward.
-;; Returns BODY's value, not the buffer text.
+;; subr.el (Emacs 31.1), verbatim.
 (defmacro with-temp-buffer (&rest body)
+  "Create a temporary buffer, and evaluate BODY there like `progn'.
+The buffer does not run the hooks `kill-buffer-hook',
+`kill-buffer-query-functions', and `buffer-list-update-hook'.
+See also `with-temp-file' and `with-output-to-string'."
   (declare (indent 0) (debug t))
-  `(let ((--tb-- (generate-new-buffer " *temp*")))
-     (unwind-protect
-         (with-current-buffer --tb-- ,@body)
-       (kill-buffer --tb--))))
+  (let ((temp-buffer (make-symbol "temp-buffer")))
+    `(let ((,temp-buffer (generate-new-buffer " *temp*" t)))
+       ;; `kill-buffer' can change current-buffer in some odd cases.
+       (with-current-buffer ,temp-buffer
+         (unwind-protect
+	     (progn ,@body)
+           (and (buffer-name ,temp-buffer)
+                (kill-buffer ,temp-buffer)))))))
 ;; subr.el's `with-output-to-string': BODY prints into a fresh buffer bound as
 ;; `standard-output', whose text is the value.
 (defmacro with-output-to-string (&rest body)
@@ -7479,6 +7486,18 @@ If NOSET is non-nil, don't bother autoloading LOAD when setting the variable."
       (integerp object)
       (and (consp object) (stringp (car object)) (integerp (cdr object)))))
 
+;; faces.el:647
+(defun face-documentation (face)
+  "Get the documentation string for FACE.
+If FACE is a face-alias, get the documentation for the target face."
+  (let ((alias (get face 'face-alias)))
+    (if alias
+        (let ((doc (documentation-property alias 'face-documentation)))
+	  (format "%s is an alias for the face `%s'.%s" face alias
+                  (if doc (format "\n%s" doc)
+                    "")))
+      (documentation-property face 'face-documentation))))
+
 ;; faces.el:662
 (defun set-face-documentation (face string)
   (put face 'face-documentation (purecopy string)))
@@ -7538,6 +7557,18 @@ Otherwise check for the existence of a global face."
 There are no X resources without a window system, so this does nothing."
   (ignore face frame)
   nil)
+
+(defun face-font (face &optional frame character)
+  "Return the font name of face FACE, or nil if it is unspecified.
+On the terminal frame of batch Emacs every realized face has the font
+\"tty\"; with FRAME t the global face's bold and italic attributes are
+consulted, which batch Emacs leaves unspecified."
+  (ignore character)
+  (if (eq frame t)
+      nil
+    (unless (facep face)
+      (signal 'error (list "Invalid face" face)))
+    "tty"))
 ;; faces.el (Emacs 31.1), verbatim.
 (defun face-list ()
   "Return a list of all defined faces."
@@ -8283,9 +8314,8 @@ Mode-specific keymaps may want to use this as their parent keymap."
 ;; modeled here — only the type registry, which is what init files exercise at
 ;; load time.  Value-for-value against Emacs 30.2 button.el.
 
-(defface button '((t :inherit link))
-  "Default face used for buttons."
-  :group 'basic-faces)
+;; `(defface button ...)' is in src/lisp/faces-31.el, which makes every face
+;; batch Emacs has in its face-id order.
 
 (defvar-keymap button-map
   :doc "Keymap used by buttons."
@@ -16836,10 +16866,10 @@ such that COMBO is equivalent to (and . CLAUSES)."
 ;; variables Emacs makes automatically buffer-local at startup, as GNU Emacs
 ;; 31.1 `emacs -Q --batch' has them: every one is bound, and setting one in a
 ;; buffer gives that buffer its own value instead of changing every buffer's.
-;; Defaults are the measured `default-value's. Left out: `lexical-binding'
-;; (rebound by `load'), `enable-multibyte-characters' (set only through
-;; `set-buffer-multibyte'), and `mode-line-format' (whose default is
-;; bindings.el's mode-line construct, not modelled).
+;; Defaults are the measured `default-value's; `mode-line-format' holds
+;; bindings.el's construct (whose parts are not defined: nothing displays it).
+;; Left out: `lexical-binding' (rebound by `load') and
+;; `enable-multibyte-characters' (set only through `set-buffer-multibyte').
 (dolist (var '(case-fold-search case-symbols-as-words deactivate-mark
                multibyte-syntax-as-symbol parse-sexp-ignore-comments
                parse-sexp-lookup-properties show-trailing-whitespace tab-width))
@@ -16890,6 +16920,13 @@ such that COMBO is equivalent to (and . CLAUSES)."
 (defvar-local line-prefix nil)
 (defvar-local line-spacing nil)
 (defvar-local make-window-start-visible nil)
+(defvar-local mode-line-format
+  '("%e" mode-line-front-space mode-line-mule-info mode-line-client
+    mode-line-modified mode-line-remote mode-line-window-dedicated
+    mode-line-frame-identification mode-line-buffer-identification "   "
+    mode-line-position (project-mode-line project-mode-line-format)
+    (vc-mode vc-mode) "  " mode-line-modes mode-line-misc-info
+    mode-line-end-spaces))
 (defvar-local mark-active nil)
 (defvar-local minor-mode-overriding-map-alist nil)
 (defvar-local overwrite-mode nil)

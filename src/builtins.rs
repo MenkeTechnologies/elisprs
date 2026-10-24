@@ -8901,7 +8901,13 @@ fn get_buffer_create(h: &mut ElispHost, a: &[Value]) -> R {
     }
     let name = as_string(h, &a[0])?;
     check_buffer_name(&name)?;
-    Ok(h.get_buffer_create(&name))
+    let existed = h.find_buffer_by_name(&name).is_some();
+    let buffer = h.get_buffer_create(&name);
+    if !existed && a.get(1).is_some_and(|v| !is_nil(v)) {
+        let idx = h.resolve_buffer(&buffer).expect("fresh buffer");
+        h.buffers[idx].inhibit_hooks = true;
+    }
+    Ok(buffer)
 }
 /// buffer.c refuses the empty name outright rather than making an unnameable
 /// buffer, in `get-buffer-create` and in `generate-new-buffer-name` alike.
@@ -8916,7 +8922,12 @@ fn generate_new_buffer(h: &mut ElispHost, a: &[Value]) -> R {
     check_buffer_name(&base)?;
     let name = h.generate_new_buffer_name(&base, None);
     // generate-new-buffer always makes a fresh buffer (the unique name is free).
-    Ok(h.get_buffer_create(&name))
+    let buffer = h.get_buffer_create(&name);
+    if a.get(1).is_some_and(|v| !is_nil(v)) {
+        let idx = h.resolve_buffer(&buffer).expect("fresh buffer");
+        h.buffers[idx].inhibit_hooks = true;
+    }
+    Ok(buffer)
 }
 fn generate_new_buffer_name(h: &mut ElispHost, a: &[Value]) -> R {
     let base = as_string(h, &a[0])?;
@@ -8949,6 +8960,14 @@ fn buffer_live_p(h: &mut ElispHost, a: &[Value]) -> R {
 }
 fn kill_buffer(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(h.kill_buffer(a.first()))
+}
+/// process.c `get-buffer-process`: elisprs runs no asynchronous processes,
+/// so no buffer has one.
+fn get_buffer_process(h: &mut ElispHost, a: &[Value]) -> R {
+    if !is_nil(&a[0]) && h.resolve_buffer(&a[0]).is_none() && !h.is_string(&a[0]) {
+        return Err(h.signal_wrong_type("stringp", &a[0]));
+    }
+    Ok(Value::Undef)
 }
 fn rename_buffer(h: &mut ElispHost, a: &[Value]) -> R {
     let newname = as_string(h, &a[0])?;
@@ -11439,6 +11458,8 @@ fn backward_word(h: &mut ElispHost, a: &[Value]) -> R {
 /// Install the primitive subr set.
 pub fn install(h: &mut ElispHost) {
     crate::window::install(h);
+    crate::window::install_frame_geometry(h);
+    crate::window::install_window_display(h);
     let mut s = |n: &str, min: usize, max: Option<usize>, f: crate::host::SubrFn| {
         h.defsubr(n, min, max, f);
     };
@@ -11807,6 +11828,7 @@ pub fn install(h: &mut ElispHost) {
     s("buffer-name", 0, Some(1), buffer_name);
     s("buffer-live-p", 1, Some(1), buffer_live_p);
     s("kill-buffer", 0, Some(1), kill_buffer);
+    s("get-buffer-process", 1, Some(1), get_buffer_process);
     s("rename-buffer", 1, Some(2), rename_buffer);
     s("buffer-list", 0, Some(1), buffer_list);
     // mark + narrowing

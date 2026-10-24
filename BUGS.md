@@ -7501,3 +7501,105 @@ Expectations: `tests/parity_read_function_stream.rs`,
   ASCII characters up in that slot, elisprs in the tree.
 - `\N{NAME}` with a Unicode character name (not `U+X`): `char-from-name`
   and its name table are not ported (`(unsupported character name …)`).
+
+## Round 48 — the window tree, window.el, `kill-buffer`'s hooks, the faces of batch Emacs
+
+**Oracle: GNU Emacs 31.1**, each form in a fresh `emacs -Q --batch -l
+scripts/fuzz/drive.el`. Closed from round 45's open list: window
+splitting and deletion, `recenter`, `pop-to-buffer` / `display-buffer`,
+and `face-list` completeness.
+
+### R48-A. ✅ FIXED — window.c's window tree; window.el verbatim
+
+`split-window`, `delete-window`, `delete-other-windows` and
+`display-buffer` were void and the window "tree" was one leaf.
+`src/window.rs` now keeps window.c's tree: live windows and internal
+windows with vertical or horizontal combinations, `parent` / `next` /
+`prev` chains (the root window's `next` is the minibuffer window), pixel
+and character geometry, normal sizes, new-total / new-pixel / new-normal
+slots and combination limits. Ported: the tree accessors,
+`window-pixel-*`, `window-total-*` with ROUND, `window-normal-size`,
+`set-window-new-*`, `window-body-*` (mode, header and tab lines; the
+border column of a window that is not rightmost; margins),
+`window-resize-apply`, `window-resize-apply-total` (which puts the root
+window below the frame's menu bar line, as batch Emacs does on the first
+split), `split-window-internal` (REFER included), `delete-window-internal`
+with `recombine_windows`, `delete-other-windows-internal`, `window-list`,
+`window-list-1`, `next-window` / `previous-window` and `get-buffer-window`
+over `window_list` / `candidate_window_p`, `frame-first-window`, and
+`current-window-configuration` / `set-window-configuration` saving and
+restoring the whole tree, then resizing the frame's windows as
+`adjust_frame_size` does (the root window 23 lines below the menu bar
+line, through window.el's `window--resize-root-window` when it has
+children). Also: `set-window-margins`, `recenter` (the initial frame's
+branch), `window-at`, `coordinates-in-window-p`, the terminal frame's
+geometry (`frame-pixel-*`, `frame-text-*`, dividers, borders,
+`select-frame`, `make-frame-visible` …), `window-scroll-functions` run by
+`set_window_buffer` for a split and `set-window-buffer`, and window.c's
+variables (`src/lisp/window-c.el`).
+
+window.el is loaded verbatim (`src/lisp/window.el`), so the splitting,
+resizing, balancing and display-buffer machinery is Emacs's own; frame.el's
+`framep-on-display`, `frame-edges` and `display-graphic-p` are added to
+`src/lisp/window-31.el`.
+
+```text
+form                                       Emacs 31.1 / now              was
+(let ((w (split-window))) (list (window-edges) (window-edges w)))
+                                           ((0 1 80 13) (0 13 80 25))    void-function
+(progn (split-window) (save-window-excursion (delete-other-windows)) (mapcar #'window-edges (window-list)))
+                                           ((0 1 80 13) (0 13 80 24))    void-function
+(display-buffer (get-buffer-create "d"))   #<window 4 on d>              void-function
+```
+
+### R48-B. ✅ FIXED — `kill-buffer` runs its hooks
+
+`kill-buffer-query-functions` and `kill-buffer-hook` did not exist and
+killing a buffer ran no Lisp. buffer.c's `Fkill_buffer` is followed: with
+the buffer current the query functions may refuse (nil is returned), the
+hook runs, a buffer made with INHIBIT-BUFFER-HOOKS (`get-buffer-create`,
+`generate-new-buffer`) runs neither, and window.el's
+`replace-buffer-in-windows` gives the buffer's windows other buffers
+(so a window with a previous buffer gets it back, a dedicated window is
+deleted). subr.el's `process-kill-buffer-query-function` is the default
+query function and `with-temp-buffer` is subr.el's verbatim (INHIBIT-
+BUFFER-HOOKS, no kill of a buffer already gone); `get-buffer-process`
+answers nil.
+
+### R48-C. ✅ FIXED — the faces of batch Emacs
+
+`face-list` held 7 faces. `src/lisp/faces-31.el` holds the `defface` forms
+of all 186 faces of `emacs -Q --batch`, verbatim from faces.el and the
+other preloaded libraries, in face-id order (generated with the oracle
+from `(reverse (face-list))` and each face's `symbol-file`), so
+`face-list`, `facep` and the faces' specs and documentation match.
+faces.el's `face-documentation` and xfaces.c's `face-font` (`"tty"` on
+the terminal frame) are added.
+
+Expectations: `tests/parity_window_tree.rs`, `tests/parity_display_buffer.rs`,
+`tests/parity_window_display_state.rs`, `tests/parity_window_hooks.rs`,
+`tests/parity_kill_buffer_hooks.rs`, `tests/parity_face_list.rs`.
+
+### Not followed, and why
+
+- `vmotion` (for `recenter` and `delete-other-windows-internal`'s window
+  start) counts logical lines; Emacs counts screen lines, so a line
+  wider than the window counts once here.
+- `window-text-pixel-size` (xdisp.c's iterator) is not ported, so
+  `fit-window-to-buffer` and `buffer-text-pixel-size` are void.
+- `kill-buffer-hook`'s default value in Emacs holds
+  `uniquify-kill-buffer-function` and `vc-kill-buffer-hook` (uniquify.el,
+  vc-hooks.el); here it is nil.
+- `run-window-scroll-functions` and `run-window-configuration-change-hook`
+  are Lisp ports, not subrs.
+- `set_window_buffer` does not bump `buffer-display-count` or set
+  `buffer-display-time`; positions saved in a window configuration are
+  numbers, not markers, so they do not move with later edits.
+
+### Still open after round 48
+
+- `current-bidi-paragraph-direction` and the rest of characters.el's
+  category data (Unicode property and charset tables).
+- `\N{NAME}` with a character name, a standalone `#^^[…]`.
+- The open items of round 46 (child environment order, `shell-file-name`,
+  `call-process` INFILE / DISPLAY / signals, `file-truename`).

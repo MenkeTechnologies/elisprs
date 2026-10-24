@@ -6,6 +6,19 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Round 48 parity vs Emacs 31.1** (see BUGS.md): window.c's window tree
+  (internal windows, sibling chains, pixel and character geometry, normal
+  sizes, `split-window-internal`, `delete-window-internal`,
+  `delete-other-windows-internal`, `window-resize-apply*`, configurations
+  that restore the tree and resize it as `adjust_frame_size` does, margins,
+  `recenter`, `window-at`, `coordinates-in-window-p`, the terminal frame's
+  geometry) with window.el loaded verbatim, so `split-window`,
+  `delete-window`, `delete-other-windows`, `balance-windows`,
+  `display-buffer`, `pop-to-buffer`, `quit-window` and side windows are
+  Emacs's own; `kill-buffer` runs `kill-buffer-query-functions`,
+  `kill-buffer-hook` (not for INHIBIT-BUFFER-HOOKS buffers) and
+  `replace-buffer-in-windows`, and `with-temp-buffer` is subr.el's; all
+  186 faces of batch Emacs are defined in face-id order.
 - **Round 47 parity vs Emacs 31.1** (see BUGS.md): `read` from a function
   stream makes lread.c `read0`'s `readchar` / `unreadchar` calls in order and
   reads vectors, `#` syntax, comments and dotted tails through it, ending on

@@ -974,3 +974,19 @@ the function `undo--wrap-and-run-primitive-undo'."
   (declare (debug (form form def-body)) (indent 2))
   `(combine-change-calls-1 ,beg ,end (lambda () ,@body)))
 
+
+;; buffer.c's DEFVARs that Fkill_buffer runs.
+(defvar kill-buffer-query-functions nil)
+(defvar kill-buffer-hook nil)
+
+(defun process-kill-buffer-query-function ()
+  "Ask before killing a buffer that has a running process."
+  (let ((process (get-buffer-process (current-buffer))))
+    (or (not process)
+        (not (memq (process-status process) '(run stop open listen)))
+        (not (process-query-on-exit-flag process))
+        (yes-or-no-p
+	 (format "Buffer %S has a running process; kill it? "
+		 (buffer-name (current-buffer)))))))
+
+(add-hook 'kill-buffer-query-functions #'process-kill-buffer-query-function)
