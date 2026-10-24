@@ -114,6 +114,21 @@ fn modify_with(
     after: Option<(usize, usize, usize)>,
     body: impl FnOnce() -> R,
 ) -> R {
+    change(beg, end, buffer, after, true, body)
+}
+
+/// [`modify_with`]; with TEXT_CHANGES false nothing is inserted or deleted
+/// and only the after-change half runs, as print.c's `print_finish` calls
+/// `signal_after_change` after an `insert_1_both` of no characters (which
+/// returns before `prepare_to_modify_buffer`).
+fn change(
+    beg: usize,
+    end: usize,
+    buffer: Option<Value>,
+    after: Option<(usize, usize, usize)>,
+    text_changes: bool,
+    body: impl FnOnce() -> R,
+) -> R {
     let in_buffer = |f: &mut dyn FnMut(&mut ElispHost) -> ModState| {
         with_host(|h| {
             let saved = h.current;
@@ -125,7 +140,15 @@ fn modify_with(
             r
         })
     };
-    let state = in_buffer(&mut mod_state);
+    // No text changes: no `prepare_to_modify_buffer` and no `deactivate-mark`.
+    let state = if text_changes {
+        in_buffer(&mut mod_state)
+    } else {
+        ModState {
+            inhibit: true,
+            prepare: false,
+        }
+    };
     let buf_arg = buffer.clone().unwrap_or(Value::Undef);
     if state.prepare {
         let fname = with_host(|h| h.intern("elisprs--prepare-to-modify"));
@@ -490,13 +513,10 @@ fn set_window_buffer(f: SubrFn, args: &[Value]) -> R {
 
 /// The printing primitives with a buffer or marker destination: print.c
 /// collects the text and inserts it once (`PRINTFINISH`), one change at the
-/// destination's insertion position in its buffer. `terpri` with ENSURE may
-/// insert nothing, and runs no hooks here.
+/// destination's insertion position in its buffer; printing nothing runs only
+/// the after-change half.
 fn print_to_buffer(name: &str, f: SubrFn, args: &[Value]) -> R {
     let pcf = usize::from(name != "terpri");
-    if name == "terpri" && args.get(1).is_some_and(el_truthy) {
-        return run(f, args);
-    }
     let target = with_host(|h| match builtins::print_dest(h, args.get(pcf)) {
         Ok(builtins::PrintDest::Buffer(bi)) => Some((bi, h.buffers[bi].point)),
         Ok(builtins::PrintDest::Marker(m)) => match h.obj(&m) {
@@ -510,8 +530,29 @@ fn print_to_buffer(name: &str, f: SubrFn, args: &[Value]) -> R {
     });
     match target {
         Some((bi, pos)) => {
-            let buffer = with_host(|h| h.buffers[bi].self_obj.clone());
-            modify(pos, pos, Some(buffer), || run(f, args))
+            // `print_finish` inserts what was printed and then always runs
+            // `signal_after_change`; an empty output inserts nothing, so it
+            // runs no before-change half.
+            let (buffer, inserts) = with_host(|h| {
+                let b = &h.buffers[bi];
+                let inserts = match name {
+                    "terpri" if args.get(1).is_some_and(el_truthy) => {
+                        // Fterpri's ENSURE: `Fbolp` at the print position.
+                        !(pos <= b.begv || b.text.get(pos - 2) == Some(&'\n'))
+                    }
+                    "princ" => match args.first() {
+                        Some(v) => h
+                            .str_text(v)
+                            .map(str::to_string)
+                            .or_else(|| h.sym_name(v))
+                            .is_none_or(|s| !s.is_empty()),
+                        None => true,
+                    },
+                    _ => true,
+                };
+                (b.self_obj.clone(), inserts)
+            });
+            change(pos, pos, Some(buffer), None, inserts, || run(f, args))
         }
         None => run(f, args),
     }
@@ -603,48 +644,29 @@ fn subst_char(f: SubrFn, args: &[Value]) -> R {
     r
 }
 
-/// `read` from a function (lread.c `readchar`/`unreadchar`): FUNCTION is
-/// called with no argument for each character (nil is the end of input) and
-/// with a character to give back the one character read past the object.
-/// The object is complete when a character arrives that it cannot include
-/// (that one is given back), or when it closes with `)`, `]` or `"`.
+/// `read` from a function: `crate::lread_fn` drives lread.c's `read0`
+/// through the function's `readchar` / `unreadchar` calls. A nil STREAM is
+/// `standard-input`, as in `Fread`.
 fn read_stream(f: SubrFn, args: &[Value]) -> R {
-    let Some(stream) = args.first() else {
-        return run(f, args);
+    let stream = match args.first() {
+        Some(s) if !el_nil(s) => s.clone(),
+        _ => with_host(|h| {
+            let sym = h.intern("standard-input");
+            h.get_value(&sym).unwrap_or(Value::Bool(true))
+        }),
     };
     let is_function = with_host(|h| {
-        !el_nil(stream)
+        !el_nil(&stream)
             && !matches!(stream, Value::Bool(true))
-            && !h.is_string(stream)
+            && !h.is_string(&stream)
             && !matches!(
-                h.obj(stream),
+                h.obj(&stream),
                 Some(crate::host::Obj::Buffer(_)) | Some(crate::host::Obj::Marker(_))
             )
+            && h.sym_name(&stream).as_deref() != Some("read-char")
     });
     if !is_function {
         return run(f, args);
     }
-    let fun = stream.clone();
-    let mut text = String::new();
-    loop {
-        let c = call_function(&fun, &[])?;
-        let Value::Int(code) = c else {
-            // End of input: whatever was read is all there is.
-            return with_host(|h| crate::reader::read_one(h, &text, 0).map(|(form, _)| form));
-        };
-        let ch = char::from_u32(code as u32).unwrap_or('\u{fffd}');
-        text.push(ch);
-        let len = text.chars().count();
-        let parsed = with_host(|h| crate::reader::read_one(h, &text, 0));
-        match parsed {
-            Ok((form, end)) if end < len => {
-                call_function(&fun, &[Value::Int(code)])?;
-                return Ok(form);
-            }
-            Ok((form, _)) if matches!(ch, ')' | ']' | '"') => return Ok(form),
-            Ok(_) => {}
-            Err(e) if e == "end-of-file" => {}
-            Err(e) => return Err(e),
-        }
-    }
+    crate::lread_fn::read_from_function(&stream)
 }

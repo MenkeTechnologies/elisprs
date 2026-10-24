@@ -6,6 +6,14 @@ All notable changes to elisprs are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **Round 47 parity vs Emacs 31.1** (see BUGS.md): `read` from a function
+  stream makes lread.c `read0`'s `readchar` / `unreadchar` calls in order and
+  reads vectors, `#` syntax, comments and dotted tails through it, ending on
+  any non-character; the reader's `#s` errors, `#s()`, non-symbol record
+  types, `#$`, `read-circle` and `#^[…]` char-table literals follow
+  lread.c; printing nothing into a buffer (`terpri` with ENSURE at the
+  beginning of a line, `princ` of an empty string) runs the after-change
+  functions over an empty span, as `print_finish` does.
 - **Round 46 parity vs Emacs 31.1** (see BUGS.md): `call-process`,
   `process-lines` and `shell-command-to-string` run their child in
   `default-directory` (callproc.c `get_current_directory`, with its

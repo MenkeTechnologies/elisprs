@@ -655,6 +655,9 @@ pub const PRELUDE: &str = r#"
 (defvar print-circle nil)
 ;; print.c `print-gensym': non-nil prints an uninterned symbol as `#:NAME'.
 (defvar print-gensym nil)
+;; lread.c `read-circle': nil makes `#N=' and `#N#' invalid syntax; special so
+;; that a `let' of it reaches the reader.
+(defvar read-circle t)
 ;; print.c `standard-output': where a print primitive given a nil PRINTCHARFUN
 ;; sends its output. t is stdout in batch; a buffer, marker or function is
 ;; honoured exactly as when passed as PRINTCHARFUN.

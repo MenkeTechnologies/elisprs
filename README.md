@@ -98,7 +98,7 @@ elisp --version
 
 ## [0x03] LANGUAGE COVERAGE
 
-**Reader syntax.** integers, floats, strings (with escapes), symbols (including `1+` / `1-` / `<=` / `:keywords`), `nil` / `t`, `'quote`, `#'function`, `?c` char literals, `;` comments, backquote (`` ` `` / `,` / `,@`), radix literals (`#x1f` / `#o17` / `#b101` / `#16rFF`), `#:uninterned` and `##` (the empty-named symbol), `#s(NAME …)` records and `#s(hash-table …)`, `#&N"…"` bool-vectors, `#("text" START END PLIST …)` propertized strings, and `#N=` / `#N#` labels for shared and circular structure — so anything the printer emits under `print-circle` reads back to the same object graph.
+**Reader syntax.** integers, floats, strings (with escapes), symbols (including `1+` / `1-` / `<=` / `:keywords`), `nil` / `t`, `'quote`, `#'function`, `?c` char literals, `;` comments, backquote (`` ` `` / `,` / `,@`), radix literals (`#x1f` / `#o17` / `#b101` / `#16rFF`), `#:uninterned` and `##` (the empty-named symbol), `#s(NAME …)` records and `#s(hash-table …)`, `#&N"…"` bool-vectors, `#("text" START END PLIST …)` propertized strings, `#^[…]` char-tables, `#$` (`load-file-name`), and `#N=` / `#N#` labels for shared and circular structure (gated by `read-circle`) — so anything the printer emits under `print-circle` reads back to the same object graph. `read` from a function stream calls the function for every character lread.c's `read0` reads and gives back, in the same order.
 
 **Special forms.** `quote` `function` `lambda` `progn` `prog1` `if` `when` `unless` `cond` `and` `or` `while` `setq` `let` `let*` `defun` `defmacro` `defvar` `defconst` `condition-case` `unwind-protect`.
 

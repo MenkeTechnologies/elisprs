@@ -19,6 +19,7 @@ pub mod freevars;
 pub mod host;
 pub mod intercepts;
 pub mod json;
+pub mod lread_fn;
 pub mod lsp;
 pub mod modhooks;
 pub mod prelude;

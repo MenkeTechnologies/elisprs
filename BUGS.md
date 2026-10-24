@@ -7439,3 +7439,65 @@ Expectations: `tests/parity_process_environment.rs`.
 - `call-process` ignores INFILE and DISPLAY, and a child killed by a signal
   answers -1 where Emacs answers the signal's description string.
 - `file-truename` and `file-chase-links` are void.
+
+## Round 47 — `read` from a function as `read0` reads, the `#` dispatch, empty prints
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch -l scripts/fuzz/drive.el`).
+Closed from round 45's open list: the calls `read` makes on a function
+stream, and `terpri` with ENSURE into a buffer.
+
+### R47-A. ✅ FIXED — `read` from a function calls it as lread.c does
+
+Round 45 fed the characters to the string reader after each call, so the
+stream function saw one give-back for the whole object, a vector, a `#x`
+integer or a list with a comment or a dotted tail failed to read, and a
+function answering -1 (or anything but a character) at the end made the
+loop spin forever. `src/lread_fn.rs` ports the character consumption of
+`read0` and its helpers (`read_char_literal`, `read_string_literal`,
+`read_char_escape`, `read_integer`, `read_bool_vector`,
+`skip_lazy_string`, `skip_space_and_comments`): the same `readchar` and
+`unreadchar` calls, in order, with `read0`'s syntax errors; the object is
+built from the characters read. A nil stream is `standard-input`.
+
+```text
+text read      Emacs 31.1 calls (char, (un C) = given back)          was
+(a b)          40 97 32 (un 32) 32 98 41 (un 41) 41                   40 97 32 98 41
+(a . b c)      … 98 32 (un 32) 32 99 (un 99) 99 → (invalid-read-syntax "expected )")
+#x1f;c         35 120 49 102 59 (un 59) → 31                          (invalid-read-syntax "#")
+"  " then -1   32 32 -1 → (end-of-file)                               never returned
+```
+
+### R47-B. ✅ FIXED — the reader's `#` dispatch
+
+- `#s` not followed by `(` is `(invalid-read-syntax "#sC")` (the buffered
+  text), `#s()` is `(invalid-read-syntax "#s")`, and a record's type slot
+  may be any object (`#s(1 2)` is a record of type 1).
+- `#$` reads as the value of `load-file-name`.
+- `read-circle` is defined (t); bound to nil, `#N=` and `#N#` are invalid
+  syntax.
+- `#^[…]` reads a char-table (checked by `char_table_from_rev_list`) and
+  `#^^[…]` a sub-char-table inside it (`sub_char_table_from_rev_list`'s
+  size, depth and minimum-character errors), so a printed char-table, also
+  under `print-circle`, reads back `equal`.
+
+### R47-C. ✅ FIXED — printing nothing into a buffer runs the after-change functions
+
+print.c's `print_finish` always calls `signal_after_change`, and
+`insert_1_both` of no characters returns before `prepare_to_modify_buffer`.
+`(terpri BUF t)` at the beginning of a line and `(princ "" BUF)` now run
+`after-change-functions` with `(PT PT 0)` and no before-change half;
+`terpri` with ENSURE that does insert runs both, as any print does.
+
+Expectations: `tests/parity_read_function_stream.rs`,
+`tests/parity_reader_hash_dispatch_31.rs`, `tests/parity_print_change_hooks.rs`.
+
+### Not followed, and why
+
+- A standalone `#^^[…]` (outside a char-table) is an error here: elisprs
+  keeps sub-char-tables inside their char-table, not as heap objects. A
+  sub-char-table at a slot of the wrong depth or first character is an
+  error for the same reason, where Emacs reads whatever was written.
+- A `#^[…]` literal whose ASCII slot disagrees with its tree: Emacs looks
+  ASCII characters up in that slot, elisprs in the tree.
+- `\N{NAME}` with a Unicode character name (not `U+X`): `char-from-name`
+  and its name table are not ported (`(unsupported character name …)`).

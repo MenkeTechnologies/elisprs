@@ -6,7 +6,10 @@
 //! (incl. `1+`, `<=`, `:keywords`), `'quote`, `#'function`, `?c` char literals,
 //! `;` comments, backquote/unquote (`` ` `` `,` `,@`), and dotted pairs (`a . b`).
 
-use crate::host::{el_truthy, ElHashTable, ElispHost, Obj};
+use crate::host::{
+    el_truthy, CharTable, CtAscii, CtSlot, ElHashTable, ElispHost, Obj, SubCharTable, CT_CHARS,
+    CT_SIZE, MAX_CHAR,
+};
 use fusevm::Value;
 use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
@@ -25,6 +28,7 @@ pub fn read_all(h: &mut ElispHost, src: &str) -> Result<Vec<Value>, String> {
         // second one is invalid syntax, not a reference back into the first.
         r.labels.clear();
         r.completed.clear();
+        r.sub_labels.clear();
         out.push(r.read_form(h)?);
     }
     Ok(out)
@@ -53,6 +57,7 @@ impl FormStream {
         // `read_objects_map` is per top-level read (see `read_all`).
         self.r.labels.clear();
         self.r.completed.clear();
+        self.r.sub_labels.clear();
         self.r.read_form(h).map(Some)
     }
 }
@@ -98,6 +103,9 @@ struct Reader {
     /// through a `#N=`, so `substitute_object_recurse` knows which nodes can be
     /// the entry point of a cycle and must be marked seen before descending.
     completed: HashSet<u32>,
+    /// `#N=#^^[…]` labels inside a char-table literal: a sub-char-table is
+    /// not a heap object here, so `#N#` copies it.
+    sub_labels: HashMap<i64, SubCharTable>,
 }
 
 impl Reader {
@@ -108,6 +116,7 @@ impl Reader {
             pos,
             labels: HashMap::new(),
             completed: HashSet::new(),
+            sub_labels: HashMap::new(),
         }
     }
 }
@@ -298,6 +307,19 @@ impl Reader {
             '#' if self.peek_at(1) == Some('s') && self.peek_at(2) == Some('(') => {
                 self.pos += 2;
                 self.read_record(h)
+            }
+            // `#s` not followed by `(`: `invalid_syntax_with_buffer`, whose
+            // buffer holds the character read after the `s`.
+            '#' if self.peek_at(1) == Some('s') => Err(match self.peek_at(2) {
+                Some(c) => format!("invalid-read-syntax: #s{c}"),
+                None => "invalid-read-syntax: #s".to_string(),
+            }),
+            '#' if self.peek_at(1) == Some('^') => self.read_char_table_literal(h),
+            // `#$` is the value of `load-file-name` (`Vload_file_name`).
+            '#' if self.peek_at(1) == Some('$') => {
+                self.pos += 2;
+                let sym = h.intern("load-file-name");
+                Ok(h.get_value(&sym).unwrap_or(Value::Undef))
             }
             // `#@NNN` reaching here is `#@00` (nil, and the rest of the input is
             // skipped) or a count that overflows; `skip_ws` skipped every other.
@@ -794,6 +816,11 @@ impl Reader {
                         None => return Err(self.hash_syntax_err(dstart)),
                     }
                 }
+                // `#N=` and `#N#` are syntax only while `read-circle` is non-nil.
+                let read_circle = {
+                    let sym = h.intern("read-circle");
+                    h.get_value(&sym).map(|v| el_truthy(&v)).unwrap_or(true)
+                };
                 match ended {
                     // `#NrDIGITS` — a radix-N integer.
                     //
@@ -814,11 +841,11 @@ impl Reader {
                         return self.read_integer(h, n as u32);
                     }
                     // `#N=OBJ` — assign number N to OBJ.
-                    '=' if n <= crate::host::MOST_POSITIVE_FIXNUM => {
+                    '=' if n <= crate::host::MOST_POSITIVE_FIXNUM && read_circle => {
                         return self.read_labelled(h, n);
                     }
                     // `#N#` — a reference to the object already numbered N.
-                    '#' if n <= crate::host::MOST_POSITIVE_FIXNUM => {
+                    '#' if n <= crate::host::MOST_POSITIVE_FIXNUM && read_circle => {
                         return self
                             .labels
                             .get(&n)
@@ -1070,8 +1097,9 @@ impl Reader {
     fn read_record(&mut self, h: &mut ElispHost) -> Result<Value, String> {
         let lst = self.read_list(h)?;
         let items = h.list_vec(&lst).ok_or("malformed #s(...) literal")?;
+        // lread.c `RE_record`: `#s()` is `invalid_syntax ("#s")`.
         if items.is_empty() {
-            return Err("empty #s(...) literal".to_string());
+            return Err("invalid-read-syntax: #s".to_string());
         }
         if h.sym_name(&items[0]).as_deref() == Some("hash-table") {
             let mut test = 1u8; // eql
@@ -1113,10 +1141,8 @@ impl Reader {
                 weakness,
             ))))
         } else {
-            // A record literal `#s(NAME slot…)`: slot 0 is the type symbol NAME,
-            // exactly as written (`(aref rec 0)` returns it).
-            h.sym_name(&items[0])
-                .ok_or("#s record type must be a symbol")?;
+            // A record literal `#s(TYPE slot…)`: `record_from_list` keeps slot
+            // 0 exactly as written, whatever object it is.
             Ok(h.alloc(Obj::Record(items)))
         }
     }
@@ -1704,4 +1730,168 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
         out.push(Token { tok, line });
     }
     Ok(out)
+}
+
+/// One element of a `#^[…]` or `#^^[…]` literal: a sub-char-table is kept
+/// as one, since it lives inside its char-table rather than on the heap.
+enum CtItem {
+    Val(Value),
+    Sub(SubCharTable),
+}
+
+impl Reader {
+    /// `#^[…]` (char-table) or `#^^[…]` (sub-char-table): read0's `#^`
+    /// dispatch, with `char_table_from_rev_list` /
+    /// `sub_char_table_from_rev_list`. `self.pos` is at the `#`.
+    fn read_char_table_literal(&mut self, h: &mut ElispHost) -> Result<Value, String> {
+        self.pos += 2;
+        let mut seen = String::from("#^");
+        let sub = self.peek() == Some('^');
+        if sub {
+            self.pos += 1;
+            seen.push('^');
+        }
+        match self.peek() {
+            Some('[') => self.pos += 1,
+            Some(c) => return Err(format!("invalid-read-syntax: {seen}{c}")),
+            None => return Err(format!("invalid-read-syntax: {seen}")),
+        }
+        if sub {
+            self.read_sub_char_table(h)?;
+            return Err(
+                "error: elisprs keeps sub-char-tables inside their char-table; \
+                 a #^^[...] outside one is not readable"
+                    .to_string(),
+            );
+        }
+        let items = self.read_ct_items(h)?;
+        // CHAR_TABLE_STANDARD_SLOTS: defalt, parent, purpose, ascii and the
+        // 64 top-level slots; the rest are extra slots.
+        if items.len() < 4 + CT_SIZE[0] {
+            return Err("invalid-read-syntax: Invalid size char-table".to_string());
+        }
+        let mut items = items.into_iter();
+        let val = |item: Option<CtItem>| match item {
+            Some(CtItem::Val(v)) => Ok(v),
+            _ => Err(CT_NESTING.to_string()),
+        };
+        let default = val(items.next())?;
+        let parent = val(items.next())?;
+        let subtype = val(items.next())?;
+        let ascii = match items.next() {
+            Some(CtItem::Sub(_)) => CtAscii::Tree,
+            Some(CtItem::Val(v)) => CtAscii::Val(v),
+            None => CtAscii::Val(Value::Undef),
+        };
+        let mut contents = Vec::with_capacity(CT_SIZE[0]);
+        for i in 0..CT_SIZE[0] {
+            contents.push(ct_slot(items.next(), 0, i as u32 * CT_CHARS[0])?);
+        }
+        let extra = items
+            .map(|item| val(Some(item)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(h.alloc(Obj::CharTable(CharTable {
+            subtype,
+            default,
+            parent,
+            extra,
+            contents,
+            ascii,
+        })))
+    }
+
+    /// The elements of a `#^[` or `#^^[` literal up to its `]`. A nested
+    /// `#^^[…]`, also one labelled `#N=` by `print-circle` and referred to
+    /// again as `#N#`, is read as a sub-char-table.
+    fn read_ct_items(&mut self, h: &mut ElispHost) -> Result<Vec<CtItem>, String> {
+        let mut items = Vec::new();
+        loop {
+            self.skip_ws();
+            let Some(c) = self.peek() else {
+                return Err("end-of-file".to_string());
+            };
+            if c == ']' {
+                self.pos += 1;
+                return Ok(items);
+            }
+            let rest = &self.chars[self.pos..];
+            let digits = rest
+                .iter()
+                .skip(1)
+                .take_while(|c| c.is_ascii_digit())
+                .count();
+            let label = (c == '#' && digits > 0)
+                .then(|| {
+                    rest[1..=digits]
+                        .iter()
+                        .collect::<String>()
+                        .parse::<i64>()
+                        .ok()
+                })
+                .flatten();
+            let after = rest.get(1 + digits).copied();
+            let is_sub = |at: usize| rest.get(at..at + 4) == Some(&['#', '^', '^', '['][..]);
+            if is_sub(0) {
+                self.pos += 4;
+                items.push(CtItem::Sub(self.read_sub_char_table(h)?));
+            } else if let (Some(n), Some('='), true) = (label, after, is_sub(digits + 2)) {
+                self.pos += digits + 2 + 4;
+                let sub = self.read_sub_char_table(h)?;
+                self.sub_labels.insert(n, sub.clone());
+                items.push(CtItem::Sub(sub));
+            } else if let Some(sub) = label
+                .filter(|_| after == Some('#'))
+                .and_then(|n| self.sub_labels.get(&n))
+            {
+                items.push(CtItem::Sub(sub.clone()));
+                self.pos += digits + 2;
+            } else {
+                items.push(CtItem::Val(self.read_form(h)?));
+            }
+        }
+    }
+
+    /// `sub_char_table_from_rev_list`, after the `#^^[`.
+    fn read_sub_char_table(&mut self, h: &mut ElispHost) -> Result<SubCharTable, String> {
+        let items = self.read_ct_items(h)?;
+        if items.len() < 2 {
+            return Err("error: Invalid size of sub-char-table".to_string());
+        }
+        let mut items = items.into_iter();
+        let depth = match items.next() {
+            Some(CtItem::Val(Value::Int(d))) if (1..=3).contains(&d) => d as usize,
+            _ => return Err("error: Invalid depth in sub-char-table".to_string()),
+        };
+        if CT_SIZE[depth] != items.len() - 1 {
+            return Err("error: Invalid size in sub-char-table".to_string());
+        }
+        let min_char = match items.next() {
+            Some(CtItem::Val(Value::Int(m))) if (0..=i64::from(MAX_CHAR)).contains(&m) => m as u32,
+            _ => return Err("error: Invalid minimum character in sub-char-table".to_string()),
+        };
+        let contents = (0..CT_SIZE[depth])
+            .map(|i| ct_slot(items.next(), depth, min_char + i as u32 * CT_CHARS[depth]))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SubCharTable {
+            depth: depth as u8,
+            min_char,
+            contents,
+        })
+    }
+}
+
+/// Emacs takes any object in any slot; elisprs's char-table is chartab.c's
+/// tree and needs each sub-char-table at the depth and first character of
+/// the slot it fills.
+const CT_NESTING: &str = "error: elisprs needs each sub-char-table at its own slot of the tree";
+
+/// The slot of a table at DEPTH that starts at character FIRST.
+fn ct_slot(item: Option<CtItem>, depth: usize, first: u32) -> Result<CtSlot, String> {
+    match item {
+        Some(CtItem::Val(v)) => Ok(CtSlot::Val(v)),
+        Some(CtItem::Sub(s)) if usize::from(s.depth) == depth + 1 && s.min_char == first => {
+            Ok(CtSlot::Sub(Box::new(s)))
+        }
+        _ => Err(CT_NESTING.to_string()),
+    }
 }

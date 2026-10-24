@@ -696,9 +696,9 @@ impl ElHashTable {
 
 /// `chartab_size`: the number of slots of a char-table (depth 0) and of a
 /// sub-char-table at depth 1, 2 and 3.
-const CT_SIZE: [usize; 4] = [64, 16, 32, 128];
+pub(crate) const CT_SIZE: [usize; 4] = [64, 16, 32, 128];
 /// `chartab_chars`: how many characters one slot covers at each depth.
-const CT_CHARS: [u32; 4] = [65_536, 4_096, 128, 1];
+pub(crate) const CT_CHARS: [u32; 4] = [65_536, 4_096, 128, 1];
 
 /// One slot of a char-table or sub-char-table: a value, or a deeper table that
 /// covers the slot's characters.
