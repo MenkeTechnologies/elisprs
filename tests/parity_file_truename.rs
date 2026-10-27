@@ -156,14 +156,26 @@ fn file_attributes_reads_lstat() {
             ns % 1000 * 1000
         )
     };
+    // A symlink's own permission bits are 0777 on Linux and umask-derived on
+    // macOS, so the `ls -l` string is built from what lstat reports.
+    let perms: String = (0..9)
+        .map(|i| {
+            if st.mode() & (0o400 >> i) != 0 {
+                b"rwx"[i % 3] as char
+            } else {
+                '-'
+            }
+        })
+        .collect();
     let expected = format!(
-        "(\"real\" {} {} {} {} {} {} 4 \"lrwxr-xr-x\" t {} {})",
+        "(\"real\" {} {} {} {} {} {} 4 \"l{}\" t {} {})",
         st.nlink(),
         st.uid(),
         st.gid(),
         t(st.atime(), st.atime_nsec()),
         t(st.mtime(), st.mtime_nsec()),
         t(st.ctime(), st.ctime_nsec()),
+        perms,
         st.ino(),
         st.dev()
     );

@@ -8907,16 +8907,21 @@ fn lisp_timestamp(h: &mut ElispHost, sec: i64, nsec: i64) -> Value {
         Value::Int(nsec % 1000 * 1000),
     ])
 }
+/// Widen a `libc::mode_t` to `u32`: it is `u16` on macOS and `u32` on Linux,
+/// so an `as u32` cast is a needed widening on one and a no-op on the other.
+fn mode_bits<T: Into<u32>>(m: T) -> u32 {
+    m.into()
+}
 /// filemode.c `filemodestring`: the ten-character `ls -l` mode string.
 fn file_mode_string(mode: u32) -> String {
-    let kind = match mode & libc::S_IFMT as u32 {
-        m if m == libc::S_IFREG as u32 => '-',
-        m if m == libc::S_IFDIR as u32 => 'd',
-        m if m == libc::S_IFBLK as u32 => 'b',
-        m if m == libc::S_IFCHR as u32 => 'c',
-        m if m == libc::S_IFLNK as u32 => 'l',
-        m if m == libc::S_IFIFO as u32 => 'p',
-        m if m == libc::S_IFSOCK as u32 => 's',
+    let kind = match mode & mode_bits(libc::S_IFMT) {
+        m if m == mode_bits(libc::S_IFREG) => '-',
+        m if m == mode_bits(libc::S_IFDIR) => 'd',
+        m if m == mode_bits(libc::S_IFBLK) => 'b',
+        m if m == mode_bits(libc::S_IFCHR) => 'c',
+        m if m == mode_bits(libc::S_IFLNK) => 'l',
+        m if m == mode_bits(libc::S_IFIFO) => 'p',
+        m if m == mode_bits(libc::S_IFSOCK) => 's',
         _ => '?',
     };
     let bit = |mask: u32, c: char| if mode & mask != 0 { c } else { '-' };
