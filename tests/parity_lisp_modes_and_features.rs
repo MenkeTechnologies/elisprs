@@ -22,10 +22,16 @@
 
 use elisprs::{eval_str, print, reset_host};
 
+/// Runs on [`elisprs::with_interpreter_stack`]: indenting and parsing through
+/// lisp-mode.el nests deeper than the harness's 2 MiB test thread holds in an
+/// unoptimised x86_64 Linux build.
 fn eval(src: &str) -> String {
-    reset_host();
-    let v = eval_str(src).expect("eval failed");
-    print(&v, true)
+    let src = src.to_string();
+    elisprs::with_interpreter_stack(move || {
+        reset_host();
+        let v = eval_str(&src).expect("eval failed");
+        print(&v, true)
+    })
 }
 
 #[test]
