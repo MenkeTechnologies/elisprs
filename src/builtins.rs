@@ -8061,6 +8061,21 @@ fn float_time(h: &mut ElispHost, a: &[Value]) -> R {
     Ok(Value::Float(time_arg_secs(h, a.first())?))
 }
 
+/// `(sleep-for SECONDS &optional MILLISECONDS)` — dispnew.c `Fsleep_for`:
+/// SECONDS is any number (`extract_float`), MILLISECONDS a fixnum added to it;
+/// a duration that is not positive returns at once. Batch Emacs has no
+/// subprocess output to wake it early, so this is a plain wait.
+fn sleep_for(h: &mut ElispHost, a: &[Value]) -> R {
+    let mut duration = as_number_p(h, &a[0], false)?.to_f64();
+    if let Some(ms) = a.get(1).filter(|v| !is_nil(v)) {
+        duration += as_fixnum_named(h, ms, "fixnump")? as f64 / 1000.0;
+    }
+    if duration > 0.0 {
+        std::thread::sleep(std::time::Duration::from_secs_f64(duration));
+    }
+    Ok(Value::Undef)
+}
+
 fn current_time(_h: &mut ElispHost, _a: &[Value]) -> R {
     let secs = now_secs();
     let isec = secs.floor() as i64;
@@ -12671,6 +12686,7 @@ pub fn install(h: &mut ElispHost) {
     s("backward-word", 0, Some(1), backward_word);
     s("random", 0, Some(1), random_fn);
     s("float-time", 0, Some(1), float_time);
+    s("sleep-for", 1, Some(2), sleep_for);
     s("current-time", 0, Some(0), current_time);
     s("format-time-string", 1, Some(3), format_time_string);
     s("current-time-string", 0, Some(2), current_time_string);

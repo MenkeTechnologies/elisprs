@@ -7714,3 +7714,114 @@ Expectations: `tests/parity_bidi_paragraph_direction.rs`.
 - The rest of characters.el's category data (charset tables).
 - `fit-window-to-buffer` (`window-text-pixel-size`), `\N{NAME}`, a
   standalone `#^^[…]`, and the open items of round 49.
+
+## Round 51 — the Lisp major modes, the preloaded features, `funcall` of a macro
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch -l FILE`, each form wrapped in
+`(condition-case e (prin1 FORM) (error (princ "ERR:") (prin1 e)))`).
+
+### R51-A. ✅ FIXED — prog-mode, lisp-data-mode, emacs-lisp-mode, lisp-interaction-mode
+
+`(emacs-lisp-mode)` was `void-function`, and `major-mode` in the initial
+buffer was `fundamental-mode` (only its syntax table was modeled). loadup.el's
+own files are now prelude segments, verbatim: `easymenu.el`, `prog-mode.el`,
+`lisp-mode.el`, `elisp-mode.el`, preceded by
+`src/lisp/lisp-modes-deps-31.el` — the definitions they read while loading
+(`menu-bar-separator`, `require-final-newline`, `mode-require-final-newline`,
+`auto-mode-alist`, `completion-table-dynamic`, `font-lock-defaults`,
+syntax.el's `syntax-propertize-rules`, easy-mmode.el's
+`define-globalized-minor-mode`, startup.el's `initial-major-mode`). The last
+segment is startup.el's own step that runs `initial-major-mode` in
+`*scratch*`. subr.el's progress reporters (which `indent-region` uses) are
+added to `src/lisp/subr-31.el`.
+
+```text
+form                                                         Emacs 31.1 / now                   was
+(list major-mode mode-name)                                  (lisp-interaction-mode             (fundamental-mode nil)
+                                                              "Lisp Interaction")
+(with-temp-buffer (emacs-lisp-mode) comment-start)           ";"                                void-function emacs-lisp-mode
+(with-temp-buffer (emacs-lisp-mode) (insert "(defun f ()\n(+ 1\n2))")
+  (indent-region (point-min) (point-max)) (buffer-string))   "(defun f ()\n  (+ 1\n     2))"     void-function emacs-lisp-mode
+(get 'emacs-lisp-mode 'derived-mode-parent)                  lisp-data-mode                     nil
+```
+
+### R51-B. ✅ FIXED — `features` is batch Emacs's
+
+`features` held twelve entries, so `(require 'cl-generic)`,
+`(require 'macroexp)`, `(require 'easymenu)`, `(require 'simple)` … — no-ops in
+Emacs, which dumps those libraries — looked for a file and signalled
+`file-missing`. It now starts as the list `emacs -Q --batch --eval
+'(prin1 features)'` reports, in that order, followed by the libraries
+elisprs implements natively (`cl-lib`, `cl-macs`, `subr-x`, `pcase`, `rx`, …),
+which stay provided because there is no file for `require` to load.
+
+### R51-C. ✅ FIXED — `setq-local` before its first use; `save-match-data`
+
+`setq-local` was defined after `run-mode-hooks` and `activate-mark` in the
+prelude, so their `setq-local` compiled as a function call: any mode with a
+`syntax-propertize-function` failed in `run-mode-hooks` with `(error "macro
+called as a function …")`. subr.el's
+`setq-local` (which expands to `(setq VAR (prog1 VAL (make-local-variable
+'VAR)))` and signals `wrong-number-of-arguments` on an odd count) and
+`save-match-data` (an uninterned `saved-match-data`) are now verbatim and
+defined before any use.
+
+### R51-D. ✅ FIXED — `funcall` of a macro is `invalid-function`
+
+eval.c's `funcall_general` signals `(invalid-function ORIGINAL-FUN)` for a
+macro. elisprs signalled `(error "macro called as a function …")`, reported
+`(invalid-function (macro . #[…]))` after resolving the symbol, and
+`void-function` for a compiler intrinsic (`when`, `lambda`).
+
+```text
+form                                       Emacs 31.1 / now            was
+(funcall 'push 1 2)                        (invalid-function push)     (error "macro called as a function …")
+(mapcar 'when '(1))                        (invalid-function when)     (void-function when)
+```
+
+### R51-E. ✅ FIXED — `buffer-local-variables`, `sleep-for`, subr.el aliases
+
+`buffer-local-variables` was void. It reports buffer.c's order: the per-buffer
+slots in `struct buffer` order (measured from the oracle), then the Lisp
+locals oldest first — buffer locals now keep their binding order
+(`IndexMap`). `sleep-for` (dispnew.c) is a subr. subr.el's `rplaca`,
+`rplacd`, `store-match-data`, `indent-to-column`, `backward-delete-char`,
+`chmod`, `mkdir` and `user-original-login-name` aliases are defined.
+
+### R51-F. ✅ FIXED — a dotted call form signals when it runs
+
+`(car 1 . 2)` was rejected by the compiler ("malformed call form"), an error no
+`condition-case` could catch that took the whole top-level form with it.
+eval.c `eval_sub` looks the head up first and then signals on the final cdr,
+both only when the form runs, so the form is now lowered to that signal:
+`(void-function HEAD)` for an undefined head, else
+`(wrong-type-argument listp TAIL)`. An unreached one is inert.
+
+### R51-G. ✅ FIXED — `load` binds `lexical-binding` to the file's cookie
+
+`lexical-binding` was nil under every file. `load` and `elisp FILE` now bind it
+as lread.c does: t for a `-*- lexical-binding: VALUE -*-` cookie on the first
+line (the second after `#!`) whose VALUE is not `nil`, else nil. In
+`*scratch*` the binding is `lisp-interaction-mode`'s local. `defcustom` is
+custom.el 31.1's, which no longer puts a `""` docstring in the STANDARD
+lambda, so a lexical file stores `((funcall #'#[nil (5) (t)]))`.
+
+Expectations: `tests/parity_lisp_modes_and_features.rs`.
+
+### Not followed, and why
+
+- A macro defined *after* a function that uses it: Emacs's interpreter expands
+  the call when it runs (`(defun f () (m))` then `(defmacro m …)` makes `(f)`
+  work); elisprs compiles the body at definition time, as the byte-compiler
+  would, so the call signals `(invalid-function m)`.
+- `macroexpand` of `defun`, `defmacro`, `save-current-buffer`, `pcase`,
+  `if-let`, `setf` shows elisprs's own lowering, not subr.el's / gv.el's.
+- Unibyte strings and raw bytes (`"\200"`, `"\M-a"`, `string-to-multibyte`,
+  `encode-coding-string`): strings are UTF-8 Rust strings with no unibyte flag.
+- `print-unreadable-function` is not consulted; variable watchers
+  (`add-variable-watcher`) are void.
+- ERT is elisprs's own runner, not ert.el: `ert-run-tests-batch` takes no
+  SELECTOR and prints its own summary instead of ert.el's report.
+- A macro used before its definition in the same file still compiles as a call
+  (see above); `(when . 1)` in a loaded file is an eager-expansion load error
+  in Emacs and a runtime signal here.

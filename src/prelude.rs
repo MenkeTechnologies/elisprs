@@ -1101,13 +1101,67 @@ Uses `defvaralias' and `make-obsolete-variable' (byte-run.el)."
   `(progn (defvar ,var ,val ,doc) (make-variable-buffer-local ',var)))
 (defmacro with-demoted-errors (fmt &rest body) (declare (debug t) (indent 1)) `(condition-case --err-- (progn ,@body) (error (message ,fmt --err--) nil)))
 
-;; Evaluate BODY with the regexp match data preserved: any `string-match` inside
-;; BODY won't clobber the caller's match state.
+;; macroexp.el: `macroexp-progn'.  Defined this early because `setq-local' below
+;; expands through it, and `setq-local' is used by functions defined long before
+;; the rest of macroexp.el is.
+(defun macroexp-progn (forms) (if (cdr forms) (cons 'progn forms) (car forms)))
+
+;; subr.el (Emacs 31.1), verbatim.  A macro must be defined before the first
+;; function body that uses it is compiled, or the use compiles as a call.
+(defmacro setq-local (&rest pairs)
+  "Make each VARIABLE local to current buffer and set it to corresponding VALUE.
+
+The arguments are variable/value pairs.  For each VARIABLE in a pair,
+make VARIABLE buffer-local in the current buffer and assign to it the
+corresponding VALUE of the pair.  The VARIABLEs are literal symbols
+and should not be quoted.
+
+The VALUE of the Nth pair is not computed until after the VARIABLE
+of the (N-1)th pair is set; thus, each VALUE can use the new VALUEs
+of VARIABLEs set by earlier pairs.
+
+The return value of the `setq-local' form is the VALUE of the last
+pair.
+
+In some corner cases you may need to resort to
+`set-buffer-local-toplevel-value' instead, which see.
+
+\(fn [VARIABLE VALUE]...)"
+  (declare (debug setq))
+  (unless (evenp (length pairs))
+    (signal 'wrong-number-of-arguments (list 'setq-local (length pairs))))
+  (let ((expr nil))
+    (while pairs
+      (unless (symbolp (car pairs))
+        (error "Attempting to set a non-symbol: %s" (car pairs)))
+      ;; Can't use backquote here, it's too early in the bootstrap.
+      (setq expr
+            (cons
+             (list 'setq (car pairs)
+                   (list 'prog1
+                    (car (cdr pairs))
+                    (list 'make-local-variable (list 'quote (car pairs)))))
+             expr))
+      (setq pairs (cdr (cdr pairs))))
+    (macroexp-progn (nreverse expr))))
+
 (defmacro save-match-data (&rest body)
+  "Execute the BODY forms, restoring the global value of the match data.
+The value returned is the value of the last form in BODY.
+NOTE: The convention in Elisp is that any function, except for a few
+exceptions like car/assoc/+/goto-char, can clobber the match data,
+so `save-match-data' should normally be used to save *your* match data
+rather than your caller's match data."
+  ;; It is better not to use backquote here,
+  ;; because that makes a bootstrapping problem
+  ;; if you need to recompile all the Lisp files using interpreted code.
   (declare (indent 0) (debug t))
-  `(let ((--save-match-- (match-data)))
-     (unwind-protect (progn ,@body)
-       (set-match-data --save-match-- t))))
+  (let ((saved-match-data (make-symbol "saved-match-data")))
+    (list 'let
+	  (list (list saved-match-data '(match-data)))
+	  (list 'unwind-protect
+	        (cons 'progn body)
+	        (list 'set-match-data saved-match-data t)))))
 
 ;;; ====================================================================
 ;;; Standard library — subr / subr-x / seq / cl-lib written in elisp on
@@ -5488,10 +5542,31 @@ If all LST elements are zeros or LST is nil, return zero."
 (defun decoded-time-dst (dt) (nth 7 dt))
 (defun decoded-time-zone (dt) (nth 8 dt))
 (defun char-displayable-p (_char &optional _display) t)
-;; Feature/module system: the libraries elisprs bundles are always "provided",
-;; so (require 'cl-lib) etc. are no-ops — `require' checks `features' and never
-;; loads a file. (Arbitrary .el files ARE loadable via the `load' builtin.)
-(defvar features '(emacs cl-lib cl-macs cl-seq cl-extra seq subr-x map pcase json gv ert))
+;; Feature/module system.  `features' starts as the list `emacs -Q --batch'
+;; reports before it reads any argument, in its order:
+;;
+;;   emacs -Q --batch --eval '(prin1 features)'
+;;
+;; Emacs preloads (dumps) every one of these, so `(require 'FEATURE)' is a
+;; no-op for each and must not go looking for a file.  The tail lists the
+;; libraries elisprs implements natively, or loads while it builds the prelude
+;; (`rx' is expanded by elisp-mode.el's syntax rules, which Emacs did at byte-
+;; compile time); a stock Emacs provides those only once they are required.
+(defvar features
+  '(rmc iso-transl tooltip cconv eldoc paren electric uniquify ediff-hook
+    vc-hooks lisp-float-type elisp-mode tabulated-list replace newcomment
+    text-mode lisp-mode prog-mode register page tab-bar menu-bar rfn-eshadow
+    isearch easymenu timer select mouse jit-lock font-lock syntax font-core
+    term/tty-colors frame minibuffer nadvice seq simple cl-generic indonesian
+    philippine cham georgian utf-8-lang misc-lang vietnamese tibetan thai
+    tai-viet lao korean japanese eucjp-ms cp51932 hebrew greek romanian slovak
+    czech european ethiopic indian cyrillic chinese composite emoji-zwj
+    charscript charprop case-table epa-hook jka-cmpr-hook help abbrev obarray
+    oclosure cl-preloaded button loaddefs theme-loaddefs faces cus-face macroexp
+    files window text-properties overlay sha1 md5 base64 format env code-pages
+    mule custom widget keymap hashtable-print-readable backquote threads kqueue
+    multi-tty make-network-process tty-child-frames emacs
+    cl-lib cl-macs cl-seq cl-extra subr-x map pcase json gv ert time-date rx))
 (defun provide (feature &optional _subfeatures)
   (unless (memq feature features) (setq features (cons feature features)))
   feature)
@@ -6905,7 +6980,6 @@ When SECTION is \\='usage or \\='doc, return only that part."
      ,@body))
 (defmacro seq-setq (args sequence)
   `(pcase-setq ,(seq--make-pcase-patterns args) ,sequence))
-(defun macroexp-progn (forms) (if (cdr forms) (cons 'progn forms) (car forms)))
 
 ;; macroexp-unprogn / macroexp-let* / macroexp-let2 (macroexp.el:560,565,601).
 ;; `macroexp-let2' evaluates BODY with SYM bound to an expression for EXP: if
@@ -7196,10 +7270,11 @@ This is like the `&' operator of the C language."
 ;; objects/frames are out of scope; where a facet needs them the boundary is
 ;; named below.
 ;;
-;; elisprs binds dynamically this milestone, so `lexical-binding' is nil; the
-;; `defcustom' macro (custom.el:249) branches on it to decide how STANDARD is
-;; stashed. With nil it quotes STANDARD directly, so `standard-value' is
-;; (list DEFAULT) — exactly what GNU Emacs leaves for a lexical-binding:nil file.
+;; `lexical-binding' is nil while the prelude loads; `load' binds it to each
+;; file's cookie (`file_lexical_cookie' in src/host.rs), and `*scratch*' has it
+;; t from `lisp-interaction-mode'.  The `defcustom' macro branches on it to
+;; decide how STANDARD is stashed: nil quotes it, so `standard-value' is
+;; (DEFAULT); t wraps it in `(funcall #'(lambda () DEFAULT))', as in Emacs.
 (defvar lexical-binding nil)
 (defvar purify-flag nil)
 (defvar custom-define-hook nil)          ; custom.el:38
@@ -7654,13 +7729,13 @@ A face name can be a string or a symbol."
   (declare (doc-string 3) (indent defun))
   (nconc (list 'custom-declare-group (list 'quote symbol) members doc) args))
 
-;; custom.el:249
+;; custom.el (Emacs 31.1; 30.2 put a "" docstring in the lambda)
 (defmacro defcustom (symbol standard doc &rest args)
   (declare (doc-string 3) (debug (name body)) (indent defun))
   `(custom-declare-variable
     ',symbol
     ,(if lexical-binding
-         ``(funcall #',(lambda () "" ,standard))
+         ``(funcall #',(lambda () ,standard))
        `',standard)
     ,doc
     ,@args))
@@ -11409,9 +11484,10 @@ backward but still to a less deep spot."
 ;;   => (60 95 95 95)
 ;;
 ;; where the standard table answers (46 46 119 40).  Install it as the initial
-;; buffer's table so those agree.  The mode CHAIN itself (`prog-mode' ->
-;; `lisp-data-mode' -> `emacs-lisp-mode' -> `lisp-interaction-mode') is not
-;; ported, so `major-mode' stays `fundamental-mode'; only the table is modeled.
+;; buffer's table so the prelude's own forms read the elisp table.  The mode
+;; itself comes later: `prelude_31::STARTUP_SCRATCH' runs `initial-major-mode'
+;; in `*scratch*' once elisp-mode.el has loaded, which installs
+;; `lisp-interaction-mode-syntax-table' (a child of this one) over it.
 (set-syntax-table emacs-lisp-mode-syntax-table)
 
 ;; ---- abbrev tables (abbrev.el) ----
@@ -11581,6 +11657,46 @@ LISTS is a list of lists of elements."
         buffer-invisibility-spec t)
   nil)
 
+;; buffer.c `Fbuffer_local_variables': the per-buffer slots in the order of
+;; `struct buffer' (`FOR_EACH_PER_BUFFER_OBJECT_AT'), then the Lisp locals of
+;; `local_var_alist', oldest binding first.  A void local is a bare symbol.
+;; The slot order is measured: make every DEFVAR_PER_BUFFER variable local in a
+;; temp buffer of `emacs -Q --batch' and read back `buffer-local-variables'.
+(defconst buffer--per-buffer-slot-order
+  '(buffer-undo-list cursor-in-non-selected-windows text-conversion-style
+    line-spacing cursor-type scroll-down-aggressively scroll-up-aggressively
+    buffer-display-time fringe-cursor-alist fringe-indicator-alist
+    indicate-buffer-boundaries indicate-empty-lines horizontal-scroll-bar
+    vertical-scroll-bar scroll-bar-height scroll-bar-width
+    fringes-outside-margins right-fringe-width left-fringe-width
+    right-margin-width left-margin-width buffer-display-count
+    buffer-invisibility-spec buffer-file-truename point-before-scroll
+    cache-long-scans buffer-auto-save-file-format buffer-file-format
+    buffer-file-coding-system enable-multibyte-characters mark-active
+    buffer-display-table abbrev-mode overwrite-mode selective-display-ellipses
+    selective-display bidi-paragraph-start-re bidi-paragraph-separate-re
+    bidi-paragraph-direction bidi-display-reordering ctl-arrow word-wrap
+    truncate-lines auto-fill-function left-margin fill-column tab-width
+    local-abbrev-table tab-line-format header-line-format mode-line-format
+    mode-name local-minor-modes major-mode buffer-read-only
+    buffer-auto-save-file-name buffer-saved-size buffer-backed-up
+    default-directory buffer-file-name)
+  "The DEFVAR_PER_BUFFER variables in `struct buffer' order.")
+(defun buffer-local-variables (&optional buffer)
+  "Return an alist of variables that are buffer-local in BUFFER."
+  (unless (or (null buffer) (bufferp buffer))
+    (signal 'wrong-type-argument (list 'bufferp buffer)))
+  (with-current-buffer (or buffer (current-buffer))
+    (let* ((locals (--buffer-local-symbols--))
+           (slots nil)
+           (rest nil))
+      (dolist (sym buffer--per-buffer-slot-order)
+        (when (memq sym locals) (push sym slots)))
+      (dolist (sym locals)
+        (unless (memq sym buffer--per-buffer-slot-order) (push sym rest)))
+      (mapcar (lambda (sym) (if (boundp sym) (cons sym (symbol-value sym)) sym))
+              (nconc (nreverse slots) (nreverse rest))))))
+
 ;; run-mode-hooks / delay-mode-hooks (subr.el, ported faithfully). The
 ;; `hack-local-variables' branch is inert here — `buffer-file-name' is always nil
 ;; (no file-visiting buffers).
@@ -11610,17 +11726,6 @@ LISTS is a list of lists of elements."
      (let ((delay-mode-hooks t))
        ,@body)))
 
-;; setq-local (subr.el): make each SYM buffer-local and set it.
-(defmacro setq-local (&rest pairs)
-  "Make each SYMBOL local to the current buffer and set it to its VALUE."
-  (let ((expansion nil) (sym nil))
-    (unless (zerop (mod (length pairs) 2))
-      (error "PAIRS must have an even number of variable/value members"))
-    (while pairs
-      (setq sym (car pairs))
-      (push `(set (make-local-variable ',sym) ,(cadr pairs)) expansion)
-      (setq pairs (cddr pairs)))
-    (cons 'progn (nreverse expansion))))
 
 ;; Derived-mode parent tracking (subr.el).
 (defun derived-mode--flush (mode)
@@ -16876,8 +16981,8 @@ such that COMBO is equivalent to (and . CLAUSES)."
 ;; buffer gives that buffer its own value instead of changing every buffer's.
 ;; Defaults are the measured `default-value's; `mode-line-format' holds
 ;; bindings.el's construct (whose parts are not defined: nothing displays it).
-;; Left out: `lexical-binding' (rebound by `load') and
-;; `enable-multibyte-characters' (set only through `set-buffer-multibyte').
+;; Left out: `lexical-binding' (rebound by `load'); `enable-multibyte-characters'
+;; is one of the always-local slots below, and only `set-buffer-multibyte' sets it.
 (dolist (var '(case-fold-search case-symbols-as-words deactivate-mark
                multibyte-syntax-as-symbol parse-sexp-ignore-comments
                parse-sexp-lookup-properties show-trailing-whitespace tab-width))
@@ -16971,7 +17076,8 @@ such that COMBO is equivalent to (and . CLAUSES)."
                 (buffer-undo-list :undo-list) (mark-active nil)
                 (point-before-scroll nil) (buffer-invisibility-spec t)
                 (buffer-file-format nil) (buffer-auto-save-file-format t)
-                (buffer-display-count 0) (buffer-display-time nil)))
+                (buffer-display-count 0) (buffer-display-time nil)
+                (enable-multibyte-characters t)))
   (--make-always-local-- (car slot) (cadr slot)))
 ;; The startup buffers now hold the working directory; the default, which only
 ;; `default-value' sees, is nil as in Emacs.

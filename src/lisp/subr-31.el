@@ -990,3 +990,275 @@ the function `undo--wrap-and-run-primitive-undo'."
 		 (buffer-name (current-buffer)))))))
 
 (add-hook 'kill-buffer-query-functions #'process-kill-buffer-query-function)
+
+;;;; subr.el — progress reporters.
+
+(defvar progress-reporter-update-functions (list #'progress-reporter-echo-area)
+  "Special hook run on progress-reporter updates.
+Each function is called with three arguments:
+REPORTER is the result of a call to `make-progress-reporter'.
+STATE can be one of:
+- A float representing the percentage complete in the range 0.0-1.0
+for a numeric reporter.
+- A monotonically increasing integer for a pulsing reporter.
+- The symbol `done' to indicate that the progress reporter is complete.
+UPDATE-TEXT is a string that a progress-reporter back-end might display
+as a result of this update.  A typical use is as the \"step\" of the
+progress reporting process.")
+
+(defsubst progress-reporter-update (reporter &optional value update-text)
+  "Report progress of an operation, by default, in the echo area.
+REPORTER should be the result of a call to `make-progress-reporter'.
+
+If REPORTER is a numerical progress reporter---i.e. if it was
+made using non-nil MIN-VALUE and MAX-VALUE arguments to
+`make-progress-reporter'---then VALUE should be a number between
+MIN-VALUE and MAX-VALUE.
+
+Optional argument UPDATE-TEXT is a string that a progress-reporter
+back-end might display as a result of this update.  A typical use is as
+the \"step\" of the progress reporting process.  If REPORTER is a
+non-numerical reporter, then VALUE should be nil, or a string to use
+instead of UPDATE-TEXT.
+
+See `progress-reporter-update-functions' for the list of functions
+called on each update.
+
+This function is relatively inexpensive.  If the change since
+last update is too small or insufficient time has passed, it does
+nothing."
+  (when (or (not (numberp value))      ; For pulsing reporter
+	    (>= value (car reporter))) ; For numerical reporter
+    (progress-reporter-do-update reporter value update-text)))
+
+(defun make-progress-reporter (message &optional min-value max-value
+				       current-value min-change min-time
+                                       context)
+  "Return progress reporter object for use with `progress-reporter-update'.
+
+MESSAGE is shown in the echo area, with a status indicator
+appended to the end.  When you call `progress-reporter-done', the
+word \"done\" is printed after the MESSAGE.  You can change the
+MESSAGE of an existing progress reporter by calling
+`progress-reporter-force-update'.
+
+MIN-VALUE and MAX-VALUE, if non-nil, are starting (0% complete)
+and final (100% complete) states of operation; the latter should
+be larger.  In this case, the status message shows the percentage
+progress.
+
+If MIN-VALUE and/or MAX-VALUE is omitted or nil, the status
+message shows a \"spinning\", non-numeric indicator.
+
+Optional CURRENT-VALUE is the initial progress; the default is
+MIN-VALUE.
+Optional MIN-CHANGE is the minimal change in percents to report;
+the default is 1%.
+CURRENT-VALUE and MIN-CHANGE do not have any effect if MIN-VALUE
+and/or MAX-VALUE are nil.
+
+Optional MIN-TIME specifies the minimum interval time between
+echo area updates (default is 0.2 seconds.)  If the OS is not
+capable of measuring fractions of seconds, this parameter is
+effectively rounded up.
+
+Optional CONTEXT can be nil or `async'.  It is consulted by back ends before
+showing progress updates.  For example, when CONTEXT is `async',
+the echo area progress reports may be muted if the echo area is busy."
+  (when (string-match "[[:alnum:]]\\'" message)
+    (setq message (concat message "...")))
+  (unless min-time
+    (setq min-time 0.2))
+  (let ((reporter
+	 (cons (or min-value 0)
+	       ;; FIXME: Use defstruct.
+	       (vector (if (>= min-time 0.02)
+			   (float-time) nil)
+		       min-value
+		       max-value
+		       message
+		       (if min-change (max (min min-change 50) 1) 1)
+                       min-time
+                       ;; Unused (formerly SUFFIX).
+                       nil
+                       ;;
+                       context))))
+    ;; Force a call to `message' now.
+    (progress-reporter-update reporter (or current-value min-value))
+    reporter))
+
+(defalias 'progress-reporter-make #'make-progress-reporter)
+
+(defun progress-reporter-text (reporter)
+  "Return REPORTER's text."
+  (aref (cdr reporter) 3))
+
+(defun progress-reporter-context (reporter)
+  "Return REPORTER's context."
+  (aref (cdr reporter) 7))
+
+(defun progress-reporter-force-update (reporter &optional
+                                                value new-message update-text)
+  "Report progress of an operation in the echo area unconditionally.
+
+REPORTER, VALUE, and UPDATE-TEXT are the same as in
+`progress-reporter-update'.
+NEW-MESSAGE, if non-nil, sets a new message for the reporter."
+  (let ((parameters (cdr reporter)))
+    (when new-message
+      (aset parameters 3 new-message))
+    (when (aref parameters 0)
+      (aset parameters 0 (float-time)))
+    (progress-reporter-do-update reporter value update-text)))
+
+(defvar progress-reporter--pulse-characters ["-" "\\" "|" "/"]
+  "Characters to use for pulsing progress reporters.")
+
+(defun progress-reporter-echo-area (reporter state update-text)
+  "Progress reporter echo area update function.
+REPORTER, STATE, and UPDATE-TEXT are the same as in
+`progress-reporter-update-functions'.
+
+Do not emit a message if the reporter context is `async' and the echo
+area is busy with something else."
+  (let ((text (progress-reporter-text reporter)))
+    (unless (and (eq (progress-reporter-context reporter) 'async)
+                 (current-message)
+                 (not (string-prefix-p text (current-message))))
+      (setq update-text (if update-text (format " %s" update-text) ""))
+      (pcase state
+        ((pred floatp)
+         (if (plusp state)
+             (message "%s%d%%%s" text (* state 100.0) update-text)
+           (message "%s%s" text update-text)))
+        ((pred integerp)
+         (let ((message-log-max nil)
+               (pulse-char
+                (aref progress-reporter--pulse-characters
+                      (mod state (length progress-reporter--pulse-characters)))))
+           (message "%s %s%s" text pulse-char update-text)))
+        ('done
+         (message "%sdone" text))))))
+
+(defun progress-reporter-do-update (reporter value &optional update-text)
+  (let* ((parameters      (cdr reporter))
+	 (update-time     (aref parameters 0))
+	 (min-value       (aref parameters 1))
+	 (max-value       (aref parameters 2))
+	 (enough-time-passed
+	  ;; See if enough time has passed since the last update.
+	  (or (not update-time)
+	      (when (time-less-p update-time nil)
+		;; Calculate time for the next update
+		(aset parameters 0 (+ update-time (aref parameters 5)))))))
+    (cond ((and min-value max-value)
+	   ;; Numerical indicator
+	   (let* ((one-percent (/ (- max-value min-value) 100.0))
+		  (percentage  (if (= max-value min-value)
+				   0
+				 (truncate (/ (- value min-value)
+					      one-percent)))))
+	     ;; Calculate NEXT-UPDATE-VALUE.  If we are not printing
+	     ;; message because not enough time has passed, use 1
+	     ;; instead of MIN-CHANGE.  This makes delays between echo
+	     ;; area updates closer to MIN-TIME.
+	     (setcar reporter
+		     (min (+ min-value (* (+ percentage
+					     (if enough-time-passed
+						 ;; MIN-CHANGE
+						 (aref parameters 4)
+					       1))
+					  one-percent))
+			  max-value))
+	     (when (integerp value)
+	       (setcar reporter (ceiling (car reporter))))
+	     ;; Print message only if enough time has passed
+	     (when enough-time-passed
+               (run-hook-with-args 'progress-reporter-update-functions
+                                   reporter
+                                   (/ percentage 100.0)
+                                   update-text))))
+	  ;; Pulsing indicator
+	  (enough-time-passed
+           (let ((index (1+ (car reporter))))
+	     (setcar reporter index)
+             (run-hook-with-args 'progress-reporter-update-functions
+                                 reporter
+                                 index
+                                 (or update-text value)))))))
+
+(defun progress-reporter-done (reporter)
+  "Print reporter's message followed by word \"done\" in echo area.
+Call the functions on `progress-reporter-update-functions`."
+  (run-hook-with-args 'progress-reporter-update-functions
+                      reporter
+                      'done
+                      nil))
+
+(defmacro dotimes-with-progress-reporter (spec reporter-or-message &rest body)
+  "Loop a certain number of times and report progress in the echo area.
+Evaluate BODY with VAR bound to successive integers running from
+0, inclusive, to COUNT, exclusive.  Then evaluate RESULT to get
+the return value (nil if RESULT is omitted).
+
+REPORTER-OR-MESSAGE is a progress reporter object or a string.  In the latter
+case, use this string to create a progress reporter.
+
+At each iteration, print the reporter message followed by progress
+percentage in the echo area.  After the loop is finished,
+print the reporter message followed by the word \"done\".
+
+This macro is a convenience wrapper around `make-progress-reporter' and friends.
+
+\(fn (VAR COUNT [RESULT]) REPORTER-OR-MESSAGE BODY...)"
+  (declare (indent 2) (debug ((symbolp form &optional form) form body)))
+  (let ((prep (make-symbol "--dotimes-prep--"))
+        (end (make-symbol "--dotimes-end--")))
+    `(let ((,prep ,reporter-or-message)
+           (,end ,(cadr spec)))
+       (when (stringp ,prep)
+         (setq ,prep (make-progress-reporter ,prep 0 ,end)))
+       (dotimes (,(car spec) ,end)
+         ,@body
+         (progress-reporter-update ,prep (1+ ,(car spec))))
+       (progress-reporter-done ,prep)
+       (or ,@(cdr (cdr spec)) nil))))
+
+(defmacro dolist-with-progress-reporter (spec reporter-or-message &rest body)
+  "Loop over a list and report progress in the echo area.
+Evaluate BODY with VAR bound to each car from LIST, in turn.
+Then evaluate RESULT to get return value, default nil.
+
+REPORTER-OR-MESSAGE is a progress reporter object or a string.  In the latter
+case, use this string to create a progress reporter.
+
+At each iteration, print the reporter message followed by progress
+percentage in the echo area.  After the loop is finished,
+print the reporter message followed by the word \"done\".
+
+\(fn (VAR LIST [RESULT]) REPORTER-OR-MESSAGE BODY...)"
+  (declare (indent 2) (debug ((symbolp form &optional form) form body)))
+  (let ((prep (make-symbol "--dolist-progress-reporter--"))
+        (count (make-symbol "--dolist-count--"))
+        (list (make-symbol "--dolist-list--")))
+    `(let ((,prep ,reporter-or-message)
+           (,count 0)
+           (,list ,(cadr spec)))
+       (when (stringp ,prep)
+         (setq ,prep (make-progress-reporter ,prep 0 (length ,list))))
+       (dolist (,(car spec) ,list)
+         ,@body
+         (progress-reporter-update ,prep (setq ,count (1+ ,count))))
+       (progress-reporter-done ,prep)
+       (or ,@(cdr (cdr spec)) nil))))
+
+;;;; subr.el — alternate names for functions.
+
+(defalias 'rplaca #'setcar)
+(defalias 'rplacd #'setcdr)
+(defalias 'indent-to-column #'indent-to)
+(defalias 'backward-delete-char #'delete-backward-char)
+(defalias 'store-match-data #'set-match-data)
+(defalias 'chmod #'set-file-modes)
+(defalias 'mkdir #'make-directory)
+(define-obsolete-function-alias 'user-original-login-name #'user-login-name "28.1")

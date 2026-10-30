@@ -347,8 +347,12 @@ pub fn format_error(e: &str) -> String {
 /// path, so it binds the same vars — otherwise `(file-name-directory
 /// load-file-name)`, which real init files (e.g. Spacemacs `init.el`) use to
 /// locate sibling files, sees a void/nil variable.
+///
+/// `lexical-binding` is bound to the file's cookie as well
+/// ([`host::file_lexical_cookie`]), which is what `load` does.
 fn with_load_file_name<T>(
     path: &str,
+    src: &str,
     run: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
     let abs = host::with_host(|h| {
@@ -363,6 +367,8 @@ fn with_load_file_name<T>(
         let _ = h.specbind(&lfn, abs.clone());
         let _ = h.specbind(&ltn, abs.clone());
         let _ = h.specbind(&lip, Value::Bool(true));
+        let lb = h.intern("lexical-binding");
+        let _ = h.specbind(&lb, Value::Bool(host::file_lexical_cookie(src)));
         d
     });
     let r = run();
@@ -416,11 +422,11 @@ fn install_entry_point_state(path: &str, src: &str, entry: EntryPoint) {
     install_abbreviated_home_dir();
     // The initial buffer's syntax table, re-installed on EVERY run.
     //
-    // The prelude ends with `(set-syntax-table emacs-lisp-mode-syntax-table)`,
-    // which models `emacs -Q --batch` starting in `*scratch*` under
-    // `lisp-interaction-mode`. That is a BUFFER-LOCAL binding, and buffer locals
-    // live in the buffer struct, not in the arena — so the heap image does not
-    // carry it and a cache hit, which skips the prelude entirely, left the
+    // The prelude ends by running `initial-major-mode` in `*scratch*`, which
+    // installs `lisp-interaction-mode-syntax-table` as `emacs -Q --batch` does.
+    // That is a BUFFER-LOCAL binding, and buffer locals live in the buffer
+    // struct, not in the arena — so the heap image does not carry it and a
+    // cache hit, which skips the prelude entirely, left the
     // initial buffer on `standard-syntax-table`. The whole `char-syntax` /
     // `\sC` / `skip-syntax-*` / `forward-sexp` family then answered the
     // `--script` column on a warm cache and the `-l` column on a cold one:
@@ -435,7 +441,7 @@ fn install_entry_point_state(path: &str, src: &str, entry: EntryPoint) {
     // initial buffer; `--script` then selects ` *load*`, whose own local is
     // unset, and correctly reads the standard table.
     host::with_host(|h| {
-        let tbl_sym = h.intern("emacs-lisp-mode-syntax-table");
+        let tbl_sym = h.intern("lisp-interaction-mode-syntax-table");
         if let Ok(tbl) = h.get_value(&tbl_sym) {
             let cur = h.intern("--current-syntax-table--");
             let _ = h.set_value(&cur, tbl);
@@ -547,7 +553,7 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
             h.import_buffer_state(buffer_state);
         });
         install_entry_point_state(path, &src, entry);
-        return with_load_file_name(path, || {
+        return with_load_file_name(path, &src, || {
             let mut last = Value::Undef;
             for chunk in chunks {
                 last = host::run_chunk(chunk)?;
@@ -580,8 +586,9 @@ pub fn eval_file_as(path: &str, entry: EntryPoint) -> Result<Value, String> {
     // Bind load-file-name only while the forms run; unbind before the clean heap
     // image is captured so the cached image carries no transient load binding.
     let load_buffer = host::with_host(|h| h.load_buffer_object());
-    let (chunks, last) =
-        with_load_file_name(path, || run_top_forms(&src, Some(load_buffer.clone())))?;
+    let (chunks, last) = with_load_file_name(path, &src, || {
+        run_top_forms(&src, Some(load_buffer.clone()))
+    })?;
     // Only the part of the image this FILE owns: `clean_prelude` is the rest,
     // and the cache stores it once per shard rather than once per entry.
     let heap_tail = host::with_host(|h| h.export_heap_tail_clean(prelude_end));

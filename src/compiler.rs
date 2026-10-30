@@ -200,7 +200,9 @@ fn compile_form(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result
 }
 
 fn compile_call(h: &mut ElispHost, b: &mut ChunkBuilder, form: &Value) -> Result<(), String> {
-    let elems = h.list_vec(form).ok_or("malformed call form")?;
+    let Some(elems) = h.list_vec(form) else {
+        return compile_dotted_call_signal(h, b, form);
+    };
     let head = elems[0].clone();
     let name = match h.obj(&head) {
         Some(Obj::Symbol(s)) => Some(s.name.clone()),
@@ -413,6 +415,52 @@ pub(crate) const SPECIAL_FORM_ARITY: &[(&str, usize, Option<usize>)] = &[
 /// check lives in `eval_sub`, so a miscounted form in a branch that never runs
 /// never signals (`(if nil (let))` is nil under both the interpreter and the
 /// byte compiler). A compile-time error would reject whole files Emacs loads.
+/// A call form whose argument list ends in a non-nil atom, `(car 1 . 2)`.
+///
+/// eval.c `eval_sub` looks the head up first, so an undefined function is
+/// `(void-function HEAD)`; anything callable then reaches `list_length` (or,
+/// for a special form or macro, the first `XCDR`) on the arguments, which
+/// signals `(wrong-type-argument listp TAIL)` with TAIL the final cdr. Neither
+/// happens until the form runs, so the form is lowered to that signal rather
+/// than rejected at compile time, where no `condition-case` could catch it.
+fn compile_dotted_call_signal(
+    h: &mut ElispHost,
+    b: &mut ChunkBuilder,
+    form: &Value,
+) -> Result<(), String> {
+    let (head, mut tail) = match h.obj(form) {
+        Some(Obj::Cons(car, cdr)) => (car.clone(), cdr.clone()),
+        _ => return Err("malformed call form".to_string()),
+    };
+    while let Some(Obj::Cons(_, cdr)) = h.obj(&tail) {
+        tail = cdr.clone();
+    }
+    let quote = h.intern("quote");
+    let quoted = |h: &mut ElispHost, v: Value| h.list_from(vec![quote.clone(), v]);
+    let signal = h.intern("signal");
+    let listp = h.intern("listp");
+    let wta = h.intern("wrong-type-argument");
+    let wta = quoted(h, wta);
+    let data = h.list_from(vec![listp, tail]);
+    let data = quoted(h, data);
+    let wrong_type = h.list_from(vec![signal.clone(), wta, data]);
+    let signal_form = if matches!(h.obj(&head), Some(Obj::Symbol(_))) {
+        let void = h.intern("void-function");
+        let void = quoted(h, void);
+        let data = h.list_from(vec![head.clone()]);
+        let data = quoted(h, data);
+        let void_signal = h.list_from(vec![signal, void, data]);
+        let fboundp = h.intern("fboundp");
+        let quoted_head = quoted(h, head);
+        let test = h.list_from(vec![fboundp, quoted_head]);
+        let if_sym = h.intern("if");
+        h.list_from(vec![if_sym, test, wrong_type, void_signal])
+    } else {
+        wrong_type
+    };
+    compile_form(h, b, &signal_form)
+}
+
 fn compile_wrong_nargs_signal(
     h: &mut ElispHost,
     b: &mut ChunkBuilder,

@@ -390,6 +390,12 @@ pub const SUBRS: &[Entry] = &[
         doc: "Return TIME (default now) as seconds since the epoch, a float.",
     },
     Entry {
+        name: "sleep-for",
+        kind: Kind::Function,
+        sig: "(sleep-for SECONDS &optional MILLISECONDS)",
+        doc: "Pause for SECONDS (any number) plus MILLISECONDS; a duration that is not positive returns at once.",
+    },
+    Entry {
         name: "current-time",
         kind: Kind::Function,
         sig: "(current-time)",

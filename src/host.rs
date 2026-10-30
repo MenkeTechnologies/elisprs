@@ -15,6 +15,7 @@
 //! operations.
 
 use fusevm::{Chunk, NumOp, VMResult, Value, VM};
+use indexmap::IndexMap;
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -1800,7 +1801,7 @@ pub struct EditBuffer {
     /// *void* local (created by `make-local-variable` on a void variable — reading
     /// it still signals `void-variable`, but `local-variable-p` is non-nil). Key
     /// absence means the variable is not local in this buffer.
-    pub locals: HashMap<u32, Option<Value>>,
+    pub locals: IndexMap<u32, Option<Value>>,
     /// The buffer's local keymap slot (`use-local-map`/`current-local-map`).
     pub local_map: Value,
     /// `MODIFF`, `CHARS_MODIFF`, `SAVE_MODIFF` and `AUTOSAVE_MODIFF`.
@@ -1956,7 +1957,7 @@ impl ElispHost {
                 mark: Value::Undef,
                 se_markers: Vec::new(),
                 restrict_stack: Vec::new(),
-                locals: HashMap::new(),
+                locals: IndexMap::new(),
                 local_map: Value::Undef,
                 mods: ModCounts::default(),
                 has_intervals: false,
@@ -2741,7 +2742,7 @@ impl ElispHost {
     }
     /// The always-local slots a buffer named NAME starts with, made while the
     /// current buffer is still the creator.
-    fn initial_slots(&self, name: &str) -> HashMap<u32, Option<Value>> {
+    fn initial_slots(&self, name: &str) -> IndexMap<u32, Option<Value>> {
         let creator = &self.buffers[self.cur_buf_idx()];
         self.always_local
             .iter()
@@ -2785,7 +2786,7 @@ impl ElispHost {
                 return Ok(v.clone());
             }
             let bi = self.cur_buf_idx();
-            self.buffers[bi].locals.remove(&id);
+            self.buffers[bi].locals.shift_remove(&id);
         }
         Ok(v.clone())
     }
@@ -3148,7 +3149,7 @@ impl ElispHost {
                     if let Some(b) = self.buffers.get_mut(buf) {
                         match old {
                             None => {
-                                b.locals.remove(&id);
+                                b.locals.shift_remove(&id);
                             }
                             Some(prev) => {
                                 b.locals.insert(id, prev);
@@ -3995,10 +3996,11 @@ impl ElispHost {
                 .buffers
                 .iter()
                 .map(|b| {
-                    let mut l: Vec<(u32, Option<Value>)> =
-                        b.locals.iter().map(|(k, v)| (*k, v.clone())).collect();
-                    l.sort_by_key(|(k, _)| *k);
-                    l
+                    // In binding order: `buffer-local-variables` reports it.
+                    b.locals
+                        .iter()
+                        .map(|(k, v)| (*k, v.clone()))
+                        .collect::<Vec<_>>()
                 })
                 .collect(),
         }
@@ -6939,6 +6941,15 @@ impl ElispHost {
     /// `funcall`/`apply` resolve before calling, which is why Emacs's arity error
     /// from them names `#<subr char-to-string>` where a direct `(char-to-string)`
     /// names the symbol.
+    /// Whether a function cell holds a macro: a macro closure, or a
+    /// `(macro . FN)` cons.
+    fn is_macro_cell(&self, cell: &Value) -> bool {
+        match self.obj(cell) {
+            Some(Obj::Closure { is_macro, .. }) => *is_macro,
+            Some(Obj::Cons(car, _)) => self.sym_name(car).as_deref() == Some("macro"),
+            _ => false,
+        }
+    }
     pub fn function_designator(&mut self, f: &Value) -> Value {
         let mut cur = f.clone();
         for _ in 0..16 {
@@ -6947,6 +6958,10 @@ impl ElispHost {
                     // An autoload object cannot be called as a value: keep the
                     // symbol so `call_function' loads the file and retries.
                     Some(_) if self.indirect_autoload(&cur).is_some() => return cur,
+                    // A macro cannot be funcalled, and `funcall_general` names
+                    // the designator as passed in its `invalid-function` signal,
+                    // so keep it rather than the `(macro . FN)` it leads to.
+                    Some(next) if self.is_macro_cell(&next) => return f.clone(),
                     Some(next) => cur = next,
                     None => return cur,
                 },
@@ -8247,6 +8262,17 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             if let Some(r) = try_rust_ffi(f, args) {
                 return r;
             }
+            // eval.c `funcall_general`: a cell that is not callable is
+            // `(invalid-function ORIGINAL-FUN)`, naming the designator as the
+            // caller passed it. A compiler intrinsic (`when`, `defun`, `lambda`)
+            // has no real function cell here, only its `(macro . FN)` stand-in,
+            // and Emacs refuses that macro the same way.
+            let intrinsic_macro = with_host(|h| {
+                h.function_cell(f).is_none() && h.introspect_function_cell(f).is_some()
+            });
+            if intrinsic_macro || e.starts_with("invalid-function: ") {
+                return Err(with_host(|h| h.signal_invalid_function(&callee)));
+            }
             return Err(e);
         }
     };
@@ -8288,8 +8314,10 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
             dynamic,
             object,
         } => {
+            // eval.c `funcall_general`: a `(macro . FN)` cell is not callable,
+            // and the signal names the designator the caller passed.
             if is_macro {
-                return Err("macro called as a function (use it in a macro position)".to_string());
+                return Err(with_host(|h| h.signal_invalid_function(&callee)));
             }
             // `funcall_lambda`'s signal names the resolved closure, not the
             // designator: `xsignal2 (Qwrong_number_of_arguments, … fun, …)`.
@@ -9252,6 +9280,35 @@ fn is_defmacro_form(form: &Value) -> bool {
     })
 }
 
+/// lread.c `lisp_file_lexical_cookie` + `get_lexical_binding`: the value
+/// `load` binds `lexical-binding` to while a file's forms run. The cookie is
+/// the `lexical-binding:` variable of a `-*- … -*-` comment on the first line
+/// (the second, after a `#!` line); any value but `nil` means t. A file
+/// without one is evaluated with nil (Emacs 31 also warns, on stderr only).
+///
+/// The binding is `specbind`'s, so in `*scratch*` — where
+/// `lisp-interaction-mode` made `lexical-binding` local — it is that local
+/// value that changes, as when Emacs loads a file with `-l`.
+pub(crate) fn file_lexical_cookie(src: &str) -> bool {
+    let mut lines = src.lines();
+    let mut first = lines.next().unwrap_or("");
+    if first.starts_with("#!") {
+        first = lines.next().unwrap_or("");
+    }
+    if !first.starts_with(';') {
+        return false;
+    }
+    let Some(start) = first.find("-*-") else {
+        return false;
+    };
+    let rest = &first[start + 3..];
+    let vars = rest.find("-*-").map_or(rest, |end| &rest[..end]);
+    vars.split(';')
+        .filter_map(|pair| pair.split_once(':'))
+        .find(|(var, _)| var.trim() == "lexical-binding")
+        .is_some_and(|(_, val)| val.trim() != "nil")
+}
+
 /// `(catch TAG THUNK)` — run the thunk; if a `throw` to a matching tag unwinds
 /// out of it, return the thrown value; otherwise re-propagate.
 /// Resolve a load candidate to an absolute path string, expanding `~/` and
@@ -9420,6 +9477,8 @@ fn intrinsic_load(f: &Value, args: &[Value]) -> Result<Value, String> {
         let _ = h.specbind(&lfn, abs.clone());
         let _ = h.specbind(&ltn, abs.clone());
         let _ = h.specbind(&lip, Value::Bool(true));
+        let lb = h.intern("lexical-binding");
+        let _ = h.specbind(&lb, Value::Bool(file_lexical_cookie(&src)));
         d
     });
 

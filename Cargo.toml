@@ -81,6 +81,9 @@ libc = "0.2"
 num-bigint = { version = "0.4", features = ["serde"] }
 num-traits = "0.2"
 num-integer = "0.1"
+# Buffer-local bindings keep their creation order, which `buffer-local-variables`
+# reports (buffer.c walks `local_var_alist`, oldest binding first).
+indexmap = "2"
 
 # Emacs-Lisp regexps (string-match / replace-regexp-in-string / match-string).
 # elisp regexp syntax is translated to the `regex`-dialect in src/regexp.rs;

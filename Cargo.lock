@@ -526,6 +526,7 @@ dependencies = [
  "fancy-regex",
  "flate2",
  "fusevm",
+ "indexmap",
  "libc",
  "lsp-server",
  "lsp-types",

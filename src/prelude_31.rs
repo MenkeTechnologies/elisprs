@@ -92,9 +92,61 @@ pub const AUTOLOADS: &str = r#"
 /// order; loaded first so later definitions keep that order.
 pub const FACES_31: &str = include_str!("lisp/faces-31.el");
 
+/// Definitions from subr.el, files.el, minibuffer.el, font-core.el, startup.el,
+/// syntax.el and easy-mmode.el that the three Lisp-mode libraries below need
+/// while they load, verbatim.
+pub const LISP_MODES_DEPS_31: &str = include_str!("lisp/lisp-modes-deps-31.el");
+
+/// emacs-lisp/easymenu.el, verbatim (preloaded by loadup.el).
+pub const EASYMENU: &str = include_str!("lisp/easymenu.el");
+
+/// progmodes/prog-mode.el, verbatim (preloaded by loadup.el).
+pub const PROG_MODE: &str = include_str!("lisp/prog-mode.el");
+
+/// emacs-lisp/lisp-mode.el, verbatim (preloaded by loadup.el).
+pub const LISP_MODE: &str = include_str!("lisp/lisp-mode.el");
+
+/// progmodes/elisp-mode.el, verbatim (preloaded by loadup.el).
+pub const ELISP_MODE: &str = include_str!("lisp/elisp-mode.el");
+
+/// startup.el's `command-line', verbatim: the step that puts `*scratch*' in
+/// `initial-major-mode', which is why `emacs -Q --batch' evaluates its forms
+/// in a `lisp-interaction-mode' buffer.
+pub const STARTUP_SCRATCH: &str = r#"
+  ;; If *scratch* exists and init file didn't change its mode, initialize it.
+  (if (get-buffer "*scratch*")
+      (with-current-buffer "*scratch*"
+	(if (eq major-mode 'fundamental-mode)
+	    (funcall initial-major-mode))))
+"#;
+
 /// Every segment, in load order.
-pub const SEGMENTS: [&str; 21] = [
-    FACES_31, TIME_DATE, SUBR_31, FILES_31, KEYMAP_C, TEXTPROP_C, MAP_31, EDITFNS_C, CATEGORY_C,
-    INDENT, NEWCOMMENT, PARAGRAPHS, FILL, UNDO_31, WINDOW_C, WINDOW_31, WINDOW_EL, SIMPLE_31,
-    TIMER, REPLACE_31, AUTOLOADS,
+pub const SEGMENTS: [&str; 27] = [
+    FACES_31,
+    TIME_DATE,
+    SUBR_31,
+    FILES_31,
+    KEYMAP_C,
+    TEXTPROP_C,
+    MAP_31,
+    EDITFNS_C,
+    CATEGORY_C,
+    INDENT,
+    NEWCOMMENT,
+    PARAGRAPHS,
+    FILL,
+    UNDO_31,
+    WINDOW_C,
+    WINDOW_31,
+    WINDOW_EL,
+    SIMPLE_31,
+    TIMER,
+    REPLACE_31,
+    AUTOLOADS,
+    LISP_MODES_DEPS_31,
+    EASYMENU,
+    PROG_MODE,
+    LISP_MODE,
+    ELISP_MODE,
+    STARTUP_SCRATCH,
 ];
