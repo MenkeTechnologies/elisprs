@@ -165,9 +165,17 @@ fn time_zone_rules() {
         eval("(list (current-time-zone 0 t) (current-time-zone 0 3600) (current-time-zone 0 5430) (current-time-zone 0 '(-18000 \"XST\")) (current-time-zone 0 \"JST-9\") (current-time-zone 1.5 \"UTC0\"))"),
         "((0 \"UTC\") (3600 \"+01\") (5430 \"+013030\") (-18000 \"XST\") (32400 \"JST\") (0 \"UTC\"))"
     );
+    // `"<>5"` has an empty quoted name, and the C library's tzset decides it:
+    // macOS reads five hours west, glibc refuses it and keeps UTC, so
+    // `emacs -Q --batch` answers (-18000 "-05") on macOS and (0 "+00") on Linux.
+    let empty_name = if cfg!(target_os = "macos") {
+        "(-18000 \"-05\")"
+    } else {
+        "(0 \"+00\")"
+    };
     assert_eq!(
         eval("(list (current-time-zone '(0 0) \"EST5EDT\") (current-time-zone 15000000 \"EST5EDT\") (current-time-zone 0 \"<>5\"))"),
-        "((-18000 \"EST\") (-14400 \"EDT\") (-18000 \"-05\"))"
+        format!("((-18000 \"EST\") (-14400 \"EDT\") {empty_name})")
     );
     assert_eq!(
         eval("(current-time-zone 0 'foo)"),
