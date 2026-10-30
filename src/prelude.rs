@@ -5549,9 +5549,9 @@ If all LST elements are zeros or LST is nil, return zero."
 ;;
 ;; Emacs preloads (dumps) every one of these, so `(require 'FEATURE)' is a
 ;; no-op for each and must not go looking for a file.  The tail lists the
-;; libraries elisprs implements natively, or loads while it builds the prelude
-;; (`rx' is expanded by elisp-mode.el's syntax rules, which Emacs did at byte-
-;; compile time); a stock Emacs provides those only once they are required.
+;; libraries elisprs implements natively; a stock Emacs provides those only once
+;; they are required.  (`rx', which lisp-mode.el expands while the prelude
+;; loads, is unloaded again afterwards: see `unload_rx_after_prelude'.)
 (defvar features
   '(rmc iso-transl tooltip cconv eldoc paren electric uniquify ediff-hook
     vc-hooks lisp-float-type elisp-mode tabulated-list replace newcomment
@@ -5566,7 +5566,7 @@ If all LST elements are zeros or LST is nil, return zero."
     files window text-properties overlay sha1 md5 base64 format env code-pages
     mule custom widget keymap hashtable-print-readable backquote threads kqueue
     multi-tty make-network-process tty-child-frames emacs
-    cl-lib cl-macs cl-seq cl-extra subr-x map pcase json gv ert time-date rx))
+    cl-lib cl-macs cl-seq cl-extra subr-x map pcase json gv ert time-date))
 (defun provide (feature &optional _subfeatures)
   (unless (memq feature features) (setq features (cons feature features)))
   feature)

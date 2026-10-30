@@ -310,6 +310,7 @@ fn load_prelude() {
         let counter = h.intern("gensym-counter");
         let _ = h.set_raw_global(&counter, Value::Int(0));
     });
+    unload_rx_after_prelude();
     host::with_host(|h| {
         let end = h.arena_len();
         h.set_prelude_end(end);
@@ -317,6 +318,53 @@ fn load_prelude() {
     host::set_prelude_compiling(false);
     host::save_prelude_snapshot();
     install_abbreviated_home_dir();
+}
+
+/// Put `rx` back where a dumped Emacs has it: not a feature, its entry points
+/// autoloads. lisp-mode.el's `rx` / `rx-define` forms are expanded when Emacs
+/// byte-compiles it, so `emacs -Q` never loads rx.el at startup; expanding them
+/// while the prelude loads did, through the autoloads. The `"rx"` entries of
+/// [`prelude_31::AUTOLOADS`] are re-installed after unbinding what rx.el
+/// defined over them (`autoload` leaves a non-autoload definition alone).
+fn unload_rx_after_prelude() {
+    let Ok(forms) = host::with_host(|h| reader::read_all(h, prelude_31::AUTOLOADS)) else {
+        return;
+    };
+    let fmakunbound = host::with_host(|h| h.intern("fmakunbound"));
+    for form in &forms {
+        let target = host::with_host(|h| {
+            let v = h.list_vec(form)?;
+            let is_rx = h.sym_name(v.first()?).as_deref() == Some("autoload")
+                && h.str_text(v.get(2)?) == Some("rx");
+            // (autoload 'SYM "rx" ...): SYM is the second element of (quote SYM).
+            is_rx.then(|| h.list_vec(&v[1])?.get(1).cloned()).flatten()
+        });
+        let Some(sym) = target else { continue };
+        let r = (|| -> Result<(), String> {
+            host::call_function(&fmakunbound, &[sym])?;
+            let expanded = host::macroexpand_all(form)?;
+            let chunk = host::with_host(|h| compiler::compile_top(h, &expanded))?;
+            host::run_chunk(chunk)?;
+            Ok(())
+        })();
+        if let Err(e) = r {
+            eprintln!("elisprs: prelude form failed: {e}");
+        }
+    }
+    host::with_host(|h| {
+        let features = h.intern("features");
+        let rx = h.intern("rx");
+        let kept: Vec<Value> = h
+            .raw_global_value(&features)
+            .ok()
+            .and_then(|l| h.list_vec(&l))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| !h.values_eq(f, &rx))
+            .collect();
+        let list = h.list_from(kept);
+        let _ = h.set_raw_global(&features, list);
+    });
 }
 
 /// Render a value (prin1 style when `readable`).
