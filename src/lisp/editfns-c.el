@@ -322,6 +322,45 @@ BUFFER defaults to the current buffer."
     (signal 'wrong-type-argument (list 'bufferp buffer)))
   nil)
 
+(defun find-buffer (variable value)
+  "Return the first buffer with VARIABLE `equal' to VALUE.
+VARIABLE's buffer-local value is compared in each live buffer, in the
+order of `buffer-list'; nil if no buffer has it."
+  (catch 'found
+    (dolist (buf (buffer-list))
+      (when (equal value (buffer-local-value variable buf))
+        (throw 'found buf)))))
+
+(defun get-file-buffer (filename)
+  "Return the buffer visiting file FILENAME (a string).
+The buffer's `buffer-file-name' must match exactly the expansion of
+FILENAME.  If there is no such live buffer, return nil."
+  (unless (stringp filename)
+    (signal 'wrong-type-argument (list 'stringp filename)))
+  (setq filename (expand-file-name filename))
+  (catch 'found
+    (dolist (buf (buffer-list))
+      (let ((name (buffer-local-value 'buffer-file-name buf)))
+        (when (and (stringp name) (string-equal name filename))
+          (throw 'found buf))))))
+
+(defun delete-all-overlays (&optional buffer)
+  "Delete all overlays of BUFFER.
+BUFFER omitted or nil means delete all overlays of the current buffer."
+  (unless (or (null buffer) (bufferp buffer))
+    (signal 'wrong-type-argument (list 'bufferp buffer)))
+  (with-current-buffer (or buffer (current-buffer))
+    (save-restriction
+      (widen)
+      (mapc #'delete-overlay (overlays-in (point-min) (point-max)))))
+  nil)
+
+;;;; data.c
+
+(defun vector-or-char-table-p (object)
+  "Return t if OBJECT is a char-table or vector."
+  (if (or (vectorp object) (char-table-p object)) t nil))
+
 ;;;; xdisp.c
 
 (defun editfns--invisible-prop (propval list)

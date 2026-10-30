@@ -2583,8 +2583,12 @@ impl ElispHost {
         if let Some(name) = self.constant_symbol_name(alias) {
             return Err(format!("error: Cannot make a constant an alias: {name}"));
         }
-        let aid = self.sym_handle(alias).ok_or("defvaralias: not a symbol")?;
-        let bid = self.sym_handle(base).ok_or("defvaralias: not a symbol")?;
+        let aid = self
+            .sym_handle(alias)
+            .ok_or_else(|| self.wrong_type_symbolp(alias))?;
+        let bid = self
+            .sym_handle(base)
+            .ok_or_else(|| self.wrong_type_symbolp(base))?;
         // Reject a chain that would make BASE indirect back to ALIAS.
         let mut probe = bid;
         for _ in 0..64 {
@@ -2684,7 +2688,7 @@ impl ElispHost {
         self.check_settable(v)?;
         let id0 = self
             .sym_handle(v)
-            .ok_or("make-local-variable: not a symbol")?;
+            .ok_or_else(|| self.wrong_type_symbolp(v))?;
         let id = self.indirect_var(id0);
         let bi = self.cur_buf_idx();
         if !self.buffers[bi].locals.contains_key(&id) {
@@ -2702,7 +2706,7 @@ impl ElispHost {
         self.check_settable(v)?;
         let id0 = self
             .sym_handle(v)
-            .ok_or("make-variable-buffer-local: not a symbol")?;
+            .ok_or_else(|| self.wrong_type_symbolp(v))?;
         let id = self.indirect_var(id0);
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.buffer_local_auto = true;
@@ -2776,7 +2780,14 @@ impl ElispHost {
     }
     /// `(kill-local-variable SYM)` — remove the current buffer's local binding for
     /// SYM (the default becomes effective again). Returns SYM.
+    /// data.c `CHECK_SYMBOL`: `(wrong-type-argument symbolp OBJECT)`.
+    pub fn wrong_type_symbolp(&self, v: &Value) -> String {
+        format!("wrong-type-argument: symbolp {}", self.print(v, true))
+    }
     pub fn kill_local_variable(&mut self, v: &Value) -> Result<Value, String> {
+        if self.sym_handle(v).is_none() && !el_nil(v) && !matches!(v, Value::Bool(true)) {
+            return Err(self.wrong_type_symbolp(v));
+        }
         if let Some(id0) = self.sym_handle(v) {
             let id = self.indirect_var(id0);
             // data.c `Fkill_local_variable`: a per-buffer slot resets only when
@@ -2829,7 +2840,9 @@ impl ElispHost {
     /// left untouched — they shadow the cell and unwind on their own.
     pub fn unset_value(&mut self, v: &Value) -> Result<(), String> {
         self.check_settable(v)?;
-        let id0 = self.sym_handle(v).ok_or("makunbound: not a symbol")?;
+        let id0 = self
+            .sym_handle(v)
+            .ok_or_else(|| self.wrong_type_symbolp(v))?;
         let id = self.indirect_var(id0);
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.value = None;
@@ -2865,7 +2878,7 @@ impl ElispHost {
                     .value
                     .clone()
                     .ok_or_else(|| format!("void-variable: {}", s.name)),
-                _ => Err("not a symbol".to_string()),
+                _ => Err(self.wrong_type_symbolp(v)),
             };
         }
         // `nil` and `t` are self-evaluating symbols; `nil` arrives either as
@@ -2874,7 +2887,7 @@ impl ElispHost {
         match v {
             Value::Bool(true) => Ok(Value::Bool(true)),
             _ if el_nil(v) => Ok(Value::Undef),
-            _ => Err("not a symbol".to_string()),
+            _ => Err(self.wrong_type_symbolp(v)),
         }
     }
     /// Index of the current buffer.
@@ -2891,7 +2904,7 @@ impl ElispHost {
                     .value
                     .clone()
                     .ok_or_else(|| format!("void-variable: {}", s.name)),
-                _ => Err("not a symbol".to_string()),
+                _ => Err(self.wrong_type_symbolp(v)),
             };
         }
         // `nil` and `t` are self-evaluating symbols; `nil` arrives either as
@@ -2900,7 +2913,7 @@ impl ElispHost {
         match v {
             Value::Bool(true) => Ok(Value::Bool(true)),
             _ if el_nil(v) => Ok(Value::Undef),
-            _ => Err("not a symbol".to_string()),
+            _ => Err(self.wrong_type_symbolp(v)),
         }
     }
     /// True if the global (default) value cell is bound (`default-boundp`).
@@ -2923,7 +2936,9 @@ impl ElispHost {
     /// lexical and buffer-local bindings.
     pub fn set_raw_global(&mut self, v: &Value, val: Value) -> Result<(), String> {
         self.check_settable(v)?;
-        let id0 = self.sym_handle(v).ok_or("set-default: not a symbol")?;
+        let id0 = self
+            .sym_handle(v)
+            .ok_or_else(|| self.wrong_type_symbolp(v))?;
         let id = self.indirect_var(id0);
         if let Obj::Symbol(s) = &mut self.arena[id as usize] {
             s.value = Some(val);

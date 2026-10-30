@@ -7825,3 +7825,34 @@ Expectations: `tests/parity_lisp_modes_and_features.rs`.
 - A macro used before its definition in the same file still compiles as a call
   (see above); `(when . 1)` in a loaded file is an eager-expansion load error
   in Emacs and a runtime signal here.
+
+## Round 52 — `CHECK_SYMBOL` in the variable primitives, buffer.c lookups
+
+**Oracle: GNU Emacs 31.1** (`emacs -Q --batch -l FILE`, each form wrapped in
+`(condition-case e FORM (error e))`).
+
+### R52-A. ✅ FIXED — a non-symbol is `(wrong-type-argument symbolp OBJECT)`
+
+data.c checks the SYMBOL argument of every variable primitive with
+`CHECK_SYMBOL`. elisprs answered `(error "not a symbol")` from `symbol-value`,
+`default-value`, `default-toplevel-value` and `buffer-local-value`;
+`(NAME "not a symbol")` from `makunbound`, `set-default`,
+`make-local-variable`, `make-variable-buffer-local` and `defvaralias`; nil
+from `boundp` and `default-boundp`; and `kill-local-variable` returned its
+argument. nil and t still count as symbols (`(makunbound nil)` is
+`(setting-constant nil)`, `(kill-local-variable t)` is t).
+
+### R52-B. ✅ FIXED — `find-buffer`, `get-file-buffer`, `delete-all-overlays`, `vector-or-char-table-p`
+
+Void before; now buffer.c's and data.c's, in `src/lisp/editfns-c.el`:
+`find-buffer` compares with `equal` in `buffer-list` order (and signals from
+`buffer-local-value` in the first buffer without the variable),
+`get-file-buffer` expands FILENAME before comparing, `delete-all-overlays`
+detaches every overlay regardless of narrowing.
+
+Expectations: `tests/parity_symbol_checks_and_buffer_lookups.rs`.
+
+### Not followed, and why
+
+- `overlay-lists`: its order is that of Emacs's overlay interval tree, which
+  elisprs does not have.

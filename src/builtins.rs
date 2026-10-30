@@ -2329,6 +2329,7 @@ fn indirect_variable(h: &mut ElispHost, a: &[Value]) -> R {
 }
 /// `(boundp SYMBOL)` — non-nil if SYMBOL currently has a value.
 fn boundp(h: &mut ElispHost, a: &[Value]) -> R {
+    check_symbol(h, &a[0])?;
     // nil and t are always bound; otherwise the value cell must resolve.
     let bound =
         is_nil(&a[0]) || matches!(a[0], Value::Bool(true)) || h.get_dynamic_value(&a[0]).is_ok();
@@ -7444,6 +7445,7 @@ fn subr_name(h: &mut ElispHost, a: &[Value]) -> R {
 /// `(default-boundp SYMBOL)` — non-nil if SYMBOL has a default value, i.e. its
 /// global value cell is bound (ignoring any buffer-local binding).
 fn default_boundp(h: &mut ElispHost, a: &[Value]) -> R {
+    check_symbol(h, &a[0])?;
     let bound = is_nil(&a[0]) || matches!(a[0], Value::Bool(true)) || h.default_boundp_raw(&a[0]);
     Ok(nil_or(bound))
 }
