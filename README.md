@@ -279,6 +279,26 @@ cargo build --release
 
 `elisp --help` / `-h` prints the usage screen; `elisp --version` prints the version.
 
+### Embedding
+
+```rust
+pub fn run_program(src: &str, input: &str) -> Result<String, String>
+```
+
+Evaluates `src` on a fresh interpreter (its own large-stack thread per call, so
+calls from several threads never share state or output) and returns everything
+printed to stdout. `read-from-minibuffer` and `read-string` behave as in
+`emacs --batch`: the prompt is printed, a line is read from `input`, and EOF
+signals `end-of-file`. An uncaught signal or `kill-emacs` with a nonzero status
+is `Err`; `(kill-emacs)` returns `Ok` with the output so far. The process never
+exits.
+
+```rust
+let out = elisprs::run_program(r#"(princ (upcase (read-string "")))"#, "hi\n")?;
+assert_eq!(out, "HI");
+assert!(elisprs::run_program(r#"(error "boom")"#, "").is_err());
+```
+
 ---
 
 ## [0x08] TEST // INTEGRITY VERIFICATION

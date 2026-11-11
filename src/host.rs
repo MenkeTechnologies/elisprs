@@ -1407,6 +1407,23 @@ fn lisp_level_arity(name: &str) -> Option<(u16, u16)> {
 /// printed" instead of printing (Emacs errors at exactly this depth).
 const PRINT_CIRCLE: usize = 200;
 
+/// The standard input `read-from-minibuffer` reads in batch: the process
+/// stdin for the `elisp` binary, or a fixed buffer an embedder feeds in.
+#[derive(Clone)]
+pub enum StdinSource {
+    Process,
+    Fed(std::io::Cursor<Vec<u8>>),
+}
+
+impl std::io::Read for StdinSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            StdinSource::Process => std::io::stdin().read(buf),
+            StdinSource::Fed(c) => c.read(buf),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ElispHost {
     pub(crate) arena: Vec<Obj>,
@@ -1501,6 +1518,13 @@ pub struct ElispHost {
     /// print.c `printchar_stdout_last`: the last character written to stdout,
     /// which is what `(terpri t t)` consults in batch. NUL before any output.
     pub(crate) stdout_last: char,
+    /// In-process stdout sink. When `Some`, everything the program writes to
+    /// stdout is appended here instead of reaching the process; an embedder
+    /// ([`crate::embed::run_program`]) turns it on. `None` is the `elisp` binary.
+    pub capture: Option<String>,
+    /// Where `read-from-minibuffer` / `read-string` read their line from in
+    /// batch; see [`StdinSource`].
+    pub stdin: StdinSource,
     /// Set by `print_inner` when nesting reaches `PRINT_CIRCLE`; the print entry
     /// points (`prin1`/`print`/`princ`/`format`) read it to signal Emacs's
     /// `error "Apparently circular structure being printed"`. `Cell` so the
@@ -1936,6 +1960,8 @@ impl ElispHost {
             pending_error: None,
             match_data: None,
             stdout_last: '\0',
+            capture: None,
+            stdin: StdinSource::Process,
             print_overflow: Cell::new(false),
             print_backquote_depth: Cell::new(0),
             print_labels: RefCell::new(HashMap::new()),
@@ -5322,11 +5348,21 @@ impl ElispHost {
         self.error.take()
     }
 
+    /// Write `s` to stdout, or to the capture buffer when one is on.
+    pub fn write_stdout(&mut self, s: &str) {
+        use std::io::Write;
+        match &mut self.capture {
+            Some(buf) => buf.push_str(s),
+            None => {
+                print!("{s}");
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+
     /// Write program output to stdout (a PRINTCHARFUN of t in batch).
     pub fn emit(&mut self, s: &str) {
-        use std::io::Write;
-        print!("{s}");
-        let _ = std::io::stdout().flush();
+        self.write_stdout(s);
         if let Some(c) = s.chars().last() {
             self.stdout_last = c;
         }
@@ -7589,6 +7625,66 @@ pub fn set_prelude_compiling(b: bool) {
     PRELUDE_COMPILING.with(|c| c.set(b));
 }
 
+/// `(kill-emacs &optional ARG RESTART)` as batch Emacs runs it (emacs.c
+/// `Fkill_emacs`): run `kill-emacs-hook` with each function's error reported on
+/// stderr and skipped (`safe_run_hooks`), then exit with ARG when it is an
+/// integer (the OS keeps its low 8 bits) and 0 otherwise. Nothing unwinds:
+/// `unwind-protect` cleanups and `condition-case` handlers do not run. Inside
+/// [`crate::embed::run_program`] the run ends instead of the process.
+fn kill_emacs(args: &[Value]) -> Result<Value, String> {
+    for f in hook_functions("kill-emacs-hook")? {
+        if let Err(e) = call_function(&f, &[]) {
+            let report = with_host(|h| {
+                let obj = h
+                    .take_pending_error(&e)
+                    .unwrap_or_else(|| h.make_error_object(&e));
+                let (f, obj) = (h.print(&f, true), h.print(&obj, true));
+                format!("Error in kill-emacs-hook ({f}): {obj}")
+            });
+            eprintln!("{report}");
+        }
+    }
+    let code = match args.first() {
+        Some(Value::Int(n)) => (*n & 0xff) as i32,
+        _ => 0,
+    };
+    if with_host(|h| h.capture.is_some()) {
+        std::panic::resume_unwind(Box::new(crate::embed::ExitNow(code)));
+    }
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    std::process::exit(code);
+}
+
+/// The functions a hook variable runs (eval.c `run_hook_with_args`): none when
+/// it is void or nil, the value itself when it is a single function, else the
+/// list's elements (`t`, the "run the global value too" marker, is skipped).
+fn hook_functions(hook: &str) -> Result<Vec<Value>, String> {
+    let (boundp, symbol_value, functionp, sym) = with_host(|h| {
+        (
+            h.intern("boundp"),
+            h.intern("symbol-value"),
+            h.intern("functionp"),
+            h.intern(hook),
+        )
+    });
+    if el_nil(&call_function(&boundp, std::slice::from_ref(&sym))?) {
+        return Ok(Vec::new());
+    }
+    let value = call_function(&symbol_value, &[sym])?;
+    if el_nil(&value) {
+        return Ok(Vec::new());
+    }
+    if el_truthy(&call_function(&functionp, std::slice::from_ref(&value))?) {
+        return Ok(vec![value]);
+    }
+    let fns = with_host(|h| h.list_vec(&value)).unwrap_or_default();
+    Ok(fns
+        .into_iter()
+        .filter(|f| !matches!(f, Value::Bool(true)))
+        .collect())
+}
+
 /// Call a function designator with already-evaluated args. The single
 /// re-entrant entry point: it never holds the host borrow across a callee, so a
 /// closure body (run on a nested fusevm VM) can re-borrow the host freely.
@@ -7729,6 +7825,7 @@ pub fn call_function(f: &Value, args: &[Value]) -> Result<Value, String> {
         })
     }) {
         match name.as_str() {
+            "kill-emacs" => return kill_emacs(args),
             "funcall" => {
                 // `(funcall)` with no function designator: Emacs signals
                 // `(wrong-number-of-arguments funcall 0)`, not a panic.

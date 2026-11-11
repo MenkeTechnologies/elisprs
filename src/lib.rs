@@ -16,6 +16,7 @@ pub mod bundled;
 pub mod cache;
 pub mod compiler;
 pub mod dap;
+pub mod embed;
 pub mod fileio;
 pub mod freevars;
 pub mod host;
@@ -35,6 +36,7 @@ pub mod tiers;
 pub mod timefns;
 pub mod window;
 
+pub use embed::run_program;
 pub use fusevm::Value;
 pub use host::{reset_host, run_chunk, with_host};
 

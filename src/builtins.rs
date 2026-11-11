@@ -7508,6 +7508,108 @@ fn read_fn(h: &mut ElispHost, a: &[Value]) -> R {
         r => r.map(|(form, _)| form),
     }
 }
+/// `(read-from-minibuffer PROMPT &optional INITIAL-CONTENTS KEYMAP READ HIST
+/// DEFAULT-VALUE INHERIT-INPUT-METHOD)` as Emacs runs it in batch (minibuf.c
+/// `read_minibuf_noninteractive`): write PROMPT to stdout, read one line from
+/// stdin up to `\n` or `\r` (not included), and return it. EOF with nothing
+/// read signals `(end-of-file "Error reading from stdin")`. With READ non-nil
+/// the line is parsed as one Lisp object (`string_to_object`). INITIAL-CONTENTS,
+/// KEYMAP, HIST and INHERIT-INPUT-METHOD play no part without a minibuffer.
+fn read_from_minibuffer(h: &mut ElispHost, a: &[Value]) -> R {
+    use std::io::Read;
+    let prompt = as_string(h, &a[0])?;
+    h.write_stdout(&prompt);
+    let mut line = Vec::new();
+    let mut ended = false;
+    let mut byte = [0u8; 1];
+    while let Ok(1) = h.stdin.read(&mut byte) {
+        if matches!(byte[0], b'\n' | b'\r') {
+            ended = true;
+            break;
+        }
+        line.push(byte[0]);
+    }
+    if line.is_empty() && !ended {
+        let msg = h.new_string("Error reading from stdin");
+        return Err(signal_with_data(h, "end-of-file", vec![msg]));
+    }
+    let text = String::from_utf8_lossy(&line).into_owned();
+    if a.get(3).is_none_or(is_nil) {
+        return Ok(h.new_string(text));
+    }
+    string_to_object(h, text, a.get(5))
+}
+
+/// minibuf.c `string_to_object`: read one object from TEXT (an empty TEXT
+/// reads DEFAULT, or its car when it is a list); anything but whitespace after
+/// the object signals `invalid-read-syntax`.
+fn string_to_object(h: &mut ElispHost, text: String, default: Option<&Value>) -> R {
+    let mut val = h.new_string(text);
+    if h.str_text(&val).is_some_and(str::is_empty) {
+        let default = default.cloned().unwrap_or(Value::Undef);
+        let car = match h.obj(&default) {
+            Some(Obj::Cons(car, _)) => car.clone(),
+            _ => Value::Undef,
+        };
+        if h.str_text(&default).is_some() {
+            val = default;
+        } else if h.str_text(&car).is_some() {
+            val = car;
+        }
+    }
+    let read = read_from_string(h, std::slice::from_ref(&val))?;
+    let Some(Obj::Cons(obj, end)) = h.obj(&read).cloned() else {
+        unreachable!("read-from-string returns (OBJECT . END)")
+    };
+    let rest: String = as_string(h, &val)?
+        .chars()
+        .skip(usize::try_from(as_integer(h, &end)?).unwrap_or(0))
+        .collect();
+    if rest.chars().any(|c| !matches!(c, ' ' | '\t' | '\n')) {
+        let msg = h.new_string("Trailing garbage following expression");
+        return Err(signal_with_data(h, "invalid-read-syntax", vec![msg]));
+    }
+    Ok(obj)
+}
+
+/// `(read-string PROMPT &optional INITIAL-INPUT HISTORY DEFAULT-VALUE
+/// INHERIT-INPUT-METHOD)`: `read-from-minibuffer`, except that an empty answer
+/// returns DEFAULT-VALUE (its car when it is a list) when that is non-nil.
+fn read_string(h: &mut ElispHost, a: &[Value]) -> R {
+    let get = |i: usize| a.get(i).cloned().unwrap_or(Value::Undef);
+    let default = get(3);
+    let val = read_from_minibuffer(
+        h,
+        &[
+            get(0),
+            get(1),
+            Value::Undef,
+            Value::Undef,
+            get(2),
+            default.clone(),
+            get(4),
+        ],
+    )?;
+    if h.str_text(&val).is_some_and(str::is_empty) && !is_nil(&default) {
+        return Ok(match h.obj(&default) {
+            Some(Obj::Cons(car, _)) => car.clone(),
+            _ => default,
+        });
+    }
+    Ok(val)
+}
+
+/// Signal `(SYMBOL . DATA)`: the error string a subr returns plus the error
+/// object `condition-case` binds (eval.c `xsignal`).
+fn signal_with_data(h: &mut ElispHost, symbol: &str, data: Vec<Value>) -> String {
+    let data = h.list_from(data);
+    let msg = format!("{symbol}: {}", h.print(&data, true));
+    let sym = h.intern(symbol);
+    let obj = h.cons(sym, data);
+    h.set_pending_error(&msg, obj);
+    msg
+}
+
 /// `(read-from-string STRING &optional START END)` — read the first object from
 /// STRING (from char index START), returning `(OBJECT . END-INDEX)`.
 fn read_from_string(h: &mut ElispHost, a: &[Value]) -> R {
@@ -12832,6 +12934,9 @@ pub fn install(h: &mut ElispHost) {
     s("load-average", 0, Some(1), load_average);
     s("read", 0, Some(1), read_fn);
     s("read-from-string", 1, Some(3), read_from_string);
+    s("read-from-minibuffer", 1, Some(7), read_from_minibuffer);
+    s("read-string", 1, Some(5), read_string);
+    s("kill-emacs", 0, Some(2), intercepted_subr);
     s("compare-strings", 6, Some(7), compare_strings);
     // Emacs 28 alias for split-string with identical semantics (direct forwarder).
     s("string-split", 1, Some(4), split_string);
