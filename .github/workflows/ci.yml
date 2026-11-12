@@ -47,6 +47,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # ubuntu-26.04 moved the backward-compatible zone files (Universal,
+      # EST5EDT, ...) into tzdata-legacy. With TZ="" glibc loads "Universal",
+      # so without the package libc names the zone "Universal", not "UTC".
+      - name: Install legacy tz names
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tzdata-legacy
       - run: cargo build --locked --verbose
       - run: cargo test --locked --verbose
 
